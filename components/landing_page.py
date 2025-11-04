@@ -19,11 +19,10 @@ def _display_header():
 def _display_hero_section():
     """Renders the main hero section using native components."""
     with st.container():
-        col1, col2 = st.columns([1.1, 0.9], gap="large")
+        col1, col2 = st.columns([1.1, 0.9], gap="large", vertical_alignment="center")
         with col1:
             # USE: st.title and st.write for hero text instead of HTML tags.
             st.header("AI Agents, Human Insight.")
-            st.space(1)
             st.write("AlphaMesh uses a team of specialized AI agents to analyze markets, debate strategies, and deliver clear, actionable investment intelligence. No code, just results.")
             if st.button("Get Started for Free", key="hero_get_started", type="primary"):
                 set_auth_mode_and_show_modal('Sign Up')
@@ -101,9 +100,9 @@ def _display_features_section():
 def _display_final_cta():
     """Displays the final call-to-action section."""
     # USE: A bordered container makes the CTA section stand out.
-    with st.container(border=True):
-        st.header("The Future of Investing is Collaborative Intelligence.")
-        st.write("Stop guessing. Start making data-driven decisions with your personal AI investment committee.")
+    with st.container(border=True, horizontal_alignment="center", ):
+        st.header("The Future of Investing is Collaborative Intelligence.", width='content')
+        st.text("Stop guessing. Start making data-driven decisions with your personal AI investment committee.")
 
         _, col, _ = st.columns([1, 0.6, 1])
         with col:
