@@ -1,0 +1,11 @@
+/* styles/header.css */
+
+
+/* Style for the logo text */
+.logo {
+    font-size: 1.5rem;
+    font-weight: 1600;
+    color: #FFFFFF;
+    /* Vertically center the logo text with the buttons */
+    padding-top: 0.35rem; 
+}
