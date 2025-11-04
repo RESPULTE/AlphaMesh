@@ -1,0 +1,199 @@
+/* --- Base & Fonts --- */
+body {
+    background-color: #0A192F; /* Deep Navy Blue */
+    color: #E0E0E0; /* Light grey for text */
+    font-family: 'Poppins', sans-serif;
+    -ms-overflow-style: none;  /* IE and Edge */
+    scrollbar-width: none;  /* Firefox */
+}
+
+/* Hide scrollbar for Chrome, Safari and Opera */
+body::-webkit-scrollbar {
+    display: none;
+}
+
+/* Import Google Font */
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
+
+/* --- Hide Streamlit's default elements --- */
+#MainMenu, header, footer {
+    visibility: hidden;
+}
+
+/* --- Header --- */
+.header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 2rem;
+    background-color: rgba(10, 25, 47, 0.85); /* Slightly transparent navy */
+    backdrop-filter: blur(10px);
+    z-index: 1000;
+    border-bottom: 1px solid #112240;
+}
+.logo {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: #FFFFFF;
+}
+.nav-buttons {
+    display: flex;
+    gap: 1rem;
+}
+.nav-button-primary, .nav-button-secondary {
+    padding: 0.5rem 1.2rem;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    border: 1px solid transparent;
+}
+.nav-button-primary {
+    background-color: #00BFFF;
+    color: #FFFFFF;
+}
+.nav-button-primary:hover {
+    background-color: #0099cc;
+}
+.nav-button-secondary {
+    background-color: transparent;
+    color: #bdc5d4;
+    border-color: #3a4a65;
+}
+.nav-button-secondary:hover {
+    background-color: #112240;
+    color: #FFFFFF;
+}
+
+/* Main content needs padding to not be hidden by fixed header */
+.main-content {
+    padding-top: 80px; /* Adjust based on header height */
+}
+
+/* --- Typography --- */
+.main-title {
+    font-size: 3.5rem;
+    font-weight: 700;
+    color: #FFFFFF;
+    line-height: 1.2;
+    margin-bottom: 1rem;
+}
+.sub-headline {
+    font-size: 1.2rem;
+    color: #bdc5d4;
+    line-height: 1.6;
+    margin-bottom: 2rem;
+}
+.section-headline {
+    font-size: 2.5rem;
+    font-weight: 600;
+    color: #FFFFFF;
+    text-align: center;
+    padding: 60px 0 40px 0;
+}
+h3 {
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+/* --- Buttons & Inputs --- */
+div.stButton > button {
+    background-color: #00BFFF;
+    color: #FFFFFF;
+    border: none;
+    padding: 14px 32px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 1.1rem;
+    width: auto;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+}
+div.stButton > button:hover {
+    background-color: #0099cc;
+    transform: translateY(-2px);
+    color: #FFFFFF; /* Ensure text color stays white on hover */
+    border: none; /* Ensure no border appears on hover */
+}
+.google-signin-container {
+    margin-top: 1.5rem;
+}
+.google-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 10px 20px;
+    border-radius: 8px;
+    background-color: #FFFFFF;
+    color: #444;
+    border: 1px solid #ddd;
+    font-weight: 600;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+}
+.google-btn:hover {
+    background-color: #f5f5f5;
+}
+.google-btn img {
+    width: 20px;
+    height: 20px;
+    margin-right: 12px;
+}
+
+/* --- Cards & Containers --- */
+.info-card {
+    background-color: #112240;
+    padding: 25px;
+    border-radius: 10px;
+    border: 1px solid #1e3a5f;
+    text-align: center;
+    height: 100%;
+}
+.tech-card {
+    text-align: center;
+}
+.tech-logo {
+    height: 60px;
+    filter: grayscale(100%) brightness(150%);
+    transition: filter 0.3s ease;
+}
+.tech-logo:hover {
+    filter: none;
+}
+.svg-container {
+    padding-top: 2rem;
+}
+
+/* --- Footer --- */
+a {
+    color: #00BFFF;
+    text-decoration: none;
+}
+a:hover {
+    text-decoration: underline;
+}
+
+/* --- Responsive Design --- */
+@media (max-width: 768px) {
+    .main-title {
+        font-size: 2.5rem;
+    }
+    .section-headline {
+        font-size: 2rem;
+    }
+    .header {
+        padding: 1rem;
+    }
+    .nav-buttons {
+        gap: 0.5rem;
+    }
+    .nav-button-primary, .nav-button-secondary {
+        padding: 0.4rem 0.8rem;
+        font-size: 0.8rem;
+    }
+}
