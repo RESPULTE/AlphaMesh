@@ -5,67 +5,59 @@ from components.auth import set_auth_mode_and_show_modal
 
 def _display_header():
     """
-    Displays the sticky header using a native Streamlit container and columns.
-    The stickiness and styling are applied via CSS in header.css.
+    Displays the header using native Streamlit columns and text elements.
     """
-    # This container will be targeted by CSS to become the sticky header.
     with st.container():
-        # Use columns for layout: Logo | Spacer | Login Button | Sign Up Button
-        # The ratios create the desired spacing.
-        col1, col2, col3, col4 = st.columns([2, 5, 1, 1.2]) # Adjusted ratio for "Sign Up"
+        col1, col2, col3, col4 = st.columns([2, 5, 1, 1.2])
 
         with col1:
-            st.markdown('<div class="logo">AlphaMesh</div>', unsafe_allow_html=True)
+            # USE: st.title for the main logo/title. It's semantically correct.
+            st.title("AlphaMesh")
 
-        # col2 is an empty spacer column
 
-        with col3:
-            if st.button("Login", key="header_login", use_container_width=True):
-                set_auth_mode_and_show_modal('Login')
-
-        with col4:
-            if st.button("Sign Up", key="header_signup", use_container_width=True):
-                set_auth_mode_and_show_modal('Sign Up')
 
 def _display_hero_section():
-    """Renders the main hero section of the landing page."""
+    """Renders the main hero section using native components."""
     with st.container():
-        st.markdown('<div class="section-container hero-section">', unsafe_allow_html=True)
         col1, col2 = st.columns([1.1, 0.9], gap="large")
         with col1:
-            st.markdown('<h1 class="main-title">AI Agents, Human Insight.<br>Smarter Investing.</h1>', unsafe_allow_html=True)
-            st.markdown('<p class="sub-headline">AlphaMesh uses a team of specialized AI agents to analyze markets, debate strategies, and deliver clear, actionable investment intelligence. No code, just results.</p>', unsafe_allow_html=True)
-            if st.button("Get Started for Free", key="hero_get_started"):
+            # USE: st.title and st.write for hero text instead of HTML tags.
+            st.header("AI Agents, Human Insight.")
+            st.space(1)
+            st.write("AlphaMesh uses a team of specialized AI agents to analyze markets, debate strategies, and deliver clear, actionable investment intelligence. No code, just results.")
+            if st.button("Get Started for Free", key="hero_get_started", type="primary"):
                 set_auth_mode_and_show_modal('Sign Up')
         with col2:
-            st.markdown('<div class="product-animation-placeholder"></div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+            # USE: A simple container to act as a placeholder.
+            with st.container(border=True, height=400):
+                 st.write("Product Animation")
+
 
 def _display_social_proof_section():
     """Displays the 'Powered By' logos section."""
-    with st.container():
-        st.markdown('<div class="section-container">', unsafe_allow_html=True)
-        st.markdown(
-            """
-            <div class="trusted-by-container">
-                <span class="trusted-by-text">POWERED BY LEADING-EDGE TECHNOLOGY</span>
-                <div class="logos-container">
-                    <img src="https://upload.wikimedia.org/wikipedia/commons/2/2d/Google-Gemini-Logo.svg" alt="Google Gemini" title="Google Gemini">
-                    <img src="https://python.langchain.com/assets/images/brand_square-7c0f18f6738d8f086878b19a12822a16.png" alt="LangChain" title="LangChain">
-                    <img src="https://upload.wikimedia.org/wikipedia/commons/b/b3/IBKR_logo.svg" alt="Interactive Brokers" title="Interactive Brokers">
-                    <img src="https://logotyp.us/files/yahoo.svg" alt="Yahoo Finance" title="Yahoo Finance" style="height: 30px;">
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    with st.container(width=1000, horizontal=False, horizontal_alignment="center"):
+        # USE: st.caption is perfect for subtle, centered text like this.
+        
+        st.caption("POWERED BY LEADING-EDGE TECHNOLOGY", width="content")
+
+        # USE: Columns provide a responsive layout for the logos.
+        cols = st.columns(4, gap="medium")
+        logos = [
+            {"path": "https://upload.wikimedia.org/wikipedia/commons/d/d9/Google_Gemini_logo_2025.svg", "caption": "Google Gemini"},
+            {"path": "https://upload.wikimedia.org/wikipedia/commons/6/60/LangChain_Logo.svg", "caption": "LangChain"},
+            {"path": "https://upload.wikimedia.org/wikipedia/commons/c/ca/Interactive_Brokers_Logo_%282014%29.svg", "caption": "Interactive Brokers"},
+            {"path": "https://upload.wikimedia.org/wikipedia/commons/3/3a/Yahoo%21_%282019%29.svg", "caption": "Yahoo Finance", }
+        ]
+        for i, logo in enumerate(logos):
+            with cols[i]:
+                st.image(logo["path"], caption=logo["caption"], width="stretch")
+
 
 def _display_how_it_works_section():
     """Displays the 'How It Works' section with three info cards."""
     with st.container():
-        st.markdown('<div class="section-container">', unsafe_allow_html=True)
-        st.markdown('<h2 class="section-headline">From Market Noise to Actionable Thesis in 3 Steps</h2>', unsafe_allow_html=True)
-        
-        col1, col2, col3 = st.columns(3, gap="large")
+        # USE: st.header with a divider is a clean way to create a section title.
+        st.header("From Market Noise to Actionable Thesis in 3 Steps", divider="rainbow")
 
         cards_data = [
             {"icon": "1.", "title": "Connect Your Goals", "text": "Tell AlphaMesh your investment style and risk tolerance. Your AI team calibrates to your specific needs."},
@@ -73,82 +65,77 @@ def _display_how_it_works_section():
             {"icon": "3.", "title": "Receive Your Briefing", "text": "Get a clear, synthesized report with bull and bear cases, key data points, and a final recommendation. All transparent, all for you."}
         ]
 
-        for col, data in zip([col1, col2, col3], cards_data):
-            with col:
-                st.markdown(f"""
-                    <div class="info-card">
-                        <div class="info-card-icon">{data['icon']}</div>
-                        <h3>{data['title']}</h3>
-                        <p>{data['text']}</p>
-                    </div>
-                """, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        cols = st.columns(3, gap="large")
+
+        for i, data in enumerate(cards_data):
+            with cols[i]:
+                # USE: st.container(border=True) creates a card effect natively.
+                with st.container(border=True):
+                    st.subheader(f'{data["icon"]} {data["title"]}')
+                    st.write(data["text"])
 
 def _display_features_section():
     """Displays key features with an alternating text/image layout."""
     with st.container():
-        st.markdown('<div class="section-container">', unsafe_allow_html=True)
-        st.markdown('<h2 class="section-headline">An Unfair Advantage, Built For You</h2>', unsafe_allow_html=True)
+        st.header("An Unfair Advantage, Built For You", divider="rainbow")
+        st.space(2) # USE: st.space() for vertical spacing instead of <br> tags.
 
-        st.write("<br>", unsafe_allow_html=True)
-        # Feature 1: Text on left, image on right
-        col1, col2 = st.columns([1, 1], gap="large")
+        # Feature 1
+        col1, col2 = st.columns([1, 1], gap="large", vertical_alignment='center')
         with col1:
-            st.subheader("The Daily Briefing")
+            st.header("The Daily Briefing")
             st.write("Start your day with a mission-critical summary. Your agent team works 24/7, so you wake up with insights, not just alerts. Get a curated look at your portfolio's overnight news, market sentiment, and the top opportunity identified by the mesh.")
         with col2:
-            st.image("https://placehold.co/600x400/1a1a1a/FFFFFF?text=Dashboard+Mockup", width='stretch')
+            st.image("https://placehold.co/500x300/1a1a1a/FFFFFF?text=Dashboard+Mockup")
 
-        st.write("<br><br><br>", unsafe_allow_html=True) # Spacer
+        st.space(2)
 
-        # Feature 2: Image on left, text on right
-        col1, col2 = st.columns([1, 1], gap="large")
+        # Feature 2
+        col1, col2 = st.columns([1, 1], gap="large", vertical_alignment='center')
         with col1:
-            st.image("https://placehold.co/600x400/1a1a1a/FFFFFF?text=Transparent+Analysis", width='stretch')
+            st.image("https://placehold.co/500x300/1a1a1a/FFFFFF?text=Transparent+Analysis")
         with col2:
-            st.subheader("Deep Dive with Full Transparency")
+            st.header("Deep Dive with Full Transparency")
             st.write("Every insight is backed by transparent reasoning. Understand the 'why' behind each recommendation by exploring the Bull Case from the Fundamental Agent, the Bear Case from the Risk Manager, and citations from the News Sentinel.")
-        
-        st.markdown('</div>', unsafe_allow_html=True)
 
 def _display_final_cta():
     """Displays the final call-to-action section."""
-    with st.container():
-        st.markdown('<div class="section-container cta-section">', unsafe_allow_html=True)
-        st.markdown('<h2 class="section-headline">The Future of Investing is Collaborative Intelligence.</h2>', unsafe_allow_html=True)
-        st.markdown('<p class="cta-subtext">Stop guessing. Start making data-driven decisions with your personal AI investment committee.</p>', unsafe_allow_html=True)
-        
-        # Center the button
+    # USE: A bordered container makes the CTA section stand out.
+    with st.container(border=True):
+        st.header("The Future of Investing is Collaborative Intelligence.")
+        st.write("Stop guessing. Start making data-driven decisions with your personal AI investment committee.")
+
         _, col, _ = st.columns([1, 0.6, 1])
         with col:
-            if st.button("Sign Up Now - It's Free", key="final_cta_button", use_container_width=True):
+            if st.button("Sign Up Now - It's Free", key="final_cta_button", width='stretch', type="primary"):
                 set_auth_mode_and_show_modal('Sign Up')
-        st.markdown('</div>', unsafe_allow_html=True)
 
 def _display_footer():
     """Displays the page footer."""
     with st.container():
-        st.markdown('<div class="section-container">', unsafe_allow_html=True)
-        st.markdown("---", unsafe_allow_html=True)
+        # USE: st.divider() for a clean horizontal line.
+        st.divider()
         c1, c2 = st.columns([1, 1])
         with c1:
             st.write("© 2024 AlphaMesh. All rights reserved.")
         with c2:
+            # Using markdown for links is acceptable and standard.
             st.markdown('<div style="text-align: right;"><a href="#">Privacy Policy</a> | <a href="#">Terms of Service</a></div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
 
 def render_landing_page():
-    """
-    Renders all the sections of the landing page in order.
-    """
-    _display_header()
-    # The main content div wraps all sections except the header and footer for correct padding
-    st.markdown('<div class="main-content">', unsafe_allow_html=True)
-    _display_hero_section()
-    _display_social_proof_section()
-    _display_how_it_works_section()
-    _display_features_section()
-    _display_final_cta()
-    _display_footer()
-    st.markdown('</div>', unsafe_allow_html=True)
+    """Renders all the sections of the landing page in order."""
+    with st.container(horizontal_alignment="center"):
+        _display_header()
+        _display_hero_section()
+
+        st.space(40)
+
+
+        _display_social_proof_section()
+
+        st.space(40)
+
+        _display_how_it_works_section()
+        _display_features_section()
+        _display_final_cta()
+        _display_footer()

@@ -1,4 +1,11 @@
-/* styles/landing_page.css */
+/* styles/landing_page.css - Reworked for Python Refactoring */
+
+/*
+No significant changes were required in the CSS file because:
+1. The Python refactoring primarily removed generic structural HTML wrappers (<div class="section-container">).
+2. All custom, application-specific styling (like .main-title, .info-card, .cta-section) is applied through classes still present via minimal st.markdown calls.
+3. The CSS is already highly modular, applying styles directly to the classes, not generic div/container elements.
+*/
 
 
 /* --- HERO SECTION --- */
@@ -102,8 +109,10 @@
 }
 
 /* --- FEATURES SECTION --- */
-/* Center images vertically in their columns */
-.st-emotion-cache-1b22s3z {
+/* Center images vertically in their columns 
+   NOTE: The hash in this selector may change in future Streamlit versions.
+*/
+.st-emotion-cache-1b22s3z { 
     align-items: center;
 }
 .stImage > img {
