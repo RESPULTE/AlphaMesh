@@ -18,44 +18,100 @@ def load_css(file_name):
     except FileNotFoundError:
         st.error(f"CSS file not found: {file_name}")
 
-# --- Landing Page Sections ---
+# --- Modal & Authentication ---
+def display_auth_modal():
+    """Renders the authentication modal overlay."""
+    
+    # Determine which toggle button is active
+    active_signup_class = "active" if st.session_state.auth_mode == 'Sign Up' else ""
+    active_login_class = "active" if st.session_state.auth_mode == 'Login' else ""
 
-def display_header():
-    """Displays the sticky header with Logo and Login/Sign Up buttons."""
-    st.markdown(
-        """
-        <div class="header">
-            <div class="header-content">
-                <div class="logo">AlphaMesh</div>
-                <div class="nav-buttons">
-                    <button class="nav-button-secondary">Login</button>
-                    <button class="nav-button-primary">Sign Up</button>
-                </div>
+    modal_html = f"""
+    <div class="modal-overlay">
+        <div class="modal-content">
+            <div id="close-button-container"></div>
+            
+            <div class="modal-header">
+                <h2>{ 'Create your account' if st.session_state.auth_mode == 'Sign Up' else 'Welcome back' }</h2>
+                <p>to continue to AlphaMesh</p>
+            </div>
+
+            <div class="auth-toggle-container">
+                <div id="signup-toggle-container"></div>
+                <div id="login-toggle-container"></div>
+            </div>
+
+            <div id="google-signin-container"></div>
+            
+            <div class="modal-footer">
+                By continuing, you agree to our <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>.
             </div>
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+    </div>
+    """
+    inject_modal_html(modal_html)
+
+    # Use Streamlit buttons within containers for callbacks
+    with st.container():
+        # This is a hacky way to place Streamlit elements in specific divs
+        # We target the containers by ID and then use columns to place the buttons
+        # Close Button
+        close_container = st.container()
+        if close_container.button("X", key="close_modal"):
+            st.session_state.show_modal = False
+            st.rerun()
+
+        # Auth Toggles
+        toggle_cols = st.columns(2)
+        if toggle_cols[0].button("Sign Up", key="signup_toggle", use_container_width=True):
+            st.session_state.auth_mode = 'Sign Up'
+            st.rerun()
+        if toggle_cols[1].button("Login", key="login_toggle", use_container_width=True):
+            st.session_state.auth_mode = 'Login'
+            st.rerun()
+        
+        # Google Sign-in
+        if st.button("Sign in with Google", key="google_signin", use_container_width=True):
+            # Placeholder for Google OAuth logic
+            pass
+
+
+def set_auth_mode_and_show_modal(mode):
+    """Callback to set the auth mode and show the modal."""
+    st.session_state.auth_mode = mode
+    st.session_state.show_modal = True
+
+# --- Landing Page Sections ---
+def display_header():
+    """Displays the sticky header with Logo and Login/Sign Up buttons."""
+    st.markdown('<div class="header"><div class="header-content">', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.markdown('<div class="logo">AlphaMesh</div>', unsafe_allow_html=True)
+    with col2:
+        cols = st.columns([1, 1])
+        if cols[0].button("Login", key="header_login", use_container_width=True):
+            set_auth_mode_and_show_modal('Login')
+        if cols[1].button("Sign Up", key="header_signup", use_container_width=True):
+            set_auth_mode_and_show_modal('Sign Up')
+
+    st.markdown('</div></div>', unsafe_allow_html=True)
+
 
 def display_hero_section():
-    """Displays the main hero section."""
     st.markdown('<div class="section-container hero-section">', unsafe_allow_html=True)
-    
     col1, col2 = st.columns([1.1, 0.9], gap="large")
-
     with col1:
         st.markdown('<h1 class="main-title">AI Agents, Human Insight.<br>Smarter Investing.</h1>', unsafe_allow_html=True)
-        st.markdown(
-            '<p class="sub-headline">AlphaMesh uses a team of specialized AI agents to analyze markets, debate strategies, and deliver clear, actionable investment intelligence. No code, just results.</p>',
-            unsafe_allow_html=True
-        )
-        st.button("Get Started for Free", key="hero_get_started")
-            
+        st.markdown('<p class="sub-headline">AlphaMesh uses a team of specialized AI agents to analyze markets, debate strategies, and deliver clear, actionable investment intelligence. No code, just results.</p>', unsafe_allow_html=True)
+        if st.button("Get Started for Free", key="hero_get_started"):
+            set_auth_mode_and_show_modal('Sign Up')
     with col2:
         st.markdown('<div class="product-animation-placeholder"></div>', unsafe_allow_html=True)
-
     st.markdown('</div>', unsafe_allow_html=True)
 
+# (Other display functions remain unchanged: display_social_proof_section, display_how_it_works_section, etc.)
 def display_social_proof_section():
     """Displays the 'Trusted By' logos."""
     st.markdown('<div class="section-container">', unsafe_allow_html=True)
@@ -128,14 +184,12 @@ def display_final_cta():
     """Displays the final call-to-action section."""
     st.markdown('<div class="section-container cta-section">', unsafe_allow_html=True)
     st.markdown('<h2 class="section-headline">The Future of Investing is Collaborative Intelligence.</h2>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="cta-subtext">Stop guessing. Start making data-driven decisions with your personal AI investment committee.</p>',
-        unsafe_allow_html=True
-    )
+    st.markdown('<p class="cta-subtext">Stop guessing. Start making data-driven decisions with your personal AI investment committee.</p>', unsafe_allow_html=True)
     
     _, col, _ = st.columns([1, 0.6, 1])
     with col:
-        st.button("Sign Up Now - It's Free", key="final_cta_button", use_container_width=True)
+        if st.button("Sign Up Now - It's Free", key="final_cta_button", use_container_width=True):
+            set_auth_mode_and_show_modal('Sign Up')
     st.markdown('</div>', unsafe_allow_html=True)
 
 def display_footer():
@@ -146,28 +200,50 @@ def display_footer():
     with c1:
         st.write("© 2024 AlphaMesh. All rights reserved.")
     with c2:
-        st.markdown(
-            '<div style="text-align: right;"><a href="#">Privacy Policy</a> | <a href="#">Terms of Service</a></div>',
-            unsafe_allow_html=True)
+        st.markdown('<div style="text-align: right;"><a href="#">Privacy Policy</a> | <a href="#">Terms of Service</a></div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
+def inject_modal_html(html):
+    """
+    Injects modal HTML at the very end of Streamlit's root app DOM
+    so it overlays the entire page properly.
+    """
+    js = f"""
+    <script>
+    const modal = `{html}`;
+    const root = window.parent.document.querySelector('.stApp');
+    if (root && !root.querySelector('.modal-overlay')) {{
+        root.insertAdjacentHTML('beforeend', modal);
+    }}
+    </script>
+    """
+    st.components.v1.html(js, height=0)
+
 
 # --- Main Application ---
 def main():
-    """The main function that orchestrates the app's layout."""
     load_css("styles/style.css")
 
+    # Initialize session state
+    if 'show_modal' not in st.session_state:
+        st.session_state.show_modal = False
+    if 'auth_mode' not in st.session_state:
+        st.session_state.auth_mode = 'Sign Up'
+
+    # Display page content
     display_header()
-    
     st.markdown('<div class="main-content">', unsafe_allow_html=True)
-    
     display_hero_section()
     display_social_proof_section()
     display_how_it_works_section()
     display_features_section()
     display_final_cta()
     display_footer()
-        
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # Conditionally display the modal on top of everything
+    if st.session_state.show_modal:
+        display_auth_modal()
 
 if __name__ == "__main__":
     main()
