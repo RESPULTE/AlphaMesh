@@ -1,69 +1,12 @@
 /* styles/style.css */
 
-/* --- :ROOT VARIABLES (GLOBAL) --- */
-:root {
-    --background-color: #111111;
-    --primary-color: #00F5D4; /* Bright Teal */
-    --primary-hover-color: #00e0c4;
-    --secondary-color: #1a1a1a;
-    --border-color: #2a2a2a;
-    --text-color: #E0E0E0;
-    --text-color-light: #a0a0a0;
-    --font-family: 'Poppins', sans-serif;
-}
 
-/* --- BASE & FONTS (GLOBAL) --- */
 @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
 
-body {
-    background-color: var(--background-color);
-    color: var(--text-color);
-    font-family: var(--font-family);
-}
-
-/* --- HIDE STREAMLIT DEFAULTS (GLOBAL) --- */
-#MainMenu, header, footer {
-    visibility: hidden;
-}
-
-/* --- LAYOUT CONTAINERS (GLOBAL UTILITY) --- */
-.section-container {
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 80px 2rem;
-}
-
-.main-content {
-    padding-top: 70px; /* Space for the fixed header */
-}
 
 
-/* --- GLOBAL ELEMENT STYLING --- */
-a {
-    color: var(--primary-color);
-    text-decoration: none;
-    transition: text-decoration 0.2s ease;
-}
-a:hover {
-    text-decoration: underline;
-}
 
-/* --- GLOBAL COMPONENT OVERRIDES --- */
-
-/* Big CTA Button Style (used in multiple places) */
-div.stButton > button {
-    background-color: var(--primary-color);
-    color: var(--background-color);
-    border: none;
-    padding: 16px 36px;
-    border-radius: 8px;
-    font-weight: 700;
-    font-size: 1.1rem;
-    transition: all 0.3s ease;
-}
 div.stButton > button:hover {
-    background-color: var(--primary-hover-color);
-    color: var(--background-color);
     transform: translateY(-3px);
     box-shadow: 0 10px 20px rgba(0, 245, 212, 0.1);
 }
