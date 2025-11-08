@@ -1,44 +1,49 @@
 import streamlit as st
 from utils.ui import load_css
-from components.auth import handle_auth_dialog
-from components.auth import set_auth_mode_and_show_modal
+# Pass the supabase client to the handler
+from components.auth import handle_auth_dialog, set_auth_mode_and_show_modal
 import os
+from supabase import create_client, Client
 
+# This GOOGLE_API_KEY may still be needed for other parts of your app, so we leave it.
 os.environ["GOOGLE_API_KEY"] = st.secrets["google"]["api_key"]
+
 
 def _display_header():
     """
     Displays the header using native Streamlit columns and text elements.
     """
     with st.container():
-        col1, col2, col3, col4 = st.columns([2, 5, 1, 1.2])
+        # Added login button to header
+        col1, col2, col3 = st.columns([6, 1, 1])
 
         with col1:
-            # USE: st.title for the main logo/title. It's semantically correct.
             st.title("AlphaMesh")
-
-
+        with col2:
+            if st.button("Login", key="header_login"):
+                set_auth_mode_and_show_modal('Login')
+        with col3:
+            if st.button("Sign Up", key="header_signup", type="primary"):
+                set_auth_mode_and_show_modal('Sign Up')
 
 def _display_hero_section():
     """Renders the main hero section using native components."""
     with st.container():
         col1, col2 = st.columns([1.1, 0.9], gap="large", vertical_alignment="center")
         with col1:
-            # USE: st.title and st.write for hero text instead of HTML tags.
             st.header("AI Agents, Human Insight.")
             st.write("AlphaMesh uses a team of specialized AI agents to analyze markets, debate strategies, and deliver clear, actionable investment intelligence. No code, just results.")
             if st.button("Get Started for Free", key="hero_get_started", type="primary"):
                 set_auth_mode_and_show_modal('Sign Up')
         with col2:
-            # USE: A simple container to act as a placeholder.
             with st.container(border=True, height=400):
                  st.write("Product Animation")
 
 
 def _display_social_proof_section():
     """Displays the 'Powered By' logos section."""
-    with st.container(width=800, horizontal=False, horizontal_alignment="center"):
-        st.caption("POWERED BY LEADING-EDGE TECHNOLOGY", width="content")
+    with st.container():
+        st.caption("POWERED BY LEADING-EDGE TECHNOLOGY",)
 
         cols = st.columns(4, gap="medium")
         logos = [
@@ -49,13 +54,12 @@ def _display_social_proof_section():
         ]
         for i, logo in enumerate(logos):
             with cols[i]:
-                st.image(logo["path"], caption=logo["caption"], use_container_width="always")
+                st.image(logo["path"], caption=logo["caption"], use_column_width="always")
 
 
 def _display_how_it_works_section():
     """Displays the 'How It Works' section with three info cards."""
     with st.container():
-        # USE: st.header with a divider is a clean way to create a section title.
         st.header("From Market Noise to Actionable Thesis in 3 Steps", divider="rainbow")
 
         cards_data = [
@@ -68,7 +72,6 @@ def _display_how_it_works_section():
 
         for i, data in enumerate(cards_data):
             with cols[i]:
-                # USE: st.container(border=True) creates a card effect natively.
                 with st.container(border=True):
                     st.subheader(f'{data["icon"]} {data["title"]}')
                     st.write(data["text"])
@@ -77,7 +80,7 @@ def _display_features_section():
     """Displays key features with an alternating text/image layout."""
     with st.container():
         st.header("An Unfair Advantage, Built For You", divider="rainbow")
-        st.space(2) # USE: st.space() for vertical spacing instead of <br> tags.
+        st.space(2) 
 
         # Feature 1
         col1, col2 = st.columns([1, 1], gap="large", vertical_alignment='center')
@@ -99,45 +102,40 @@ def _display_features_section():
 
 def _display_final_cta():
     """Displays the final call-to-action section."""
-    # USE: A bordered container makes the CTA section stand out.
-    with st.container(border=True, horizontal_alignment="center", ):
-        st.header("The Future of Investing is Collaborative Intelligence.", width='content')
-        st.text("Stop guessing. Start making data-driven decisions with your personal AI investment committee.")
+    with st.container(border=True):
+        st.header("The Future of Investing is Collaborative Intelligence.")
+        st.write("Stop guessing. Start making data-driven decisions with your personal AI investment committee.")
 
         _, col, _ = st.columns([1, 0.6, 1])
         with col:
-            if st.button("Sign Up Now - It's Free", key="final_cta_button", width='stretch', type="primary"):
+            if st.button("Sign Up Now - It's Free", key="final_cta_button", use_container_width=True, type="primary"):
                 set_auth_mode_and_show_modal('Sign Up')
 
 def _display_footer():
     """Displays the page footer."""
     with st.container():
-        # USE: st.divider() for a clean horizontal line.
         st.divider()
         c1, c2 = st.columns([1, 1])
         with c1:
             st.write("© 2024 AlphaMesh. All rights reserved.")
         with c2:
-            # Using markdown for links is acceptable and standard.
             st.markdown('<div style="text-align: right;"><a href="#">Privacy Policy</a> | <a href="#">Terms of Service</a></div>', unsafe_allow_html=True)
 
 def render_landing_page():
     """Renders all the sections of the landing page in order."""
-    with st.container(horizontal_alignment="center"):
-        _display_header()
-        _display_hero_section()
-
-        st.space(40)
-
-
-        _display_social_proof_section()
-
-        st.space(40)
-
-        _display_how_it_works_section()
-        _display_features_section()
-        _display_final_cta()
-        _display_footer()
+    _display_header()
+    st.container(height=40, border=False)
+    _display_hero_section()
+    st.container(height=40, border=False)
+    _display_social_proof_section()
+    st.container(height=40, border=False)
+    _display_how_it_works_section()
+    st.container(height=40, border=False)
+    _display_features_section()
+    st.container(height=40, border=False)
+    _display_final_cta()
+    st.container(height=40, border=False)
+    _display_footer()
 
 def main():
     """
@@ -152,33 +150,26 @@ def main():
         initial_sidebar_state="collapsed"
     )
 
+    # --- Initialize Supabase Client ---
+    supabase_url = st.secrets["supabase"]["url"]
+    supabase_key = st.secrets["supabase"]["anon_key"]
+    supabase = create_client(supabase_url, supabase_key)
+    
     # --- Load CSS ---
-    # Load global styles first, then page-specific styles
     load_css("styles/style.css")
 
     # --- Initialize Session State ---
-    # Use a single initialization block for clarity
     if 'show_auth_dialog' not in st.session_state:
         st.session_state.show_auth_dialog = False
     if 'auth_mode' not in st.session_state:
-        st.session_state.auth_mode = 'Sign Up' # Default to Sign Up
-    # 🆕 New state for authentication status
+        st.session_state.auth_mode = 'Sign Up'
     if 'is_authenticated' not in st.session_state:
         st.session_state.is_authenticated = False
 
-    # --- Render Page Content ---
-    if st.session_state.is_authenticated:
-        # ⚠️ This is the traditional way to handle page rendering *without* the built-in
-        # multi-page app runner. For the official multi-page structure (using 'pages/' folder),
-        # Streamlit handles the routing. We rely on st.switch_page() in auth.py.
-        # This app.py simply renders the landing page content as the default entry.
-        # The switch_page call will take precedence.
-        pass # Do nothing, st.switch_page() handles the redirect.
-    else:
-        render_landing_page()
+    render_landing_page()
 
-    # --- Conditionally Display Dialog ---
-    handle_auth_dialog()
+    handle_auth_dialog(supabase)
+
 
 if __name__ == "__main__":
     main()

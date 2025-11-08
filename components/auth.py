@@ -1,6 +1,7 @@
 # components/auth.py
 
 import streamlit as st
+from supabase import Client
 
 def set_auth_mode_and_show_modal(mode: str):
     """
@@ -9,79 +10,92 @@ def set_auth_mode_and_show_modal(mode: str):
     """
     st.session_state.auth_mode = mode
     st.session_state.show_auth_dialog = True
-    st.rerun()  # Trigger a rerun so the dialog appears on next run
+    st.rerun()
 
-def authenticate_user(username: str = None):
+def authenticate_user(supabase: Client, email: str, password: str):
     """
-    Placeholder function for actual Google OAuth/Login logic.
-    Sets the session state to authenticated and triggers page switch.
+    Authenticates the user with Supabase, handling both sign-up and login.
+    The mode is determined by st.session_state.auth_mode.
     """
-    # --- ⚠️ FUTURE IMPLEMENTATION CHECK (Simulated) ---
-    # In the future, this function will call an authentication service.
-    # For now, we simulate a successful login.
-    
-    auth_successful = True # st.session_state.auth_mode == 'Login' or username == "test@alphamesh.ai"
+    mode = st.session_state.get("auth_mode", "Login")
 
-    if auth_successful:
-        # Clear the dialog state
-        st.session_state.is_authenticated = True
-        st.session_state.show_auth_dialog = False
+    try:
+        if mode == 'Sign Up':
+            response = supabase.auth.sign_up({"email": email, "password": password})
+            st.toast("Account created successfully! Welcome.", icon="🎉")
+        elif mode == 'Login':
+            response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+            st.toast(f"Welcome back, {email}!", icon="👋")
         
-        st.toast(f"Welcome, {username if username else 'User'}!", icon="👋")
-        
-        # Redirect to the dashboard page file (must be in the 'pages/' folder)
-        st.switch_page("pages/dashboard.py")
-        
-    else:
-        st.error("Authentication failed. Please check your credentials.", icon="🚨")
+        if response.user and response.session:
+            st.session_state.is_authenticated = True
+            st.session_state.show_auth_dialog = False
+            st.session_state.user = response.user
+            # This is the redirect to the dashboard after successful auth
+            st.switch_page("pages/dashboard.py")
+        else:
+            st.error("Authentication failed. Please try again.", icon="🚨")
 
-# ✅ Define dialog function using decorator
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {e}", icon="🚨")
+
 @st.dialog("Authentication", width="small")
-def auth_dialog():
+def auth_dialog(supabase: Client):
     """
-    Renders the internal content of the authentication dialog.
+    Renders a unified authentication dialog with tabs for Login and Sign Up.
     """
-    mode = st.session_state.auth_mode
+    # Use st.radio to create a tab-like switcher.
+    # The default selection is determined by the button the user clicked on the landing page.
+    modes = ["Login", "Sign Up"]
+    current_mode_index = modes.index(st.session_state.get('auth_mode', 'Login'))
     
-    st.subheader(f"{ 'Create your account' if mode == 'Sign Up' else 'Welcome back' }")
-    st.markdown(f"<p style='color: var(--text-color-light);'>to { 'continue' if mode == 'Login' else 'get started' } with AlphaMesh</p>", unsafe_allow_html=True)
-    
-    st.markdown("---") # Visual separator
+    selected_mode = st.radio(
+        "Select Action", 
+        modes, 
+        index=current_mode_index, 
+        horizontal=True,
+        label_visibility="collapsed"
+    )
 
-    # --- Simple Email/Password Form ---
-    if mode == 'Sign Up':
-        st.text_input("Email", placeholder="you@example.com", key="dialog_email")
-        st.text_input("Password", type="password", key="dialog_password_1")
-        st.text_input("Confirm Password", type="password", key="dialog_password_2")
-    else:
-        st.text_input("Email", placeholder="you@example.com", key="dialog_email_login")
-        st.text_input("Password", type="password", key="dialog_password_login")
-        
+    # If the user switches the tab, update the session state and rerun to reflect the change.
+    if selected_mode != st.session_state.auth_mode:
+        st.session_state.auth_mode = selected_mode
+        st.rerun()
+
+    # --- Display Form Fields based on selected mode ---
+    st.markdown("---")
     
-    if st.button(mode, key="dialog_form_submit", use_container_width=True, type="primary"):
-        # Placeholder for form-based login/signup logic
-        email_key = "dialog_email" if mode == 'Sign Up' else "dialog_email_login"
-        current_email = st.session_state.get(email_key, 'Placeholder User')
-        authenticate_user(current_email)
+    email = st.text_input("Email", placeholder="you@example.com", key="auth_email")
+    password = st.text_input("Password", type="password", key="auth_password")
+
+    if selected_mode == 'Sign Up':
+        confirm_password = st.text_input("Confirm Password", type="password", key="auth_confirm_password")
+    
+    st.write("") # Spacer
+    
+    if st.button(selected_mode, key="dialog_form_submit", use_container_width=True, type="primary"):
+        if not email or not password:
+            st.warning("Please enter both email and password.", icon="⚠️")
+        elif selected_mode == 'Sign Up' and password != confirm_password:
+            st.error("Passwords do not match.", icon="🚨")
+        else:
+            # The authenticate_user function already knows the mode from session_state
+            authenticate_user(supabase, email, password)
 
     st.markdown('<div style="text-align: center; margin: 1.5rem 0 1.5rem 0; color: var(--text-color-light);">— OR —</div>', unsafe_allow_html=True)
     
-    # --- Google Sign-in Button (calls the authentication logic) ---
     if st.button("Sign in with Google", key="dialog_google_signin", use_container_width=True):
-        authenticate_user('Google User') # Pass a generic user name
+        st.info("Google Sign-In is not yet configured.", icon="ℹ️")
 
-    # --- Footer ---
     st.markdown("""
         <div style="text-align: center; font-size: 0.8rem; color: var(--text-color-light); margin-top: 2rem;">
             By continuing, you agree to our <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>.
         </div>
     """, unsafe_allow_html=True)
 
-
-def handle_auth_dialog():
+def handle_auth_dialog(supabase: Client):
     """
     Checks session state and shows the dialog if triggered.
     """
     if st.session_state.get("show_auth_dialog", False) and not st.session_state.is_authenticated:
-        # Show the dialog only if triggered and the user is not yet logged in
-        auth_dialog()
+        auth_dialog(supabase)
