@@ -2,6 +2,9 @@ import streamlit as st
 from utils.ui import load_css
 from components.auth import handle_auth_dialog
 from components.auth import set_auth_mode_and_show_modal
+import os
+
+os.environ["GOOGLE_API_KEY"] = st.secrets["google"]["api_key"]
 
 def _display_header():
     """

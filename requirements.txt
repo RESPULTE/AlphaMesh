@@ -1,2 +1,6 @@
 streamlit
-streamlit-modal
+langchain
+langchain-community
+langchain-google-genai
+chromadb
+sentence-transformers
