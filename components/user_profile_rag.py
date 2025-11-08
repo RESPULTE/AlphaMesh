@@ -95,7 +95,7 @@ class UserProfileRAG:
     def _retrieve_long_term_context(self) -> str:
         """Retrieves summarized user facts from the knowledge graph."""
         try:
-            cypher_chain = GraphCypherQAChain.from_llm(graph=self.graph, llm=self.llm, validate_cypher=True)
+            cypher_chain = GraphCypherQAChain.from_llm(graph=self.graph, llm=self.llm, validate_cypher=True, allow_dangerous_requests=True )
             graph_query = f"What are the known interests, name, profession, and goals for the user with id '{self.user_id}'? Summarize the findings."
             result = cypher_chain.invoke({"query": graph_query})
             return result.get('result', 'Failed to retrieve from graph.')

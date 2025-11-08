@@ -13,10 +13,6 @@ st.markdown("This is your personalized investment intelligence hub. I can learn 
 
 # --- Session State Management ---
 
-# 1. Ensure a unique user ID for the session
-if "user_id" not in st.session_state:
-    st.session_state.user_id = str(uuid.uuid4())
-
 # 2. Initialize the RAG agent for the user
 # Caching the agent to avoid re-initializing on every script rerun
 @st.cache_resource

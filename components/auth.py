@@ -30,7 +30,7 @@ def authenticate_user(supabase: Client, email: str, password: str):
         if response.user and response.session:
             st.session_state.is_authenticated = True
             st.session_state.show_auth_dialog = False
-            st.session_state.user = response.user
+            st.session_state.user_id = response.user.user_metadata["email"]
             # This is the redirect to the dashboard after successful auth
             st.switch_page("pages/dashboard.py")
         else:
