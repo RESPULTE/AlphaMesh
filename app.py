@@ -3,11 +3,15 @@ from utils.ui import load_css
 # Pass the supabase client to the handler
 from components.auth import handle_auth_dialog, set_auth_mode_and_show_modal
 import os
-from supabase import create_client, Client
+import logging
+from supabase import create_client
 
 # This GOOGLE_API_KEY may still be needed for other parts of your app, so we leave it.
 os.environ["GOOGLE_API_KEY"] = st.secrets["google"]["api_key"]
-
+logging.basicConfig(
+    level=logging.INFO,       # Show INFO and above
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 def _display_header():
     """

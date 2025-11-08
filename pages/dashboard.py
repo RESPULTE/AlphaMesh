@@ -1,7 +1,7 @@
 # pages/dashboard.py
 import streamlit as st
-import uuid
-from components.user_profile_rag import UserProfileRAG
+from components.rag_handler import UserProfileRAG, generate_augmented_response
+from components.services import get_llm, get_graph, get_vector_store
 
 st.set_page_config(
     page_title="AlphaMesh Dashboard",
@@ -11,25 +11,41 @@ st.set_page_config(
 st.title("Welcome to your AlphaMesh Dashboard")
 st.markdown("This is your personalized investment intelligence hub. I can learn about your interests and goals over time.")
 
-# --- Session State Management ---
+# --- Service and Agent Initialization ---
 
-# 2. Initialize the RAG agent for the user
-# Caching the agent to avoid re-initializing on every script rerun
+# Initialize all backend services
+llm = get_llm()
+graph = get_graph()
+vector_store = get_vector_store()
+
+# Check if services initialized correctly before proceeding
+if not all([llm, graph, vector_store]):
+    st.error("One or more backend services failed to initialize. The application cannot continue.")
+    st.stop() # Halts the script execution
+
+# Caching the RAG handler to avoid re-initializing on every script rerun for the same user
 @st.cache_resource
-def get_rag_agent(user_id):
-    try:
-        return UserProfileRAG(user_id=user_id)
-    except ConnectionError as e:
-        st.error(f"Fatal Error: Could not connect to backend services. Please check your API keys and database connections in st.secrets. Details: {e}")
-        return None
+def get_rag_handler(user_id, _llm, _graph, _vector_store):
+    """Factory function to create and cache the RAG handler per user."""
+    return UserProfileRAG(
+        user_id=user_id,
+        llm=_llm,
+        graph=_graph,
+        vector_store=_vector_store
+    )
 
-rag_agent = get_rag_agent(st.session_state.user_id)
+# Assume st.session_state.user_id is set upon login
+if 'user_id' not in st.session_state:
+    st.warning("Please log in to use the dashboard.")
+    st.stop()
 
-# 3. Initialize chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+rag_handler = get_rag_handler(st.session_state.user_id, llm, graph, vector_store)
 
 # --- Chat Interface ---
+
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 # Display chat messages from history
 for message in st.session_state.messages:
@@ -38,20 +54,28 @@ for message in st.session_state.messages:
 
 # Accept user input
 if prompt := st.chat_input("Ask AlphaMesh anything... (e.g., 'My name is Jane and I'm interested in tech stocks')"):
-    if rag_agent is None:
-        st.error("The assistant is currently offline due to a connection issue.")
-    else:
-        # Store and display user input
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    # Store and display user input
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        # Generate and display the personalized response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                # The single, powerful call to our RAG agent
-                response = rag_agent.get_augmented_response(prompt)
-                st.markdown(response)
+    # Generate and display the personalized response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            # 1. Get context from the RAG handler
+            # This step also updates the user's memory profile
+            context = rag_handler.get_context_for_prompt(prompt)
 
-        # Add assistant message to history
-        st.session_state.messages.append({"role": "assistant", "content": response})
+            # 2. Invoke the LLM with the prepared context
+            response = generate_augmented_response(
+                llm=llm,
+                short_term_context=context["short_term_context"],
+                long_term_context=context["long_term_context"],
+                user_input=prompt
+            )
+            rag_handler.update_memories_from_turn(prompt, response)
+            
+            st.markdown(response)
+
+    # Add assistant message to history
+    st.session_state.messages.append({"role": "assistant", "content": response})
