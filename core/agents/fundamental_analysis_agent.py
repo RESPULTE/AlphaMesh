@@ -1,7 +1,12 @@
-from typing import Literal
+import sqlite3
+from typing import Any, Dict, List, Literal
 
 import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import yfinance as yf
+from core.services import ServiceManager
+from edgar import Company, set_identity
 from langchain_classic.tools.retriever import create_retriever_tool
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
@@ -14,6 +19,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from newspaper import article
+from realtime import SystemMessage
 
 # --- Constants for Prompts and Settings ---
 REWRITE_PROMPT = (
@@ -44,7 +50,7 @@ def fetch_stock_news(
 
     def _summarize_article(text: str) -> str:
         """Summarizes a single article using the provided language model."""
-        prompt = (
+        prompt = SystemMessage(
             f"Summarize the following article about {ticker} stock. "
             f"Include only the relevant parts related to the company's performance, "
             f"financials, market reactions, or major events.\n\n{text}"
@@ -84,6 +90,8 @@ def create_retriever_for_stock(
         chunk_size=100, chunk_overlap=50
     )
     doc_splits = text_splitter.split_documents(docs)
+
+    print(f"split '{len(docs)}' documents into '{len(doc_splits)}' splits")
 
     vectorstore = InMemoryVectorStore.from_documents(
         documents=doc_splits, embedding=embedding_function
@@ -179,9 +187,6 @@ def create_graph_workflow(
     return workflow.compile()
 
 
-from core.services import ServiceManager
-
-
 def run_analysis(ticker: str, question: str):
     """
     Main function to run the stock analysis agent.
@@ -219,9 +224,202 @@ def run_analysis(ticker: str, question: str):
                 print(update)
 
 
+class FundamentalAnalysisAgent:
+    def __init__(self, db_name="financial_data.db"):
+        self.db_name = db_name
+        self.conn = sqlite3.connect(self.db_name)
+        self.cursor = self.conn.cursor()
+        self._create_table()
+        set_identity("yeapzing@gmail.com")
+
+    def _create_table(self):
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS income_statements (
+                ticker TEXT,
+                concept TEXT,
+                label TEXT,
+                date TEXT,
+                value REAL,
+                UNIQUE(ticker, concept, date)
+            )
+        """
+        )
+        self.conn.commit()
+
+    def get_financial_data(self, ticker: str, years: int = 5) -> pd.DataFrame:
+        # First, try to fetch from the database
+        df = pd.read_sql(
+            f"SELECT * FROM income_statements WHERE ticker='{ticker}'", self.conn
+        )
+
+        if not df.empty:
+            print(f"Data for {ticker} found in the database.")
+            return df
+
+        # If not in DB, fetch from EDGAR
+        print(f"Fetching data for {ticker} from EDGAR.")
+        company = Company(ticker)
+        filings = company.get_filings(form="10-K").latest(years)
+        all_income_dfs = []
+
+        for filing in filings:
+            try:
+                xbrl = filing.xbrl()
+                if not xbrl:
+                    continue
+                income_statement = xbrl.statements.income_statement()
+                df = income_statement.to_dataframe()
+                all_income_dfs.append(df)
+            except Exception as e:
+                print(f"Could not process filing from {filing.filing_date}. Error: {e}")
+
+        if not all_income_dfs:
+            return pd.DataFrame()
+
+        # Consolidate and store in DB
+        consolidated_df = self._consolidate_data(all_income_dfs)
+        self._store_data(ticker, consolidated_df)
+
+        return consolidated_df
+
+    def _consolidate_data(self, all_income_dfs: List[pd.DataFrame]) -> pd.DataFrame:
+        # (This logic is adapted from your provided sample)
+        merge_keys = ["concept", "label"]
+        if not all_income_dfs:
+            return pd.DataFrame()
+
+        consolidated_df = all_income_dfs[0].set_index(merge_keys)
+        date_cols = [
+            col for col in consolidated_df.columns if self.can_convert_to_datetime(col)
+        ]
+        consolidated_df = consolidated_df[date_cols]
+
+        for next_df in all_income_dfs[1:]:
+            next_df_indexed = next_df.set_index(merge_keys)
+            next_date_cols = [
+                col
+                for col in next_df_indexed.columns
+                if self.can_convert_to_datetime(col)
+            ]
+            new_cols_to_add = [
+                col for col in next_date_cols if col not in consolidated_df.columns
+            ]
+
+            if new_cols_to_add:
+                consolidated_df = consolidated_df.join(
+                    next_df_indexed[new_cols_to_add], how="outer"
+                )
+
+        return consolidated_df.reset_index()
+
+    def _store_data(self, ticker: str, df: pd.DataFrame):
+        # Melt the DataFrame to a long format suitable for SQL
+        melted_df = df.melt(
+            id_vars=["concept", "label"], var_name="date", value_name="value"
+        )
+        melted_df["ticker"] = ticker
+
+        # Write to SQL
+        melted_df.to_sql(
+            "income_statements", self.conn, if_exists="append", index=False
+        )
+        print(f"Data for {ticker} stored in the database.")
+
+    def can_convert_to_datetime(self, s: str) -> bool:
+        try:
+            pd.to_datetime(s)
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    def calculate_cumulative_growth(
+        self, ticker: str, metric: str, years: int = 5
+    ) -> Dict[str, Any]:
+        df = self.get_financial_data(ticker, years)
+        if df.empty:
+            return {"error": f"No data for {ticker}"}
+
+        # Find the metric
+        metric_row = df[df["concept"] == metric]
+        if metric_row.empty:
+            return {"error": f"Metric {metric} not found for {ticker}"}
+
+        # Extract values and calculate growth
+        date_cols = [col for col in df.columns if self.can_convert_to_datetime(col)]
+        values = metric_row[date_cols].iloc[0].dropna()
+
+        if len(values) < 2:
+            return {"error": "Not enough data to calculate growth"}
+
+        initial_value = values.iloc[0]
+        final_value = values.iloc[-1]
+
+        growth = (final_value - initial_value) / initial_value
+        return {
+            "ticker": ticker,
+            "metric": metric,
+            "cumulative_growth": f"{growth:.2%}",
+            "initial_value": initial_value,
+            "final_value": final_value,
+        }
+
+    def compare_metrics(
+        self, tickers: List[str], metric: str, years: int = 5
+    ) -> go.Figure:
+        fig = go.Figure()
+
+        for ticker in tickers:
+            df = self.get_financial_data(ticker, years)
+            if df.empty:
+                continue
+
+            metric_row = df[df["concept"] == metric]
+            if metric_row.empty:
+                continue
+
+            date_cols = [col for col in df.columns if self.can_convert_to_datetime(col)]
+            values = metric_row[date_cols].iloc[0].dropna()
+
+            fig.add_trace(
+                go.Scatter(
+                    x=pd.to_datetime(values.index),
+                    y=values.values,
+                    mode="lines+markers",
+                    name=ticker,
+                )
+            )
+
+        fig.update_layout(
+            title=f"Comparison of {metric}",
+            xaxis_title="Year",
+            yaxis_title="Value",
+            legend_title="Tickers",
+        )
+        return fig
+
+
 if __name__ == "__main__":
     # --- User Input ---
     stock_ticker = "NVDA"
-    user_question = "Why did NVDA stock go up recently?"
+    user_question = "Why did NVDA stock go down recently?"
 
-    run_analysis(stock_ticker, user_question)
+    # run_analysis(stock_ticker, user_question)
+
+    # Example usage of the new agent
+    agent = FundamentalAnalysisAgent()
+
+    # 1. Fetch data for a single company (will be stored in DB)
+    print("\n--- Fetching single company data ---")
+    aapl_data = agent.get_financial_data("AAPL")
+    print(aapl_data.head())
+
+    # 2. Calculate cumulative growth
+    print("\n--- Calculating Cumulative Growth ---")
+    growth = agent.calculate_cumulative_growth("AAPL", "us-gaap_Revenues")
+    print(growth)
+
+    # 3. Compare metrics for multiple companies
+    print("\n--- Comparing Metrics ---")
+    fig = agent.compare_metrics(["AAPL", "MSFT", "GOOGL"], "us-gaap_NetIncomeLoss")
+    fig.show()

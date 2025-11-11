@@ -71,3 +71,6 @@ class ServiceManager:
                 print(f"Error initializing Chroma vector store: {e}")
                 raise
         return self._vector_store
+
+
+service_manager = ServiceManager()
