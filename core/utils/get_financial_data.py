@@ -2,7 +2,7 @@ import sqlite3
 import pandas as pd
 from edgar import Company, set_identity
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Union
 
 # --- CONFIGURATION ---
 USER_AGENT = "FinancialResearchBot student@university.edu"
@@ -167,7 +167,7 @@ class FinancialDatabase:
 
                 xbrl = filing.xbrl()
                 if not xbrl:
-                    print(f"  No XBRL data found.")
+                    print(f"No XBRL data found.")
                     continue
 
                 data_frames = []
@@ -206,7 +206,7 @@ class FinancialDatabase:
                     existing_years.add(estimated_year)
                     processed_count += 1
                 else:
-                    print(f"  No processable data found.")
+                    print(f"No processable data found.")
 
             except Exception as e:
                 print(f"  Failed to process filing: {e}")
@@ -215,20 +215,27 @@ class FinancialDatabase:
         self,
         ticker: str,
         years: Optional[List[int]] = None,
-        statement_type: Optional[str] = None,
+        statements: Union[str, List[str], None] = None,
     ) -> pd.DataFrame:
         ticker = ticker.upper()
         query = "SELECT * FROM financials WHERE company = ?"
         params = [ticker]
 
+        # Handle Years (Single Int or List of Ints)
         if years:
+            if isinstance(years, int):
+                years = [years]
             placeholders = ",".join(["?"] * len(years))
             query += f" AND year IN ({placeholders})"
             params.extend(years)
 
-        if statement_type:
-            query += " AND statement_type = ?"
-            params.append(statement_type)
+        # Handle Statements (Single Str or List of Strs)
+        if statements:
+            if isinstance(statements, str):
+                statements = [statements]
+            placeholders = ",".join(["?"] * len(statements))
+            query += f" AND statement_type IN ({placeholders})"
+            params.extend(statements)
 
         with self._get_connection() as conn:
             df = pd.read_sql(query, conn, params=params)
@@ -242,22 +249,67 @@ class FinancialDatabase:
             index=["statement_type", "concept"], columns="year", values="value"
         )
 
+    def get_income_statement(
+        self, ticker: str, year: Optional[int] = None
+    ) -> pd.DataFrame:
+        """Quickly fetch income statements."""
+        return self.pivot_data(self.get_data(ticker, years=year, statements="income"))
+
+    def get_balance_sheet(
+        self, ticker: str, year: Optional[int] = None
+    ) -> pd.DataFrame:
+        """Quickly fetch balance sheets."""
+        return self.pivot_data(self.get_data(ticker, years=year, statements="balance"))
+
+    def get_cash_flow(self, ticker: str, year: Optional[int] = None) -> pd.DataFrame:
+        """Quickly fetch cash flow statements."""
+        return self.pivot_data(self.get_data(ticker, years=year, statements="cashflow"))
+
+    def get_fiscal_year(self, ticker: str, year: int) -> pd.DataFrame:
+        """Fetch all data (all statements) for a specific year."""
+        return self.pivot_data(self.get_data(ticker, years=year))
+
+    def search_concept(self, ticker: str, keyword: str) -> pd.DataFrame:
+        """
+        Search for specific line items (e.g., 'Revenue', 'Net Income')
+        across all years. Helpful if you don't know the exact XBRL tag.
+        """
+        ticker = ticker.upper()
+        query = """
+            SELECT * FROM financials 
+            WHERE company = ? AND concept LIKE ?
+        """
+        # Add wildcards for SQL LIKE
+        search_term = f"%{keyword}%"
+
+        with self._get_connection() as conn:
+            df = pd.read_sql(query, conn, params=(ticker, search_term))
+
+        return self.pivot_data(df)
+
 
 # --- EXAMPLE USAGE ---
 if __name__ == "__main__":
     db = FinancialDatabase("financial_data.db")
+    company = "NVDA"
 
-    # 1. Add Apple (AAPL)
-    db.update_company_data("AAPL", num_years=5)
+    # Ensure data exists
+    db.update_company_data(company, num_years=3)
 
-    # 2. Retrieve and display
-    print("\n--- Displaying Data for AAPL ---")
-    df = db.get_data("AAPL")
+    print("\n--- 1. Filter by Statement (Income Only) ---")
+    # Using the intuitive wrapper
+    print(db.get_income_statement(company))
 
-    if not df.empty:
-        # Display readable pivot
-        # Format floats to 2 decimal places for readability
-        pd.set_option("display.float_format", lambda x: "%.2f" % x)
-        print(db.pivot_data(df).head(20))
-    else:
-        print("No data found.")
+    print("\n--- 2. Filter by Year (2023 Only) ---")
+    # Using the intuitive wrapper
+    print(db.get_fiscal_year(company, 2023))
+
+    print("\n--- 3. Complex Filter (Cashflow & Balance for 2022 & 2023) ---")
+    # Using the robust get_data method
+    df_complex = db.get_data(
+        company, years=[2022, 2023], statements=["cashflow", "balance"]
+    )
+    print(db.pivot_data(df_complex))
+
+    print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
+    print(db.search_concept(company, "assets"))
