@@ -6,6 +6,8 @@ from typing import List, Optional, Union
 
 # --- CONFIGURATION ---
 USER_AGENT = "FinancialResearchBot student@university.edu"
+ALL_STATEMENT_TYPE = ["income", "balance", "cashflow"]
+DEFAULT_YEARS = 5
 
 
 class FinancialDatabase:
@@ -132,9 +134,25 @@ class FinancialDatabase:
 
         existing_years = self._get_existing_years(ticker)
 
+        # Check if we already have enough recent data to satisfy the request.
+        # We look back (num_years + 1) to account for fiscal years ending in the previous calendar year.
+        current_year = datetime.now().year
+        cutoff_year = current_year - (num_years + 2)
+
+        # Count how many years in the DB are recent enough
+        recent_years_count = sum(1 for y in existing_years if y > cutoff_year)
+
+        if recent_years_count >= num_years:
+            print(
+                f"Skipping fetch for {ticker}: Found {recent_years_count} recent years in DB (Requested: {num_years})."
+            )
+            return
+
         try:
             company = Company(ticker)
-            filings = company.get_filings(form="10-K").latest(num_years + 3)
+            print(num_years)
+            # Fetch slightly more than needed to ensure we cover fiscal year offsets
+            filings = company.get_filings(form="10-K").latest(num_years)
         except Exception as e:
             print(f"Error fetching filings for {ticker}: {e}")
             return
@@ -146,6 +164,7 @@ class FinancialDatabase:
         processed_count = 0
 
         for filing in filings:
+            # Stop if we have processed enough NEW years or total years
             if processed_count >= num_years:
                 break
 
@@ -157,8 +176,15 @@ class FinancialDatabase:
                 )
 
                 if estimated_year in existing_years:
+                    # Even inside the loop, we check.
+                    # If we hit a year we have, we don't download/process,
+                    # but we continue checking older filings just in case there's a gap,
+                    # unless we are confident we have the sequence.
                     print(f"Skipping {estimated_year} (Already exists)")
-                    processed_count += 1
+
+                    # Optimization: If we hit a year that exists, and we know we have
+                    # a continuous block of older data, we could technically break here too.
+                    # For now, we just skip processing this specific filing.
                     continue
 
                 print(
@@ -214,28 +240,31 @@ class FinancialDatabase:
     def get_data(
         self,
         ticker: str,
-        years: Optional[List[int]] = None,
-        statements: Union[str, List[str], None] = None,
+        years: Optional[List[int]] = [DEFAULT_YEARS],
+        statements: Union[str, List[str]] = ALL_STATEMENT_TYPE,
     ) -> pd.DataFrame:
         ticker = ticker.upper()
         query = "SELECT * FROM financials WHERE company = ?"
         params = [ticker]
 
         # Handle Years (Single Int or List of Ints)
-        if years:
-            if isinstance(years, int):
-                years = [years]
-            placeholders = ",".join(["?"] * len(years))
-            query += f" AND year IN ({placeholders})"
-            params.extend(years)
+        if years is None:
+            years = [DEFAULT_YEARS]
+
+        if isinstance(years, int):
+            years = [years]
+        placeholders = ",".join(["?"] * len(years))
+        query += f" AND year IN ({placeholders})"
+        params.extend(years)
 
         # Handle Statements (Single Str or List of Strs)
-        if statements:
-            if isinstance(statements, str):
-                statements = [statements]
-            placeholders = ",".join(["?"] * len(statements))
-            query += f" AND statement_type IN ({placeholders})"
-            params.extend(statements)
+        if statements is None:
+            statements = ALL_STATEMENT_TYPE
+        if isinstance(statements, str):
+            statements = [statements]
+        placeholders = ",".join(["?"] * len(statements))
+        query += f" AND statement_type IN ({placeholders})"
+        params.extend(statements)
 
         with self._get_connection() as conn:
             df = pd.read_sql(query, conn, params=params)
@@ -249,41 +278,46 @@ class FinancialDatabase:
             index=["statement_type", "concept"], columns="year", values="value"
         )
 
-    def get_income_statement(
-        self, ticker: str, year: Optional[int] = None
-    ) -> pd.DataFrame:
-        """Quickly fetch income statements."""
-        return self.pivot_data(self.get_data(ticker, years=year, statements="income"))
-
-    def get_balance_sheet(
-        self, ticker: str, year: Optional[int] = None
-    ) -> pd.DataFrame:
-        """Quickly fetch balance sheets."""
-        return self.pivot_data(self.get_data(ticker, years=year, statements="balance"))
-
-    def get_cash_flow(self, ticker: str, year: Optional[int] = None) -> pd.DataFrame:
-        """Quickly fetch cash flow statements."""
-        return self.pivot_data(self.get_data(ticker, years=year, statements="cashflow"))
-
     def get_fiscal_year(self, ticker: str, year: int) -> pd.DataFrame:
         """Fetch all data (all statements) for a specific year."""
         return self.pivot_data(self.get_data(ticker, years=year))
 
-    def search_concept(self, ticker: str, keyword: str) -> pd.DataFrame:
+    def search_concept(
+        self,
+        ticker: str,
+        keyword: str,
+        start_year: int | None = None,
+        end_year: int | None = None,
+    ) -> pd.DataFrame:
         """
         Search for specific line items (e.g., 'Revenue', 'Net Income')
-        across all years. Helpful if you don't know the exact XBRL tag.
+        across a range of years (optional). Useful when the exact XBRL tag is unknown.
         """
+
         ticker = ticker.upper()
-        query = """
-            SELECT * FROM financials 
-            WHERE company = ? AND concept LIKE ?
-        """
-        # Add wildcards for SQL LIKE
         search_term = f"%{keyword}%"
 
+        # Build dynamic SQL query
+        query = """
+            SELECT * FROM financials
+            WHERE company = ?
+            AND concept LIKE ?
+        """
+        params = [ticker, search_term]
+
+        if start_year is not None:
+            query += " AND year >= ?"
+            params.append(start_year)
+
+        if end_year is not None:
+            query += " AND year <= ?"
+            params.append(end_year)
+
+        # Optional: sort by year for cleanliness
+        query += " ORDER BY year ASC"
+
         with self._get_connection() as conn:
-            df = pd.read_sql(query, conn, params=(ticker, search_term))
+            df = pd.read_sql(query, conn, params=params)
 
         return self.pivot_data(df)
 
@@ -291,14 +325,10 @@ class FinancialDatabase:
 # --- EXAMPLE USAGE ---
 if __name__ == "__main__":
     db = FinancialDatabase("financial_data.db")
-    company = "NVDA"
+    company = "MSFT"
 
     # Ensure data exists
-    db.update_company_data(company, num_years=3)
-
-    print("\n--- 1. Filter by Statement (Income Only) ---")
-    # Using the intuitive wrapper
-    print(db.get_income_statement(company))
+    db.update_company_data(company, num_years=5)
 
     print("\n--- 2. Filter by Year (2023 Only) ---")
     # Using the intuitive wrapper
@@ -312,4 +342,4 @@ if __name__ == "__main__":
     print(db.pivot_data(df_complex))
 
     print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
-    print(db.search_concept(company, "assets"))
+    print(db.search_concept(company, "cash", start_year=2021, end_year=2024))

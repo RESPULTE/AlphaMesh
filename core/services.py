@@ -24,7 +24,7 @@ class ServiceManager:
                 self._llm = ChatGoogleGenerativeAI(
                     model=settings.LLM_MODEL,
                     google_api_key=settings.GOOGLE_API_KEY,
-                    temperature=0,
+                    temperature=0.1,
                 )
             except Exception as e:
                 print(f"Error initializing LLM: {e}")
