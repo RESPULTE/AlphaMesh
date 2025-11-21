@@ -188,7 +188,7 @@ def run_analysis(ticker: str, question: str):
     """
     print("--- Initializing Services ---")
     service_manager = ServiceManager()
-    llm = service_manager.get_llm()
+    llm = service_manager.get_agent()
     embedding_func = service_manager.get_embedding_func()
 
     print(f"\n--- retrieving News Data for {ticker} ---")

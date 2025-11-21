@@ -38,7 +38,7 @@ class FinancialDatabase:
             )
             conn.commit()
 
-    def _get_existing_years(self, ticker: str) -> set:
+    def get_existing_years(self, ticker: str) -> set:
         query = "SELECT DISTINCT year FROM financials WHERE company = ?"
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -132,7 +132,7 @@ class FinancialDatabase:
         ticker = ticker.upper()
         print(f"--- Processing {ticker} ---")
 
-        existing_years = self._get_existing_years(ticker)
+        existing_years = self.get_existing_years(ticker)
 
         # Check if we already have enough recent data to satisfy the request.
         # We look back (num_years + 1) to account for fiscal years ending in the previous calendar year.
@@ -285,25 +285,33 @@ class FinancialDatabase:
     def search_concept(
         self,
         ticker: str,
-        keyword: str,
+        keyword: str | List[str],
         start_year: int | None = None,
         end_year: int | None = None,
     ) -> pd.DataFrame:
         """
         Search for specific line items (e.g., 'Revenue', 'Net Income')
-        across a range of years (optional). Useful when the exact XBRL tag is unknown.
+        across a range of years (optional). Supports multiple keywords.
         """
 
         ticker = ticker.upper()
-        search_term = f"%{keyword}%"
 
-        # Build dynamic SQL query
-        query = """
+        # --- Handle keyword(s) ---
+        if isinstance(keyword, list):
+            like_clauses = " OR ".join(["concept LIKE ?" for _ in keyword])
+            search_terms = [f"%{kw}%" for kw in keyword]
+        else:
+            like_clauses = "concept LIKE ?"
+            search_terms = [f"%{keyword}%"]
+
+        # --- Build query ---
+        query = f"""
             SELECT * FROM financials
             WHERE company = ?
-            AND concept LIKE ?
+            AND ({like_clauses})
         """
-        params = [ticker, search_term]
+
+        params = [ticker] + search_terms
 
         if start_year is not None:
             query += " AND year >= ?"
@@ -313,9 +321,9 @@ class FinancialDatabase:
             query += " AND year <= ?"
             params.append(end_year)
 
-        # Optional: sort by year for cleanliness
         query += " ORDER BY year ASC"
 
+        # --- Execute ---
         with self._get_connection() as conn:
             df = pd.read_sql(query, conn, params=params)
 
@@ -341,8 +349,12 @@ if __name__ == "__main__":
     # )
     # print(db.pivot_data(df_complex))
 
-    # print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
-    # print(db.search_concept(company, "earning", start_year=2021, end_year=2024))
+    print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
+    print(
+        db.search_concept(
+            company, ["earning", "asset", "profit"], start_year=2021, end_year=2024
+        )
+    )
 
     # import json
 

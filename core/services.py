@@ -17,7 +17,7 @@ class ServiceManager:
         self._graph = None
         self._vector_store = None
 
-    def get_llm(self) -> ChatGoogleGenerativeAI:
+    def get_agent(self) -> ChatGoogleGenerativeAI:
         """Initializes and returns the language model instance."""
         if self._llm is None:
             try:
