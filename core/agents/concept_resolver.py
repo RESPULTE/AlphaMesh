@@ -1,11 +1,16 @@
 import json
 import re
 from rapidfuzz import process, fuzz
+import os
 
 
 class ConceptResolver:
-    def __init__(self, mapping_path="./concept_mapping.json"):
+    def __init__(self, mapping_path=None):
         try:
+            mapping_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "concept_mappings.json",
+            )
             with open(mapping_path, "r") as f:
                 self.mapping = json.load(f)
         except Exception as e:
@@ -39,9 +44,7 @@ class ConceptResolver:
         # Check if term is a key in the JSON
         if term in self.mapping:
             xbrl_tag = self.mapping[term]
-            # verify if this tag exists in the actual dataframe
-            if xbrl_tag in self.official_concepts:
-                return xbrl_tag
+            return xbrl_tag
         return None
 
     # ---------------------------------------------------------
@@ -65,12 +68,7 @@ class ConceptResolver:
 
             if score >= threshold:
                 xbrl_tag = self.mapping[best_match_key]
-                # We found a concept match, now does the column exist in the DF?
-                if xbrl_tag in self.official_concepts:
-                    return xbrl_tag
-
-                # Edge Case: The concept matches, but the specific XBRL tag isn't in this specific company's file.
-                # You might want to log this or try a fallback.
+                return xbrl_tag
 
         return None
 
@@ -82,11 +80,10 @@ class ConceptResolver:
         Fallback: If not in JSON, look at the actual dataframe columns
         and see if the words exist there.
         """
-        keywords = term.lower().split()
         for col in self.official_concepts:
             norm = self.normalize(col)
             # If all user keywords appear in the normalized column name
-            if all(kw in norm for kw in keywords):
+            if term.lower() in norm:
                 return col
         return None
 
@@ -97,10 +94,13 @@ class ConceptResolver:
         """
         Final Fallback: Fuzzy match against the ugly XBRL tags directly.
         """
-        best, score, _ = process.extractOne(
-            term, self.official_concepts, scorer=fuzz.WRatio
-        )
-        return best if score > 70 else None
+        try:
+            best, score, _ = process.extractOne(
+                term, self.official_concepts, scorer=fuzz.WRatio
+            )
+            return best if score > 70 else None
+        except Exception:
+            return None
 
     # ---------------------------------------------------------
     # Main Entry Point

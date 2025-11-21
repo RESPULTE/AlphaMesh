@@ -80,6 +80,8 @@
     "stock based compensation": "us-gaap_ShareBasedCompensation",
     "cost of goods sold": "us-gaap_CostOfGoodsAndServicesSold",
     "cogs": "us-gaap_CostOfGoodsAndServicesSold",
+    "earnings per share basic": "us-gaap_EarningsPerShareBasic",
+    "earnings per share diluted": "us-gaap_EarningsPerShareDiluted",
     "eps basic": "us-gaap_EarningsPerShareBasic",
     "eps diluted": "us-gaap_EarningsPerShareDiluted",
     "general admin expense": "us-gaap_GeneralAndAdministrativeExpense",

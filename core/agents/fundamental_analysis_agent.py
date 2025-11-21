@@ -1,317 +1,427 @@
 import datetime
-from typing import List, Dict, Any, Optional, Literal
 import pandas as pd
+from typing import List, Dict, Any, Optional, Literal
 from pydantic import BaseModel, Field
 
 # LangChain / LangGraph imports
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-# --- MOCK IMPORTS (Replace these with your actual project imports) ---
-# In a real scenario, these would come from your local files.
+# --- LOCAL IMPORTS ---
 from core.services import service_manager
-from core.agents import fundamental_metric_helper
 from core.agents.get_financial_data import FinancialDatabase
+from core.agents.concept_resolver import ConceptResolver
+
+# Initialize Resolver globally
+RESOLVER = ConceptResolver()
+
+# -------------------------------------------------------------------
+# 1. DATABASE EXTENSION
+# -------------------------------------------------------------------
+
+
+class ExtendedFinancialDatabase(FinancialDatabase):
+    """Extends DB to handle saving calculated metrics safely."""
+
+    def save_calculated_metric(self, df: pd.DataFrame):
+        if df.empty:
+            return
+        df = df.copy()
+        df["statement_type"] = "calculated"
+        required = ["company", "year", "statement_type", "concept", "value"]
+
+        if not all(c in df.columns for c in required):
+            print(f"   [DB Error] Missing cols: {df.columns}")
+            return
+
+        final_df = df[required]
+        with self._get_connection() as conn:
+            try:
+                cursor = conn.cursor()
+                for _, row in final_df.iterrows():
+                    # Delete existing calculation to allow overwrite
+                    cursor.execute(
+                        "DELETE FROM financials WHERE company=? AND year=? AND statement_type='calculated' AND concept=?",
+                        (row["company"], row["year"], row["concept"]),
+                    )
+                conn.commit()
+                final_df.to_sql("financials", conn, if_exists="append", index=False)
+                print(
+                    f"   [DB] Saved {len(final_df)} rows for '{final_df['concept'].iloc[0]}'."
+                )
+            except Exception as e:
+                print(f"   [DB] Error saving: {e}")
 
 
 # -------------------------------------------------------------------
-
-# --- 1. State Definition ---
+# 2. STATE DEFINITION
+# -------------------------------------------------------------------
 
 
 class AgentState(BaseModel):
-    """
-    The state object passed between nodes in the LangGraph.
-    """
-
     messages: List[BaseMessage]
     user_query: str
     ticker: Optional[str] = None
     period_start: Optional[int] = None
     period_end: Optional[int] = None
-    concepts: Optional[List[str]] = None
-    financial_data_json: Optional[str] = (
-        None  # Store DF as JSON string to pass between nodes
-    )
-    error: Optional[str] = None
+
+    # --- QUEUE MANAGEMENT ---
+    metrics_queue: List[str] = Field(default_factory=list)
+    current_metric: Optional[str] = None
+
+    # --- EPHEMERAL FLAGS ---
+    direct_resolved_tag: Optional[str] = None
+    is_complex_calculation: bool = False
+    ingredient_names: List[str] = Field(default_factory=list)
+    resolved_ingredients: Dict[str, str] = Field(default_factory=dict)
+
+    # --- GLOBAL DATA STATUS ---
+    data_status: str = "Empty"
 
 
-# --- 2. Helper Classes & Tools ---
+GLOBAL_DATAFRAME_CONTEXT: Optional[pd.DataFrame] = None
+
+# -------------------------------------------------------------------
+# 3. TOOLS
+# -------------------------------------------------------------------
+
+
+@tool
+def calculate_and_store_ratio(
+    ticker: str, metric_name: str, numerator_tag: str, denominator_tag: str
+):
+    """
+    Calculates a ratio (numerator/denominator) using RESOLVED tags.
+    Saves result to DB.
+    """
+    global GLOBAL_DATAFRAME_CONTEXT
+    if GLOBAL_DATAFRAME_CONTEXT is None or GLOBAL_DATAFRAME_CONTEXT.empty:
+        return "Error: No data context."
+
+    df = GLOBAL_DATAFRAME_CONTEXT.copy()
+
+    def get_series(tag):
+        try:
+            matches = df[df.index.get_level_values("concept") == tag]
+            return matches.iloc[0] if not matches.empty else None
+        except:
+            return None
+
+    num = get_series(numerator_tag)
+    den = get_series(denominator_tag)
+
+    if num is None:
+        return f"Missing data for {numerator_tag}"
+    if den is None:
+        return f"Missing data for {denominator_tag}"
+
+    try:
+        res = num / den
+    except Exception as e:
+        return f"Math error: {e}"
+
+    db_rows = []
+    for year, val in res.items():
+        if str(year).isdigit() and pd.notna(val):
+            db_rows.append(
+                {
+                    "company": ticker,
+                    "year": int(year),
+                    "concept": metric_name,
+                    "value": float(val),
+                }
+            )
+
+    ExtendedFinancialDatabase().save_calculated_metric(pd.DataFrame(db_rows))
+    return f"Calculated {metric_name} successfully."
+
+
+# -------------------------------------------------------------------
+# 4. NODES
+# -------------------------------------------------------------------
 
 
 class ScopeParser(BaseModel):
-    """Structured output for the parser node."""
-
-    ticker: str = Field(description="The stock ticker symbol.")
-    start_year: int = Field(description="The start year of the analysis.")
-    end_year: int = Field(description="The end year of the analysis.")
-    concepts: List[str] = Field(
-        description="List of relevant financial concept names for the query."
+    ticker: str
+    start_year: int
+    end_year: int
+    target_metrics: List[str] = Field(
+        description="List of financial metrics requested."
     )
 
 
-# Global variable to hold the DataFrame temporarily for tools to access
-# This avoids passing the massive DataFrame into the LLM Context Window.
-CURRENT_CONTEXT_DATA: Optional[pd.DataFrame] = None
-
-
-@tool
-def calculate_pe_ratio_tool():
-    """Calculates the Price-to-Earnings (P/E) Ratio based on loaded data."""
-    if CURRENT_CONTEXT_DATA is None:
-        return "Error: No financial data loaded."
-    try:
-        # In reality, you call: fundamental_metric_helper.calculate_pe_ratio(CURRENT_CONTEXT_DATA)
-        result = fundamental_metric_helper.calculate_pe_ratio(CURRENT_CONTEXT_DATA)
-        return f"The P/E Ratio is {result}"
-    except Exception as e:
-        return f"Error calculating PE: {str(e)}"
-
-
-@tool
-def calculate_cagr_tool(metric_name: str = "revenue"):
-    """Calculates the Compound Annual Growth Rate (CAGR) for a specific metric (default: revenue)."""
-    if CURRENT_CONTEXT_DATA is None:
-        return "Error: No financial data loaded."
-    try:
-        result = fundamental_metric_helper.calculate_cagr(
-            CURRENT_CONTEXT_DATA, metric_name
-        )
-        return f"The CAGR for {metric_name} is {result:.2%}"
-    except Exception as e:
-        return f"Error calculating CAGR: {str(e)}"
-
-
-@tool
-def calculate_debt_to_equity_tool():
-    """Calculates the Debt-to-Equity ratio."""
-    if CURRENT_CONTEXT_DATA is None:
-        return "Error: No financial data loaded."
-    try:
-        result = fundamental_metric_helper.calculate_debt_to_equity(
-            CURRENT_CONTEXT_DATA
-        )
-        return f"The Debt-to-Equity Ratio is {result}"
-    except Exception as e:
-        return f"Error calculating Debt/Equity: {str(e)}"
-
-
-# List of available tools
-analysis_tools = [
-    calculate_pe_ratio_tool,
-    calculate_cagr_tool,
-    calculate_debt_to_equity_tool,
-]
-
-# --- 3. Nodes ---
-
-
-def parse_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node 1: Parse User Input.
-    Extracts Company Ticker and Period. Defaults to last 5 years if unspecified.
-    """
-    print(f"--- [Node] Parsing Input: {state.user_query} ---")
-
+def parser_node(state: AgentState) -> Dict[str, Any]:
+    print(f"\n--- [Node] Parser: '{state.user_query}' ---")
     llm = service_manager.get_agent()
-
     current_year = datetime.datetime.now().year
-    default_start = current_year - 5
 
-    parser_prompt = ChatPromptTemplate.from_messages(
+    prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                f"The current year is {current_year}."
-                f"Extract the Company Ticker, Year Range and the relevant financial metric from the user query. "
-                f"If the company is named (e.g. 'Apple'), convert it to Ticker (e.g. 'AAPL'). "
-                f"If no period is specified, default to {default_start} to {current_year}. "
-                "return JSON",
+                f"Current year: {current_year}. Extract Ticker, Year Range, and LIST of Metrics. "
+                "Default to last 5 years. Return JSON.",
             ),
             ("human", "{query}"),
         ]
     )
 
-    # Use structured output for reliability
-    structured_llm = llm.with_structured_output(ScopeParser)
-    chain = parser_prompt | structured_llm
-
     try:
-        result = chain.invoke({"query": state.user_query})
+        res = (prompt | llm.with_structured_output(ScopeParser)).invoke(
+            {"query": state.user_query}
+        )
         return {
-            "ticker": result.ticker,
-            "period_start": result.start_year,
-            "period_end": result.end_year,
-            "concepts": result.concepts,
+            "ticker": res.ticker.upper(),
+            "period_start": res.start_year,
+            "period_end": res.end_year,
+            "metrics_queue": res.target_metrics,
+            "current_metric": None,
         }
     except Exception as e:
-        return {"error": f"Failed to parse input: {str(e)}"}
+        return {"messages": [BaseMessage(content=f"Error parsing: {e}")]}
 
 
-def data_manager_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node 2: Check DB & Fetch Data.
-    Ensures data is available locally, then loads it into the global context.
-    """
-    if state.error:
-        return {}  # Skip if previous error
+def scheduler_node(state: AgentState) -> Dict[str, Any]:
+    queue = state.metrics_queue
+    if not queue:
+        print("--- [Node] Scheduler: Queue Empty. Done. ---")
+        return {"current_metric": None}
 
-    ticker = state.ticker
-    start = state.period_start
-    end = state.period_end
-    concepts = state.concepts
-
-    print(f"--- [Node] Checking Data for {ticker} ({start}-{end}) ---")
-
-    db = FinancialDatabase()
-
-    try:
-
-        # 2. Validation: If empty or missing years, fetch from API
-        # (Simplified logic: if None, fetch)
-        if not set(range(start, end + 1)).issubset(db.get_existing_years(ticker)):
-            print("   > Data missing locally. Fetching from external source...")
-            db.update_company_data(ticker, 2025 - min(start, end) + 1)
-
-        df = db.search_concept(ticker, concepts, start_year=start, end_year=end)
-
-        if df is None or df.empty:
-            return {"error": f"Could not retrieve data for {ticker}."}
-
-        # 3. Set Global Context for Tools
-        # We do not put the DF in the state 'messages' to save tokens.
-        # We put it in a global variable that Tools can access.
-        global CURRENT_CONTEXT_DATA
-        CURRENT_CONTEXT_DATA = df
-
-        # We store a lightweight reference or summary in state if needed
-        return {"financial_data_json": str(df.columns.tolist())}
-
-    except Exception as e:
-        return {"error": f"Database Error: {str(e)}"}
-
-
-def analysis_agent_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Node 3: Agent Reasoning.
-    Decides which tool to call based on the user query and available tools.
-    """
-    if state.error:
-        return {"messages": [AIMessage(content=state.error)]}
-
-    print("--- [Node] Analyst Agent Reasoning ---")
-
-    llm = service_manager.get_agent()
-    llm_with_tools = llm.bind_tools(analysis_tools)
-
-    # Construct context for the agent
-    sys_msg = SystemMessage(
-        content=f"You are a Fundamental Analysis Agent. "
-        f"You are analyzing {state.ticker} from {state.period_start} to {state.period_end}. "
-        f"Financial data is already loaded in the system context. "
-        f"Select the appropriate tool to answer the user's question. "
-        f"If the calculation is done, summarize the results."
+    next_metric = queue[0]
+    remaining = queue[1:]
+    print(
+        f"--- [Node] Scheduler: Starting '{next_metric}' (Remaining: {len(remaining)}) ---"
     )
 
-    # Get the history (messages)
-    # If this is the first pass, add the system message and user query
-    messages = state.messages
-    if not messages:
-        messages = [sys_msg, HumanMessage(content=state.user_query)]
+    return {
+        "current_metric": next_metric,
+        "metrics_queue": remaining,
+        "direct_resolved_tag": None,
+        "is_complex_calculation": False,
+        "ingredient_names": [],
+        "resolved_ingredients": {},
+    }
+
+
+def resolve_target_node(state: AgentState) -> Dict[str, Any]:
+    metric = state.current_metric
+    print(f"--- [Node] Resolve Target: '{metric}' ---")
+    tag = RESOLVER.resolve(metric)
+
+    if tag:
+        print(f"   > Direct match found: {tag}")
+        return {"direct_resolved_tag": tag, "is_complex_calculation": False}
     else:
-        # Ensure system message is present if strictly needed,
-        # usually LangGraph handles history, but we prepend context here.
-        messages = [sys_msg] + messages
-
-    response = llm_with_tools.invoke(messages)
-
-    return {"messages": [response]}
+        print(f"   > No direct match. Needs decomposition.")
+        return {"direct_resolved_tag": None, "is_complex_calculation": True}
 
 
-def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
-    """
-    Conditional Edge: Checks if the Agent made a tool call or a final response.
-    """
-    messages = state.messages
-    last_message = messages[-1]
+def decomposer_node(state: AgentState) -> Dict[str, Any]:
+    metric = state.current_metric
+    print(f"--- [Node] Decomposer: Breaking down '{metric}' ---")
+    llm = service_manager.get_agent()
 
-    if state.error:
-        return "__end__"
+    class Ingredients(BaseModel):
+        names: List[str] = Field(description="List of 2-3 raw financial concepts.")
 
-    if last_message.tool_calls:
-        return "tools"
-    return "__end__"
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Break down the requested metric into standard 10-K items (e.g. 'PE Ratio' -> ['Price', 'EPS']). Return JSON.",
+            ),
+            ("human", f"Metric: {metric}"),
+        ]
+    )
+
+    res = (prompt | llm.with_structured_output(Ingredients)).invoke({})
+    print(f"   > Ingredients: {res.names}")
+    return {"ingredient_names": res.names}
 
 
-# --- 4. Graph Construction ---
+def resolve_ingredients_node(state: AgentState) -> Dict[str, Any]:
+    print(f"--- [Node] Resolve Ingredients ---")
+    ingredients = state.ingredient_names
+    resolved_map = {}
+
+    for name in ingredients:
+        tag = RESOLVER.resolve(name)
+        if tag:
+            resolved_map[name] = tag
+        else:
+            print(f"   > Warning: Could not resolve ingredient '{name}'")
+
+    return {"resolved_ingredients": resolved_map}
+
+
+def fetch_data_node(state: AgentState) -> Dict[str, Any]:
+    print(f"--- [Node] Fetch Data ---")
+    db = ExtendedFinancialDatabase()
+    db.update_company_data(state.ticker, num_years=5)
+
+    tags_to_fetch = []
+    if state.direct_resolved_tag:
+        tags_to_fetch.append(state.direct_resolved_tag)
+    elif state.resolved_ingredients:
+        tags_to_fetch = list(state.resolved_ingredients.values())
+
+    if not tags_to_fetch:
+        return {"data_status": "Error: No tags to fetch"}
+
+    df = db.search_concept(
+        state.ticker, tags_to_fetch, state.period_start, state.period_end
+    )
+
+    global GLOBAL_DATAFRAME_CONTEXT
+    if not df.empty:
+        if GLOBAL_DATAFRAME_CONTEXT is not None:
+            GLOBAL_DATAFRAME_CONTEXT = pd.concat([GLOBAL_DATAFRAME_CONTEXT, df])
+            GLOBAL_DATAFRAME_CONTEXT = GLOBAL_DATAFRAME_CONTEXT[
+                ~GLOBAL_DATAFRAME_CONTEXT.index.duplicated(keep="first")
+            ]
+        else:
+            GLOBAL_DATAFRAME_CONTEXT = df
+        return {"data_status": "Data Loaded"}
+
+    return {"data_status": "No Data Found"}
+
+
+def calculator_setup_node(state: AgentState) -> Dict[str, Any]:
+    """Prepares the tool call for the calculator."""
+    print(f"--- [Node] Calculator Setup ---")
+    llm = service_manager.get_agent()
+
+    # --- FIX IS HERE ---
+    # We use placeholders {metric} and {tags} in the prompt string,
+    # and pass the actual data via the .invoke() dictionary.
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "User wants: {metric}. "
+                "Resolved tags: {tags}. "
+                "Call 'calculate_and_store_ratio' using these tags.",
+            ),
+            ("human", "Calculate."),
+        ]
+    )
+
+    llm_with_tools = llm.bind_tools([calculate_and_store_ratio])
+
+    # Pass complex objects as strings in the invoke call
+    res = (prompt | llm_with_tools).invoke(
+        {"metric": state.current_metric, "tags": str(state.resolved_ingredients)}
+    )
+
+    return {"messages": [res]}
+
+
+def analyst_node(state: AgentState) -> Dict[str, Any]:
+    print(f"--- [Node] Analyst ---")
+    llm = service_manager.get_agent()
+    global GLOBAL_DATAFRAME_CONTEXT
+
+    data_str = (
+        GLOBAL_DATAFRAME_CONTEXT.to_string()
+        if GLOBAL_DATAFRAME_CONTEXT is not None
+        else "No Data"
+    )
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a financial analyst. Answer the user's query using the data below.",
+            ),
+            ("human", f"Query: {state.user_query}\n\nData:\n{data_str}"),
+        ]
+    )
+
+    res = (prompt | llm).invoke({})
+    return {"messages": [res]}
+
+
+# -------------------------------------------------------------------
+# 5. ROUTING LOGIC
+# -------------------------------------------------------------------
+
+
+def route_scheduler(state: AgentState) -> Literal["resolve_target", "analyst"]:
+    if state.current_metric:
+        return "resolve_target"
+    return "analyst"
+
+
+def route_target_resolution(state: AgentState) -> Literal["fetch_data", "decomposer"]:
+    if state.direct_resolved_tag:
+        return "fetch_data"
+    return "decomposer"
+
+
+def route_after_fetch(state: AgentState) -> Literal["scheduler", "calculator_setup"]:
+    if state.is_complex_calculation:
+        return "calculator_setup"
+    return "scheduler"
+
+
+# -------------------------------------------------------------------
+# 6. GRAPH CONSTRUCTION
+# -------------------------------------------------------------------
 
 
 def build_graph():
     workflow = StateGraph(AgentState)
 
-    # Add Nodes
-    workflow.add_node("parser", parse_node)
-    workflow.add_node("data_manager", data_manager_node)
-    workflow.add_node("analyst", analysis_agent_node)
-    workflow.add_node("tools", ToolNode(analysis_tools))
+    workflow.add_node("parser", parser_node)
+    workflow.add_node("scheduler", scheduler_node)
+    workflow.add_node("resolve_target", resolve_target_node)
+    workflow.add_node("decomposer", decomposer_node)
+    workflow.add_node("resolve_ingredients", resolve_ingredients_node)
+    workflow.add_node("fetch_data", fetch_data_node)
+    workflow.add_node("calculator_setup", calculator_setup_node)
+    workflow.add_node("tools", ToolNode([calculate_and_store_ratio]))
+    workflow.add_node("analyst", analyst_node)
 
-    # Define Edges
     workflow.set_entry_point("parser")
+    workflow.add_edge("parser", "scheduler")
 
-    # Parser -> Data Manager
-    workflow.add_edge("parser", "data_manager")
-
-    # Data Manager -> Analyst
-    workflow.add_edge("data_manager", "analyst")
-
-    # Analyst -> Conditional (Tools or End)
     workflow.add_conditional_edges(
-        "analyst",
-        should_continue,
+        "scheduler",
+        route_scheduler,
+        {"resolve_target": "resolve_target", "analyst": "analyst"},
+    )
+    workflow.add_conditional_edges(
+        "resolve_target",
+        route_target_resolution,
+        {"fetch_data": "fetch_data", "decomposer": "decomposer"},
     )
 
-    # Tools -> Analyst (Loop back with result)
-    workflow.add_edge("tools", "analyst")
+    workflow.add_edge("decomposer", "resolve_ingredients")
+    workflow.add_edge("resolve_ingredients", "fetch_data")
+
+    workflow.add_conditional_edges(
+        "fetch_data",
+        route_after_fetch,
+        {"scheduler": "scheduler", "calculator_setup": "calculator_setup"},
+    )
+
+    workflow.add_edge("calculator_setup", "tools")
+    workflow.add_edge("tools", "scheduler")
+    workflow.add_edge("analyst", END)
 
     return workflow.compile()
 
 
-# --- 5. Execution Entry Point ---
-
-
-def run_fundamental_analysis(prompt: str):
-    app = build_graph()
-
-    print(f"Initializing Agent with prompt: '{prompt}'")
-
-    initial_state = AgentState(messages=[], user_query=prompt)
-
-    # Run the graph
-    final_state = None
-    for output in app.stream(initial_state):
-        for key, value in output.items():
-            # Visualize the flow
-            print(f"Finished Node: {key}")
-
-            print(f"State Update: {value}\n")
-            pass
-
-    # Extract Final Response
-    # The final state is usually accessible via invoke, but with stream we grab the last yield
-    # Ideally, we re-invoke to get the final state object simply:
-    final_state_dict = app.invoke(initial_state)
-
-    last_msg = final_state_dict["messages"][-1]
-    print("\n" + "=" * 30)
-    print("FINAL ANALYSIS REPORT")
-    print("=" * 30)
-    print(last_msg.content)
-
-
 if __name__ == "__main__":
-    # Example usage
-    user_prompt = "Analyze the pe ratio for the company apple over the last 3 years."
-    run_fundamental_analysis(user_prompt)
+    app = build_graph()
+    prompt = "Calculate Revenue, PE Ratio, and Profit Margin for MSFT for last 2 years."
+    print(f"Starting: '{prompt}'")
+    initial = AgentState(messages=[], user_query=prompt)
+    out = app.invoke(initial)
+    print("\n" + "=" * 40)
+    print("FINAL REPORT")
+    print("=" * 40)
+    print(out["messages"][-1].content)

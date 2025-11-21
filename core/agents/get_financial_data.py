@@ -150,7 +150,6 @@ class FinancialDatabase:
 
         try:
             company = Company(ticker)
-            print(num_years)
             # Fetch slightly more than needed to ensure we cover fiscal year offsets
             filings = company.get_filings(form="10-K").latest(num_years)
         except Exception as e:
