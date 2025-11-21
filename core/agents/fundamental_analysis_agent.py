@@ -94,38 +94,89 @@ def calculate_and_store_ratio(
     ticker: str, metric_name: str, numerator_tag: str, denominator_tag: str
 ):
     """
-    Calculates a ratio (numerator/denominator) using RESOLVED tags.
-    Saves result to DB.
+    Robust ratio calculator:
+      - Reads GLOBAL_DATAFRAME_CONTEXT (which must be normalized to MultiIndex
+        ['company','concept','year'] with a 'value' column).
+      - Extracts series for numerator_tag and denominator_tag for the requested ticker,
+        aligns years, computes ratio (numerator / denominator).
+      - Saves results to DB and appends calculated rows to GLOBAL_DATAFRAME_CONTEXT.
+    Returns a short status string for logging.
     """
     global GLOBAL_DATAFRAME_CONTEXT
     if GLOBAL_DATAFRAME_CONTEXT is None or GLOBAL_DATAFRAME_CONTEXT.empty:
         return "Error: No data context."
 
-    df = GLOBAL_DATAFRAME_CONTEXT.copy()
+    # Ensure the expected index and column exist
+    df = GLOBAL_DATAFRAME_CONTEXT
 
-    def get_series(tag):
-        try:
-            matches = df[df.index.get_level_values("concept") == tag]
-            return matches.iloc[0] if not matches.empty else None
-        except:
-            return None
-
-    num = get_series(numerator_tag)
-    den = get_series(denominator_tag)
-
-    if num is None:
-        return f"Missing data for {numerator_tag}"
-    if den is None:
-        return f"Missing data for {denominator_tag}"
+    # Accept either the normalized MultiIndex or a "flat" table and normalize on the fly
+    def normalize_context(d: pd.DataFrame) -> pd.DataFrame:
+        # If there are columns 'company','concept','year','value', convert to multiindex
+        cols = set(d.columns)
+        if {"company", "concept", "year", "value"}.issubset(cols):
+            tmp = d.copy()
+            tmp["year"] = tmp["year"].astype(int)
+            tmp = tmp.set_index(["company", "concept", "year"])
+            # keep single 'value' column
+            return tmp[["value"]]
+        # If already has multiindex with names that include 'company'/'concept'/'year'
+        if isinstance(d.index, pd.MultiIndex):
+            names = list(d.index.names)
+            if all(x in names for x in ("company", "concept", "year")):
+                # ensure value column exists
+                if "value" in d.columns:
+                    return d[["value"]]
+        # otherwise try to coerce
+        raise ValueError("GLOBAL_DATAFRAME_CONTEXT not in expected format")
 
     try:
-        res = num / den
+        norm = normalize_context(df)
     except Exception as e:
-        return f"Math error: {e}"
+        return f"Context normalization error: {e}"
 
+    # helper to get a Series indexed by year for (ticker, tag)
+    def get_series_for(tag: str) -> Optional[pd.Series]:
+        try:
+            sel = norm.loc[(ticker, tag)]
+            # sel is a DataFrame with index = year, column 'value'
+            if isinstance(sel, pd.DataFrame):
+                s = sel["value"]
+            elif isinstance(sel, pd.Series):
+                # case when selecting yields Series (unlikely) -> try to coerce
+                s = sel
+            else:
+                return None
+            # ensure index are ints (years)
+            s.index = s.index.astype(int)
+            s = s.sort_index()
+            return s
+        except KeyError:
+            return None
+
+    num_s = get_series_for(numerator_tag)
+    den_s = get_series_for(denominator_tag)
+
+    if num_s is None:
+        return f"Missing data for numerator tag '{numerator_tag}'"
+    if den_s is None:
+        return f"Missing data for denominator tag '{denominator_tag}'"
+
+    # Align on years (outer join would produce NaNs; we only compute where both present)
+    joined = pd.concat([num_s, den_s], axis=1, keys=["num", "den"])
+    joined = joined.dropna(subset=["num", "den"])
+    if joined.empty:
+        return "No overlapping years with data to compute ratio."
+
+    try:
+        ratio = joined["num"] / joined["den"]
+    except Exception as e:
+        return f"Math error while computing ratio: {e}"
+
+    # Prepare rows to save
     db_rows = []
-    for year, val in res.items():
-        if str(year).isdigit() and pd.notna(val):
+    for year, val in ratio.items():
+        # year is index (int)
+        if pd.notna(val):
             db_rows.append(
                 {
                     "company": ticker,
@@ -135,8 +186,35 @@ def calculate_and_store_ratio(
                 }
             )
 
+    if not db_rows:
+        return "No valid numeric ratio values to save."
+
+    # Save to DB
     ExtendedFinancialDatabase().save_calculated_metric(pd.DataFrame(db_rows))
-    return f"Calculated {metric_name} successfully."
+
+    # Append into the global context so analyst sees it
+    try:
+        calc_df = pd.DataFrame(db_rows)  # columns company, year, concept, value
+        calc_df = calc_df.set_index(["company", "concept", "year"])[["value"]]
+        # Avoid duplicate index rows; prefer calculated overwrite
+        if GLOBAL_DATAFRAME_CONTEXT is None or GLOBAL_DATAFRAME_CONTEXT.empty:
+            GLOBAL_DATAFRAME_CONTEXT = calc_df
+        else:
+            # combine, with calculated rows overwriting existing same (company,concept,year)
+            combined = pd.concat(
+                [
+                    GLOBAL_DATAFRAME_CONTEXT[
+                        ~GLOBAL_DATAFRAME_CONTEXT.index.isin(calc_df.index)
+                    ],
+                    calc_df,
+                ]
+            )
+            GLOBAL_DATAFRAME_CONTEXT = combined.sort_index()
+    except Exception as e:
+        # Non-fatal: DB saved but global append failed
+        return f"Saved to DB but failed to append to context: {e}"
+
+    return f"Calculated '{metric_name}' for {len(db_rows)} year(s) and saved to DB/context."
 
 
 # -------------------------------------------------------------------
@@ -262,10 +340,8 @@ def fetch_data_node(state: AgentState) -> Dict[str, Any]:
     db = ExtendedFinancialDatabase()
     db.update_company_data(state.ticker, num_years=5)
 
-    tags_to_fetch = []
-    if state.direct_resolved_tag:
-        tags_to_fetch.append(state.direct_resolved_tag)
-    elif state.resolved_ingredients:
+    tags_to_fetch = state.direct_resolved_tag
+    if state.resolved_ingredients:
         tags_to_fetch = list(state.resolved_ingredients.values())
 
     if not tags_to_fetch:
@@ -290,33 +366,46 @@ def fetch_data_node(state: AgentState) -> Dict[str, Any]:
 
 
 def calculator_setup_node(state: AgentState) -> Dict[str, Any]:
-    """Prepares the tool call for the calculator."""
+    """
+    Prepare and call the actual calculator function. We pick numerator/denominator
+    heuristically from resolved_ingredients (order preserved). If there are >2
+    ingredients, we pick the first two. If only two ingredients are present the
+    first is numerator, second denominator.
+    This function *calls* calculate_and_store_ratio directly and returns a message.
+    """
     print(f"--- [Node] Calculator Setup ---")
-    llm = service_manager.get_agent()
+    # Defensive checks
+    metric = state.current_metric
+    resolved_map = state.resolved_ingredients or {}
 
-    # --- FIX IS HERE ---
-    # We use placeholders {metric} and {tags} in the prompt string,
-    # and pass the actual data via the .invoke() dictionary.
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "User wants: {metric}. "
-                "Resolved tags: {tags}. "
-                "Call 'calculate_and_store_ratio' using these tags.",
-            ),
-            ("human", "Calculate."),
-        ]
-    )
+    if not resolved_map:
+        return {
+            "messages": [
+                BaseMessage(content="Calculator: no resolved ingredients available.")
+            ]
+        }
+    # order-preserving extraction (dict may be ordered)
+    tags = list(resolved_map.values())
+    if len(tags) < 2:
+        return {
+            "messages": [
+                BaseMessage(
+                    content="Calculator: need at least 2 resolved tags to form a ratio."
+                )
+            ]
+        }
+    numerator_tag = tags[0]
+    denominator_tag = tags[1]
 
-    llm_with_tools = llm.bind_tools([calculate_and_store_ratio])
+    # call calculator tool
+    try:
+        result = calculate_and_store_ratio(
+            state.ticker, metric, numerator_tag, denominator_tag
+        )
+    except Exception as e:
+        result = f"Calculator raised exception: {e}"
 
-    # Pass complex objects as strings in the invoke call
-    res = (prompt | llm_with_tools).invoke(
-        {"metric": state.current_metric, "tags": str(state.resolved_ingredients)}
-    )
-
-    return {"messages": [res]}
+    return {"messages": str(result)}
 
 
 def analyst_node(state: AgentState) -> Dict[str, Any]:
@@ -417,7 +506,7 @@ def build_graph():
 
 if __name__ == "__main__":
     app = build_graph()
-    prompt = "Calculate Revenue, PE Ratio, and Profit Margin for MSFT for last 2 years."
+    prompt = "Calculate P/E ratio and revenue for CRWD for last 3 years."
     print(f"Starting: '{prompt}'")
     initial = AgentState(messages=[], user_query=prompt)
     out = app.invoke(initial)

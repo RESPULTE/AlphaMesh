@@ -348,10 +348,13 @@ if __name__ == "__main__":
     # )
     # print(db.pivot_data(df_complex))
 
-    print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
+    # print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
     print(
         db.search_concept(
-            company, ["earning", "asset", "profit"], start_year=2021, end_year=2024
+            company,
+            ["us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax"],
+            start_year=2021,
+            end_year=2024,
         )
     )
 
