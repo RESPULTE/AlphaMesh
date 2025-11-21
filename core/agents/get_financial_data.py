@@ -327,19 +327,27 @@ if __name__ == "__main__":
     db = FinancialDatabase("financial_data.db")
     company = "MSFT"
 
-    # Ensure data exists
-    db.update_company_data(company, num_years=5)
+    # # Ensure data exists
+    # db.update_company_data(company, num_years=5)
 
-    print("\n--- 2. Filter by Year (2023 Only) ---")
-    # Using the intuitive wrapper
-    print(db.get_fiscal_year(company, 2023))
+    # print("\n--- 2. Filter by Year (2023 Only) ---")
+    # # Using the intuitive wrapper
+    # print(db.get_fiscal_year(company, 2023))
 
-    print("\n--- 3. Complex Filter (Cashflow & Balance for 2022 & 2023) ---")
-    # Using the robust get_data method
-    df_complex = db.get_data(
-        company, years=[2022, 2023], statements=["cashflow", "balance"]
-    )
-    print(db.pivot_data(df_complex))
+    # print("\n--- 3. Complex Filter (Cashflow & Balance for 2022 & 2023) ---")
+    # # Using the robust get_data method
+    # df_complex = db.get_data(
+    #     company, years=[2022, 2023], statements=["cashflow", "balance"]
+    # )
+    # print(db.pivot_data(df_complex))
 
-    print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
-    print(db.search_concept(company, "cash", start_year=2021, end_year=2024))
+    # print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
+    # print(db.search_concept(company, "earning", start_year=2021, end_year=2024))
+
+    # import json
+
+    # print(
+    #     json.dumps(
+    #         db.get_data(company, 2024, ALL_STATEMENT_TYPE)["concept"].tolist(), indent=2
+    #     )
+    # )
