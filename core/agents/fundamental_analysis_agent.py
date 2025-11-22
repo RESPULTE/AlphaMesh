@@ -6,54 +6,15 @@ from pydantic import BaseModel, Field
 # LangChain / LangGraph imports
 from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 
 # --- LOCAL IMPORTS ---
 from core.services import service_manager
-from core.agents.get_financial_data import FinancialDatabase
 from core.agents.concept_resolver import ConceptResolver
+from core.agents.get_financial_data import FinancialDatabase
 
 # Initialize Resolver globally
 RESOLVER = ConceptResolver()
-
-# -------------------------------------------------------------------
-# 1. DATABASE EXTENSION
-# -------------------------------------------------------------------
-
-
-class ExtendedFinancialDatabase(FinancialDatabase):
-    """Extends DB to handle saving calculated metrics safely."""
-
-    def save_calculated_metric(self, df: pd.DataFrame):
-        if df.empty:
-            return
-        df = df.copy()
-        df["statement_type"] = "calculated"
-        required = ["company", "year", "statement_type", "concept", "value"]
-
-        if not all(c in df.columns for c in required):
-            print(f"   [DB Error] Missing cols: {df.columns}")
-            return
-
-        final_df = df[required]
-        with self._get_connection() as conn:
-            try:
-                cursor = conn.cursor()
-                for _, row in final_df.iterrows():
-                    # Delete existing calculation to allow overwrite
-                    cursor.execute(
-                        "DELETE FROM financials WHERE company=? AND year=? AND statement_type='calculated' AND concept=?",
-                        (row["company"], row["year"], row["concept"]),
-                    )
-                conn.commit()
-                final_df.to_sql("financials", conn, if_exists="append", index=False)
-                print(
-                    f"   [DB] Saved {len(final_df)} rows for '{final_df['concept'].iloc[0]}'."
-                )
-            except Exception as e:
-                print(f"   [DB] Error saving: {e}")
 
 
 # -------------------------------------------------------------------
@@ -68,153 +29,54 @@ class AgentState(BaseModel):
     period_start: Optional[int] = None
     period_end: Optional[int] = None
 
-    # --- QUEUE MANAGEMENT ---
-    metrics_queue: List[str] = Field(default_factory=list)
-    current_metric: Optional[str] = None
+    # --- UNIFIED QUEUE MANAGEMENT ---
+    # Single queue for everything (top-level metrics AND ingredients)
+    queue: List[str] = Field(default_factory=list)
 
-    # --- EPHEMERAL FLAGS ---
-    direct_resolved_tag: Optional[str] = None
-    is_complex_calculation: bool = False
-    ingredient_names: List[str] = Field(default_factory=list)
-    resolved_ingredients: Dict[str, str] = Field(default_factory=dict)
+    # The item currently being processed from the queue
+    current_concept: Optional[str] = None
 
-    # --- GLOBAL DATA STATUS ---
+    # --- RESOLUTION STATE ---
+    # Stores successful resolutions: {"Concept Name": "XBRL_Tag"}
+    resolved_tags: Dict[str, str] = Field(default_factory=dict)
+
+    # Stores calculation logic: {"PE Ratio": ["Price", "EPS"]}
+    # Used to know if a concept needs calculation instead of fetching
+    formulas: Dict[str, List[str]] = Field(default_factory=dict)
+
+    # --- DATA STATUS ---
     data_status: str = "Empty"
+    financial_context: Optional[pd.DataFrame] = Field(default=None)
 
+    class Config:
+        arbitrary_types_allowed = True
 
-GLOBAL_DATAFRAME_CONTEXT: Optional[pd.DataFrame] = None
 
 # -------------------------------------------------------------------
-# 3. TOOLS
+# 3. CALCULATION LOGIC
 # -------------------------------------------------------------------
 
 
-@tool
-def calculate_and_store_ratio(
-    ticker: str, metric_name: str, numerator_tag: str, denominator_tag: str
-):
+def calculate_ratio_logic(
+    current_context: Optional[pd.DataFrame],
+    numerator_tag: str,
+    denominator_tag: str,
+) -> pd.Series:
     """
-    Robust ratio calculator:
-      - Reads GLOBAL_DATAFRAME_CONTEXT (which must be normalized to MultiIndex
-        ['company','concept','year'] with a 'value' column).
-      - Extracts series for numerator_tag and denominator_tag for the requested ticker,
-        aligns years, computes ratio (numerator / denominator).
-      - Saves results to DB and appends calculated rows to GLOBAL_DATAFRAME_CONTEXT.
-    Returns a short status string for logging.
+    Calculates a ratio based on the provided DataFrame context.
     """
-    global GLOBAL_DATAFRAME_CONTEXT
-    if GLOBAL_DATAFRAME_CONTEXT is None or GLOBAL_DATAFRAME_CONTEXT.empty:
-        return "Error: No data context."
+    if current_context is None or current_context.empty:
+        return "Error: No data context available for calculation.", current_context
 
-    # Ensure the expected index and column exist
-    df = GLOBAL_DATAFRAME_CONTEXT
+    df = current_context.copy()
 
-    # Accept either the normalized MultiIndex or a "flat" table and normalize on the fly
-    def normalize_context(d: pd.DataFrame) -> pd.DataFrame:
-        # If there are columns 'company','concept','year','value', convert to multiindex
-        cols = set(d.columns)
-        if {"company", "concept", "year", "value"}.issubset(cols):
-            tmp = d.copy()
-            tmp["year"] = tmp["year"].astype(int)
-            tmp = tmp.set_index(["company", "concept", "year"])
-            # keep single 'value' column
-            return tmp[["value"]]
-        # If already has multiindex with names that include 'company'/'concept'/'year'
-        if isinstance(d.index, pd.MultiIndex):
-            names = list(d.index.names)
-            if all(x in names for x in ("company", "concept", "year")):
-                # ensure value column exists
-                if "value" in d.columns:
-                    return d[["value"]]
-        # otherwise try to coerce
-        raise ValueError("GLOBAL_DATAFRAME_CONTEXT not in expected format")
+    def safe_division(row):
+        n, d = row[numerator_tag], row[denominator_tag]
+        if d == 0 or pd.isna(d) or pd.isna(n):
+            return 0.0
+        return n / d
 
-    try:
-        norm = normalize_context(df)
-    except Exception as e:
-        return f"Context normalization error: {e}"
-
-    # helper to get a Series indexed by year for (ticker, tag)
-    def get_series_for(tag: str) -> Optional[pd.Series]:
-        try:
-            sel = norm.loc[(ticker, tag)]
-            # sel is a DataFrame with index = year, column 'value'
-            if isinstance(sel, pd.DataFrame):
-                s = sel["value"]
-            elif isinstance(sel, pd.Series):
-                # case when selecting yields Series (unlikely) -> try to coerce
-                s = sel
-            else:
-                return None
-            # ensure index are ints (years)
-            s.index = s.index.astype(int)
-            s = s.sort_index()
-            return s
-        except KeyError:
-            return None
-
-    num_s = get_series_for(numerator_tag)
-    den_s = get_series_for(denominator_tag)
-
-    if num_s is None:
-        return f"Missing data for numerator tag '{numerator_tag}'"
-    if den_s is None:
-        return f"Missing data for denominator tag '{denominator_tag}'"
-
-    # Align on years (outer join would produce NaNs; we only compute where both present)
-    joined = pd.concat([num_s, den_s], axis=1, keys=["num", "den"])
-    joined = joined.dropna(subset=["num", "den"])
-    if joined.empty:
-        return "No overlapping years with data to compute ratio."
-
-    try:
-        ratio = joined["num"] / joined["den"]
-    except Exception as e:
-        return f"Math error while computing ratio: {e}"
-
-    # Prepare rows to save
-    db_rows = []
-    for year, val in ratio.items():
-        # year is index (int)
-        if pd.notna(val):
-            db_rows.append(
-                {
-                    "company": ticker,
-                    "year": int(year),
-                    "concept": metric_name,
-                    "value": float(val),
-                }
-            )
-
-    if not db_rows:
-        return "No valid numeric ratio values to save."
-
-    # Save to DB
-    ExtendedFinancialDatabase().save_calculated_metric(pd.DataFrame(db_rows))
-
-    # Append into the global context so analyst sees it
-    try:
-        calc_df = pd.DataFrame(db_rows)  # columns company, year, concept, value
-        calc_df = calc_df.set_index(["company", "concept", "year"])[["value"]]
-        # Avoid duplicate index rows; prefer calculated overwrite
-        if GLOBAL_DATAFRAME_CONTEXT is None or GLOBAL_DATAFRAME_CONTEXT.empty:
-            GLOBAL_DATAFRAME_CONTEXT = calc_df
-        else:
-            # combine, with calculated rows overwriting existing same (company,concept,year)
-            combined = pd.concat(
-                [
-                    GLOBAL_DATAFRAME_CONTEXT[
-                        ~GLOBAL_DATAFRAME_CONTEXT.index.isin(calc_df.index)
-                    ],
-                    calc_df,
-                ]
-            )
-            GLOBAL_DATAFRAME_CONTEXT = combined.sort_index()
-    except Exception as e:
-        # Non-fatal: DB saved but global append failed
-        return f"Saved to DB but failed to append to context: {e}"
-
-    return f"Calculated '{metric_name}' for {len(db_rows)} year(s) and saved to DB/context."
+    return df.apply(safe_division, axis=0)
 
 
 # -------------------------------------------------------------------
@@ -226,9 +88,7 @@ class ScopeParser(BaseModel):
     ticker: str
     start_year: int
     end_year: int
-    target_metrics: List[str] = Field(
-        description="List of financial metrics requested."
-    )
+    target_metrics: List[str]
 
 
 def parser_node(state: AgentState) -> Dict[str, Any]:
@@ -240,8 +100,7 @@ def parser_node(state: AgentState) -> Dict[str, Any]:
         [
             (
                 "system",
-                f"Current year: {current_year}. Extract Ticker, Year Range, and LIST of Metrics. "
-                "Default to last 5 years. Return JSON.",
+                f"Current year: {current_year}. Extract Ticker, Year Range, and LIST of Metrics. Default to last 5 years. Return JSON.",
             ),
             ("human", "{query}"),
         ]
@@ -251,171 +110,192 @@ def parser_node(state: AgentState) -> Dict[str, Any]:
         res = (prompt | llm.with_structured_output(ScopeParser)).invoke(
             {"query": state.user_query}
         )
+        # Initialize the queue with the requested metrics
         return {
             "ticker": res.ticker.upper(),
             "period_start": res.start_year,
             "period_end": res.end_year,
-            "metrics_queue": res.target_metrics,
-            "current_metric": None,
+            "queue": res.target_metrics,
+            "current_concept": None,
         }
     except Exception as e:
         return {"messages": [BaseMessage(content=f"Error parsing: {e}")]}
 
 
 def scheduler_node(state: AgentState) -> Dict[str, Any]:
-    queue = state.metrics_queue
+    """
+    Pops the next item from the FIFO queue.
+    """
+    queue = state.queue
     if not queue:
         print("--- [Node] Scheduler: Queue Empty. Done. ---")
-        return {"current_metric": None}
+        return {"current_concept": None}
 
-    next_metric = queue[0]
+    next_concept = queue[0]
     remaining = queue[1:]
+
     print(
-        f"--- [Node] Scheduler: Starting '{next_metric}' (Remaining: {len(remaining)}) ---"
+        f"--- [Node] Scheduler: Popped '{next_concept}'. Queue size: {len(remaining)} ---"
     )
 
-    return {
-        "current_metric": next_metric,
-        "metrics_queue": remaining,
-        "direct_resolved_tag": None,
-        "is_complex_calculation": False,
-        "ingredient_names": [],
-        "resolved_ingredients": {},
-    }
+    return {"current_concept": next_concept, "queue": remaining}
 
 
-def resolve_target_node(state: AgentState) -> Dict[str, Any]:
-    metric = state.current_metric
-    print(f"--- [Node] Resolve Target: '{metric}' ---")
-    tag = RESOLVER.resolve(metric)
+def resolver_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Unified resolver. Tries to find a standard XBRL tag.
+    If found, we mark it for Fetching.
+    If not found, we mark it for Decomposition.
+    """
+    concept = state.current_concept
+    print(f"--- [Node] Resolver: Checking '{concept}' ---")
+
+    # Try to resolve
+    tag = RESOLVER.resolve(concept)
 
     if tag:
-        print(f"   > Direct match found: {tag}")
-        return {"direct_resolved_tag": tag, "is_complex_calculation": False}
+        print(f"   > Resolved '{concept}' -> '{tag}'")
+        # Store the mapping.
+        # Note: We store the Original Name -> Resolved Tag
+        return {"resolved_tags": {**state.resolved_tags, concept: tag}}
     else:
-        print(f"   > No direct match. Needs decomposition.")
-        return {"direct_resolved_tag": None, "is_complex_calculation": True}
+        print(f"   > Could not resolve '{concept}' directly.")
+        return {}  # No state update, routing will send to decomposer
 
 
 def decomposer_node(state: AgentState) -> Dict[str, Any]:
-    metric = state.current_metric
-    print(f"--- [Node] Decomposer: Breaking down '{metric}' ---")
+    """
+    Breaks down a complex metric, adds ingredients to the front of the queue,
+    and saves the formula for later calculation.
+    """
+    concept = state.current_concept
+    print(f"--- [Node] Decomposer: Breaking down '{concept}' ---")
     llm = service_manager.get_agent()
 
     class Ingredients(BaseModel):
-        names: List[str] = Field(description="List of 2-3 raw financial concepts.")
+        names: List[str] = Field(description="List of 2 raw financial concepts needed.")
 
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "Break down the requested metric into standard 10-K items (e.g. 'PE Ratio' -> ['Price', 'EPS']). Return JSON.",
+                "Break down the requested metric into standard 10-K items (e.g. 'PE Ratio' -> ['Price', 'Earnings Per Share']). Return JSON.",
             ),
-            ("human", f"Metric: {metric}"),
+            ("human", f"Metric: {concept}"),
         ]
     )
 
     res = (prompt | llm.with_structured_output(Ingredients)).invoke({})
-    print(f"   > Ingredients: {res.names}")
-    return {"ingredient_names": res.names}
+    ingredients = res.names
+    print(f"   > Ingredients: {ingredients}")
 
+    # UPDATE THE QUEUE:
+    # 1. We need to process ingredients first.
+    # 2. Then we need to come back to 'concept' to calculate it.
+    # New Queue = [Ingredient1, Ingredient2, Original_Concept, ...Old_Queue]
 
-def resolve_ingredients_node(state: AgentState) -> Dict[str, Any]:
-    print(f"--- [Node] Resolve Ingredients ---")
-    ingredients = state.ingredient_names
-    resolved_map = {}
+    # IMPORTANT: We verify we aren't creating an infinite loop.
+    # If the 'concept' is already in formulas, we shouldn't be here, but as a safeguard:
+    new_queue_front = ingredients + [concept]
+    combined_queue = new_queue_front + state.queue
 
-    for name in ingredients:
-        tag = RESOLVER.resolve(name)
-        if tag:
-            resolved_map[name] = tag
-        else:
-            print(f"   > Warning: Could not resolve ingredient '{name}'")
+    # Store the formula: Concept -> [Ing1, Ing2]
+    new_formulas = {**state.formulas, concept: ingredients}
 
-    return {"resolved_ingredients": resolved_map}
+    return {"queue": combined_queue, "formulas": new_formulas}
 
 
 def fetch_data_node(state: AgentState) -> Dict[str, Any]:
-    print(f"--- [Node] Fetch Data ---")
-    db = ExtendedFinancialDatabase()
+    """
+    Fetches data for the current_concept using its resolved tag.
+    """
+    concept = state.current_concept
+    tag = state.resolved_tags.get(concept)
+    print(f"--- [Node] Fetch Data: '{concept}' (Tag: {tag}) ---")
+
+    if not tag:
+        return {"data_status": "Error: No tag found"}
+
+    db = FinancialDatabase()
+    # Ensure company data is present
     db.update_company_data(state.ticker, num_years=5)
 
-    tags_to_fetch = state.direct_resolved_tag
-    if state.resolved_ingredients:
-        tags_to_fetch = list(state.resolved_ingredients.values())
+    # Fetch specific tag
+    df = db.search_concept(state.ticker, [tag], state.period_start, state.period_end)
 
-    if not tags_to_fetch:
-        return {"data_status": "Error: No tags to fetch"}
-
-    df = db.search_concept(
-        state.ticker, tags_to_fetch, state.period_start, state.period_end
-    )
-
-    global GLOBAL_DATAFRAME_CONTEXT
+    current_context = state.financial_context
     if not df.empty:
-        if GLOBAL_DATAFRAME_CONTEXT is not None:
-            GLOBAL_DATAFRAME_CONTEXT = pd.concat([GLOBAL_DATAFRAME_CONTEXT, df])
-            GLOBAL_DATAFRAME_CONTEXT = GLOBAL_DATAFRAME_CONTEXT[
-                ~GLOBAL_DATAFRAME_CONTEXT.index.duplicated(keep="first")
-            ]
+        if current_context is not None and not current_context.empty:
+            combined = pd.concat([current_context, df])
+            combined = combined.drop_duplicates()
+            return {"financial_context": combined, "data_status": "Data Loaded"}
         else:
-            GLOBAL_DATAFRAME_CONTEXT = df
-        return {"data_status": "Data Loaded"}
+            return {"financial_context": df, "data_status": "Data Loaded"}
 
     return {"data_status": "No Data Found"}
 
 
-def calculator_setup_node(state: AgentState) -> Dict[str, Any]:
+def calculator_node(state: AgentState) -> Dict[str, Any]:
     """
-    Prepare and call the actual calculator function. We pick numerator/denominator
-    heuristically from resolved_ingredients (order preserved). If there are >2
-    ingredients, we pick the first two. If only two ingredients are present the
-    first is numerator, second denominator.
-    This function *calls* calculate_and_store_ratio directly and returns a message.
+    Executed when a concept is in 'formulas' and its ingredients are ready.
     """
-    print(f"--- [Node] Calculator Setup ---")
-    # Defensive checks
-    metric = state.current_metric
-    resolved_map = state.resolved_ingredients or {}
+    target = state.current_concept
+    ingredients = state.formulas.get(target, [])
+    print(f"--- [Node] Calculator: Calculating '{target}' using {ingredients} ---")
 
-    if not resolved_map:
-        return {
-            "messages": [
-                BaseMessage(content="Calculator: no resolved ingredients available.")
-            ]
-        }
-    # order-preserving extraction (dict may be ordered)
-    tags = list(resolved_map.values())
-    if len(tags) < 2:
+    # Look up the resolved tags for the ingredients
+    # The ingredients (e.g., "Price") should now be in resolved_tags because they were processed earlier in queue
+    resolved_ingredient_tags = []
+    for ing in ingredients:
+        tag = state.resolved_tags.get(ing)
+        if not tag:
+            print(f"   > Error: Ingredient '{ing}' was not resolved/fetched.")
+            return {
+                "messages": [
+                    BaseMessage(
+                        content=f"Failed to calculate {target}: missing data for {ing}"
+                    )
+                ]
+            }
+        resolved_ingredient_tags.append(tag)
+
+    if len(resolved_ingredient_tags) < 2:
         return {
             "messages": [
                 BaseMessage(
-                    content="Calculator: need at least 2 resolved tags to form a ratio."
+                    content=f"Calculator requires 2 ingredients, found {len(resolved_ingredient_tags)}"
                 )
             ]
         }
-    numerator_tag = tags[0]
-    denominator_tag = tags[1]
 
-    # call calculator tool
-    try:
-        result = calculate_and_store_ratio(
-            state.ticker, metric, numerator_tag, denominator_tag
-        )
-    except Exception as e:
-        result = f"Calculator raised exception: {e}"
+    calculated_data = calculate_ratio_logic(
+        state.financial_context,
+        resolved_ingredient_tags[0],  # Numerator
+        resolved_ingredient_tags[1],  # Denominator
+    )
 
-    return {"messages": str(result)}
+    calculated_data = calculated_data.to_frame().T
+    calculated_data.index = ["P/E Ratio"]
+
+    updated_context = pd.concat([state.financial_context, calculated_data])
+
+    # We treat the calculated metric as "Resolved" now, so we don't try to decompose it again if it appears
+    # (though strictly it shouldn't appear again based on queue logic)
+
+    return {
+        "messages": [BaseMessage(content="calculated successfully", type="ai")],
+        "financial_context": updated_context,
+    }
 
 
 def analyst_node(state: AgentState) -> Dict[str, Any]:
     print(f"--- [Node] Analyst ---")
     llm = service_manager.get_agent()
-    global GLOBAL_DATAFRAME_CONTEXT
+    context_df = state.financial_context
 
     data_str = (
-        GLOBAL_DATAFRAME_CONTEXT.to_string()
-        if GLOBAL_DATAFRAME_CONTEXT is not None
+        context_df.to_string()
+        if context_df is not None and not context_df.empty
         else "No Data"
     )
 
@@ -438,22 +318,39 @@ def analyst_node(state: AgentState) -> Dict[str, Any]:
 # -------------------------------------------------------------------
 
 
-def route_scheduler(state: AgentState) -> Literal["resolve_target", "analyst"]:
-    if state.current_metric:
-        return "resolve_target"
-    return "analyst"
+def route_scheduler(state: AgentState) -> Literal["resolver", "calculator", "analyst"]:
+    """
+    Decides what to do with the item popped from the queue.
+    """
+    concept = state.current_concept
+
+    # 1. If queue was empty, concept is None -> Go to Analyst
+    if concept is None:
+        return "analyst"
+
+    # 2. Check if this concept is a known 'formula' (meaning it was decomposed earlier)
+    # If it is, that means we put it back in the queue to wait for ingredients.
+    # Now it's back, so we calculate.
+    if concept in state.formulas:
+        return "calculator"
+
+    # 3. Otherwise, it's a raw concept (either user input or a decomposed ingredient)
+    # We need to resolve it.
+    return "resolver"
 
 
-def route_target_resolution(state: AgentState) -> Literal["fetch_data", "decomposer"]:
-    if state.direct_resolved_tag:
+def route_resolver(state: AgentState) -> Literal["fetch_data", "decomposer"]:
+    """
+    After resolver runs, did we find a tag?
+    """
+    concept = state.current_concept
+
+    # Check if the current concept exists in the resolved map
+    if concept in state.resolved_tags:
         return "fetch_data"
+
+    # If not found, we must decompose it
     return "decomposer"
-
-
-def route_after_fetch(state: AgentState) -> Literal["scheduler", "calculator_setup"]:
-    if state.is_complex_calculation:
-        return "calculator_setup"
-    return "scheduler"
 
 
 # -------------------------------------------------------------------
@@ -466,39 +363,42 @@ def build_graph():
 
     workflow.add_node("parser", parser_node)
     workflow.add_node("scheduler", scheduler_node)
-    workflow.add_node("resolve_target", resolve_target_node)
+
+    # Single resolver node
+    workflow.add_node("resolver", resolver_node)
+
     workflow.add_node("decomposer", decomposer_node)
-    workflow.add_node("resolve_ingredients", resolve_ingredients_node)
     workflow.add_node("fetch_data", fetch_data_node)
-    workflow.add_node("calculator_setup", calculator_setup_node)
-    workflow.add_node("tools", ToolNode([calculate_and_store_ratio]))
+    workflow.add_node("calculator", calculator_node)
     workflow.add_node("analyst", analyst_node)
 
+    # Entry
     workflow.set_entry_point("parser")
     workflow.add_edge("parser", "scheduler")
 
+    # Scheduler Routing
     workflow.add_conditional_edges(
         "scheduler",
         route_scheduler,
-        {"resolve_target": "resolve_target", "analyst": "analyst"},
+        {"resolver": "resolver", "calculator": "calculator", "analyst": "analyst"},
     )
+
+    # Resolver Routing
     workflow.add_conditional_edges(
-        "resolve_target",
-        route_target_resolution,
+        "resolver",
+        route_resolver,
         {"fetch_data": "fetch_data", "decomposer": "decomposer"},
     )
 
-    workflow.add_edge("decomposer", "resolve_ingredients")
-    workflow.add_edge("resolve_ingredients", "fetch_data")
+    # Decomposer sends back to scheduler (updated queue)
+    workflow.add_edge("decomposer", "scheduler")
 
-    workflow.add_conditional_edges(
-        "fetch_data",
-        route_after_fetch,
-        {"scheduler": "scheduler", "calculator_setup": "calculator_setup"},
-    )
+    # Fetch Data sends back to scheduler (get next item)
+    workflow.add_edge("fetch_data", "scheduler")
 
-    workflow.add_edge("calculator_setup", "tools")
-    workflow.add_edge("tools", "scheduler")
+    # Calculator sends back to scheduler (get next item)
+    workflow.add_edge("calculator", "scheduler")
+
     workflow.add_edge("analyst", END)
 
     return workflow.compile()
@@ -506,11 +406,12 @@ def build_graph():
 
 if __name__ == "__main__":
     app = build_graph()
-    prompt = "Calculate P/E ratio and revenue for CRWD for last 3 years."
+    prompt = "Calculate pe ratio for CRWD for last 3 years."
     print(f"Starting: '{prompt}'")
+
     initial = AgentState(messages=[], user_query=prompt)
     out = app.invoke(initial)
+
     print("\n" + "=" * 40)
     print("FINAL REPORT")
-    print("=" * 40)
-    print(out["messages"][-1].content)
+    print("=" * 40)workflow for the fundamental analyst    print(out["messages"][-1].content)

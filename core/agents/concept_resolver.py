@@ -20,6 +20,12 @@ class ConceptResolver:
         self.official_concepts = set(self.mapping.values())
         self.common_concepts = list(self.mapping.keys())
 
+    def update_company_concepts(self, concepts: list):
+        """
+        Update the official concepts with company-specific concepts.
+        """
+        self.official_concepts = set(concepts)
+
     def normalize(self, s: str) -> str:
         """
         Aggressive normalization to strip special chars and lowercase.

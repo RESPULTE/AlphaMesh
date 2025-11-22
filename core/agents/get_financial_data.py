@@ -13,6 +13,8 @@ DEFAULT_YEARS = 5
 class FinancialDatabase:
     def __init__(self, db_name: str = "financial_data.db"):
         self.db_name = db_name
+        self._cached_existing_years = set()
+
         self._init_db()
         set_identity(USER_AGENT)
 
@@ -39,12 +41,17 @@ class FinancialDatabase:
             conn.commit()
 
     def get_existing_years(self, ticker: str) -> set:
+        if len(self._cached_existing_years) > 0:
+            return self._cached_existing_years
+
         query = "SELECT DISTINCT year FROM financials WHERE company = ?"
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, (ticker,))
             rows = cursor.fetchall()
-        return {row[0] for row in rows}
+
+        self._cached_existing_years.update({row[0] for row in rows})
+        return self._cached_existing_years.copy()
 
     def _process_dataframe(
         self, df: pd.DataFrame, ticker: str, year: int, stmt_type: str
@@ -236,6 +243,8 @@ class FinancialDatabase:
             except Exception as e:
                 print(f"  Failed to process filing: {e}")
 
+        # self._cached_existing_years.update(list(range(current_year - 10, current_year + 1)))
+
     def get_data(
         self,
         ticker: str,
@@ -273,9 +282,7 @@ class FinancialDatabase:
     def pivot_data(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        return df.pivot_table(
-            index=["statement_type", "concept"], columns="year", values="value"
-        )
+        return df.pivot_table(index=["concept"], columns="year", values="value")
 
     def get_fiscal_year(self, ticker: str, year: int) -> pd.DataFrame:
         """Fetch all data (all statements) for a specific year."""
@@ -327,6 +334,34 @@ class FinancialDatabase:
             df = pd.read_sql(query, conn, params=params)
 
         return self.pivot_data(df)
+
+    def save_calculated_metric(self, df: pd.DataFrame):
+        if df.empty:
+            return
+        df = df.copy()
+        df["statement_type"] = "calculated"
+        required = ["company", "year", "statement_type", "concept", "value"]
+
+        if not all(c in df.columns for c in required):
+            print(f"   [DB Error] Missing cols: {df.columns}")
+            return
+
+        final_df = df[required]
+        with self._get_connection() as conn:
+            try:
+                cursor = conn.cursor()
+                for _, row in final_df.iterrows():
+                    cursor.execute(
+                        "DELETE FROM financials WHERE company=? AND year=? AND statement_type='calculated' AND concept=?",
+                        (row["company"], row["year"], row["concept"]),
+                    )
+                conn.commit()
+                final_df.to_sql("financials", conn, if_exists="append", index=False)
+                print(
+                    f"   [DB] Saved {len(final_df)} rows for '{final_df['concept'].iloc[0]}'."
+                )
+            except Exception as e:
+                print(f"   [DB] Error saving: {e}")
 
 
 # --- EXAMPLE USAGE ---
