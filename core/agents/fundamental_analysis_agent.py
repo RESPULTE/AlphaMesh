@@ -414,4 +414,5 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 40)
     print("FINAL REPORT")
-    print("=" * 40)workflow for the fundamental analyst    print(out["messages"][-1].content)
+    print("=" * 40)
+    print(out["messages"][-1].content)
