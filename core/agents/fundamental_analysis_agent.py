@@ -1,14 +1,15 @@
 import datetime
 import pandas as pd
-from typing import List, Dict, Any, Optional, Literal
+import operator
+from typing import List, Dict, Any, Optional, Literal, Annotated
 from pydantic import BaseModel, Field
 
 # LangChain / LangGraph imports
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 
-# --- LOCAL IMPORTS ---
+# --- LOCAL IMPORTS (Assumed existing) ---
 from core.services import service_manager
 from core.agents.concept_resolver import ConceptResolver
 from core.agents.get_financial_data import FinancialDatabase
@@ -18,69 +19,40 @@ RESOLVER = ConceptResolver()
 
 
 # -------------------------------------------------------------------
-# 2. STATE DEFINITION
+# 1. STATE DEFINITIONS
 # -------------------------------------------------------------------
 
 
-class AgentState(BaseModel):
-    messages: List[BaseMessage]
-    user_query: str
+class InputState(BaseModel):
+    messages: Annotated[List[BaseMessage], operator.add]
+
+
+class OutputState(BaseModel):
+    messages: Annotated[List[BaseMessage], operator.add]
+
+
+class AgentState(InputState, OutputState):
+    # --- Scope ---
     ticker: Optional[str] = None
     period_start: Optional[int] = None
     period_end: Optional[int] = None
 
-    # --- UNIFIED QUEUE MANAGEMENT ---
-    # Single queue for everything (top-level metrics AND ingredients)
-    queue: List[str] = Field(default_factory=list)
+    # --- Execution Stack (LIFO) ---
+    task_stack: List[str] = Field(default_factory=list)
 
-    # The item currently being processed from the queue
-    current_concept: Optional[str] = None
-
-    # --- RESOLUTION STATE ---
-    # Stores successful resolutions: {"Concept Name": "XBRL_Tag"}
+    # --- Knowledge Graph ---
     resolved_tags: Dict[str, str] = Field(default_factory=dict)
-
-    # Stores calculation logic: {"PE Ratio": ["Price", "EPS"]}
-    # Used to know if a concept needs calculation instead of fetching
     formulas: Dict[str, List[str]] = Field(default_factory=dict)
 
-    # --- DATA STATUS ---
-    data_status: str = "Empty"
-    financial_context: Optional[pd.DataFrame] = Field(default=None)
+    # --- Data ---
+    financial_data: Optional[pd.DataFrame] = None
 
     class Config:
         arbitrary_types_allowed = True
 
 
 # -------------------------------------------------------------------
-# 3. CALCULATION LOGIC
-# -------------------------------------------------------------------
-
-
-def calculate_ratio_logic(
-    current_context: Optional[pd.DataFrame],
-    numerator_tag: str,
-    denominator_tag: str,
-) -> pd.Series:
-    """
-    Calculates a ratio based on the provided DataFrame context.
-    """
-    if current_context is None or current_context.empty:
-        return "Error: No data context available for calculation.", current_context
-
-    df = current_context.copy()
-
-    def safe_division(row):
-        n, d = row[numerator_tag], row[denominator_tag]
-        if d == 0 or pd.isna(d) or pd.isna(n):
-            return 0.0
-        return n / d
-
-    return df.apply(safe_division, axis=0)
-
-
-# -------------------------------------------------------------------
-# 4. NODES
+# 2. WORKER NODES
 # -------------------------------------------------------------------
 
 
@@ -88,11 +60,11 @@ class ScopeParser(BaseModel):
     ticker: str
     start_year: int
     end_year: int
-    target_metrics: List[str]
+    metrics: List[str]
 
 
 def parser_node(state: AgentState) -> Dict[str, Any]:
-    print(f"\n--- [Node] Parser: '{state.user_query}' ---")
+    print(f"\n--- [Node] Parser ---")
     llm = service_manager.get_agent()
     current_year = datetime.datetime.now().year
 
@@ -106,301 +78,222 @@ def parser_node(state: AgentState) -> Dict[str, Any]:
         ]
     )
 
-    try:
-        res = (prompt | llm.with_structured_output(ScopeParser)).invoke(
-            {"query": state.user_query}
-        )
-        # Initialize the queue with the requested metrics
-        return {
-            "ticker": res.ticker.upper(),
-            "period_start": res.start_year,
-            "period_end": res.end_year,
-            "queue": res.target_metrics,
-            "current_concept": None,
-        }
-    except Exception as e:
-        return {"messages": [BaseMessage(content=f"Error parsing: {e}")]}
+    # Safely handle input messages
+    query = state.messages[-1].content if state.messages else ""
+    res = (prompt | llm.with_structured_output(ScopeParser)).invoke({"query": query})
+
+    return {
+        "ticker": res.ticker.upper(),
+        "period_start": res.start_year,
+        "period_end": res.end_year,
+        "task_stack": res.metrics,
+        "financial_data": pd.DataFrame(),
+    }
 
 
-def scheduler_node(state: AgentState) -> Dict[str, Any]:
+def fetch_data_node(state: AgentState) -> Dict[str, Any]:
     """
-    Pops the next item from the FIFO queue.
+    Fetches data. If the tag isn't in state yet, it resolves it here first.
     """
-    queue = state.queue
-    if not queue:
-        print("--- [Node] Scheduler: Queue Empty. Done. ---")
-        return {"current_concept": None}
+    current_task = state.task_stack[0]
 
-    next_concept = queue[0]
-    remaining = queue[1:]
+    # 1. Determine Tag (Check cache or resolve fresh)
+    tag = state.resolved_tags.get(current_task)
+    if not tag:
+        tag = RESOLVER.resolve(current_task)
 
-    print(
-        f"--- [Node] Scheduler: Popped '{next_concept}'. Queue size: {len(remaining)} ---"
-    )
+    print(f"--- [Node] Fetcher: '{current_task}' -> {tag} ---")
 
-    return {"current_concept": next_concept, "queue": remaining}
-
-
-def resolver_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Unified resolver. Tries to find a standard XBRL tag.
-    If found, we mark it for Fetching.
-    If not found, we mark it for Decomposition.
-    """
-    concept = state.current_concept
-    print(f"--- [Node] Resolver: Checking '{concept}' ---")
-
-    # Try to resolve
-    tag = RESOLVER.resolve(concept)
+    # 2. Fetch
+    updates = {"task_stack": state.task_stack[1:]}  # Default: pop task
 
     if tag:
-        print(f"   > Resolved '{concept}' -> '{tag}'")
-        # Store the mapping.
-        # Note: We store the Original Name -> Resolved Tag
-        return {"resolved_tags": {**state.resolved_tags, concept: tag}}
-    else:
-        print(f"   > Could not resolve '{concept}' directly.")
-        return {}  # No state update, routing will send to decomposer
+        # Save the resolution for future reference
+        updates["resolved_tags"] = {**state.resolved_tags, current_task: tag}
+
+        db = FinancialDatabase()
+        db.update_company_data(state.ticker, num_years=5)
+        RESOLVER.update_company_concepts(db.get_all_concepts_for_company(state.ticker))
+
+        new_data = db.search_concept(
+            state.ticker, [tag], state.period_start, state.period_end
+        )
+
+        if not new_data.empty:
+            current_df = state.financial_data
+            updated_df = (
+                new_data
+                if (current_df is None or current_df.empty)
+                else current_df.combine_first(new_data)
+            )
+            updates["financial_data"] = updated_df
+
+    return updates
 
 
 def decomposer_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Breaks down a complex metric, adds ingredients to the front of the queue,
-    and saves the formula for later calculation.
-    """
-    concept = state.current_concept
-    print(f"--- [Node] Decomposer: Breaking down '{concept}' ---")
+    current_task = state.task_stack[0]
+    print(f"--- [Node] Decomposer: '{current_task}' ---")
     llm = service_manager.get_agent()
 
     class Ingredients(BaseModel):
-        names: List[str] = Field(description="List of 2 raw financial concepts needed.")
+        names: List[str]
 
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "Break down the requested metric into standard 10-K items (e.g. 'PE Ratio' -> ['Price', 'Earnings Per Share']). Return JSON.",
+                "Break down the metric into 2 standard financial concepts found in 10-K. Return JSON.",
             ),
-            ("human", f"Metric: {concept}"),
+            ("human", f"Metric: {current_task}"),
         ]
     )
 
     res = (prompt | llm.with_structured_output(Ingredients)).invoke({})
-    ingredients = res.names
-    print(f"   > Ingredients: {ingredients}")
 
-    # UPDATE THE QUEUE:
-    # 1. We need to process ingredients first.
-    # 2. Then we need to come back to 'concept' to calculate it.
-    # New Queue = [Ingredient1, Ingredient2, Original_Concept, ...Old_Queue]
+    # Push ingredients to front of stack
+    new_stack = res.names + [current_task] + state.task_stack[1:]
 
-    # IMPORTANT: We verify we aren't creating an infinite loop.
-    # If the 'concept' is already in formulas, we shouldn't be here, but as a safeguard:
-    new_queue_front = ingredients + [concept]
-    combined_queue = new_queue_front + state.queue
-
-    # Store the formula: Concept -> [Ing1, Ing2]
-    new_formulas = {**state.formulas, concept: ingredients}
-
-    return {"queue": combined_queue, "formulas": new_formulas}
-
-
-def fetch_data_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Fetches data for the current_concept using its resolved tag.
-    """
-    concept = state.current_concept
-    tag = state.resolved_tags.get(concept)
-    print(f"--- [Node] Fetch Data: '{concept}' (Tag: {tag}) ---")
-
-    if not tag:
-        return {"data_status": "Error: No tag found"}
-
-    db = FinancialDatabase()
-    # Ensure company data is present
-    db.update_company_data(state.ticker, num_years=5)
-
-    RESOLVER.update_company_concepts(db.get_all_concepts_for_company(state.ticker))
-    # Fetch specific tag
-    df = db.search_concept(state.ticker, [tag], state.period_start, state.period_end)
-    if df.empty:
-        return {"data_status": f"No data found for tag '{tag}'"}
-
-    current_context = state.financial_context
-    if current_context is not None and not current_context.empty:
-        combined = pd.concat([current_context, df])
-        combined = combined.drop_duplicates()
-        return {
-            "financial_context": combined,
-            "data_status": "Data Loaded and combined",
-        }
-
-    return {"financial_context": df, "data_status": "Data Loaded"}
+    return {
+        "task_stack": new_stack,
+        "formulas": {**state.formulas, current_task: res.names},
+    }
 
 
 def calculator_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Executed when a concept is in 'formulas' and its ingredients are ready.
-    """
-    target = state.current_concept
+    target = state.task_stack[0]
     ingredients = state.formulas.get(target, [])
-    print(f"--- [Node] Calculator: Calculating '{target}' using {ingredients} ---")
+    print(f"--- [Node] Calculator: '{target}' ---")
 
-    # Look up the resolved tags for the ingredients
-    # The ingredients (e.g., "Price") should now be in resolved_tags because they were processed earlier in queue
-    resolved_ingredient_tags = []
+    df = state.financial_data
+    cols = []
+
+    # Identify columns for ingredients
     for ing in ingredients:
+        # Check by name OR by tag
         tag = state.resolved_tags.get(ing)
-        if not tag:
-            print(f"   > Error: Ingredient '{ing}' was not resolved/fetched.")
-            return {
-                "messages": [
-                    BaseMessage(
-                        content=f"Failed to calculate {target}: missing data for {ing}"
-                    )
-                ]
-            }
-        resolved_ingredient_tags.append(tag)
+        if ing in df.columns:
+            cols.append(ing)
+        elif tag and tag in df.columns:
+            cols.append(tag)
 
-    if len(resolved_ingredient_tags) < 2:
-        return {
-            "messages": [
-                BaseMessage(
-                    content=f"Calculator requires 2 ingredients, found {len(resolved_ingredient_tags)}"
-                )
-            ]
-        }
+    if len(cols) < 2:
+        # Missing ingredients (logic error or fetch fail), pop to avoid infinite loop
+        return {"task_stack": state.task_stack[1:]}
 
-    calculated_data = calculate_ratio_logic(
-        state.financial_context,
-        resolved_ingredient_tags[0],  # Numerator
-        resolved_ingredient_tags[1],  # Denominator
-    )
+    # Calculate
+    def safe_div(row):
+        n, d = row.get(cols[0], 0), row.get(cols[1], 0)
+        return n / d if d else 0.0
 
-    calculated_data = calculated_data.to_frame().T
-    calculated_data.index = ["P/E Ratio"]
-
-    updated_context = pd.concat([state.financial_context, calculated_data])
-
-    # We treat the calculated metric as "Resolved" now, so we don't try to decompose it again if it appears
-    # (though strictly it shouldn't appear again based on queue logic)
+    result = df.apply(safe_div, axis=1).to_frame(name=target)
 
     return {
-        "messages": [BaseMessage(content="calculated successfully", type="ai")],
-        "financial_context": updated_context,
+        "financial_data": df.combine_first(result),
+        "task_stack": state.task_stack[1:],
     }
 
 
 def analyst_node(state: AgentState) -> Dict[str, Any]:
     print(f"--- [Node] Analyst ---")
     llm = service_manager.get_agent()
-    context_df = state.financial_context
-
     data_str = (
-        context_df.to_string()
-        if context_df is not None and not context_df.empty
+        state.financial_data.to_string()
+        if state.financial_data is not None
         else "No Data"
     )
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            (
-                "system",
-                "You are a financial analyst. Answer the user's query using the data below.",
-            ),
-            ("human", f"Query: {state.user_query}\n\nData:\n{data_str}"),
+            ("system", "You are a financial analyst. Answer based on the data."),
+            ("human", f"Query: {state.messages[-1].content}\n\nData:\n{data_str}"),
         ]
     )
 
-    res = (prompt | llm).invoke({})
-    return {"messages": [res]}
+    return {"messages": [(prompt | llm).invoke({})]}
 
 
 # -------------------------------------------------------------------
-# 5. ROUTING LOGIC
+# 3. CONDITIONAL ROUTING LOGIC
 # -------------------------------------------------------------------
 
 
-def route_scheduler(state: AgentState) -> Literal["resolver", "calculator", "analyst"]:
+def decide_next_step(
+    state: AgentState,
+) -> Literal["analyst", "calculator", "fetch_data", "decomposer"]:
     """
-    Decides what to do with the item popped from the queue.
+    Determines the next node based on the state of the stack and data availability.
+    This replaces the 'Monitor' node.
     """
-    concept = state.current_concept
+    stack = state.task_stack
 
-    # 1. If queue was empty, concept is None -> Go to Analyst
-    if concept is None:
+    # 1. Empty Stack -> Finished
+    if not stack:
         return "analyst"
 
-    # 2. Check if this concept is a known 'formula' (meaning it was decomposed earlier)
-    # If it is, that means we put it back in the queue to wait for ingredients.
-    # Now it's back, so we calculate.
-    if concept in state.formulas:
+    current = stack[0]
+
+    # 2. Optimization: If data already exists, skip processing?
+    # We can handle this by routing to fetcher/calculator and letting them pop immediately,
+    # OR check here. checking here is cleaner for the graph flow.
+    df = state.financial_data
+    tag = state.resolved_tags.get(current)
+    if df is not None and not df.empty:
+        if current in df.columns or (tag and tag in df.columns):
+            # If data exists, we need to pop it.
+            # Since edges can't update state, we must route to a node that will pop it.
+            # We route to 'fetch_data' which handles "already existing" logic gracefully (by popping).
+            return "fetch_data"
+
+    # 3. Formula Logic
+    if current in state.formulas:
         return "calculator"
 
-    # 3. Otherwise, it's a raw concept (either user input or a decomposed ingredient)
-    # We need to resolve it.
-    return "resolver"
-
-
-def route_resolver(state: AgentState) -> Literal["fetch_data", "decomposer"]:
-    """
-    After resolver runs, did we find a tag?
-    """
-    concept = state.current_concept
-
-    # Check if the current concept exists in the resolved map
-    if concept in state.resolved_tags:
+    # 4. Resolution Logic
+    # We perform a lookahead check.
+    # If it's already a known tag OR resolves successfully, go to Fetcher.
+    if current in state.resolved_tags or RESOLVER.resolve(current) is not None:
         return "fetch_data"
 
-    # If not found, we must decompose it
+    # 5. Fallback -> Decompose
     return "decomposer"
 
 
 # -------------------------------------------------------------------
-# 6. GRAPH CONSTRUCTION
+# 4. GRAPH CONSTRUCTION
 # -------------------------------------------------------------------
 
 
 def build_graph():
-    workflow = StateGraph(AgentState)
+    workflow = StateGraph(
+        AgentState, input_schema=InputState, output_schema=OutputState
+    )
 
+    # Add Nodes
     workflow.add_node("parser", parser_node)
-    workflow.add_node("scheduler", scheduler_node)
-
-    # Single resolver node
-    workflow.add_node("resolver", resolver_node)
-
-    workflow.add_node("decomposer", decomposer_node)
     workflow.add_node("fetch_data", fetch_data_node)
+    workflow.add_node("decomposer", decomposer_node)
     workflow.add_node("calculator", calculator_node)
     workflow.add_node("analyst", analyst_node)
 
-    # Entry
-    workflow.set_entry_point("parser")
-    workflow.add_edge("parser", "scheduler")
+    # Entry Point
+    workflow.add_edge(START, "parser")
 
-    # Scheduler Routing
-    workflow.add_conditional_edges(
-        "scheduler",
-        route_scheduler,
-        {"resolver": "resolver", "calculator": "calculator", "analyst": "analyst"},
-    )
+    # Connect Every Worker to the Router (Conditional Edge)
+    # The parser prepares the initial stack, then we decide where to go.
+    # Every processing node (fetch, decompose, calc) loops back via this decision.
 
-    # Resolver Routing
-    workflow.add_conditional_edges(
-        "resolver",
-        route_resolver,
-        {"fetch_data": "fetch_data", "decomposer": "decomposer"},
-    )
+    route_config = {
+        "analyst": "analyst",
+        "calculator": "calculator",
+        "fetch_data": "fetch_data",
+        "decomposer": "decomposer",
+    }
 
-    # Decomposer sends back to scheduler (updated queue)
-    workflow.add_edge("decomposer", "scheduler")
-
-    # Fetch Data sends back to scheduler (get next item)
-    workflow.add_edge("fetch_data", "scheduler")
-
-    # Calculator sends back to scheduler (get next item)
-    workflow.add_edge("calculator", "scheduler")
+    workflow.add_conditional_edges("parser", decide_next_step, route_config)
+    workflow.add_conditional_edges("fetch_data", decide_next_step, route_config)
+    workflow.add_conditional_edges("decomposer", decide_next_step, route_config)
+    workflow.add_conditional_edges("calculator", decide_next_step, route_config)
 
     workflow.add_edge("analyst", END)
 
@@ -409,13 +302,16 @@ def build_graph():
 
 if __name__ == "__main__":
     app = build_graph()
-    prompt = "Analyse the revenue and earnings for the company NVDA for last 3 years."
-    print(f"Starting: '{prompt}'")
+    user_input = {
+        "messages": [
+            HumanMessage(
+                content="Analyze revenue, earnings and profit for MSFT for last 3 years."
+            )
+        ]
+    }
 
-    initial = AgentState(messages=[], user_query=prompt)
-    out = app.invoke(initial)
+    print("Starting Agent...")
+    final_output = app.invoke(user_input)
 
     print("\n" + "=" * 40)
-    print("FINAL REPORT")
-    print("=" * 40)
-    print(out["messages"][-1].content)
+    print(final_output["messages"][-1].content)
