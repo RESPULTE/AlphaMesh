@@ -11,6 +11,7 @@ from langgraph.graph import StateGraph, START, END
 
 # --- LOCAL IMPORTS (Assumed existing) ---
 from core.services import service_manager
+from core.agents.concept_resolver import COMMON_FINANCIAL_CONCEPTS
 
 # Initialize Resolver globally
 
@@ -74,6 +75,10 @@ def parser_node(state: InputState) -> AgentState:
     query = state.messages[-1].content if state.messages else ""
     res = (prompt | llm.with_structured_output(ScopeParser)).invoke({"query": query})
 
+    print(
+        f"[Parser] Extracted - Ticker: {res.ticker}, Years: {res.start_year}-{res.end_year}, Metrics: {res.metrics}"
+    )
+
     db = service_manager.get_financial_database()
     db.update_company_data(
         res.ticker.upper(), num_years=min(res.start_year, res.end_year, 5)
@@ -83,6 +88,8 @@ def parser_node(state: InputState) -> AgentState:
     composite_metrics = dict()
     for metric in res.metrics:
         resolved_metric = db.resolve_concept(res.ticker.upper(), metric)
+        print(f"[Fetcher] Resolving metric '{metric}' -> '{resolved_metric}'")
+
         if resolved_metric is None:
             print(f"[Fetcher] Could not resolve concept for '{metric}'")
             composite_metrics[metric] = set()
@@ -147,7 +154,9 @@ def decomposer_node(state: AgentState) -> Dict[str, Any]:
         [
             (
                 "system",
-                "Break down these financial metrics into constituent standard 10-K concepts. Return a JSON list.",
+                "Break down these financial metrics into constituent components here: \n"
+                f"{COMMON_FINANCIAL_CONCEPTS}"
+                " \n Return a JSON list.",
             ),
             ("human", "Metrics to decompose: {metrics}"),
         ]
@@ -364,7 +373,7 @@ if __name__ == "__main__":
     app = build_graph()
     user_input = {
         "messages": [
-            HumanMessage(content="Analyze Entreprise Value for MSFT for last 3 years.")
+            HumanMessage(content="Analyze free cash flow for MSFT for last 3 years.")
         ]
     }
 
@@ -374,13 +383,13 @@ if __name__ == "__main__":
     print("\n" + "=" * 40)
     print(final_output["messages"][-1].content)
 
-    from PIL import Image as PILImage
-    import io
+    # from PIL import Image as PILImage
+    # import io
 
-    png_data = app.get_graph().draw_mermaid_png()
+    # png_data = app.get_graph().draw_mermaid_png()
 
-    # Load into PIL
-    img = PILImage.open(io.BytesIO(png_data))
+    # # Load into PIL
+    # img = PILImage.open(io.BytesIO(png_data))
 
-    # Open in new window
-    img.show()
+    # # Open in new window
+    # img.show()

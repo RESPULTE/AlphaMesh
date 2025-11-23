@@ -1,13 +1,21 @@
 import json
 import re
-from rapidfuzz import process, fuzz
 import os
 from typing import List, Optional
 
+FINANCIAL_CONCEPT_MAPPING = {}
+try:
+    mapping_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "concept_mappings.json"
+    )
+    with open(mapping_path, "r") as f:
+        FINANCIAL_CONCEPT_MAPPING = json.load(f)
+except Exception as e:
+    print(f"[ConceptResolver] Error loading mapping file: {e}")
+COMMON_FINANCIAL_CONCEPTS = list(FINANCIAL_CONCEPT_MAPPING.keys())
 
-def build_concept_resolver(
-    company_concepts: List[str], mapping_path: Optional[str] = None
-):
+
+def build_concept_resolver(company_concepts: List[str]):
     """
     Returns a function `resolve(user_term)` that maps input words to actual financial concepts.
 
@@ -18,19 +26,8 @@ def build_concept_resolver(
     # ------------------------
     # Load mapping
     # ------------------------
-    mapping = {}
-    try:
-        if mapping_path is None:
-            mapping_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "concept_mappings.json"
-            )
-        with open(mapping_path, "r") as f:
-            mapping = json.load(f)
-    except Exception as e:
-        print(f"[ConceptResolver] Error loading mapping file: {e}")
 
     official_concepts = set(company_concepts)
-    common_concepts = list(mapping.keys())
 
     # ------------------------
     # Normalization helper
@@ -48,33 +45,13 @@ def build_concept_resolver(
     # ------------------------
     def resolve_exact_mapping(term: str):
         term = term.lower().strip()
-        return mapping.get(term)
-
-    def resolve_fuzzy_mapping(term: str, threshold=85):
-        term = term.lower().strip()
-        match_result = process.extractOne(
-            term, common_concepts, scorer=fuzz.token_set_ratio
-        )
-        if match_result:
-            best_key, score, _ = match_result
-            if score >= threshold:
-                return mapping[best_key]
-        return None
+        return FINANCIAL_CONCEPT_MAPPING.get(term)
 
     def resolve_column_keyword(term: str):
         for col in official_concepts:
             if term.lower() in normalize(col):
                 return col
         return None
-
-    def resolve_column_fuzzy(term: str):
-        try:
-            best, score, _ = process.extractOne(
-                term, official_concepts, scorer=fuzz.WRatio
-            )
-            return best if score > 70 else None
-        except Exception:
-            return None
 
     # ------------------------
     # Main resolve function
@@ -83,12 +60,7 @@ def build_concept_resolver(
         if not user_term:
             return None
 
-        for strategy in [
-            resolve_exact_mapping,
-            resolve_fuzzy_mapping,
-            resolve_column_keyword,
-            resolve_column_fuzzy,
-        ]:
+        for strategy in [resolve_exact_mapping, resolve_column_keyword]:
             col = strategy(user_term)
             if col:
                 return col
