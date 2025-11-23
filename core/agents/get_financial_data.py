@@ -135,6 +135,15 @@ class FinancialDatabase:
 
         return final_df
 
+    def get_all_concepts_for_company(self, ticker: str) -> List[str]:
+        ticker = ticker.upper()
+        query = "SELECT DISTINCT concept FROM financials WHERE company = ?"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, (ticker,))
+            rows = cursor.fetchall()
+        return [row[0] for row in rows]
+
     def update_company_data(self, ticker: str, num_years: int = 5):
         ticker = ticker.upper()
         print(f"--- Processing {ticker} ---")

@@ -220,19 +220,22 @@ def fetch_data_node(state: AgentState) -> Dict[str, Any]:
     # Ensure company data is present
     db.update_company_data(state.ticker, num_years=5)
 
+    RESOLVER.update_company_concepts(db.get_all_concepts_for_company(state.ticker))
     # Fetch specific tag
     df = db.search_concept(state.ticker, [tag], state.period_start, state.period_end)
+    if df.empty:
+        return {"data_status": f"No data found for tag '{tag}'"}
 
     current_context = state.financial_context
-    if not df.empty:
-        if current_context is not None and not current_context.empty:
-            combined = pd.concat([current_context, df])
-            combined = combined.drop_duplicates()
-            return {"financial_context": combined, "data_status": "Data Loaded"}
-        else:
-            return {"financial_context": df, "data_status": "Data Loaded"}
+    if current_context is not None and not current_context.empty:
+        combined = pd.concat([current_context, df])
+        combined = combined.drop_duplicates()
+        return {
+            "financial_context": combined,
+            "data_status": "Data Loaded and combined",
+        }
 
-    return {"data_status": "No Data Found"}
+    return {"financial_context": df, "data_status": "Data Loaded"}
 
 
 def calculator_node(state: AgentState) -> Dict[str, Any]:
@@ -406,7 +409,7 @@ def build_graph():
 
 if __name__ == "__main__":
     app = build_graph()
-    prompt = "Calculate pe ratio for CRWD for last 3 years."
+    prompt = "Analyse the revenue and earnings for the company NVDA for last 3 years."
     print(f"Starting: '{prompt}'")
 
     initial = AgentState(messages=[], user_query=prompt)
