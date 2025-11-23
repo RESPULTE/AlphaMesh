@@ -1,21 +1,18 @@
 import datetime
 import pandas as pd
 import operator
-from typing import List, Dict, Any, Optional, Literal, Annotated
-from pydantic import BaseModel, Field
+from typing import Any, List, Dict, Optional, Annotated, Set
+from pydantic import BaseModel, ConfigDict, Field
 
 # LangChain / LangGraph imports
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, END, START
+from langgraph.graph import StateGraph, START, END
 
 # --- LOCAL IMPORTS (Assumed existing) ---
 from core.services import service_manager
-from core.agents.concept_resolver import ConceptResolver
-from core.agents.get_financial_data import FinancialDatabase
 
 # Initialize Resolver globally
-RESOLVER = ConceptResolver()
 
 
 # -------------------------------------------------------------------
@@ -37,18 +34,13 @@ class AgentState(InputState, OutputState):
     period_start: Optional[int] = None
     period_end: Optional[int] = None
 
-    # --- Execution Stack (LIFO) ---
-    task_stack: List[str] = Field(default_factory=list)
-
-    # --- Knowledge Graph ---
-    resolved_tags: Dict[str, str] = Field(default_factory=dict)
-    formulas: Dict[str, List[str]] = Field(default_factory=dict)
+    metric_to_process: Set[str] = Field(default_factory=list)
+    composite_metrics: Dict[str, Set[str]] = Field(default_factory=dict)
 
     # --- Data ---
     financial_data: Optional[pd.DataFrame] = None
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 # -------------------------------------------------------------------
@@ -63,7 +55,7 @@ class ScopeParser(BaseModel):
     metrics: List[str]
 
 
-def parser_node(state: AgentState) -> Dict[str, Any]:
+def parser_node(state: InputState) -> AgentState:
     print(f"\n--- [Node] Parser ---")
     llm = service_manager.get_agent()
     current_year = datetime.datetime.now().year
@@ -82,119 +74,141 @@ def parser_node(state: AgentState) -> Dict[str, Any]:
     query = state.messages[-1].content if state.messages else ""
     res = (prompt | llm.with_structured_output(ScopeParser)).invoke({"query": query})
 
+    db = service_manager.get_financial_database()
+    db.update_company_data(
+        res.ticker.upper(), num_years=min(res.start_year, res.end_year, 5)
+    )
+
+    metrics_to_process = set()
+    composite_metrics = dict()
+    for metric in res.metrics:
+        resolved_metric = db.resolve_concept(res.ticker.upper(), metric)
+        if resolved_metric is None:
+            print(f"[Fetcher] Could not resolve concept for '{metric}'")
+            composite_metrics[metric] = set()
+            continue
+        metrics_to_process.add(resolved_metric)
+
     return {
         "ticker": res.ticker.upper(),
         "period_start": res.start_year,
         "period_end": res.end_year,
-        "task_stack": res.metrics,
+        "metric_to_process": metrics_to_process,
+        "composite_metrics": composite_metrics,
         "financial_data": pd.DataFrame(),
     }
 
 
-def fetch_data_node(state: AgentState) -> Dict[str, Any]:
+def fetch_data_node(state: AgentState) -> AgentState:
     """
     Fetches data. If the tag isn't in state yet, it resolves it here first.
     """
-    current_task = state.task_stack[0]
+    print(f"\n--- [Node] Fetcher ---")
+    print(f"Fetching data for ticker: {state.metric_to_process}")
 
-    # 1. Determine Tag (Check cache or resolve fresh)
-    tag = state.resolved_tags.get(current_task)
-    if not tag:
-        tag = RESOLVER.resolve(current_task)
+    db = service_manager.get_financial_database()
+    new_data = db.get_concept(
+        state.ticker,
+        tuple(state.metric_to_process),
+        state.period_start,
+        state.period_end,
+    )
 
-    print(f"--- [Node] Fetcher: '{current_task}' -> {tag} ---")
-
-    # 2. Fetch
-    updates = {"task_stack": state.task_stack[1:]}  # Default: pop task
-
-    if tag:
-        # Save the resolution for future reference
-        updates["resolved_tags"] = {**state.resolved_tags, current_task: tag}
-
-        db = FinancialDatabase()
-        db.update_company_data(state.ticker, num_years=5)
-        RESOLVER.update_company_concepts(db.get_all_concepts_for_company(state.ticker))
-
-        new_data = db.search_concept(
-            state.ticker, [tag], state.period_start, state.period_end
+    if new_data is None or new_data.empty:
+        print(
+            f"[Fetcher] No data found for the company'{state.ticker}' (metrics to process: '{state.metric_to_process}')"
         )
 
-        if not new_data.empty:
-            current_df = state.financial_data
-            updated_df = (
-                new_data
-                if (current_df is None or current_df.empty)
-                else current_df.combine_first(new_data)
-            )
-            updates["financial_data"] = updated_df
+    print(f"[Fetcher] Fetched data for {len(new_data)} metrics.")
+    print(new_data)
 
-    return updates
+    return {"financial_data": state.financial_data.combine_first(new_data)}
 
 
 def decomposer_node(state: AgentState) -> Dict[str, Any]:
-    current_task = state.task_stack[0]
-    print(f"--- [Node] Decomposer: '{current_task}' ---")
+    # Extract the list of metrics needing decomposition
+    targets = state.composite_metrics.keys()
+    if not targets:
+        return {}
+
     llm = service_manager.get_agent()
+    print(f"--- [Decomposer] Batch processing: {targets} ---")
 
-    class Ingredients(BaseModel):
-        names: List[str]
+    # Define Schema for Batch Processing
+    class Recipe(BaseModel):
+        metric: str
+        ingredients: Set[str]
 
+    class BatchResponse(BaseModel):
+        breakdowns: List[Recipe]
+
+    # Single API Call
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "Break down the metric into 2 standard financial concepts found in 10-K. Return JSON.",
+                "Break down these financial metrics into constituent standard 10-K concepts. Return a JSON list.",
             ),
-            ("human", f"Metric: {current_task}"),
+            ("human", "Metrics to decompose: {metrics}"),
         ]
     )
 
-    res = (prompt | llm.with_structured_output(Ingredients)).invoke({})
+    res = (prompt | llm.with_structured_output(BatchResponse)).invoke(
+        {"metrics": ", ".join(targets)}
+    )
 
-    # Push ingredients to front of stack
-    new_stack = res.names + [current_task] + state.task_stack[1:]
+    updated_composite_metrics = state.composite_metrics.copy()
+    updated_metrics_to_process = state.metric_to_process.copy()
+    db = service_manager.get_financial_database()
+    for item in res.breakdowns:
+        if not item.ingredients:
+            continue
+
+        print(f"   > {item.metric} -> {item.ingredients}")
+
+        ingredients = set()
+        for i in item.ingredients:
+            resolved_ingredient = db.resolve_concept(state.ticker, i)
+            if resolved_ingredient is None:
+                print(
+                    f"[Decomposer] Could not resolve concept for ingredient '{i}' of composite metric '{item.metric}'"
+                )
+                continue
+            ingredients.add(resolved_ingredient)
+            print(f"[Decomposer] Resolved ingredient '{i}' to '{resolved_ingredient}'")
+
+        updated_composite_metrics[item.metric] = ingredients
+        updated_metrics_to_process.update(ingredients)
 
     return {
-        "task_stack": new_stack,
-        "formulas": {**state.formulas, current_task: res.names},
+        "composite_metrics": updated_composite_metrics,
+        "metric_to_process": updated_metrics_to_process,
     }
 
 
-def calculator_node(state: AgentState) -> Dict[str, Any]:
-    target = state.task_stack[0]
-    ingredients = state.formulas.get(target, [])
-    print(f"--- [Node] Calculator: '{target}' ---")
+def calculator_node(state: AgentState) -> AgentState:
 
-    df = state.financial_data
-    cols = []
+    df = state.financial_data.copy()
+    if df is None or df.empty:
+        print("[Calculator] No financial data available for calculations.")
+        return {}
 
-    # Identify columns for ingredients
-    for ing in ingredients:
-        # Check by name OR by tag
-        tag = state.resolved_tags.get(ing)
-        if ing in df.columns:
-            cols.append(ing)
-        elif tag and tag in df.columns:
-            cols.append(tag)
+    for composite_metric, constituent_metrics in state.composite_metrics.items():
+        print(f"[Calculator] Calculating {composite_metric} from {constituent_metrics}")
 
-    if len(cols) < 2:
-        # Missing ingredients (logic error or fetch fail), pop to avoid infinite loop
-        return {"task_stack": state.task_stack[1:]}
-
-    # Calculate
-    def safe_div(row):
-        n, d = row.get(cols[0], 0), row.get(cols[1], 0)
-        return n / d if d else 0.0
-
-    result = df.apply(safe_div, axis=1).to_frame(name=target)
+        result = (
+            df.loc[list(constituent_metrics)]
+            .apply(operator.truediv, axis=1)
+            .to_frame(name=composite_metric)
+        )
 
     return {
         "financial_data": df.combine_first(result),
-        "task_stack": state.task_stack[1:],
+        "metric_to_process": state.metric_to_process[1:],
     }
 
 
-def analyst_node(state: AgentState) -> Dict[str, Any]:
+def analyst_node(state: AgentState) -> OutputState:
     print(f"--- [Node] Analyst ---")
     llm = service_manager.get_agent()
     data_str = (
@@ -211,52 +225,6 @@ def analyst_node(state: AgentState) -> Dict[str, Any]:
     )
 
     return {"messages": [(prompt | llm).invoke({})]}
-
-
-# -------------------------------------------------------------------
-# 3. CONDITIONAL ROUTING LOGIC
-# -------------------------------------------------------------------
-
-
-def decide_next_step(
-    state: AgentState,
-) -> Literal["analyst", "calculator", "fetch_data", "decomposer"]:
-    """
-    Determines the next node based on the state of the stack and data availability.
-    This replaces the 'Monitor' node.
-    """
-    stack = state.task_stack
-
-    # 1. Empty Stack -> Finished
-    if not stack:
-        return "analyst"
-
-    current = stack[0]
-
-    # 2. Optimization: If data already exists, skip processing?
-    # We can handle this by routing to fetcher/calculator and letting them pop immediately,
-    # OR check here. checking here is cleaner for the graph flow.
-    df = state.financial_data
-    tag = state.resolved_tags.get(current)
-    if df is not None and not df.empty:
-        if current in df.columns or (tag and tag in df.columns):
-            # If data exists, we need to pop it.
-            # Since edges can't update state, we must route to a node that will pop it.
-            # We route to 'fetch_data' which handles "already existing" logic gracefully (by popping).
-            return "fetch_data"
-
-    # 3. Formula Logic
-    if current in state.formulas:
-        return "calculator"
-
-    # 4. Resolution Logic
-    # We perform a lookahead check.
-    # If it's already a known tag OR resolves successfully, go to Fetcher.
-    if current in state.resolved_tags or RESOLVER.resolve(current) is not None:
-        return "fetch_data"
-
-    # 5. Fallback -> Decompose
-    return "decomposer"
 
 
 # -------------------------------------------------------------------
@@ -278,23 +246,14 @@ def build_graph():
 
     # Entry Point
     workflow.add_edge(START, "parser")
-
-    # Connect Every Worker to the Router (Conditional Edge)
-    # The parser prepares the initial stack, then we decide where to go.
-    # Every processing node (fetch, decompose, calc) loops back via this decision.
-
-    route_config = {
-        "analyst": "analyst",
-        "calculator": "calculator",
-        "fetch_data": "fetch_data",
-        "decomposer": "decomposer",
-    }
-
-    workflow.add_conditional_edges("parser", decide_next_step, route_config)
-    workflow.add_conditional_edges("fetch_data", decide_next_step, route_config)
-    workflow.add_conditional_edges("decomposer", decide_next_step, route_config)
-    workflow.add_conditional_edges("calculator", decide_next_step, route_config)
-
+    workflow.add_edge("parser", "decomposer")
+    workflow.add_edge("decomposer", "fetch_data")
+    workflow.add_conditional_edges(
+        "fetch_data",
+        lambda state: "calculator" if state.composite_metrics else "analyst",
+        {"calculator": "calculator", "analyst": "analyst"},
+    )
+    workflow.add_edge("calculator", "analyst")
     workflow.add_edge("analyst", END)
 
     return workflow.compile()
@@ -305,7 +264,7 @@ if __name__ == "__main__":
     user_input = {
         "messages": [
             HumanMessage(
-                content="Analyze revenue, earnings and profit for MSFT for last 3 years."
+                content="Analyze revenue and earnings per share for MSFT for last 3 years."
             )
         ]
     }
@@ -315,3 +274,14 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 40)
     print(final_output["messages"][-1].content)
+
+    from PIL import Image as PILImage
+    import io
+
+    png_data = app.get_graph().draw_mermaid_png()
+
+    # Load into PIL
+    img = PILImage.open(io.BytesIO(png_data))
+
+    # Open in new window
+    img.show()

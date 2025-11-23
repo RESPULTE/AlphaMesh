@@ -2,134 +2,97 @@ import json
 import re
 from rapidfuzz import process, fuzz
 import os
+from typing import List, Optional
 
 
-class ConceptResolver:
-    def __init__(self, mapping_path=None):
-        try:
+def build_concept_resolver(
+    company_concepts: List[str], mapping_path: Optional[str] = None
+):
+    """
+    Returns a function `resolve(user_term)` that maps input words to actual financial concepts.
+
+    Parameters:
+        company_concepts: List of financial concept names for the company
+        mapping_path: Optional path to JSON mapping file. Defaults to 'concept_mappings.json' in same folder.
+    """
+    # ------------------------
+    # Load mapping
+    # ------------------------
+    mapping = {}
+    try:
+        if mapping_path is None:
             mapping_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "concept_mappings.json",
+                os.path.dirname(os.path.abspath(__file__)), "concept_mappings.json"
             )
-            with open(mapping_path, "r") as f:
-                self.mapping = json.load(f)
-        except Exception as e:
-            print(f"Error loading mapping file: {e}")
-            self.mapping = {}
+        with open(mapping_path, "r") as f:
+            mapping = json.load(f)
+    except Exception as e:
+        print(f"[ConceptResolver] Error loading mapping file: {e}")
 
-        self.official_concepts = set(self.mapping.values())
-        self.common_concepts = list(self.mapping.keys())
+    official_concepts = set(company_concepts)
+    common_concepts = list(mapping.keys())
 
-    def update_company_concepts(self, concepts: list):
-        """
-        Update the official concepts with company-specific concepts.
-        """
-        self.official_concepts = set(concepts)
-
-    def normalize(self, s: str) -> str:
-        """
-        Aggressive normalization to strip special chars and lowercase.
-        """
+    # ------------------------
+    # Normalization helper
+    # ------------------------
+    def normalize(s: str) -> str:
         if not isinstance(s, str):
             return ""
         s = s.lower()
-        # Remove prefixes specific to XBRL to help with direct column matching later
         s = s.replace("us-gaap_", "").replace("msft_", "").replace("_", " ")
         s = re.sub(r"[^a-z0-9 ]+", "", s)
         return s.strip()
 
-    # ---------------------------------------------------------
-    # STRATEGY 1: Exact Mapping
-    # ---------------------------------------------------------
-    def resolve_exact_mapping(self, term: str):
-        """
-        Checks if the user term exists exactly in the JSON keys.
-        """
+    # ------------------------
+    # Resolve strategies
+    # ------------------------
+    def resolve_exact_mapping(term: str):
         term = term.lower().strip()
+        return mapping.get(term)
 
-        # Check if term is a key in the JSON
-        if term in self.mapping:
-            xbrl_tag = self.mapping[term]
-            return xbrl_tag
-        return None
-
-    # ---------------------------------------------------------
-    # STRATEGY 2: Fuzzy Mapping on JSON Keys (The Improvement)
-    # ---------------------------------------------------------
-    def resolve_fuzzy_mapping(self, term: str, threshold=85):
-        """
-        Matches user input against the HUMAN READABLE keys in the JSON.
-        Example: User types "acc payables" -> Matches JSON key "accounts payable" -> Returns "us-gaap_AccountsPayableCurrent"
-        """
+    def resolve_fuzzy_mapping(term: str, threshold=85):
         term = term.lower().strip()
-
-        # Extract the best match from the JSON keys (not the columns)
-        # limit=1 returns a list of tuples [(match, score, index)]
         match_result = process.extractOne(
-            term, self.common_concepts, scorer=fuzz.WRatio
+            term, common_concepts, scorer=fuzz.token_set_ratio
         )
-
         if match_result:
-            best_match_key, score, _ = match_result
-
+            best_key, score, _ = match_result
             if score >= threshold:
-                xbrl_tag = self.mapping[best_match_key]
-                return xbrl_tag
-
+                return mapping[best_key]
         return None
 
-    # ---------------------------------------------------------
-    # STRATEGY 3: Keyword/Partial Match on DataFrame Columns
-    # ---------------------------------------------------------
-    def resolve_column_keyword(self, term: str):
-        """
-        Fallback: If not in JSON, look at the actual dataframe columns
-        and see if the words exist there.
-        """
-        for col in self.official_concepts:
-            norm = self.normalize(col)
-            # If all user keywords appear in the normalized column name
-            if term.lower() in norm:
+    def resolve_column_keyword(term: str):
+        for col in official_concepts:
+            if term.lower() in normalize(col):
                 return col
         return None
 
-    # ---------------------------------------------------------
-    # STRATEGY 4: Fuzzy Match on DataFrame Columns
-    # ---------------------------------------------------------
-    def resolve_column_fuzzy(self, term: str):
-        """
-        Final Fallback: Fuzzy match against the ugly XBRL tags directly.
-        """
+    def resolve_column_fuzzy(term: str):
         try:
             best, score, _ = process.extractOne(
-                term, self.official_concepts, scorer=fuzz.WRatio
+                term, official_concepts, scorer=fuzz.WRatio
             )
             return best if score > 70 else None
         except Exception:
             return None
 
-    # ---------------------------------------------------------
-    # Main Entry Point
-    # ---------------------------------------------------------
-    def resolve(self, user_term: str):
+    # ------------------------
+    # Main resolve function
+    # ------------------------
+    def resolve(user_term: str) -> Optional[str]:
         if not user_term:
             return None
 
-        # 1. Check Exact JSON Key
-        col = self.resolve_exact_mapping(user_term)
-        if col:
-            return col
+        for strategy in [
+            resolve_exact_mapping,
+            resolve_fuzzy_mapping,
+            resolve_column_keyword,
+            resolve_column_fuzzy,
+        ]:
+            col = strategy(user_term)
+            if col:
+                return col
 
-        # 2. Check Fuzzy JSON Key (Finds "closely related" words in your dictionary)
-        col = self.resolve_fuzzy_mapping(user_term)
-        if col:
-            return col
+        return None
 
-        # 3. Check Keywords in actual DF Columns
-        col = self.resolve_column_keyword(user_term)
-        if col:
-            return col
-
-        # 4. Last Resort: Fuzzy match actual DF Columns
-        col = self.resolve_column_fuzzy(user_term)
-        return col
+    return resolve

@@ -1,8 +1,12 @@
+from collections.abc import Iterable
 import sqlite3
 import pandas as pd
 from edgar import Company, set_identity
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
+from functools import lru_cache
+
+from core.agents.concept_resolver import build_concept_resolver
 
 # --- CONFIGURATION ---
 USER_AGENT = "FinancialResearchBot student@university.edu"
@@ -14,6 +18,7 @@ class FinancialDatabase:
     def __init__(self, db_name: str = "financial_data.db"):
         self.db_name = db_name
         self._cached_existing_years = set()
+        self.concept_resolver = {}
 
         self._init_db()
         set_identity(USER_AGENT)
@@ -40,6 +45,7 @@ class FinancialDatabase:
             )
             conn.commit()
 
+    @lru_cache(maxsize=100)
     def get_existing_years(self, ticker: str) -> set:
         if len(self._cached_existing_years) > 0:
             return self._cached_existing_years
@@ -135,6 +141,7 @@ class FinancialDatabase:
 
         return final_df
 
+    @lru_cache(maxsize=100)
     def get_all_concepts_for_company(self, ticker: str) -> List[str]:
         ticker = ticker.upper()
         query = "SELECT DISTINCT concept FROM financials WHERE company = ?"
@@ -254,6 +261,7 @@ class FinancialDatabase:
 
         # self._cached_existing_years.update(list(range(current_year - 10, current_year + 1)))
 
+    @lru_cache(maxsize=100)
     def get_data(
         self,
         ticker: str,
@@ -297,10 +305,18 @@ class FinancialDatabase:
         """Fetch all data (all statements) for a specific year."""
         return self.pivot_data(self.get_data(ticker, years=year))
 
-    def search_concept(
+    def resolve_concept(self, ticker: str, concept: str) -> str | None:
+        if ticker not in self.concept_resolver:
+            all_concepts = self.get_all_concepts_for_company(ticker)
+            self.concept_resolver[ticker] = build_concept_resolver(all_concepts)
+
+        return self.concept_resolver[ticker](concept)
+
+    @lru_cache(maxsize=100)
+    def get_concept(
         self,
         ticker: str,
-        keyword: str | List[str],
+        keyword: str | Tuple[str],
         start_year: int | None = None,
         end_year: int | None = None,
     ) -> pd.DataFrame:
@@ -312,7 +328,7 @@ class FinancialDatabase:
         ticker = ticker.upper()
 
         # --- Handle keyword(s) ---
-        if isinstance(keyword, list):
+        if isinstance(keyword, Iterable):
             like_clauses = " OR ".join(["concept LIKE ?" for _ in keyword])
             search_terms = [f"%{kw}%" for kw in keyword]
         else:
@@ -394,7 +410,7 @@ if __name__ == "__main__":
 
     # print("\n--- 4. Search for a Concept (e.g., 'Assets') ---")
     print(
-        db.search_concept(
+        db.get_concept(
             company,
             ["us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax"],
             start_year=2021,

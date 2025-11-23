@@ -4,6 +4,8 @@ from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_neo4j import Neo4jGraph
 
+from core.agents.get_financial_data import FinancialDatabase
+
 
 class ServiceManager:
     """
@@ -16,6 +18,7 @@ class ServiceManager:
         self._embedding_func = None
         self._graph = None
         self._vector_store = None
+        self._financial_db = None
 
     def get_agent(self) -> ChatGoogleGenerativeAI:
         """Initializes and returns the language model instance."""
@@ -71,6 +74,15 @@ class ServiceManager:
                 print(f"Error initializing Chroma vector store: {e}")
                 raise
         return self._vector_store
+
+    def get_financial_database(self) -> FinancialDatabase:
+        if self._financial_db is None:
+            try:
+                self._financial_db = FinancialDatabase()
+            except Exception as e:
+                print(f"Error initializing Financial Database: {e}")
+                raise
+        return self._financial_db
 
 
 service_manager = ServiceManager()
