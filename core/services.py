@@ -20,18 +20,21 @@ class ServiceManager:
         self._vector_store = None
         self._financial_db = None
 
-    def get_agent(self) -> ChatGoogleGenerativeAI:
+    def get_agent(self, temperature=0.0) -> ChatGoogleGenerativeAI:
         """Initializes and returns the language model instance."""
         if self._llm is None:
             try:
                 self._llm = ChatGoogleGenerativeAI(
                     model=settings.LLM_MODEL,
                     google_api_key=settings.GOOGLE_API_KEY,
-                    temperature=0.1,
+                    temperature=temperature,
                 )
             except Exception as e:
                 print(f"Error initializing LLM: {e}")
                 raise
+        if temperature != self._llm.temperature:
+            self._llm.temperature = temperature
+
         return self._llm
 
     def get_embedding_func(self) -> GoogleGenerativeAIEmbeddings:

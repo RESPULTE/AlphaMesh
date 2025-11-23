@@ -138,7 +138,7 @@ def decomposer_node(state: AgentState) -> Dict[str, Any]:
     if not targets:
         return {}
 
-    llm = service_manager.get_agent()
+    llm = service_manager.get_agent(temperature=0)
     print(f"--- [Decomposer] Batch processing: {targets} ---")
 
     # Define Schema for Batch Processing
@@ -154,9 +154,10 @@ def decomposer_node(state: AgentState) -> Dict[str, Any]:
         [
             (
                 "system",
-                "Break down these financial metrics into constituent components here: \n"
-                f"{COMMON_FINANCIAL_CONCEPTS}"
-                " \n Return a JSON list.",
+                "You are a financial decomposition assistant. "
+                "Break each metric into its constituent components using only these concepts:\n"
+                f"{COMMON_FINANCIAL_CONCEPTS}\n"
+                "Return a JSON list of objects with 'metric' and 'ingredients'. Obey instructions exactly.",
             ),
             ("human", "Metrics to decompose: {metrics}"),
         ]
@@ -236,13 +237,6 @@ def calculator_node(state: AgentState) -> AgentState:
 
     # 3. Prepare Context for the Agent
     #    We provide the exact list of available row indices (the us-gaap tags)
-    available_indices = df.index.tolist()
-
-    # Truncate list for prompt safety if too long, though usually fine for financial summaries
-    indices_preview = (
-        available_indices if len(available_indices) < 50 else available_indices[:50]
-    )
-
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -262,7 +256,7 @@ def calculator_node(state: AgentState) -> AgentState:
             (
                 "human",
                 (
-                    f"Available Row Indices (Ingredients): {indices_preview}\n\n"
+                    f"Available Row Indices (Ingredients): {df.index.tolist()}\n\n"
                     f"Requested Metrics to Calculate: {targets}\n\n"
                     "Provide the Pandas formulas to compute these metrics as new rows."
                 ),
@@ -314,13 +308,16 @@ def calculator_node(state: AgentState) -> AgentState:
 
     print(f"[Calculator] Finished. Added {calculated_count} new rows.")
 
+    db = service_manager.get_financial_database()
+    db.save_calculated_metric(state.ticker, df)
+
     # Return updated state
     return {"financial_data": df}
 
 
 def analyst_node(state: AgentState) -> OutputState:
     print(f"--- [Node] Analyst ---")
-    llm = service_manager.get_agent()
+    llm = service_manager.get_agent(temperature=1.0)
     data_str = (
         state.financial_data.to_string()
         if state.financial_data is not None
@@ -373,7 +370,9 @@ if __name__ == "__main__":
     app = build_graph()
     user_input = {
         "messages": [
-            HumanMessage(content="Analyze free cash flow for MSFT for last 3 years.")
+            HumanMessage(
+                content="Analyze revenue, earnings and free cash flow for MSFT for last 3 years."
+            )
         ]
     }
 

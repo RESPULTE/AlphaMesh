@@ -360,33 +360,8 @@ class FinancialDatabase:
 
         return self.pivot_data(df)
 
-    def save_calculated_metric(self, df: pd.DataFrame):
-        if df.empty:
-            return
-        df = df.copy()
-        df["statement_type"] = "calculated"
-        required = ["company", "year", "statement_type", "concept", "value"]
-
-        if not all(c in df.columns for c in required):
-            print(f"   [DB Error] Missing cols: {df.columns}")
-            return
-
-        final_df = df[required]
-        with self._get_connection() as conn:
-            try:
-                cursor = conn.cursor()
-                for _, row in final_df.iterrows():
-                    cursor.execute(
-                        "DELETE FROM financials WHERE company=? AND year=? AND statement_type='calculated' AND concept=?",
-                        (row["company"], row["year"], row["concept"]),
-                    )
-                conn.commit()
-                final_df.to_sql("financials", conn, if_exists="append", index=False)
-                print(
-                    f"   [DB] Saved {len(final_df)} rows for '{final_df['concept'].iloc[0]}'."
-                )
-            except Exception as e:
-                print(f"   [DB] Error saving: {e}")
+    def save_calculated_metric(self, ticker: str, df: pd.DataFrame):
+        pass
 
 
 # --- EXAMPLE USAGE ---
