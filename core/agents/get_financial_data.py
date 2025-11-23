@@ -361,7 +361,72 @@ class FinancialDatabase:
         return self.pivot_data(df)
 
     def save_calculated_metric(self, ticker: str, df: pd.DataFrame):
-        pass
+        """
+        Persists calculated metrics into the database.
+        Transforms the 'wide' DataFrame (Years as columns) back into the 'long' database format.
+        """
+
+        if df is None or df.empty:
+            return
+
+        ticker = ticker.upper()
+        print(f"[DB] Saving calculated metrics for {ticker}...")
+
+        # 1. Reset index so 'concept' becomes a column we can manipulate
+        # Current: Index=Concept, Columns=Years
+        work_df = df.copy().reset_index()
+
+        # 2. Melt (Unpivot) the DataFrame
+        # Converts columns [2022, 2023, ...] into rows under a 'year' column
+        # id_vars='concept' keeps the concept name for every row
+        melted_df = work_df.melt(
+            id_vars=["concept"], var_name="year", value_name="value"
+        )
+
+        # Drop rows with NaN values or invalid years
+        melted_df.dropna(subset=["value", "year"], inplace=True)
+
+        # Add Schema Columns
+        melted_df["company"] = ticker
+        # We tag these as 'calculated' to distinguish from raw XBRL 'income'/'balance' data
+        melted_df["statement_type"] = "calculated"
+
+        # 4. Prepare for SQL Insertion
+        # Select specific columns in the order expected by the DB schema
+        # Schema: company, year, statement_type, concept, value
+        final_df = melted_df[["company", "year", "statement_type", "concept", "value"]]
+
+        final_df = final_df[
+            ~final_df["concept"].isin(self.get_all_concepts_for_company(ticker))
+        ]
+
+        # Convert to list of tuples for bulk insertion
+        data_tuples = list(final_df.itertuples(index=False, name=None))
+
+        if not data_tuples:
+            print("[DB] No valid data to save after cleaning.")
+            return
+
+        # 5. Execute Upsert (INSERT OR REPLACE)
+        # This ensures if we recalculate a metric, we update the old value instead of crashing
+        upsert_sql = """
+            INSERT OR REPLACE INTO financials (company, year, statement_type, concept, value)
+            VALUES (?, ?, ?, ?, ?)
+            """
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.executemany(upsert_sql, data_tuples)
+                conn.commit()
+            print(f"[DB] Successfully saved {len(data_tuples)} calculated data points.")
+
+            # Clear cache so subsequent reads pick up the new data
+            self.get_data.cache_clear()
+            self.get_concept.cache_clear()
+
+        except Exception as e:
+            print(f"[DB] Error saving calculated metrics: {e}")
 
 
 # --- EXAMPLE USAGE ---
