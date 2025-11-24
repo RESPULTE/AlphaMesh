@@ -1,8 +1,10 @@
 from typing import Literal
 
+from pydantic import BaseModel, Field
 import yfinance as yf
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
+from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from newspaper import Article
@@ -10,6 +12,7 @@ from newspaper import Article
 # --- Import Services ---
 from core.services import service_manager
 
+# --- Constants for Prompts ---
 # --- Constants for Prompts ---
 REWRITE_PROMPT = (
     "Look at the input and try to reason about the underlying semantic intent / meaning.\n"
@@ -29,6 +32,14 @@ GENERATE_PROMPT = (
     "Context: {context}"
 )
 
+GRADER_PROMPT = (
+    "You are a grader assessing whether a retrieved financial news article contains "
+    "sufficient information to answer a user question.\n\n"
+    "Retrieved Context:\n{context}\n\n"
+    "User Question:\n{question}\n\n"
+    "Assess if the context contains specific facts, numbers, or explanations required to answer the question. "
+    "If the context is vague, unrelated, or empty, mark as insufficient."
+)
 # --- Ingestion Logic ---
 
 
@@ -50,9 +61,11 @@ def fetch_and_ingest_stock_news(ticker: str, max_articles: int = 5):
         if new["content"]["contentType"] == "VIDEO":
             continue
 
-        url = new["content"]["clickThroughUrl"].get("url")
-        if url is None:
-            url = new["content"]["canonicalUrl"].get("url")
+        url = (
+            new["content"]["clickThroughUrl"].get("url")
+            if new["content"]["clickThroughUrl"] is not None
+            else new["content"]["canonicalUrl"].get("url")
+        )
 
         try:
             # Download Raw Article
@@ -123,39 +136,77 @@ def create_retriever_tool(ticker: str):
 # --- Graph Nodes ---
 
 
-def generate_query_or_respond(state: MessagesState, llm, retriever_tool):
+def generate_query_or_respond(state: MessagesState, llm: BaseChatModel, retriever_tool):
     """Decide whether to use the retriever tool or respond directly."""
     # Bind the specific tool for this ticker
     response = llm.bind_tools([retriever_tool]).invoke(state["messages"])
     return {"messages": [response]}
 
 
-def grade_documents(
-    state: MessagesState,
+# --- Data Models ---
+
+
+class RetrievalGrade(BaseModel):
+    """Binary score for retrieval sufficiency."""
+
+    is_sufficient: bool = Field(
+        description="True if the context provides enough information to answer the question, False otherwise."
+    )
+    reason: str = Field(
+        description="Brief explanation of why the context is sufficient or insufficient."
+    )
+
+
+# --- Hybrid Grading Function ---
+
+
+def hybrid_grade_documents(
+    state: MessagesState, llm: BaseChatModel
 ) -> Literal["generate_answer", "rewrite_question"]:
     """
-    Check if the tool returned valid content.
-    Note: The RAG Manager already performed semantic grading.
-    Here we just check if the result is empty.
+    Option B: Hybrid Heuristic + LLM Grading.
+
+    1. Heuristic: Checks for empty content or missing keywords (fast fail).
+    2. LLM: Self-assessment on semantic sufficiency.
     """
+    question = state["messages"][0].content
     last_message = state["messages"][-1]
 
-    # Ensure the last message is a ToolMessage
+    # --- 1. Heuristics (Fast Fail) ---
+
+    # A. Check if tool was actually called
     if not isinstance(last_message, ToolMessage):
-        # If the LLM didn't call a tool, we might need to force it or just end.
-        # For this flow, we assume tool usage.
         return "rewrite_question"
 
-    context = last_message.content
+    context = last_message.content.strip()
 
-    if "No relevant news found" in context or not context.strip():
-        print("--- No relevant documents found, rewriting question ---")
+    # B. Check for specific failure strings from the tool
+    if "No relevant news found" in context or not context:
+        print("--- Heuristic Fail: Empty or No News Found ---")
         return "rewrite_question"
 
-    return "generate_answer"
+    # C. Check for length (Too short implies lack of substance)
+    if len(context) < 100:
+        print("--- Heuristic Fail: Context too short ---")
+        return "rewrite_question"
+
+    # --- 2. LLM Self-Assessment (Slow Check) ---
+    print("--- Heuristics Passed. Running LLM Self-Assessment... ---")
+
+    grader_llm = llm.with_structured_output(RetrievalGrade)
+
+    prompt = GRADER_PROMPT.format(question=question, context=context)
+    grade_result = grader_llm.invoke(prompt)
+
+    if grade_result.is_sufficient:
+        print(f"--- Grading Passed: {grade_result.reason} ---")
+        return "generate_answer"
+    else:
+        print(f"--- Grading Failed: {grade_result.reason} ---")
+        return "rewrite_question"
 
 
-def rewrite_question(state: MessagesState, llm):
+def rewrite_question(state: MessagesState, llm: BaseChatModel):
     """Rewrite the original user question for better retrieval."""
     print("--- Rewriting Question ---")
     # Find the original user question (usually the first message)
@@ -165,7 +216,7 @@ def rewrite_question(state: MessagesState, llm):
     return {"messages": [{"role": "user", "content": response.content}]}
 
 
-def generate_answer(state: MessagesState, llm):
+def generate_answer(state: MessagesState, llm: BaseChatModel):
     """Generate a final answer using the retrieved context."""
     print("--- Generating Answer ---")
 
@@ -210,9 +261,10 @@ def create_graph_workflow(llm, retriever_tool):
         {"tools": "retrieve", END: "generate_answer"},
     )
 
+    # Updated Conditional Edge: Uses hybrid_grade_documents
     workflow.add_conditional_edges(
         "retrieve",
-        grade_documents,
+        lambda state: hybrid_grade_documents(state, llm),
         {"generate_answer": "generate_answer", "rewrite_question": "rewrite_question"},
     )
 
@@ -222,38 +274,38 @@ def create_graph_workflow(llm, retriever_tool):
     return workflow.compile()
 
 
-def run_analysis(ticker: str, question: str):
-    """
-    Main function to run the stock analysis agent.
-    """
-    print("--- Initializing Services ---")
-    llm = service_manager.get_agent()
-
-    # 1. Fetch & Store Data (Automatic Ingestion)
-    fetch_and_ingest_stock_news(ticker)
-
-    # 2. Create Tool wrapping the ServiceManager Retrieval
-    print(f"\n--- Creating Retriever Tool for {ticker} ---")
-    retriever_tool = create_retriever_tool(ticker)
-
-    # 3. Build Graph
-    print("\n--- Building Graph Workflow ---")
-    graph = create_graph_workflow(llm, retriever_tool)
-
-    # 4. Execute
-    print("\n--- Executing Graph ---")
-    initial_state = {"messages": [{"role": "user", "content": question}]}
-
-    for chunk in graph.stream(initial_state):
-        for node, update in chunk.items():
-            print(f"\n--- Update from node: {node} ---")
-            if hasattr(update["messages"][-1], "pretty_print"):
-                update["messages"][-1].pretty_print()
-            else:
-                print(update)
-
-
 if __name__ == "__main__":
+
+    def run_analysis(ticker: str, question: str):
+        """
+        Main function to run the stock analysis agent.
+        """
+        print("--- Initializing Services ---")
+        llm = service_manager.get_agent()
+
+        # 1. Fetch & Store Data (Automatic Ingestion)
+        fetch_and_ingest_stock_news(ticker)
+
+        # 2. Create Tool wrapping the ServiceManager Retrieval
+        print(f"\n--- Creating Retriever Tool for {ticker} ---")
+        retriever_tool = create_retriever_tool(ticker)
+
+        # 3. Build Graph
+        print("\n--- Building Graph Workflow ---")
+        graph = create_graph_workflow(llm, retriever_tool)
+
+        # 4. Execute
+        print("\n--- Executing Graph ---")
+        initial_state = {"messages": [{"role": "user", "content": question}]}
+
+        for chunk in graph.stream(initial_state):
+            for node, update in chunk.items():
+                print(f"\n--- Update from node: {node} ---")
+                if hasattr(update["messages"][-1], "pretty_print"):
+                    update["messages"][-1].pretty_print()
+                else:
+                    print(update)
+
     # --- User Input ---
     stock_ticker = "NVDA"
     user_question = "Why did NVDA stock go down recently?"

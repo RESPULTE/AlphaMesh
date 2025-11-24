@@ -229,7 +229,8 @@ class FinancialVectorStoreManager:
         # Here we assume the retriever is pre-configured or we use the vector_store directly for filtering.
 
         raw_docs = self._retrieve_documents(query, filter_dict)
-        return self.grade_documents(query, raw_docs)
+        filtered_docs = self.grade_documents(query, raw_docs)
+        return filtered_docs
 
     def _retrieve_documents(
         self, query: str, filter_dict: Optional[Dict] = None
