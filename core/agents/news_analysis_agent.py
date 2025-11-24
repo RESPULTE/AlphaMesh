@@ -1,28 +1,23 @@
 from typing import Literal
 
-import numpy as np
 import yfinance as yf
-from core.services import ServiceManager
-from langchain_core.documents import Document
-from langchain_core.vectorstores import InMemoryVectorStore
-from langchain_google_genai import (
-    ChatGoogleGenerativeAI,
-    GoogleGenerativeAI,
-    GoogleGenerativeAIEmbeddings,
-)
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from newspaper import Article
 
-# --- Constants for Prompts and Settings ---
+# --- Import Services ---
+from core.services import service_manager
+
+# --- Constants for Prompts ---
 REWRITE_PROMPT = (
     "Look at the input and try to reason about the underlying semantic intent / meaning.\n"
     "Here is the initial question:"
     "\n ------- \n"
     "{question}"
     "\n ------- \n"
-    "Formulate an improved question:"
+    "Formulate an improved question to search a financial database:"
 )
 
 GENERATE_PROMPT = (
@@ -34,132 +29,170 @@ GENERATE_PROMPT = (
     "Context: {context}"
 )
 
-SIMILARITY_THRESHOLD = 0.4  # Tune this based on experiments
+# --- Ingestion Logic ---
 
 
-def fetch_stock_news(
-    ticker: str, llm: GoogleGenerativeAI, max_articles: int = 5
-) -> list[Document]:
-    """Fetch raw articles and convert them into LangChain Documents (unsummarized)."""
+def fetch_and_ingest_stock_news(ticker: str, max_articles: int = 5):
+    """
+    Fetches raw articles using yfinance/newspaper and ingests them
+    into the centralized Vector Store via the Service Manager.
+    """
+    print(f"--- Fetching and Ingesting News for {ticker} ---")
 
-    def _summarize_article(text: str) -> str:
-        """Summarizes a single article using the provided language model."""
-        prompt = (
-            f"Summarize the following article about {ticker} stock. "
-            f"Include only the relevant parts related to the company's performance, "
-            f"financials, market reactions, or major events.\n\n{text}"
-        )
-        summary = llm.invoke(prompt).content
-        return summary
+    # Get the manager instance
+    rag_manager = service_manager.get_vector_store_manager()
 
     stock = yf.Ticker(ticker)
     news = stock.get_news(max_articles)
-    docs = []
+
+    count = 0
     for new in news:
         if new["content"]["contentType"] == "VIDEO":
             continue
+
+        url = new["content"]["clickThroughUrl"].get("url")
+        if url is None:
+            url = new["content"]["canonicalUrl"].get("url")
+
         try:
-            url = new["content"]["clickThroughUrl"].get("url")
-            if url is None:
-                url = new["content"]["canonicalUrl"].get("url")
+            # Download Raw Article
             article_raw = Article(url)
             article_raw.download()
             article_raw.parse()
-            text = _summarize_article(article_raw.text)
-            docs.append(
-                Document(
-                    page_content=text,
-                    metadata={"title": new["content"]["title"], "url": url},
-                )
+
+            # Prepare Metadata
+            source_meta = {
+                "url": url,
+                "title": new["content"]["title"],
+                "source": "Yahoo Finance",  # or extract from article_raw
+                "ticker": ticker,
+                "publish_time": new["content"]["pubDate"],
+            }
+
+            # Ingest into RAG System (Handles summarization & chunking internally)
+            success = rag_manager.ingest_article(
+                raw_text=article_raw.text, source_metadata=source_meta
             )
+
+            if success:
+                print(f"Successfully ingested: {new['content']['title']}")
+                count += 1
+            else:
+                print(f"Skipped (Duplicate or Empty): {new['content']['title']}")
+
         except Exception as e:
-            print(f"Error parsing {url}: {e}")
-    return docs
+            print(f"Error processing {url}: {e}")
+
+    print(f"--- Ingestion Complete. Added {count} articles. ---")
 
 
-def create_retriever_for_stock(
-    ticker: str,
-    docs: Document,
-    embedding_function: GoogleGenerativeAIEmbeddings,
-):
+# --- Tool Definition ---
+
+
+def create_retriever_tool(ticker: str):
     """
-    Creates a retriever tool for a given stock ticker by fetching,
-    loading, and processing its latest news.
+    Creates a tool that uses the ServiceManager's RAG capabilities
+    specifically filtered for the requested ticker.
     """
+    rag_manager = service_manager.get_vector_store_manager()
 
-    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=100, chunk_overlap=50
-    )
-    doc_splits = text_splitter.split_documents(docs)
+    @tool
+    def retrieve_news(query: str) -> str:
+        """
+        Search for news and financial data related to the stock.
+        Returns relevant context strings.
+        """
+        # Use the manager's retrieve method which handles embedding and grading
+        docs = rag_manager.retrieve(query=query, filter_dict={"ticker": ticker})
 
-    print(f"split '{len(docs)}' documents into '{len(doc_splits)}' splits")
+        if not docs:
+            return "No relevant news found."
 
-    vectorstore = InMemoryVectorStore.from_documents(
-        documents=doc_splits, embedding=embedding_function
-    )
-    retriever = vectorstore.as_retriever()
-    return retriever.as_tool(
-        name=f"{ticker}_news_retriever", description=f"Retriever for {ticker} news"
-    )
+        # Format documents into a context string
+        context = "\n\n".join(
+            [
+                f"Source: {doc.metadata.get('title', 'Unknown')}\nContent: {doc.page_content}"
+                for doc in docs
+            ]
+        )
+        return context
 
-
-# --- Utility Functions ---
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two vectors."""
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    return retrieve_news
 
 
 # --- Graph Nodes ---
+
+
 def generate_query_or_respond(state: MessagesState, llm, retriever_tool):
     """Decide whether to use the retriever tool or respond directly."""
+    # Bind the specific tool for this ticker
     response = llm.bind_tools([retriever_tool]).invoke(state["messages"])
     return {"messages": [response]}
 
 
 def grade_documents(
-    state: MessagesState, embedding_func: GoogleGenerativeAIEmbeddings
+    state: MessagesState,
 ) -> Literal["generate_answer", "rewrite_question"]:
-    """Determine if retrieved documents are relevant to the question."""
-    question = state["messages"][0].content
-    context = state["messages"][-1].content
+    """
+    Check if the tool returned valid content.
+    Note: The RAG Manager already performed semantic grading.
+    Here we just check if the result is empty.
+    """
+    last_message = state["messages"][-1]
 
-    question_emb = embedding_func.embed_query(question)
-    context_emb = embedding_func.embed_query(context)
-
-    similarity = _cosine_similarity(np.array(question_emb), np.array(context_emb))
-
-    if similarity > SIMILARITY_THRESHOLD:
-        return "generate_answer"
-    else:
+    # Ensure the last message is a ToolMessage
+    if not isinstance(last_message, ToolMessage):
+        # If the LLM didn't call a tool, we might need to force it or just end.
+        # For this flow, we assume tool usage.
         return "rewrite_question"
 
+    context = last_message.content
 
-def rewrite_question(state: MessagesState, llm: ChatGoogleGenerativeAI):
+    if "No relevant news found" in context or not context.strip():
+        print("--- No relevant documents found, rewriting question ---")
+        return "rewrite_question"
+
+    return "generate_answer"
+
+
+def rewrite_question(state: MessagesState, llm):
     """Rewrite the original user question for better retrieval."""
+    print("--- Rewriting Question ---")
+    # Find the original user question (usually the first message)
     question = state["messages"][0].content
     prompt = REWRITE_PROMPT.format(question=question)
     response = llm.invoke(prompt)
     return {"messages": [{"role": "user", "content": response.content}]}
 
 
-def generate_answer(state: MessagesState, llm: ChatGoogleGenerativeAI):
+def generate_answer(state: MessagesState, llm):
     """Generate a final answer using the retrieved context."""
+    print("--- Generating Answer ---")
+
+    # Get the original question
     question = state["messages"][0].content
-    context = state["messages"][-1].content
+
+    # Get the context from the last ToolMessage
+    # We iterate backwards to find the tool output
+    context = ""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, ToolMessage):
+            context = msg.content
+            break
+
     prompt = GENERATE_PROMPT.format(question=question, context=context)
     response = llm.invoke(prompt)
     return {"messages": [response]}
 
 
-def create_graph_workflow(
-    llm: ChatGoogleGenerativeAI,
-    embedding_func: GoogleGenerativeAIEmbeddings,
-    retriever_tool,
-):
+# --- Workflow Construction ---
+
+
+def create_graph_workflow(llm, retriever_tool):
     """Builds and compiles the LangGraph workflow."""
     workflow = StateGraph(MessagesState)
 
-    # Add nodes to the graph
+    # Add nodes
     workflow.add_node(
         "generate_query_or_respond",
         lambda state: generate_query_or_respond(state, llm, retriever_tool),
@@ -168,16 +201,21 @@ def create_graph_workflow(
     workflow.add_node("rewrite_question", lambda state: rewrite_question(state, llm))
     workflow.add_node("generate_answer", lambda state: generate_answer(state, llm))
 
-    # Define the graph edges
+    # Edges
     workflow.add_edge(START, "generate_query_or_respond")
+
     workflow.add_conditional_edges(
         "generate_query_or_respond",
         tools_condition,
         {"tools": "retrieve", END: "generate_answer"},
     )
+
     workflow.add_conditional_edges(
-        "retrieve", lambda state: grade_documents(state, embedding_func)
+        "retrieve",
+        grade_documents,
+        {"generate_answer": "generate_answer", "rewrite_question": "rewrite_question"},
     )
+
     workflow.add_edge("generate_answer", END)
     workflow.add_edge("rewrite_question", "generate_query_or_respond")
 
@@ -189,32 +227,26 @@ def run_analysis(ticker: str, question: str):
     Main function to run the stock analysis agent.
     """
     print("--- Initializing Services ---")
-    service_manager = ServiceManager()
     llm = service_manager.get_agent()
-    embedding_func = service_manager.get_embedding_func()
 
-    print(f"\n--- retrieving News Data for {ticker} ---")
-    docs = fetch_stock_news(ticker, llm)
+    # 1. Fetch & Store Data (Automatic Ingestion)
+    fetch_and_ingest_stock_news(ticker)
 
-    print(f"\n--- Creating Retriever for {ticker} ---")
-    retriever_tool = create_retriever_for_stock(
-        ticker=ticker, docs=docs, embedding_function=embedding_func
-    )
+    # 2. Create Tool wrapping the ServiceManager Retrieval
+    print(f"\n--- Creating Retriever Tool for {ticker} ---")
+    retriever_tool = create_retriever_tool(ticker)
 
-    if not retriever_tool:
-        print("Failed to create retriever tool. Exiting.")
-        return
-
+    # 3. Build Graph
     print("\n--- Building Graph Workflow ---")
-    graph = create_graph_workflow(llm, embedding_func, retriever_tool)
+    graph = create_graph_workflow(llm, retriever_tool)
 
+    # 4. Execute
     print("\n--- Executing Graph ---")
     initial_state = {"messages": [{"role": "user", "content": question}]}
 
     for chunk in graph.stream(initial_state):
         for node, update in chunk.items():
             print(f"\n--- Update from node: {node} ---")
-            # The final output is a message object, others might be dicts
             if hasattr(update["messages"][-1], "pretty_print"):
                 update["messages"][-1].pretty_print()
             else:

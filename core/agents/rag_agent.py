@@ -285,13 +285,7 @@ class FinancialVectorStoreManager:
 if __name__ == "__main__":
     from core.services import service_manager
 
-    manager = FinancialVectorStoreManager(
-        service_manager.get_vector_store_retriever(),
-        service_manager.get_agent(),
-        service_manager.get_embedding_func(),
-        service_manager.get_vector_store(),
-    )
-
+    manager = service_manager.get_vector_store_manager()
     # 2. Ingest
     article_text = "Apple Inc. (AAPL) reported Q4 revenue of $89.5B..."
     source_meta = {

@@ -5,6 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_neo4j import Neo4jGraph
 
 from core.agents.get_financial_data import FinancialDatabase
+from core.agents.rag_agent import FinancialVectorStoreManager
 
 
 class ServiceManager:
@@ -18,7 +19,9 @@ class ServiceManager:
         self._embedding_func = None
         self._graph = None
         self._vector_store = None
+
         self._financial_db = None
+        self._vector_store_manager = None
 
     def get_agent(self, temperature=0.0) -> ChatGoogleGenerativeAI:
         """Initializes and returns the language model instance."""
@@ -91,6 +94,21 @@ class ServiceManager:
                 print(f"Error initializing Financial Database: {e}")
                 raise
         return self._financial_db
+
+    def get_vector_store_manager(self):
+        if self._vector_store_manager is None:
+            try:
+                vector_store = self.get_vector_store()
+                self._vector_store_manager = FinancialVectorStoreManager(
+                    vector_store.as_retriever(),
+                    self.get_agent(temperature=0.0),
+                    self.get_embedding_func(),
+                    vector_store,
+                )
+            except Exception as e:
+                print(f"Error initializing Vector Store Manager: {e}")
+                raise
+        return self._vector_store_manager
 
 
 service_manager = ServiceManager()
