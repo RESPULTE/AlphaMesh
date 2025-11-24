@@ -3,7 +3,6 @@ from typing import Literal
 import numpy as np
 import yfinance as yf
 from core.services import ServiceManager
-from langchain_classic.tools.retriever import create_retriever_tool
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_google_genai import (
@@ -14,7 +13,7 @@ from langchain_google_genai import (
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
-from newspaper import article
+from newspaper import Article
 
 # --- Constants for Prompts and Settings ---
 REWRITE_PROMPT = (
@@ -39,7 +38,7 @@ SIMILARITY_THRESHOLD = 0.4  # Tune this based on experiments
 
 
 def fetch_stock_news(
-    ticker: str, llm: GoogleGenerativeAI, max_articles: int = 3
+    ticker: str, llm: GoogleGenerativeAI, max_articles: int = 5
 ) -> list[Document]:
     """Fetch raw articles and convert them into LangChain Documents (unsummarized)."""
 
@@ -57,9 +56,16 @@ def fetch_stock_news(
     news = stock.get_news(max_articles)
     docs = []
     for new in news:
+        if new["content"]["contentType"] == "VIDEO":
+            continue
         try:
-            url = new["content"]["clickThroughUrl"]["url"]
-            text = _summarize_article(article(url).text)
+            url = new["content"]["clickThroughUrl"].get("url")
+            if url is None:
+                url = new["content"]["canonicalUrl"].get("url")
+            article_raw = Article(url)
+            article_raw.download()
+            article_raw.parse()
+            text = _summarize_article(article_raw.text)
             docs.append(
                 Document(
                     page_content=text,
@@ -92,13 +98,9 @@ def create_retriever_for_stock(
         documents=doc_splits, embedding=embedding_function
     )
     retriever = vectorstore.as_retriever()
-
-    retriever_tool = create_retriever_tool(
-        retriever,
-        f"retrieve_stock_news_{ticker}",
-        f"Search and return information about {ticker} stock news.",
+    return retriever.as_tool(
+        name=f"{ticker}_news_retriever", description=f"Retriever for {ticker} news"
     )
-    return retriever_tool
 
 
 # --- Utility Functions ---

@@ -15,7 +15,7 @@ DEFAULT_YEARS = 5
 
 
 class FinancialDatabase:
-    def __init__(self, db_name: str = "financial_data.db"):
+    def __init__(self, db_name: str = "./data/financial_data.db"):
         self.db_name = db_name
         self._cached_existing_years = set()
         self.concept_resolver = {}

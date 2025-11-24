@@ -2,11 +2,11 @@ from dotenv import load_dotenv
 import os
 
 # Load environment variables from .env file
-load_dotenv(dotenv_path="./AlphaMesh/core/.env")
+load_dotenv(dotenv_path="./core/.env")
 
 
 class Settings:
-    GOOGLE_API_KEY = "AIzaSyD24xJig14J0PHnkyqxRe3P4HqM8tY8yDI"
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     NEO4J_URL = os.getenv("NEO4J_URL")
     NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
     NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
