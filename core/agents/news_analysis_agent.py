@@ -41,6 +41,7 @@ GRADER_PROMPT = (
     "If the context is vague, unrelated, or empty, mark as insufficient."
 )
 # --- Ingestion Logic ---
+NO_NEWS_ERROR_MESSAGE = "No relevant news found."
 
 
 def fetch_and_ingest_stock_news(ticker: str, max_articles: int = 5):
@@ -119,7 +120,7 @@ def create_retriever_tool(ticker: str):
         docs = rag_manager.retrieve(query=query, filter_dict={"ticker": ticker})
 
         if not docs:
-            return "No relevant news found."
+            return NO_NEWS_ERROR_MESSAGE
 
         # Format documents into a context string
         context = "\n\n".join(
@@ -181,7 +182,7 @@ def hybrid_grade_documents(
     context = last_message.content.strip()
 
     # B. Check for specific failure strings from the tool
-    if "No relevant news found" in context or not context:
+    if NO_NEWS_ERROR_MESSAGE in context or not context:
         print("--- Heuristic Fail: Empty or No News Found ---")
         return "rewrite_question"
 
@@ -258,7 +259,7 @@ def create_graph_workflow(llm, retriever_tool):
     workflow.add_conditional_edges(
         "generate_query_or_respond",
         tools_condition,
-        {"tools": "retrieve", END: "generate_answer"},
+        {"tools": "retrieve", END: END},
     )
 
     # Updated Conditional Edge: Uses hybrid_grade_documents
@@ -308,6 +309,8 @@ if __name__ == "__main__":
 
     # --- User Input ---
     stock_ticker = "NVDA"
-    user_question = "Why did NVDA stock go down recently?"
+    user_question = (
+        "Why did company exploded into cakes and butter raining swimming pool?"
+    )
 
     run_analysis(stock_ticker, user_question)
