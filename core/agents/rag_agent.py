@@ -193,7 +193,7 @@ class HybridRAGBuilder:
         better_query = chain.invoke({"query": query})
 
         return {
-            "query": better_query,
+            "query": better_query.content,
             "retrieval_attempts": state.get("retrieval_attempts", 0) + 1,
         }
 
@@ -410,7 +410,7 @@ def create_hybrid_rag_subgraph(
     llm: BaseChatModel,
     vector_store: Optional[VectorStore] = None,
     config: Optional[Dict[str, Any]] = None,
-) -> StateGraph:
+):
     """
     Creates a compiled LangGraph subgraph for Hybrid RAG.
 
@@ -431,25 +431,28 @@ def create_hybrid_rag_subgraph(
     return builder.build()
 
 
-app = create_hybrid_rag_subgraph()
-
 if __name__ == "__main__":
-    import asyncio
+    from core.services import service_manager
 
-    async def run_example():
-        initial_state: HybridRAGState = {
-            "query": "What is the capital of France?",
-            "original_query": "What is the capital of France?",
-            "documents": [],
-            "generation": "",
-            "retrieval_attempts": 0,
-            "is_relevant": False,
-            "is_grounded": False,
-            "upsert_status": "",
-            "error": None,
-        }
+    app = create_hybrid_rag_subgraph(
+        retriever=service_manager.get_vector_store_retriever(),
+        llm=service_manager.get_agent(),
+        vector_store=service_manager.get_vector_store(),
+    )
 
-        result = await app.invoke_async(initial_state)
-        print("Final Result:", result)
+    initial_state: HybridRAGState = {
+        "query": "What is the capital of France?",
+        "original_query": "What is the capital of France?",
+        "documents": [],
+        "generation": "",
+        "retrieval_attempts": 0,
+        "is_relevant": False,
+        "is_grounded": False,
+        "upsert_status": "",
+        "error": None,
+    }
 
-    asyncio.run(run_example())
+    for chunk in app.stream(initial_state):
+        for node, update in chunk.items():
+            print(f"\n--- Update from node: {node} ---")
+            print(update)

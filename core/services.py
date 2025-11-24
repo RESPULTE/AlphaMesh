@@ -78,6 +78,11 @@ class ServiceManager:
                 raise
         return self._vector_store
 
+    def get_vector_store_retriever(self):
+        """Returns a retriever from the Chroma vector store."""
+        vector_store = self.get_vector_store()
+        return vector_store.as_retriever()
+
     def get_financial_database(self) -> FinancialDatabase:
         if self._financial_db is None:
             try:
