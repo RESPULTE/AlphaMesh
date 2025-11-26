@@ -1,7 +1,0 @@
-# Format: RawTag = NORMALIZED_METRIC
-Revenues = REVENUE
-RevenueFromContractWithCustomerExcludingAssessedTax = REVENUE
-NetIncomeLoss = NET_INCOME
-Assets = TOTAL_ASSETS
-Liabilities = TOTAL_LIABILITIES
-NetCashProvidedByUsedInOperatingActivities = OPERATING_CASH_FLOW

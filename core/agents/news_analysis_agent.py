@@ -309,8 +309,6 @@ if __name__ == "__main__":
 
     # --- User Input ---
     stock_ticker = "NVDA"
-    user_question = (
-        "Why did company exploded into cakes and butter raining swimming pool?"
-    )
+    user_question = "Why did NVDA stock bad?"
 
     run_analysis(stock_ticker, user_question)
