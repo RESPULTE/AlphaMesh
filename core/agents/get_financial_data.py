@@ -1,12 +1,12 @@
-from collections.abc import Iterable
 import sqlite3
-import pandas as pd
-from edgar import Company, set_identity
+from collections.abc import Iterable
 from datetime import datetime
-from typing import List, Optional, Tuple, Union
 from functools import lru_cache
+from typing import List, Optional, Tuple, Union
 
+import pandas as pd
 from core.agents.concept_resolver import build_concept_resolver
+from edgar import Company, set_identity
 
 # --- CONFIGURATION ---
 USER_AGENT = "FinancialResearchBot student@university.edu"
@@ -318,6 +318,7 @@ class FinancialDatabase:
         keyword: str | Tuple[str],
         start_year: int | None = None,
         end_year: int | None = None,
+        exact: bool = False,
     ) -> pd.DataFrame:
         """
         Search for specific line items (e.g., 'Revenue', 'Net Income')
@@ -326,22 +327,30 @@ class FinancialDatabase:
 
         ticker = ticker.upper()
 
-        # --- Handle keyword(s) ---
-        if isinstance(keyword, Iterable):
-            like_clauses = " OR ".join(["concept LIKE ?" for _ in keyword])
-            search_terms = [f"%{kw}%" for kw in keyword]
+        # --- Normalize keyword(s) ---
+        if isinstance(keyword, Iterable) and not isinstance(keyword, str):
+            keywords = list(keyword)
         else:
-            like_clauses = "concept LIKE ?"
-            search_terms = [f"%{keyword}%"]
+            keywords = [keyword]
+
+        # --- Build where clause ---
+        if exact:
+            # Exact match (concept = ?)
+            clause = " OR ".join(["concept = ?" for _ in keywords])
+            params = keywords[:]  # no wildcards
+        else:
+            # Partial match (concept LIKE %kw%)
+            clause = " OR ".join(["concept LIKE ?" for _ in keywords])
+            params = [f"%{kw}%" for kw in keywords]
 
         # --- Build query ---
         query = f"""
             SELECT * FROM financials
             WHERE company = ?
-            AND ({like_clauses})
+            AND ({clause})
         """
 
-        params = [ticker] + search_terms
+        params = [ticker] + params
 
         if start_year is not None:
             query += " AND year >= ?"

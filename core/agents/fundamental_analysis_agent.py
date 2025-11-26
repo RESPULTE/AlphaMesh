@@ -1,17 +1,18 @@
 import datetime
-import re
-import pandas as pd
 import operator
-from typing import Any, List, Dict, Optional, Annotated
-from pydantic import BaseModel, ConfigDict, Field
+import re
+from typing import Annotated, Any, Dict, List, Optional
+
+import pandas as pd
+
+# --- LOCAL IMPORTS (Assumed existing) ---
+from core.services import service_manager
 
 # LangChain / LangGraph imports
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import StateGraph, START, END
-
-# --- LOCAL IMPORTS (Assumed existing) ---
-from core.services import service_manager
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, ConfigDict, Field
 
 # Initialize Resolver globally
 
@@ -104,37 +105,10 @@ def parser_node(state: InputState) -> AgentState:
     }
 
 
-def fetch_data_node(state: AgentState) -> AgentState:
-    """
-    Fetches data. If the tag isn't in state yet, it resolves it here first.
-    """
-    print(f"\n--- [Node] Fetcher ---")
-    print(f"Fetching data for ticker: {state.metric_to_process}")
-
-    db = service_manager.get_financial_database()
-    new_data = db.get_concept(
-        state.ticker,
-        tuple(state.metric_to_process),
-        state.period_start,
-        state.period_end,
-    )
-
-    if new_data is None or new_data.empty:
-        print(
-            f"[Fetcher] No data found for the company'{state.ticker}' (metrics to process: '{state.metric_to_process}')"
-        )
-
-    print(f"[Fetcher] Fetched data for {len(new_data)} metrics.")
-    print(new_data)
-
-    return {
-        "financial_data": (
-            state.financial_data.combine_first(new_data)
-            if not state.financial_data.empty
-            else new_data
-        ),
-        "metric_to_process": [],
-    }
+# ! update this to have metric_to_process if needed
+# ? assumes that the orchestrator gives out a structured response here
+class BatchResponse(BaseModel):
+    formulas: List[str]
 
 
 def decomposer_node(state: AgentState) -> Dict[str, Any]:
@@ -144,12 +118,10 @@ def decomposer_node(state: AgentState) -> Dict[str, Any]:
 
     print(f"--- [Decomposer] Batch processing: {state.formulas} ---")
 
-    class BatchResponse(BaseModel):
-        formulas: List[str]
-
     # Single API Call
     db = service_manager.get_financial_database()
 
+    # ! update this to have metric_to_process if needed
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -174,8 +146,8 @@ def decomposer_node(state: AgentState) -> Dict[str, Any]:
         {"metrics": ", ".join(state.formulas)}
     )
 
-    updated_metrics_to_process = state.formulas.copy()
-    updated_formulas = state.metric_to_process.copy()
+    updated_metrics_to_process = state.metric_to_process.copy()
+    updated_formulas = []
 
     for formula in res.formulas:
         updated_metrics_to_process.extend(re.findall(r"\((.*?)\)", formula))
@@ -184,10 +156,45 @@ def decomposer_node(state: AgentState) -> Dict[str, Any]:
         new_lhs = lhs.strip().replace(" ", "_")
         new_rhs = rhs.replace("(", "").replace(")", "")
         updated_formulas.append(f"{new_lhs} = {new_rhs}")
+        print(f"{new_lhs} = {new_rhs}")
 
     return {
         "formulas": updated_formulas,
         "metric_to_process": updated_metrics_to_process,
+    }
+
+
+def fetch_data_node(state: AgentState) -> AgentState:
+    """
+    Fetches data. If the tag isn't in state yet, it resolves it here first.
+    """
+    print(f"\n--- [Node] Fetcher ---")
+    print(f"Fetching data for ticker: {state.metric_to_process}")
+
+    db = service_manager.get_financial_database()
+    new_data = db.get_concept(
+        state.ticker,
+        tuple(state.metric_to_process),
+        state.period_start,
+        state.period_end,
+        exact=True,
+    )
+
+    if new_data is None or new_data.empty:
+        print(
+            f"[Fetcher] No data found for the company'{state.ticker}' (metrics to process: '{state.metric_to_process}')"
+        )
+
+    print(f"[Fetcher] Fetched data for {len(new_data)} metrics.")
+    print(new_data)
+
+    return {
+        "financial_data": (
+            state.financial_data.combine_first(new_data)
+            if not state.financial_data.empty
+            else new_data
+        ),
+        "metric_to_process": [],
     }
 
 
@@ -272,7 +279,7 @@ if __name__ == "__main__":
     user_input = {
         "messages": [
             HumanMessage(
-                content="Analyze revenue, earnings and free cash flow for META for last 3 years."
+                content="Analyze revenue, earnings and free cash flow, and debt to asset ratio for META for last 3 years."
             )
         ]
     }
