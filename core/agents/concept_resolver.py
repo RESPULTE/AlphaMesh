@@ -13,6 +13,7 @@ try:
 except Exception as e:
     print(f"[ConceptResolver] Error loading mapping file: {e}")
 COMMON_FINANCIAL_CONCEPTS = list(FINANCIAL_CONCEPT_MAPPING.keys())
+OFFICIAL_FINANCIAL_CONCEPTS = list(FINANCIAL_CONCEPT_MAPPING.values())
 
 
 def build_concept_resolver(company_concepts: List[str]):
@@ -60,10 +61,12 @@ def build_concept_resolver(company_concepts: List[str]):
         if not user_term:
             return None
 
-        for strategy in [resolve_exact_mapping, resolve_column_keyword]:
+        for strategy in [resolve_column_keyword]:
             col = strategy(user_term)
             if col:
                 return col
+
+        print(f"[ConceptResolver] Could not resolve concept for term '{user_term}'")
 
         return None
 

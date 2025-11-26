@@ -116,6 +116,7 @@ class FinancialDatabase:
                 columns={concept_col_name: "concept", value_col_name: "value"},
                 inplace=True,
             )
+            subset["concept"] = subset["concept"].str.removeprefix("us-gaap_")
 
         except KeyError:
             print(f"   Warning: Could not map columns for {stmt_type}")
@@ -160,7 +161,7 @@ class FinancialDatabase:
         # Check if we already have enough recent data to satisfy the request.
         # We look back (num_years + 1) to account for fiscal years ending in the previous calendar year.
         current_year = datetime.now().year
-        cutoff_year = current_year - (num_years + 2)
+        cutoff_year = current_year - (num_years + 1)
 
         # Count how many years in the DB are recent enough
         recent_years_count = sum(1 for y in existing_years if y > cutoff_year)
@@ -299,11 +300,9 @@ class FinancialDatabase:
     def pivot_data(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        return df.pivot_table(index=["concept"], columns="year", values="value")
-
-    def get_fiscal_year(self, ticker: str, year: int) -> pd.DataFrame:
-        """Fetch all data (all statements) for a specific year."""
-        return self.pivot_data(self.get_data(ticker, years=year))
+        return df.pivot_table(
+            index=["company", "concept"], columns="year", values="value"
+        )
 
     def resolve_concept(self, ticker: str, concept: str) -> str | None:
         if ticker not in self.concept_resolver:
@@ -380,7 +379,7 @@ class FinancialDatabase:
         # Converts columns [2022, 2023, ...] into rows under a 'year' column
         # id_vars='concept' keeps the concept name for every row
         melted_df = work_df.melt(
-            id_vars=["concept"], var_name="year", value_name="value"
+            id_vars=["company", "concept"], var_name="year", value_name="value"
         )
 
         # Drop rows with NaN values or invalid years

@@ -1,7 +1,8 @@
 import datetime
+import re
 import pandas as pd
 import operator
-from typing import Any, List, Dict, Optional, Annotated, Set
+from typing import Any, List, Dict, Optional, Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 # LangChain / LangGraph imports
@@ -11,10 +12,8 @@ from langgraph.graph import StateGraph, START, END
 
 # --- LOCAL IMPORTS (Assumed existing) ---
 from core.services import service_manager
-from core.agents.concept_resolver import COMMON_FINANCIAL_CONCEPTS
 
 # Initialize Resolver globally
-
 
 # -------------------------------------------------------------------
 # 1. STATE DEFINITIONS
@@ -35,11 +34,11 @@ class AgentState(InputState, OutputState):
     period_start: Optional[int] = None
     period_end: Optional[int] = None
 
-    metric_to_process: Set[str] = Field(default_factory=list)
-    composite_metrics: Dict[str, Set[str]] = Field(default_factory=dict)
+    metric_to_process: Annotated[list[str], operator.add] = Field(default_factory=list)
+    formulas: list[str] = Field(default_factory=list)
 
     # --- Data ---
-    financial_data: Optional[pd.DataFrame] = None
+    financial_data: pd.DataFrame = Field(default_factory=pd.DataFrame)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -84,25 +83,24 @@ def parser_node(state: InputState) -> AgentState:
         res.ticker.upper(), num_years=min(res.start_year, res.end_year, 5)
     )
 
-    metrics_to_process = set()
-    composite_metrics = dict()
+    metrics_to_process = []
+    formulas = []
     for metric in res.metrics:
         resolved_metric = db.resolve_concept(res.ticker.upper(), metric)
         print(f"[Fetcher] Resolving metric '{metric}' -> '{resolved_metric}'")
 
         if resolved_metric is None:
             print(f"[Fetcher] Could not resolve concept for '{metric}'")
-            composite_metrics[metric] = set()
+            formulas.append(metric)
             continue
-        metrics_to_process.add(resolved_metric)
+        metrics_to_process.append(resolved_metric)
 
     return {
         "ticker": res.ticker.upper(),
         "period_start": res.start_year,
         "period_end": res.end_year,
         "metric_to_process": metrics_to_process,
-        "composite_metrics": composite_metrics,
-        "financial_data": pd.DataFrame(),
+        "formulas": formulas,
     }
 
 
@@ -129,190 +127,92 @@ def fetch_data_node(state: AgentState) -> AgentState:
     print(f"[Fetcher] Fetched data for {len(new_data)} metrics.")
     print(new_data)
 
-    return {"financial_data": state.financial_data.combine_first(new_data)}
+    return {
+        "financial_data": (
+            state.financial_data.combine_first(new_data)
+            if not state.financial_data.empty
+            else new_data
+        ),
+        "metric_to_process": [],
+    }
 
 
 def decomposer_node(state: AgentState) -> Dict[str, Any]:
     # Extract the list of metrics needing decomposition
-    targets = state.composite_metrics.keys()
-    if not targets:
+    if len(state.formulas) == 0:
         return {}
 
-    llm = service_manager.get_agent(temperature=0)
-    print(f"--- [Decomposer] Batch processing: {targets} ---")
-
-    # Define Schema for Batch Processing
-    class Recipe(BaseModel):
-        metric: str
-        ingredients: Set[str]
+    print(f"--- [Decomposer] Batch processing: {state.formulas} ---")
 
     class BatchResponse(BaseModel):
-        breakdowns: List[Recipe]
+        formulas: List[str]
 
     # Single API Call
+    db = service_manager.get_financial_database()
+
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 "You are a financial decomposition assistant. "
-                "Break each metric into its constituent components using only these concepts:\n"
-                f"{COMMON_FINANCIAL_CONCEPTS}\n"
-                "Return a JSON list of objects with 'metric' and 'ingredients'. Obey instructions exactly.",
+                "For each requested metric, provide ONLY an explicit mathematical formula using exclusively the concepts listed below:\n"
+                f"{db.get_all_concepts_for_company(state.ticker)}\n"
+                "Rules:\n"
+                "1. The formula must strictly follow this style:\n"
+                "   metric = (concept_1) + (concept_2) - (concept_3) * (concept_4) / (concept_5)\n"
+                "2. Use brackets '()' around each constituent concept.\n"
+                "3. Use only +, -, *, / operators as appropriate.\n"
+                "4. Do NOT include explanations, text, or extra metadata.\n"
+                "5. Output exactly one formula per metric, nothing else.",
             ),
             ("human", "Metrics to decompose: {metrics}"),
         ]
     )
+    llm = service_manager.get_agent(temperature=0)
 
-    res = (prompt | llm.with_structured_output(BatchResponse)).invoke(
-        {"metrics": ", ".join(targets)}
+    res: BatchResponse = (prompt | llm.with_structured_output(BatchResponse)).invoke(
+        {"metrics": ", ".join(state.formulas)}
     )
 
-    updated_composite_metrics = state.composite_metrics.copy()
-    updated_metrics_to_process = state.metric_to_process.copy()
-    db = service_manager.get_financial_database()
-    for item in res.breakdowns:
-        if not item.ingredients:
-            continue
+    updated_metrics_to_process = state.formulas.copy()
+    updated_formulas = state.metric_to_process.copy()
 
-        print(f"   > {item.metric} -> {item.ingredients}")
+    for formula in res.formulas:
+        updated_metrics_to_process.extend(re.findall(r"\((.*?)\)", formula))
 
-        ingredients = set()
-        for i in item.ingredients:
-            resolved_ingredient = db.resolve_concept(state.ticker, i)
-            if resolved_ingredient is None:
-                print(
-                    f"[Decomposer] Could not resolve concept for ingredient '{i}' of composite metric '{item.metric}'"
-                )
-                continue
-            ingredients.add(resolved_ingredient)
-            print(f"[Decomposer] Resolved ingredient '{i}' to '{resolved_ingredient}'")
-
-        updated_composite_metrics[item.metric] = ingredients
-        updated_metrics_to_process.update(ingredients)
+        lhs, rhs = formula.split("=")
+        new_lhs = lhs.strip().replace(" ", "_")
+        new_rhs = rhs.replace("(", "").replace(")", "")
+        updated_formulas.append(f"{new_lhs} = {new_rhs}")
 
     return {
-        "composite_metrics": updated_composite_metrics,
+        "formulas": updated_formulas,
         "metric_to_process": updated_metrics_to_process,
     }
 
 
 def calculator_node(state: AgentState) -> AgentState:
-    print(f"\n--- [Node] Calculator (Row-Based) ---")
-
-    # 1. Load Data
-    df = state.financial_data.copy()
-    targets = list(state.composite_metrics.keys())
-
-    # Basic validation
-    if df is None or df.empty:
-        print("[Calculator] No financial data available.")
-        return {}
-
-    if not targets:
-        print("[Calculator] No composite metrics requested.")
-        return {}
-
-    llm = service_manager.get_agent()
-
-    # 2. Define the Schema
-    #    We instruct the agent that it is working with ROWS, not columns.
-    class FinancialFormula(BaseModel):
-        metric_name: str = Field(
-            description="The name of the new metric to be created (e.g., 'NetProfitMargin')"
-        )
-        expression: str = Field(
-            description=(
-                "A valid Python/Pandas expression to calculate this metric using Row-based operations. "
-                "The DataFrame 'df' has Metrics as the Index and Years as Columns. "
-                "You MUST use `df.loc['metric_name']` to access data. "
-                "Example: `df.loc['us-gaap_NetIncome'] / df.loc['us-gaap_Revenues']`"
-            )
-        )
-        reasoning: str = Field(
-            description="Why this formula is mathematically correct for the financial concept."
-        )
-
-    class CalculationPlan(BaseModel):
-        calculations: List[FinancialFormula]
-
-    # 3. Prepare Context for the Agent
-    #    We provide the exact list of available row indices (the us-gaap tags)
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                (
-                    "You are a Financial Data Engineer. You are working with a Time-Series DataFrame `df`.\n"
-                    "**Structure:**\n"
-                    "- Index (Rows): Financial Concepts (e.g., 'us-gaap_Assets')\n"
-                    "- Columns: Years (e.g., '2022', '2023')\n\n"
-                    "**Your Goal:** Generate Python expressions to calculate new financial metrics based on the user's request.\n"
-                    "**Rules:**\n"
-                    "1. You MUST access data using `df.loc['Exact_Index_Name']`.\n"
-                    "2. Operations should be vectorized (e.g., Row A / Row B).\n"
-                    "3. Do not use column access like `df['Name']`."
-                ),
-            ),
-            (
-                "human",
-                (
-                    f"Available Row Indices (Ingredients): {df.index.tolist()}\n\n"
-                    f"Requested Metrics to Calculate: {targets}\n\n"
-                    "Provide the Pandas formulas to compute these metrics as new rows."
-                ),
-            ),
-        ]
-    )
-
-    # 4. Invoke the Agent
-    try:
-        print(f"[Calculator] Planning formulas for: {targets}")
-        chain = prompt | llm.with_structured_output(CalculationPlan)
-        result = chain.invoke({})
-    except Exception as e:
-        print(f"[Calculator] Planning failed: {e}")
-        return {}
-
-    # 5. Execute the Formulas safely
-    calculated_count = 0
-
-    # Prepare the execution scope
-    # We make 'df' available, along with pandas for advanced logic if they need it
-    local_scope = {"df": df}
-    global_scope = {"pd": pd}
-
-    for calc in result.calculations:
-        print(f"   > Generating {calc.metric_name}...")
-        print(f"     Expression: {calc.expression}")
-
-        try:
-            # Evaluate the string expression generated by the LLM
-            # expected result is a pd.Series (Year 2022, Year 2023...)
-            computed_series = eval(calc.expression, global_scope, local_scope)
-
-            # Validate result shape (it should match the number of columns/years)
-            if isinstance(computed_series, (pd.Series, pd.DataFrame)):
-                # Add the new row to the DataFrame
-                # We use .loc to insert the new metric as a new row
-                df.loc[calc.metric_name] = computed_series
-                calculated_count += 1
-            else:
-                print(
-                    f"     [Warning] Result was not a Series/DataFrame. Got {type(computed_series)}."
-                )
-
-        except KeyError as e:
-            print(f"     [Error] Agent used a tag that doesn't exist in the index: {e}")
-        except Exception as e:
-            print(f"     [Error] Calculation syntax error: {e}")
-
-    print(f"[Calculator] Finished. Added {calculated_count} new rows.")
-
     db = service_manager.get_financial_database()
-    db.save_calculated_metric(state.ticker, df)
 
-    # Return updated state
-    return {"financial_data": df}
+    work_df = state.financial_data.T
+    work_df.columns = [concept for _, concept in work_df.columns]
+    for f in state.formulas:
+        try:
+            # lhs, rhs = f.split("=")
+            work_df.eval(f, inplace=True)
+            # state.financial_data.loc[(state.ticker, lhs)] = retval
+        except Exception as e:
+            print(f"could not process the formula: {f}\n, due to {e}")
+
+    work_df.columns = pd.MultiIndex.from_tuples(
+        [(state.ticker, concept) for concept in work_df.columns],
+        names=state.financial_data.index.names,
+    )
+    state.financial_data = work_df.T
+
+    db.save_calculated_metric(state.ticker, state.financial_data)
+
+    return {"financial_data": state.financial_data, "formulas": []}
 
 
 def analyst_node(state: AgentState) -> OutputState:
@@ -355,9 +255,10 @@ def build_graph():
     workflow.add_edge(START, "parser")
     workflow.add_edge("parser", "decomposer")
     workflow.add_edge("decomposer", "fetch_data")
+
     workflow.add_conditional_edges(
         "fetch_data",
-        lambda state: "calculator" if state.composite_metrics else "analyst",
+        lambda state: "calculator" if state.formulas else "analyst",
         {"calculator": "calculator", "analyst": "analyst"},
     )
     workflow.add_edge("calculator", "analyst")
@@ -371,7 +272,7 @@ if __name__ == "__main__":
     user_input = {
         "messages": [
             HumanMessage(
-                content="Analyze revenue, earnings and free cash flow for MSFT for last 3 years."
+                content="Analyze revenue, earnings and free cash flow for META for last 3 years."
             )
         ]
     }
