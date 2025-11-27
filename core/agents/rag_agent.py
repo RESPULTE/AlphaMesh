@@ -1,20 +1,20 @@
-import logging
 import hashlib
+import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
 from langchain_core.documents import Document
-from langchain_core.retrievers import BaseRetriever
-from langchain_core.vectorstores import VectorStore
-from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain_core.vectorstores import VectorStore
 
 # New Import for Semantic Chunking
 from langchain_experimental.text_splitter import SemanticChunker
+from pydantic import BaseModel, ConfigDict, Field
 
 # Configure Logging
 logger = logging.getLogger(__name__)
@@ -229,8 +229,9 @@ class FinancialVectorStoreManager:
         # Here we assume the retriever is pre-configured or we use the vector_store directly for filtering.
 
         raw_docs = self._retrieve_documents(query, filter_dict)
-        filtered_docs = self.grade_documents(query, raw_docs)
-        return filtered_docs
+        # filtered_docs = self.grade_documents(query, raw_docs)
+        # return filtered_docs
+        return raw_docs
 
     def _retrieve_documents(
         self, query: str, filter_dict: Optional[Dict] = None
@@ -252,30 +253,30 @@ class FinancialVectorStoreManager:
             logger.error(f"Retrieval failed: {e}")
             return []
 
-    def grade_documents(self, query: str, documents: List[Document]) -> List[Document]:
-        """
-        Grades relevance. Returns only relevant documents.
-        """
-        if not documents or not query:
-            return []
+    # def grade_documents(self, query: str, documents: List[Document]) -> List[Document]:
+    #     """
+    #     Grades relevance. Returns only relevant documents.
+    #     """
+    #     if not documents or not query:
+    #         return []
 
-        batch_inputs = [
-            {"query": query, "document": doc.page_content} for doc in documents
-        ]
+    #     batch_inputs = [
+    #         {"query": query, "document": doc.page_content} for doc in documents
+    #     ]
 
-        try:
-            scores = self._grader.batch(batch_inputs)
-        except Exception as e:
-            logger.error(f"Batch grading failed: {e}")
-            return []
+    #     try:
+    #         scores = self._grader.batch(batch_inputs)
+    #     except Exception as e:
+    #         logger.error(f"Batch grading failed: {e}")
+    #         return []
 
-        filtered_docs = []
-        for doc, score in zip(documents, scores):
-            if score.binary_score.lower() == "yes":
-                filtered_docs.append(doc)
+    #     filtered_docs = []
+    #     for doc, score in zip(documents, scores):
+    #         if score.binary_score.lower() == "yes":
+    #             filtered_docs.append(doc)
 
-        logger.info(f"Graded {len(documents)} docs. {len(filtered_docs)} relevant.")
-        return filtered_docs
+    #     logger.info(f"Graded {len(documents)} docs. {len(filtered_docs)} relevant.")
+    #     return filtered_docs
 
     # --- Helpers ---
 

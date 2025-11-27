@@ -7,7 +7,7 @@ from core.agents.fundamental_analysis_agent import (
 from core.agents.news_analysis_agent import (
     create_graph_workflow,
     create_retriever_tool,
-    fetch_and_ingest_stock_news,
+    query_and_ingest_stock_news,
 )
 
 # --- Service & Agent Imports ---
@@ -161,7 +161,7 @@ class AgentRegistry:
         """Factory method to get the correct graph."""
         if agent_type == AgentType.NEWS:
             llm = service_manager.get_agent()
-            fetch_and_ingest_stock_news(ticker)
+            query_and_ingest_stock_news(ticker)
             tool = create_retriever_tool(ticker)
             return create_graph_workflow(llm, tool)
 
