@@ -1,27 +1,20 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
 import yfinance as yf
-from langchain_core.messages import ToolMessage
-from langchain_core.tools import tool
-from langchain_core.language_models import BaseChatModel
-from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
-from newspaper import Article
 
 # --- Import Services ---
 from core.services import service_manager
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
+from newspaper import Article, ArticleException
+from pydantic import BaseModel, Field
 
 # --- Constants for Prompts ---
 # --- Constants for Prompts ---
-REWRITE_PROMPT = (
-    "Look at the input and try to reason about the underlying semantic intent / meaning.\n"
-    "Here is the initial question:"
-    "\n ------- \n"
-    "{question}"
-    "\n ------- \n"
-    "Formulate an improved question to search a financial database:"
-)
+
 
 GENERATE_PROMPT = (
     "You are an assistant for question-answering tasks. "
@@ -94,7 +87,7 @@ def fetch_and_ingest_stock_news(ticker: str, max_articles: int = 5):
             else:
                 print(f"Skipped (Duplicate or Empty): {new['content']['title']}")
 
-        except Exception as e:
+        except (Exception, ArticleException) as e:
             print(f"Error processing {url}: {e}")
 
     print(f"--- Ingestion Complete. Added {count} articles. ---")
@@ -207,16 +200,6 @@ def hybrid_grade_documents(
         return "rewrite_question"
 
 
-def rewrite_question(state: MessagesState, llm: BaseChatModel):
-    """Rewrite the original user question for better retrieval."""
-    print("--- Rewriting Question ---")
-    # Find the original user question (usually the first message)
-    question = state["messages"][0].content
-    prompt = REWRITE_PROMPT.format(question=question)
-    response = llm.invoke(prompt)
-    return {"messages": [{"role": "user", "content": response.content}]}
-
-
 def generate_answer(state: MessagesState, llm: BaseChatModel):
     """Generate a final answer using the retrieved context."""
     print("--- Generating Answer ---")
@@ -250,7 +233,6 @@ def create_graph_workflow(llm, retriever_tool):
         lambda state: generate_query_or_respond(state, llm, retriever_tool),
     )
     workflow.add_node("retrieve", ToolNode([retriever_tool]))
-    workflow.add_node("rewrite_question", lambda state: rewrite_question(state, llm))
     workflow.add_node("generate_answer", lambda state: generate_answer(state, llm))
 
     # Edges
@@ -263,52 +245,47 @@ def create_graph_workflow(llm, retriever_tool):
     )
 
     # Updated Conditional Edge: Uses hybrid_grade_documents
-    workflow.add_conditional_edges(
-        "retrieve",
-        lambda state: hybrid_grade_documents(state, llm),
-        {"generate_answer": "generate_answer", "rewrite_question": "rewrite_question"},
-    )
-
+    # workflow.add_conditional_edges(
+    #     "retrieve",
+    #     lambda state: hybrid_grade_documents(state, llm),
+    #     {"generate_answer": "generate_answer", "x": "x"},
+    # )
+    workflow.add_edge("retrieve", "generate_answer")
     workflow.add_edge("generate_answer", END)
-    workflow.add_edge("rewrite_question", "generate_query_or_respond")
 
     return workflow.compile()
 
 
+def run_analysis(ticker: str, question: str) -> str:
+    """
+    Main function to run the stock analysis agent.
+    """
+    print("--- Initializing News Analysis Services ---")
+    llm = service_manager.get_agent()
+
+    # 1. Fetch & Store Data (Automatic Ingestion)
+    fetch_and_ingest_stock_news(ticker)
+
+    # 2. Create Tool wrapping the ServiceManager Retrieval
+    print(f"\n--- Creating Retriever Tool for {ticker} ---")
+    retriever_tool = create_retriever_tool(ticker)
+
+    # 3. Build Graph
+    print("\n--- Building News Graph Workflow ---")
+    graph = create_graph_workflow(llm, retriever_tool)
+
+    # 4. Execute
+    print("\n--- Executing News Graph ---")
+    initial_state = {"messages": [{"role": "user", "content": question}]}
+    final_state = graph.invoke(initial_state)
+
+    return final_state["messages"][-1].content
+
+
 if __name__ == "__main__":
-
-    def run_analysis(ticker: str, question: str):
-        """
-        Main function to run the stock analysis agent.
-        """
-        print("--- Initializing Services ---")
-        llm = service_manager.get_agent()
-
-        # 1. Fetch & Store Data (Automatic Ingestion)
-        fetch_and_ingest_stock_news(ticker)
-
-        # 2. Create Tool wrapping the ServiceManager Retrieval
-        print(f"\n--- Creating Retriever Tool for {ticker} ---")
-        retriever_tool = create_retriever_tool(ticker)
-
-        # 3. Build Graph
-        print("\n--- Building Graph Workflow ---")
-        graph = create_graph_workflow(llm, retriever_tool)
-
-        # 4. Execute
-        print("\n--- Executing Graph ---")
-        initial_state = {"messages": [{"role": "user", "content": question}]}
-
-        for chunk in graph.stream(initial_state):
-            for node, update in chunk.items():
-                print(f"\n--- Update from node: {node} ---")
-                if hasattr(update["messages"][-1], "pretty_print"):
-                    update["messages"][-1].pretty_print()
-                else:
-                    print(update)
-
     # --- User Input ---
     stock_ticker = "NVDA"
     user_question = "Why did NVDA stock bad?"
-
-    run_analysis(stock_ticker, user_question)
+    result = run_analysis(stock_ticker, user_question)
+    print("\n--- Final News Analysis Result ---")
+    print(result)

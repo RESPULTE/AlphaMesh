@@ -45,7 +45,6 @@ class FinancialDatabase:
             )
             conn.commit()
 
-    @lru_cache(maxsize=100)
     def get_existing_years(self, ticker: str) -> set:
         if len(self._cached_existing_years) > 0:
             return self._cached_existing_years
@@ -156,14 +155,12 @@ class FinancialDatabase:
         ticker = ticker.upper()
         print(f"--- Processing {ticker} ---")
 
-        existing_years = self.get_existing_years(ticker)
-
         # Check if we already have enough recent data to satisfy the request.
         # We look back (num_years + 1) to account for fiscal years ending in the previous calendar year.
-        current_year = datetime.now().year
-        cutoff_year = current_year - (num_years + 1)
+        cutoff_year = datetime.now().year - (num_years + 1)
 
         # Count how many years in the DB are recent enough
+        existing_years = self.get_existing_years(ticker)
         recent_years_count = sum(1 for y in existing_years if y > cutoff_year)
 
         if recent_years_count >= num_years:
@@ -262,11 +259,10 @@ class FinancialDatabase:
 
         # self._cached_existing_years.update(list(range(current_year - 10, current_year + 1)))
 
-    @lru_cache(maxsize=100)
     def get_data(
         self,
         ticker: str,
-        years: Optional[List[int]] = [DEFAULT_YEARS],
+        years: Optional[List[int]] = DEFAULT_YEARS,
         statements: Union[str, List[str]] = ALL_STATEMENT_TYPE,
     ) -> pd.DataFrame:
         ticker = ticker.upper()
@@ -311,7 +307,6 @@ class FinancialDatabase:
 
         return self.concept_resolver[ticker](concept)
 
-    @lru_cache(maxsize=100)
     def get_concept(
         self,
         ticker: str,
@@ -428,10 +423,6 @@ class FinancialDatabase:
                 cursor.executemany(upsert_sql, data_tuples)
                 conn.commit()
             print(f"[DB] Successfully saved {len(data_tuples)} calculated data points.")
-
-            # Clear cache so subsequent reads pick up the new data
-            self.get_data.cache_clear()
-            self.get_concept.cache_clear()
 
         except Exception as e:
             print(f"[DB] Error saving calculated metrics: {e}")

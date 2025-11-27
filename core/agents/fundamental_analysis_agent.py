@@ -65,7 +65,9 @@ def parser_node(state: InputState) -> AgentState:
         [
             (
                 "system",
-                f"Current year: {current_year}. Extract Ticker, Year Range, and LIST of Metrics. Default to last 5 years. Return JSON.",
+                f"Current year: {current_year}. Extract Ticker, Year Range, and LIST of Metrics. Default to last 5 years if not specified.\n"
+                "Rules:\n"
+                "1 Return JSON.",
             ),
             ("human", "{query}"),
         ]
@@ -81,7 +83,7 @@ def parser_node(state: InputState) -> AgentState:
 
     db = service_manager.get_financial_database()
     db.update_company_data(
-        res.ticker.upper(), num_years=min(res.start_year, res.end_year, 5)
+        res.ticker.upper(), num_years=res.end_year - res.start_year + 1
     )
 
     metrics_to_process = []
@@ -146,7 +148,7 @@ def decomposer_node(state: AgentState) -> Dict[str, Any]:
         {"metrics": ", ".join(state.formulas)}
     )
 
-    updated_metrics_to_process = state.metric_to_process.copy()
+    updated_metrics_to_process = []
     updated_formulas = []
 
     for formula in res.formulas:
@@ -185,7 +187,12 @@ def fetch_data_node(state: AgentState) -> AgentState:
             f"[Fetcher] No data found for the company'{state.ticker}' (metrics to process: '{state.metric_to_process}')"
         )
 
-    print(f"[Fetcher] Fetched data for {len(new_data)} metrics.")
+    if len(new_data) != len(state.metric_to_process):
+        print(
+            f"[Error] metrics {set(state.metric_to_process) - set([c for _, c in new_data.index])} did not get fetched."
+        )
+    else:
+        print(f"[Fetcher] Fetched data for {len(new_data)} metrics.")
     print(new_data)
 
     return {
