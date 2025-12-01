@@ -1,309 +1,332 @@
 import datetime
 import operator
 import re
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, List, Optional, Type
 
 import pandas as pd
-
-# --- LOCAL IMPORTS (Assumed existing) ---
+from core.agents.base_agent import AbstractAgent, AgentOutput
 from core.services import service_manager
-
-# LangChain / LangGraph imports
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
-# Initialize Resolver globally
-
-# -------------------------------------------------------------------
-# 1. STATE DEFINITIONS
-# -------------------------------------------------------------------
+# --- Internal State Models ---
 
 
-class InputState(BaseModel):
+class _AgentState(BaseModel):
+    """
+    Internal state for the agent.
+    Includes fields from FundamentalAnalysisInput plus internal processing fields.
+    """
+
+    # Base message history
     messages: Annotated[List[BaseMessage], operator.add]
 
+    # Input fields mapped from FundamentalAnalysisInput
+    ticker: str = Field(default="")
+    metrics: List[str] = Field(default_factory=list)
+    start_year: int = Field(default=0)
+    end_year: int = Field(default=0)
 
-class OutputState(BaseModel):
-    messages: Annotated[List[BaseMessage], operator.add]
-
-
-class AgentState(InputState, OutputState):
-    # --- Scope ---
-    ticker: Optional[str] = None
-    period_start: Optional[int] = None
-    period_end: Optional[int] = None
-
-    metric_to_process: Annotated[list[str], operator.add] = Field(default_factory=list)
+    # Internal processing fields
+    metrics_to_process: Annotated[list[str], operator.add] = Field(default_factory=list)
     formulas: list[str] = Field(default_factory=list)
-
-    # --- Data ---
     financial_data: pd.DataFrame = Field(default_factory=pd.DataFrame)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
-# -------------------------------------------------------------------
-# 2. WORKER NODES
-# -------------------------------------------------------------------
-
-
-class ScopeParser(BaseModel):
-    ticker: str
-    start_year: int
-    end_year: int
-    metrics: List[str]
-
-
-def parser_node(state: InputState) -> AgentState:
-    print(f"\n--- [Node] Parser ---")
-    llm = service_manager.get_agent()
-    current_year = datetime.datetime.now().year
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                f"Current year: {current_year}. Extract Ticker, Year Range, and LIST of Metrics. Default to last 5 years if not specified.\n"
-                "Rules:\n"
-                "1 Return JSON.",
-            ),
-            ("human", "{query}"),
-        ]
-    )
-
-    # Safely handle input messages
-    query = state.messages[-1].content if state.messages else ""
-    res = (prompt | llm.with_structured_output(ScopeParser)).invoke({"query": query})
-
-    print(
-        f"[Parser] Extracted - Ticker: {res.ticker}, Years: {res.start_year}-{res.end_year}, Metrics: {res.metrics}"
-    )
-
-    db = service_manager.get_financial_database()
-    db.update_company_data(
-        res.ticker.upper(), num_years=res.end_year - res.start_year + 1
-    )
-
-    metrics_to_process = []
-    formulas = []
-    for metric in res.metrics:
-        resolved_metric = db.resolve_concept(res.ticker.upper(), metric)
-        print(f"[Fetcher] Resolving metric '{metric}' -> '{resolved_metric}'")
-
-        if resolved_metric is None:
-            print(f"[Fetcher] Could not resolve concept for '{metric}'")
-            formulas.append(metric)
-            continue
-        metrics_to_process.append(resolved_metric)
-
-    return {
-        "ticker": res.ticker.upper(),
-        "period_start": res.start_year,
-        "period_end": res.end_year,
-        "metric_to_process": metrics_to_process,
-        "formulas": formulas,
-    }
-
-
-# ! update this to have metric_to_process if needed
-# ? assumes that the orchestrator gives out a structured response here
-class BatchResponse(BaseModel):
+class _BatchResponse(BaseModel):
     formulas: List[str]
 
 
-def decomposer_node(state: AgentState) -> Dict[str, Any]:
-    # Extract the list of metrics needing decomposition
-    if len(state.formulas) == 0:
-        return {}
+# --- Public Input Schema ---
 
-    print(f"--- [Decomposer] Batch processing: {state.formulas} ---")
 
-    # Single API Call
-    db = service_manager.get_financial_database()
+class FundamentalAnalysisInput(BaseModel):
+    """Input schema for the Fundamental Analysis Agent."""
 
-    # ! update this to have metric_to_process if needed
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a financial decomposition assistant. "
-                "For each requested metric, provide ONLY an explicit mathematical formula using exclusively the concepts listed below:\n"
-                f"{db.get_all_concepts_for_company(state.ticker)}\n"
-                "Rules:\n"
-                "1. The formula must strictly follow this style:\n"
-                "   metric = (concept_1) + (concept_2) - (concept_3) * (concept_4) / (concept_5)\n"
-                "2. Use brackets '()' around each constituent concept.\n"
-                "3. Use only +, -, *, / operators as appropriate.\n"
-                "4. Do NOT include explanations, text, or extra metadata.\n"
-                "5. Output exactly one formula per metric, nothing else.",
-            ),
-            ("human", "Metrics to decompose: {metrics}"),
-        ]
+    ticker: str = Field(description="The stock ticker symbol to analyze.")
+    metrics: List[str] = Field(
+        description="The list of financial metrics to analyze (e.g., 'revenue', 'net income')."
     )
-    llm = service_manager.get_agent(temperature=0)
-
-    res: BatchResponse = (prompt | llm.with_structured_output(BatchResponse)).invoke(
-        {"metrics": ", ".join(state.formulas)}
+    start_year: Optional[int] = Field(
+        default=None,
+        description="The starting year for the analysis. Defaults to 5 years ago.",
+    )
+    end_year: Optional[int] = Field(
+        default=None,
+        description="The ending year for the analysis. Defaults to the current year.",
+    )
+    raw_input: str = Field(
+        description="The original user query for context in the final analysis."
     )
 
-    updated_metrics_to_process = []
-    updated_formulas = []
 
-    for formula in res.formulas:
-        updated_metrics_to_process.extend(re.findall(r"\((.*?)\)", formula))
-
-        lhs, rhs = formula.split("=")
-        new_lhs = lhs.strip().replace(" ", "_")
-        new_rhs = rhs.replace("(", "").replace(")", "")
-        updated_formulas.append(f"{new_lhs} = {new_rhs}")
-        print(f"{new_lhs} = {new_rhs}")
-
-    return {
-        "formulas": updated_formulas,
-        "metric_to_process": updated_metrics_to_process,
-    }
+# --- Agent Definition ---
 
 
-def fetch_data_node(state: AgentState) -> AgentState:
-    """
-    Fetches data. If the tag isn't in state yet, it resolves it here first.
-    """
-    print(f"\n--- [Node] Fetcher ---")
-    print(f"Fetching data for ticker: {state.metric_to_process}")
+class FundamentalAnalysisAgent(AbstractAgent):
+    """Agent for deep-dive quantitative analysis of company financials."""
 
-    db = service_manager.get_financial_database()
-    new_data = db.get_concept(
-        state.ticker,
-        tuple(state.metric_to_process),
-        state.period_start,
-        state.period_end,
-        exact=True,
-    )
+    def __init__(self):
+        super().__init__()
+        self._graph = self._build_graph()
 
-    if new_data is None or new_data.empty:
-        print(
-            f"[Fetcher] No data found for the company'{state.ticker}' (metrics to process: '{state.metric_to_process}')"
+    @property
+    def name(self) -> str:
+        return "fundamentals_agent"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Focuses on quantitative data: financial statements, balance sheets, "
+            "revenue numbers, margins, and growth ratios. Use this for questions "
+            "about a company's profitability, financial health, and valuation metrics."
         )
 
-    if len(new_data) != len(state.metric_to_process):
-        print(
-            f"[Error] metrics {set(state.metric_to_process) - set([c for _, c in new_data.index])} did not get fetched."
-        )
-    else:
-        print(f"[Fetcher] Fetched data for {len(new_data)} metrics.")
-    print(new_data)
+    @classmethod
+    def get_input_schema_class(cls) -> Type[BaseModel]:
+        return FundamentalAnalysisInput
 
-    return {
-        "financial_data": (
-            state.financial_data.combine_first(new_data)
+    def run(self, input_data: FundamentalAnalysisInput) -> AgentOutput:
+        """Executes the fundamental analysis workflow."""
+        print(
+            f"--- [Agent: {self.name}] Executing with input: {input_data.model_dump()} ---"
+        )
+
+        # Calculate default years if not provided
+        current_year = datetime.datetime.now().year
+        s_year = input_data.start_year if input_data.start_year else (current_year - 5)
+        e_year = input_data.end_year if input_data.end_year else current_year
+
+        # Construct the initial state to match _AgentState structure
+        initial_state = {
+            "messages": [HumanMessage(content=input_data.raw_input)],
+            "ticker": input_data.ticker.upper(),
+            "metrics": input_data.metrics,
+            "start_year": s_year,
+            "end_year": e_year,
+            # Initialize internal fields
+            "metrics_to_process": [],
+            "formulas": [],
+            "financial_data": pd.DataFrame(),
+        }
+
+        # Invoke the graph
+        final_state = self._graph.invoke(initial_state)
+
+        # The final output is in the 'messages' of the final state
+        output_content = final_state["messages"][-1].content
+
+        return AgentOutput(agent_name=self.name, output=output_content)
+
+    def _build_graph(self):
+        """Builds and compiles the LangGraph workflow."""
+        workflow = StateGraph(_AgentState)
+
+        workflow.add_node("parser", self._parser_node)
+        workflow.add_node("fetch_data", self._fetch_data_node)
+        workflow.add_node("decomposer", self._decomposer_node)
+        workflow.add_node("calculator", self._calculator_node)
+        workflow.add_node("analyst", self._analyst_node)
+
+        workflow.add_edge(START, "parser")
+        workflow.add_edge("parser", "decomposer")
+        workflow.add_edge("decomposer", "fetch_data")
+
+        workflow.add_conditional_edges(
+            "fetch_data",
+            lambda state: "calculator" if state.formulas else "analyst",
+            {"calculator": "calculator", "analyst": "analyst"},
+        )
+        workflow.add_edge("calculator", "analyst")
+        workflow.add_edge("analyst", END)
+
+        return workflow.compile()
+
+    # --- Node Implementations ---
+
+    def _parser_node(self, state: _AgentState) -> dict[str, Any]:
+        """
+        Parses the inputs in the state to prepare for data fetching.
+        """
+        print(f"\n--- [Node] Parser ---")
+
+        # Access data directly from the state object
+        ticker = state.ticker
+        start_year = state.start_year
+        end_year = state.end_year
+        metrics = state.metrics
+
+        print(
+            f"[Parser] Processing - Ticker: {ticker}, Years: {start_year}-{end_year}, Metrics: {metrics}"
+        )
+
+        db = service_manager.get_financial_database()
+        db.update_company_data(ticker, num_years=end_year - start_year + 1)
+
+        metrics_to_process = []
+        formulas = []
+
+        for metric in metrics:
+            resolved_metric = db.resolve_concept(ticker, metric)
+            print(f"[Parser] Resolving metric '{metric}' -> '{resolved_metric}'")
+
+            if resolved_metric is None:
+                print(
+                    f"[Parser] Could not resolve concept for '{metric}', treating as formula input."
+                )
+                formulas.append(metric)
+                continue
+            metrics_to_process.append(resolved_metric)
+
+        # Return updates to the state
+        return {
+            "metrics_to_process": metrics_to_process,
+            "formulas": formulas,
+        }
+
+    def _decomposer_node(self, state: _AgentState) -> dict[str, Any]:
+        if not state.formulas:
+            return {}
+
+        print(f"--- [Decomposer] Batch processing: {state.formulas} ---")
+        db = service_manager.get_financial_database()
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are a financial decomposition assistant. "
+                    "For each requested metric, provide ONLY an explicit mathematical formula using exclusively the concepts listed below:\n"
+                    f"{db.get_all_concepts_for_company(state.ticker)}\n"
+                    "Rules:\n"
+                    "1. The formula must strictly follow this style: metric = (concept_1) + (concept_2)\n"
+                    "2. Use brackets '()' around each constituent concept.\n"
+                    "3. Use only +, -, *, / operators.\n"
+                    "4. Output exactly one formula per metric, nothing else.",
+                ),
+                ("human", "Metrics to decompose: {metrics}"),
+            ]
+        )
+
+        llm = service_manager.get_agent(temperature=0)
+        res: _BatchResponse = (
+            prompt | llm.with_structured_output(_BatchResponse)
+        ).invoke({"metrics": ", ".join(state.formulas)})
+
+        updated_metrics = []
+        updated_formulas = []
+
+        for formula in res.formulas:
+            updated_metrics.extend(re.findall(r"\((.*?)\)", formula))
+            lhs, rhs = formula.split("=")
+            new_lhs = lhs.strip().replace(" ", "_")
+            new_rhs = rhs.replace("(", "").replace(")", "")
+            updated_formulas.append(f"{new_lhs} = {new_rhs}")
+
+        return {"formulas": updated_formulas, "metrics_to_process": updated_metrics}
+
+    def _fetch_data_node(self, state: _AgentState) -> dict[str, Any]:
+        print(f"\n--- [Node] Fetcher ---")
+        metrics = state.metrics_to_process or []
+
+        if not metrics:
+            return {}
+
+        print(f"Fetching data for ticker: {state.ticker} -> {metrics}")
+        db = service_manager.get_financial_database()
+
+        new_data = db.get_concept(
+            state.ticker,
+            tuple(metrics),
+            state.start_year,
+            state.end_year,
+            exact=True,
+        )
+
+        current_data = state.financial_data
+        combined_data = (
+            current_data.combine_first(new_data) if not current_data.empty else new_data
+        )
+
+        # Clear metrics_to_process as they are now in financial_data
+        return {"financial_data": combined_data, "metrics_to_process": []}
+
+    def _calculator_node(self, state: _AgentState) -> dict[str, Any]:
+        print(f"\n--- [Node] Calculator ---")
+        # Transpose for easier eval calculation (columns as variables)
+        work_df = state.financial_data.T
+
+        # Flatten MultiIndex if necessary or ensure simple column names for eval
+        # Assuming get_concept returns MultiIndex (Ticker, Metric)
+        work_df.columns = [concept for _, concept in work_df.columns]
+
+        for f in state.formulas:
+            try:
+                work_df.eval(f, inplace=True)
+            except Exception as e:
+                print(f"Could not process formula: {f}, due to {e}")
+
+        # Reconstruct MultiIndex columns
+        work_df.columns = pd.MultiIndex.from_tuples(
+            [(state.ticker, concept) for concept in work_df.columns],
+            names=state.financial_data.index.names,
+        )
+
+        calculated_data = work_df.T
+        db = service_manager.get_financial_database()
+        db.save_calculated_metric(state.ticker, calculated_data)
+
+        return {"financial_data": calculated_data, "formulas": []}
+
+    def _analyst_node(self, state: _AgentState) -> dict[str, Any]:
+        print(f"--- [Node] Analyst ---")
+        llm = service_manager.get_agent(temperature=0.7)
+        data_str = (
+            (state.financial_data).to_string()
             if not state.financial_data.empty
-            else new_data
-        ),
-        "metric_to_process": [],
-    }
+            else "No data available."
+        )
 
-
-def calculator_node(state: AgentState) -> AgentState:
-    db = service_manager.get_financial_database()
-
-    work_df = state.financial_data.T
-    work_df.columns = [concept for _, concept in work_df.columns]
-    for f in state.formulas:
-        try:
-            # lhs, rhs = f.split("=")
-            work_df.eval(f, inplace=True)
-            # state.financial_data.loc[(state.ticker, lhs)] = retval
-        except Exception as e:
-            print(f"could not process the formula: {f}\n, due to {e}")
-
-    work_df.columns = pd.MultiIndex.from_tuples(
-        [(state.ticker, concept) for concept in work_df.columns],
-        names=state.financial_data.index.names,
-    )
-    state.financial_data = work_df.T
-
-    db.save_calculated_metric(state.ticker, state.financial_data)
-
-    return {"financial_data": state.financial_data, "formulas": []}
-
-
-def analyst_node(state: AgentState) -> OutputState:
-    print(f"--- [Node] Analyst ---")
-    llm = service_manager.get_agent(temperature=1.0)
-    data_str = (
-        state.financial_data.to_string()
-        if state.financial_data is not None
-        else "No Data"
-    )
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", "You are a financial analyst. Answer based on the data."),
-            ("human", f"Query: {state.messages[-1].content}\n\nData:\n{data_str}"),
-        ]
-    )
-
-    return {"messages": [(prompt | llm).invoke({})]}
-
-
-# -------------------------------------------------------------------
-# 4. GRAPH CONSTRUCTION
-# -------------------------------------------------------------------
-
-
-def build_graph():
-    workflow = StateGraph(
-        AgentState, input_schema=InputState, output_schema=OutputState
-    )
-
-    # Add Nodes
-    workflow.add_node("parser", parser_node)
-    workflow.add_node("fetch_data", fetch_data_node)
-    workflow.add_node("decomposer", decomposer_node)
-    workflow.add_node("calculator", calculator_node)
-    workflow.add_node("analyst", analyst_node)
-
-    # Entry Point
-    workflow.add_edge(START, "parser")
-    workflow.add_edge("parser", "decomposer")
-    workflow.add_edge("decomposer", "fetch_data")
-
-    workflow.add_conditional_edges(
-        "fetch_data",
-        lambda state: "calculator" if state.formulas else "analyst",
-        {"calculator": "calculator", "analyst": "analyst"},
-    )
-    workflow.add_edge("calculator", "analyst")
-    workflow.add_edge("analyst", END)
-
-    return workflow.compile()
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are a senior financial analyst. Provide a clear, concise analysis based on the provided data. "
+                    "Explain the key trends and what they mean for the company.",
+                ),
+                (
+                    "human",
+                    f"Original Query: {state.messages[-1].content}\n\nData:\n{data_str}",
+                ),
+            ]
+        )
+        response = (prompt | llm).invoke({})
+        return {"messages": [response]}
 
 
 if __name__ == "__main__":
-    app = build_graph()
-    user_input = {
-        "messages": [
-            HumanMessage(
-                content="Analyze revenue, earnings and free cash flow, and debt to asset ratio for META for last 3 years."
-            )
-        ]
-    }
+    # 1. Create an instance of the agent
+    fundamental_agent = FundamentalAnalysisAgent()
 
+    # 2. Define the structured input for the agent
+    user_request = FundamentalAnalysisInput(
+        ticker="META",
+        metrics=["revenue", "net income", "free cash flow", "debt to asset ratio"],
+        start_year=2020,
+        end_year=2023,
+        raw_input="Analyze revenue, earnings and free cash flow, and debt to asset ratio for META for last 3 years.",
+    )
+
+    # 3. Execute the agent's run method
     print("Starting Agent...")
-    final_output = app.invoke(user_input)
+    final_output = fundamental_agent.run(user_request)
 
+    # 4. Print the result
     print("\n" + "=" * 40)
-    print(final_output["messages"][-1].content)
-
-    # from PIL import Image as PILImage
-    # import io
-
-    # png_data = app.get_graph().draw_mermaid_png()
-
-    # # Load into PIL
-    # img = PILImage.open(io.BytesIO(png_data))
-
-    # # Open in new window
-    # img.show()
+    print(f"Agent '{final_output.agent_name}' completed its analysis.")
+    print("Final Answer:")
+    print(final_output.output)
