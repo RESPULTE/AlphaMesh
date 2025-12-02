@@ -1,7 +1,8 @@
 # components/auth.py
 
 import streamlit as st
-from supabase import Client
+
+# from supabase import Client
 
 
 def set_auth_mode_and_show_modal(mode: str):

@@ -54,7 +54,6 @@ class OrchestratorAgent:
             func=agent_wrapper,
             name=agent_instance.name,
             description=agent_instance.description,
-            # This is the fix: It passes the full schema (types + descriptions) to the LLM
             args_schema=agent_instance.get_input_schema_class(),
         )
 
@@ -166,4 +165,8 @@ if __name__ == "__main__":
     orchestrator = OrchestratorAgent()
 
     # This should now correctly populate inputs because the LLM sees the Pydantic schema
-    print(orchestrator.run("Why did NVDA rise recently?"))
+    print(
+        orchestrator.run(
+            "Why did NVDA rise recently, does it have anything to do with its fcf?"
+        )
+    )
