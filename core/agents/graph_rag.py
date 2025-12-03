@@ -1,9 +1,9 @@
 """
-Evolving Knowledge Graph RAG System
+Evolving Temporal Graph RAG System
 Refactored for:
-1. Strict Property vs. Node separation (Fixing the 'John is a node' error).
-2. Modeling Learning Progress (Concepts, Skills, Goals).
-3. No Raw Chat Storage (Privacy focused).
+1. Temporal Awareness (Start/End dates on relationships).
+2. Dynamic State Management (Handling User preference shifts).
+3. Configuration-driven logic (No hardcoded if/else chains).
 """
 
 from typing import Any, Dict, List, Literal, Optional
@@ -16,142 +16,120 @@ from langchain_neo4j import Neo4jGraph
 from pydantic import BaseModel, Field
 
 # ============================================================================
-# 1. Strict Schema Definitions
+# 1. Temporal Schema & Configuration
 # ============================================================================
 
 # ALLOWED NODE TYPES
-# We intentionally REMOVED 'Person' to prevent the user from being duplicated.
-# If the user mentions "Elon Musk", that can be a 'KeyFigure' or generic 'Entity',
-# but the User themselves is handled via properties.
 AllowedNodeLabels = Literal[
-    "Concept",  # e.g., "Graph Databases", "Python"
-    "Skill",  # e.g., "System Design", "Prompt Engineering"
-    "Goal",  # e.g., "Build a RAG Agent"
-    "Resource",  # e.g., "Neo4j Documentation"
-    "Project",  # e.g., "My Chatbot"
-    "Inquiry",  # Abstracted question/topic of interest
+    "Concept",  # Python, App Development
+    "Skill",  # System Design
+    "Preference",  # Detailed, Brief, Visual (Abstract nodes for styles)
+    "Goal",  # Build a Chatbot
+    "Project",  # My Side Project
 ]
 
 # ALLOWED RELATIONSHIP TYPES
 AllowedRelTypes = Literal[
-    "INTERESTED_IN",  # User -> Concept
-    "LEARNING",  # User -> Skill (implies active study)
-    "MASTERED",  # User -> Skill (implies competence)
+    "HAS_PREFERENCE",  # User -> Preference (Exclusive: User usually has 1 active style)
+    "INTERESTED_IN",  # User -> Concept (Stateful: Can change to DISLIKES)
+    "DISLIKES",  # User -> Concept
+    "LEARNING",  # User -> Skill
+    "MASTERED",  # User -> Skill
     "WORKING_ON",  # User -> Project
-    "HAS_GOAL",  # User -> Goal
-    "RELATED_TO",  # Concept -> Concept
-    "REQUIRES",  # Goal -> Skill
 ]
+
+# --- DYNAMIC BEHAVIOR CONFIGURATION ---
+# This dictates how the Graph Manager handles updates.
+# NOTHING is hardcoded in the logic; it follows these rules.
+RELATIONSHIP_BEHAVIOR = {
+    # Rule: "EXCLUSIVE_CATEGORY"
+    # Meaning: User can only have ONE active relationship of this type to ANY node.
+    # Ex: If User sets "Brief" preference, close "Detailed" preference.
+    "HAS_PREFERENCE": "EXCLUSIVE_CATEGORY",
+    # Rule: "ENTITY_STATE"
+    # Meaning: User can only have ONE active relationship to a SPECIFIC node.
+    # Ex: If User "DISLIKES" App Dev, close "INTERESTED_IN" App Dev.
+    "INTERESTED_IN": "ENTITY_STATE",
+    "DISLIKES": "ENTITY_STATE",
+    "LEARNING": "ENTITY_STATE",
+    "MASTERED": "ENTITY_STATE",
+}
+
+# Grouping conflicting types for Entity State logic
+# If a new rel is in this group, close ALL other active rels in this group for that target.
+CONFLICTING_REL_GROUPS = {
+    "SENTIMENT": ["INTERESTED_IN", "DISLIKES"],
+    "PROFICIENCY": ["LEARNING", "MASTERED"],
+}
 
 
 class UserProfileUpdate(BaseModel):
-    """
-    Captures INTRINSIC attributes of the user.
-    These become PROPERTIES of the :User node, not separate nodes.
-    """
+    """Intrinsic properties of the User node (Name, Role)."""
 
-    name: Optional[str] = Field(None, description="The user's stated name.")
-    role: Optional[str] = Field(
-        None, description="Professional role (e.g., 'Backend Engineer')."
-    )
-    experience_level: Optional[str] = Field(
-        None, description="e.g., 'Junior', 'Senior', 'Beginner'."
-    )
-    learning_style: Optional[str] = Field(
-        None, description="e.g., 'Visual', 'Hands-on'."
-    )
-    current_focus: Optional[str] = Field(
-        None, description="What they are currently focused on generally."
-    )
+    name: Optional[str] = None
+    role: Optional[str] = None
+    experience_level: Optional[str] = None
 
 
 class GraphNode(BaseModel):
-    """Represents an EXTRINSIC entity (Concept, Skill, etc.)."""
+    """Extrinsic Entities."""
 
-    id: str = Field(description="Unique identifier (lowercase name).")
-    label: AllowedNodeLabels = Field(description="The category of the node.")
-    properties: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Metadata (e.g., {'difficulty': 'Hard', 'status': 'Active'}).",
-    )
+    id: str = Field(description="Unique ID (lowercase).")
+    label: AllowedNodeLabels
+    properties: Dict[str, Any] = Field(default_factory=dict)
 
 
 class GraphRelationship(BaseModel):
-    """Represents the connection between User and Concepts, or Concept to Concept."""
+    """Temporal Relationship Update."""
 
-    source: str = Field(description="Source node ID. Use 'CURRENT_USER' for the user.")
-    target: str = Field(description="Target node ID. Use 'CURRENT_USER' for the user.")
-    type: AllowedRelTypes = Field(description="Relationship type.")
-    properties: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Edge attributes (e.g., {'confidence': 0.8, 'date': '2023-10-10'}).",
-    )
+    source: str = Field(description="Source ID ('CURRENT_USER' for user).")
+    target: str = Field(description="Target ID.")
+    type: AllowedRelTypes
+    properties: Dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeGraphUpdate(BaseModel):
-    """The complete payload to update the User's Knowledge Graph."""
-
-    user_attributes: UserProfileUpdate = Field(
-        description="Updates to the User's own profile properties."
-    )
-    nodes: List[GraphNode] = Field(
-        default_factory=list, description="New concepts, skills, or goals."
-    )
-    relationships: List[GraphRelationship] = Field(
-        default_factory=list,
-        description="Connections identifying structure and progress.",
-    )
+    user_attributes: UserProfileUpdate
+    nodes: List[GraphNode]
+    relationships: List[GraphRelationship]
 
 
 # ============================================================================
-# 2. Strategic Knowledge Extractor
+# 2. Temporal Knowledge Extractor
 # ============================================================================
 
 
 class KnowledgeExtractor:
-    """
-    Distinguishes between User Attributes (Properties) and Knowledge Entities (Nodes).
-    """
-
     def __init__(self, llm):
         self.llm = llm.with_structured_output(KnowledgeGraphUpdate)
 
-    async def extract_knowledge(self, chat_history: List[Any]) -> KnowledgeGraphUpdate:
-
-        # We only analyze the recent context to keep extraction focused
-        recent_messages = chat_history[-4:]
+    async def extract_knowledge(self, conversation: List[Any]) -> KnowledgeGraphUpdate:
+        # We look at the last few messages to catch context changes
         formatted_history = "\n".join(
-            [f"{m.type.upper()}: {m.content}" for m in recent_messages]
+            [f"{m.type.upper()}: {m.content}" for m in conversation]
         )
 
-        system_prompt = """You are a Knowledge Graph Architect building a 'Learning Profile' for a user.
+        system_prompt = """You are a Temporal Knowledge Graph Architect.
+        Your goal is to capture the *current state* of the user's mind.
 
-YOUR GOAL:
-Map the user's conversation into a structured graph comprising:
-1. **User Properties (Intrinsic)**: Things the user IS (Name, Role, Experience). 
-   - Example: "I'm John" -> User Property `name="John"`. Do NOT make a Node.
-2. **Concepts & Skills (Extrinsic)**: Things the user interacts WITH.
-   - Example: "I'm learning Neo4j" -> Node `Neo4j` (Concept).
-3. **Relationships**: How the user relates to concepts (LEARNING, MASTERED, INTERESTED_IN).
+        RULES:
+        1. **Detect Changes**: If the user says "I used to like X, but now I hate it", output a `DISLIKES` relationship. The system will automatically archive the old `INTERESTED_IN` relationship.
+        2. **Preferences**: If the user says "Give me brief answers", connect User -> `Brief` (Preference).
+        3. **User Anchor**: Use 'CURRENT_USER' as the ID for the user.
 
-CRITICAL RULES:
-- **NO CHAT LOGS**: Do not store the raw message text. Abstract it into concepts or goals.
-- **The 'John' Rule**: If the user gives their name, it is a PROPERTY of the User node. NOT a separate Person node.
-- **Relationship Directions**: 
-  - User -> Concept (INTERESTED_IN)
-  - Project -> Requires -> Skill
-- **Inquiry Handling**: If the user asks a complex question, create an `:Inquiry` node with a summary topic, not the full text.
+        RELATIONSHIP TYPES:
+        - HAS_PREFERENCE: For communication styles (Brief, Detailed, Code-Only).
+        - INTERESTED_IN / DISLIKES: For concepts/topics.
+        - LEARNING / MASTERED: For skills.
 
-Analyze the following interaction:
-"""
-
+        Extract the CURRENT truth. Do not worry about the past; the database handles history.
+        """
         prompt = ChatPromptTemplate.from_messages(
             [("system", system_prompt), ("human", formatted_history)]
         )
 
         try:
-            chain = prompt | self.llm
-            return await chain.ainvoke({})
+            return await (prompt | self.llm).ainvoke({})
         except Exception as e:
             print(f"Extraction Error: {e}")
             return KnowledgeGraphUpdate(
@@ -160,14 +138,14 @@ Analyze the following interaction:
 
 
 # ============================================================================
-# 3. Graph Manager (The Storage Engine)
+# 3. Temporal Graph Manager (The Dynamic Engine)
 # ============================================================================
 
 
-class GraphManager:
+class TemporalGraphManager:
     """
-    Handles the physical storage of nodes and properties.
-    Separates 'User Property Updates' from 'Graph Topology Updates'.
+    Manages graph updates with Time-Travel capabilities.
+    Automatically 'closes' old relationships based on behavior configuration.
     """
 
     def __init__(self, graph: Neo4jGraph):
@@ -175,12 +153,11 @@ class GraphManager:
         self._initialize_schema()
 
     def _initialize_schema(self):
-        """Ensures the graph is optimized for this schema."""
         constraints = [
             "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
-            "CREATE CONSTRAINT concept_id IF NOT EXISTS FOR (c:Concept) REQUIRE c.id IS UNIQUE",
-            "CREATE CONSTRAINT skill_id IF NOT EXISTS FOR (s:Skill) REQUIRE s.id IS UNIQUE",
             "CREATE INDEX node_id IF NOT EXISTS FOR (n:Entity) ON (n.id)",
+            # Index for performance on checking active relationships
+            "CREATE INDEX rel_end_date IF NOT EXISTS FOR ()-[r:HAS_PREFERENCE]-() ON (r.end_date)",
         ]
         for q in constraints:
             try:
@@ -190,116 +167,159 @@ class GraphManager:
 
     def update_graph(self, user_id: str, knowledge: KnowledgeGraphUpdate):
         """
-        Orchestrates the update:
-        1. Update User Properties (SET)
-        2. Merge Nodes (MERGE)
-        3. Merge Relationships (MERGE)
+        Transactional update wrapper.
         """
-
         # 1. Update User Properties
-        # Filter out None values to avoid overwriting existing data with nulls
         user_props = {
             k: v
             for k, v in knowledge.user_attributes.model_dump().items()
             if v is not None
         }
-
         if user_props:
             self.graph.query(
-                """
-                MERGE (u:User {id: $user_id})
-                SET u += $props, u.last_active = timestamp()
-                """,
+                "MERGE (u:User {id: $user_id}) SET u += $props, u.last_active = datetime()",
                 {"user_id": user_id, "props": user_props},
             )
 
-        # 2. Upsert Nodes
+        # 2. Upsert Nodes (Standard MERGE)
         for node in knowledge.nodes:
-            # We explicitly prevent 'User' or 'Person' labels coming from the generic node list
-            # to ensure the "John is a node" error never recurs.
-            if node.label in ["User", "Person"]:
+            if node.label == "User":
                 continue
-
             query = f"""
             MERGE (n:{node.label} {{id: $id}})
-            ON CREATE SET n += $props, n.created_at = timestamp()
-            ON MATCH SET n += $props, n.updated_at = timestamp()
+            ON CREATE SET n += $props, n.created_at = datetime()
+            ON MATCH SET n += $props, n.updated_at = datetime()
             """
             self.graph.query(query, {"id": node.id, "props": node.properties})
 
-        # 3. Upsert Relationships
+        # 3. Handle Temporal Relationships
         for rel in knowledge.relationships:
-            # Resolve 'CURRENT_USER' placeholder to actual ID
-            source = user_id if rel.source == "CURRENT_USER" else rel.source
-            target = user_id if rel.target == "CURRENT_USER" else rel.target
+            self._upsert_temporal_relationship(user_id, rel)
 
-            # Skip self-loops if extraction failed
-            if source == target:
-                continue
-
-            query = f"""
-            MATCH (s {{id: $source}})
-            MATCH (t {{id: $target}})
-            MERGE (s)-[r:{rel.type}]->(t)
-            ON CREATE SET r += $props, r.created_at = timestamp()
-            ON MATCH SET r += $props, r.updated_at = timestamp()
-            """
-            try:
-                self.graph.query(
-                    query, {"source": source, "target": target, "props": rel.properties}
-                )
-            except Exception as e:
-                print(f"Rel Error ({rel.type}): {e}")
-
-    def get_user_learning_state(self, user_id: str) -> str:
+    def _upsert_temporal_relationship(self, user_id: str, rel: GraphRelationship):
         """
-        Retrieves a semantic summary of the user's graph.
-        Focuses on what they are learning, working on, and their goals.
+        The core logic for handling state changes dynamically.
+        """
+        source = user_id if rel.source == "CURRENT_USER" else rel.source
+        target = user_id if rel.target == "CURRENT_USER" else rel.target
+
+        behavior = RELATIONSHIP_BEHAVIOR.get(rel.type, "STANDARD")
+
+        # LOGIC BRANCH 1: Exclusive Category (e.g., Preference Style)
+        # "User can have only ONE active 'HAS_PREFERENCE' relationship total."
+        if behavior == "EXCLUSIVE_CATEGORY":
+            print("Exclusive Category Behavior:")
+            print(f"Closing all active '{rel.type}' relationships for {source}.")
+
+            self._close_category_relationships(source, rel.type)
+            self._create_new_active_relationship(
+                source, target, rel.type, rel.properties
+            )
+
+        # LOGIC BRANCH 2: Entity State (e.g., Interest vs Dislike)
+        # "User can have only ONE active sentiment towards 'App Dev'."
+        elif behavior == "ENTITY_STATE":
+            print("Entity State Behavior:")
+            print(f"Closing all active '{rel.type}' relationships for {target}.")
+
+            # Determine which types conflict with this one (e.g., INTERESTED_IN conflicts with DISLIKES)
+            conflicting_types = self._get_conflicting_types(rel.type)
+            self._close_entity_state_relationships(source, target, conflicting_types)
+            self._create_new_active_relationship(
+                source, target, rel.type, rel.properties
+            )
+
+        # LOGIC BRANCH 3: Standard (Accumulative)
+        else:
+            print("Standard Behavior:")
+            print(f"Creating new '{rel.type}' relationship for {source} -> {target}.")
+            self._create_new_active_relationship(
+                source, target, rel.type, rel.properties
+            )
+
+    def _get_conflicting_types(self, rel_type: str) -> List[str]:
+        """Finds all relationship types that conflict with the new one."""
+        for group in CONFLICTING_REL_GROUPS.values():
+            if rel_type in group:
+                print(f"Conflict Group: {group}")
+                return group
+        return [rel_type]  # Default: conflicts with itself
+
+    def _close_category_relationships(self, source_id: str, rel_type: str):
+        """Closes ANY active relationship of this type from the source."""
+        query = f"""
+        MATCH (s {{id: $source}})-[r:{rel_type}]->()
+        WHERE r.end_date IS NULL
+        SET r.end_date = datetime()
+        """
+        self.graph.query(query, {"source": source_id})
+
+    def _close_entity_state_relationships(
+        self, source_id: str, target_id: str, types: List[str]
+    ):
+        """Closes active relationships of specific types between specific nodes."""
+        # Dynamic type matching in Cypher requires listing or APOC.
+        # We'll stick to a WHERE clause for safety without APOC.
+        types_str = "|".join([f"`{t}`" for t in types])
+        query = f"""
+        MATCH (s {{id: $source}})-[r:{types_str}]->(t {{id: $target}})
+        WHERE r.end_date IS NULL
+        SET r.end_date = datetime()
+        """
+        self.graph.query(query, {"source": source_id, "target": target_id})
+
+    def _create_new_active_relationship(
+        self, source: str, target: str, rel_type: str, props: dict
+    ):
+        """Creates the new relationship with start_date = now and end_date = null."""
+        query = f"""
+        MATCH (s {{id: $source}})
+        MATCH (t {{id: $target}})
+        CREATE (s)-[r:{rel_type}]->(t)
+        SET r += $props, r.start_date = datetime(), r.end_date = null
+        """
+        self.graph.query(query, {"source": source, "target": target, "props": props})
+
+    def get_current_user_state(self, user_id: str) -> str:
+        """
+        Fetches ONLY active relationships (where end_date is null).
         """
         query = """
         MATCH (u:User {id: $user_id})
         
-        // Get User Properties
-        WITH u
+        // Active Preferences
+        OPTIONAL MATCH (u)-[r1:HAS_PREFERENCE]->(p:Preference)
+        WHERE r1.end_date IS NULL
+        WITH u, collect(p.id) as preferences
         
-        // Get Active Interests & Skills
-        OPTIONAL MATCH (u)-[r1:INTERESTED_IN|LEARNING|MASTERED]->(c)
-        WITH u, collect(c.id + ' (' + type(r1) + ')') as interests
+        // Active Interests
+        OPTIONAL MATCH (u)-[r2:INTERESTED_IN]->(c:Concept)
+        WHERE r2.end_date IS NULL
+        WITH u, preferences, collect(c.id) as interests
         
-        // Get Goals
-        OPTIONAL MATCH (u)-[:HAS_GOAL]->(g:Goal)
-        WITH u, interests, collect(g.id) as goals
+        // Active Dislikes (Important context!)
+        OPTIONAL MATCH (u)-[r3:DISLIKES]->(d:Concept)
+        WHERE r3.end_date IS NULL
+        WITH u, preferences, interests, collect(d.id) as dislikes
         
-        // Get Current Projects
-        OPTIONAL MATCH (u)-[:WORKING_ON]->(p:Project)
-        WITH u, interests, goals, collect(p.id) as projects
-        
-        RETURN u {.*, id: null} as profile, interests, goals, projects
+        RETURN u {.*, id:null, created_at:null, last_active:null} as profile, 
+               preferences, interests, dislikes
         """
 
         data = self.graph.query(query, {"user_id": user_id})
         if not data:
-            return "New User."
+            return "New User"
 
-        record = data[0]
-
-        # Format for LLM Context
-        context = "User Profile:\n"
-        for k, v in record["profile"].items():
-            if k not in ["created_at", "last_active"]:
-                context += f"- {k}: {v}\n"
-
-        context += (
-            f"\nLearning Journey:\n- Concepts: {', '.join(record['interests'])}\n"
-        )
-        context += f"- Active Goals: {', '.join(record['goals'])}\n"
-        context += f"- Projects: {', '.join(record['projects'])}\n"
-
-        return context
+        rec = data[0]
+        return f"""Current Profile:
+Attributes: {rec['profile']}
+Active Preferences: {rec['preferences']}
+Current Interests: {rec['interests']}
+Known Dislikes: {rec['dislikes']}"""
 
 
 # ============================================================================
-# 4. Main Agent Controller
+# 4. Main Agent
 # ============================================================================
 
 
@@ -308,117 +328,143 @@ class EvolvingGraphRAGAgent:
         self.user_id = user_id
         self.graph = graph
         self.llm = llm
-
-        self.graph_manager = GraphManager(self.graph)
+        self.manager = TemporalGraphManager(self.graph)
         self.extractor = KnowledgeExtractor(self.llm)
-        self.chat_history: List[Any] = []
 
     async def process_interaction(self, user_input: str) -> str:
-        # 1. Get Graph Context (The User's "State")
-        user_state = self.graph_manager.get_user_learning_state(self.user_id)
+        # 1. Get Current State
+        state = self.manager.get_current_user_state(self.user_id)
 
-        # 2. Generate Response (Using State + History)
-        response = await self._generate_response(user_input, user_state)
+        # 2. Generate Response
+        response = await self._generate_response(user_input, state)
 
-        # 3. Update History (In-memory only)
-        self.chat_history.append(HumanMessage(content=user_input))
-        self.chat_history.append(AIMessage(content=response))
-
-        # 4. Evolve Graph (Extract & Update)
-        # We pass the history so the LLM understands "it", "that", etc.
-        knowledge = await self.extractor.extract_knowledge(self.chat_history)
-
-        # 5. Post-Process: Anchor relationships to the User
-        self._anchor_knowledge_to_user(knowledge)
-
-        # 6. Commit to DB
-        self.graph_manager.update_graph(self.user_id, knowledge)
+        # 3. Extract & Evolve
+        knowledge = await self.extractor.extract_knowledge(
+            [HumanMessage(content=user_input), AIMessage(content=response)]
+        )
+        self.manager.update_graph(self.user_id, knowledge)
 
         return response
 
-    async def _generate_response(self, user_input: str, user_state: str) -> str:
-        system_msg = f"""You are a personalized AI tutor.
+    async def _generate_response(self, user_input: str, state: str) -> str:
+        system_msg = f"""You are a helpful assistant.
         
-USER STATE (Knowledge Graph):
-{user_state}
+        USER'S CURRENT CONTEXT:
+        {state}
 
-INSTRUCTIONS:
-- Adapt your difficulty level based on the user's 'experience_level' and 'mastered' skills.
-- If the user has a Goal, help them towards it.
-- If the user mentions a Project, ask about its progress.
-- Do NOT explicitly say "According to your graph...". Be natural.
-"""
-        messages = (
-            [SystemMessage(content=system_msg)]
-            + self.chat_history[-6:]
-            + [HumanMessage(content=user_input)]
-        )
-        response = await self.llm.ainvoke(messages)
-        return response.content
-
-    def _anchor_knowledge_to_user(self, knowledge: KnowledgeGraphUpdate):
+        NOTE:
+        - If the user has 'Dislikes', do NOT suggest those topics.
+        - Adapt to their 'Active Preferences' (e.g., if 'brief', be concise).
         """
-        Ensures relationships meant for the user are correctly ID'd.
-        The LLM is prompted to use 'CURRENT_USER', but we double check.
-        """
-        # If the LLM inferred "user" or "me" as a source/target, normalize it.
-        for rel in knowledge.relationships:
-            if rel.source.lower() in ["user", "me", "self", "current_user"]:
-                rel.source = "CURRENT_USER"  # Handled in GraphManager
-            if rel.target.lower() in ["user", "me", "self", "current_user"]:
-                rel.target = "CURRENT_USER"
+        messages = [SystemMessage(content=system_msg)] + [
+            HumanMessage(content=user_input)
+        ]
+        return (await self.llm.ainvoke(messages)).content
 
 
 # ============================================================================
-# Example Usage
+# Example Execution: The "Change of Heart" Scenario
 # ============================================================================
 
 
 async def main():
-    # Setup
+    # 1. Setup
     graph = service_manager.get_graph()
     llm = service_manager.get_agent()
+    agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_evolution_demo")
 
-    # Initialize Agent
-    agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_12345")
+    # 🛑 RESET GRAPH for a clean demo
+    print("🧹 Clearing Database for Demo...")
+    graph.query("MATCH (n) DETACH DELETE n")
 
-    # Scenario: User introducing themselves and their goals
-    # interactions = [
-    #     "Hi, I'm John. I'm a Senior Backend Dev.",
-    #     "I want to build a Chatbot using Neo4j.",
-    #     "I already know Python pretty well, but I'm new to Graph Theory.",
-    #     "What should I learn first?",
-    # ]
+    # Helper to visualize the graph state
+    def print_graph_snapshot(step_name):
+        print(f"\n{'='*20} {step_name} {'='*20}")
 
-    interactions = ["What do you know about me?"]
-
-    print(f"{'='*50}\nSTARTING INTERACTION\n{'='*50}")
-
-    for msg in interactions:
-        print(f"\nUser: {msg}")
-        resp = await agent.process_interaction(msg)
-        print(f"Assistant: {resp}")
-
-    # Verify the Graph Structure
-    print(f"\n{'='*50}\nGRAPH STATE VERIFICATION\n{'='*50}")
-
-    # Check User Properties (Should have name='John', role='Senior Backend Dev')
-    user_node = graph.query("MATCH (u:User {id: 'user_12345'}) RETURN u")
-    print("User Node Properties:", user_node)
-
-    # Check Concepts & Relationships
-    # Should see:
-    # (User)-[:MASTERED]->(Python)
-    # (User)-[:INTERESTED_IN]->(Graph Theory)
-    # (User)-[:HAS_GOAL]->(Build Chatbot)
-    rels = graph.query(
+        # Fetch Active Edges
+        active = graph.query(
+            """
+            MATCH (u:User)-[r]->(n) 
+            WHERE r.end_date IS NULL 
+            RETURN type(r) as rel, n.id as node, n.label as label
         """
-        MATCH (u:User {id: 'user_12345'})-[r]->(n) 
-        RETURN type(r) as relation, n.id as entity, labels(n) as type
-    """
+        )
+
+        # Fetch Archived Edges
+        archived = graph.query(
+            """
+            MATCH (u:User)-[r]->(n) 
+            WHERE r.end_date IS NOT NULL 
+            RETURN type(r) as rel, n.id as node, r.end_date as ended
+        """
+        )
+
+        print("🟢 ACTIVE STATE:")
+        if not active:
+            print("   (Empty)")
+        for row in active:
+            print(f"   (User) --[{row['rel']}]--> ({row['node']}) [{row['label']}]")
+
+        print("\n🔴 HISTORY (Archived):")
+        if not archived:
+            print("   (None)")
+        for row in archived:
+            print(
+                f"   (User) --[{row['rel']}]--> ({row['node']}) [Ended: {row['ended']}]"
+            )
+        print("=" * 60)
+
+    # ============================================================
+    # 📨 Message 1: Initialization
+    # Setting identity, interest, and specific preference.
+    # ============================================================
+    msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
+    print(f"\nUser: {msg_1}")
+    await agent.process_interaction(msg_1)
+    print_graph_snapshot("AFTER MESSAGE 1")
+    # EXPECTED:
+    # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
+    # History: None
+
+    # ============================================================
+    # 📨 Message 2: Expansion
+    # Adding a new skill (Accumulative change).
+    # ============================================================
+    msg_2 = "I am also starting to learn Docker for containerization."
+    print(f"\nUser: {msg_2}")
+    await agent.process_interaction(msg_2)
+    print_graph_snapshot("AFTER MESSAGE 2")
+    # EXPECTED:
+    # Active: ... + LEARNING -> docker
+    # History: None
+
+    # ============================================================
+    # 📨 Message 3: Preference Shift (Conflict Type 1)
+    # Changing "Detailed" -> "Brief".
+    # The 'detailed' edge should close.
+    # ============================================================
+    msg_3 = (
+        "Actually, your answers are too long. Keep them brief and concise from now on."
     )
-    for r in rels:
-        print(f"User --[{r['relation']}]--> {r['entity']} ({r['type'][0]})")
+    print(f"\nUser: {msg_3}")
+    await agent.process_interaction(msg_3)
+    print_graph_snapshot("AFTER MESSAGE 3")
+    # EXPECTED:
+    # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
+    # History: HAS_PREFERENCE -> detailed
+
+    # ============================================================
+    # 📨 Message 4: Sentiment Shift (Conflict Type 2)
+    # Changing "Love Python" -> "Dislike Python".
+    # The 'INTERESTED_IN' Python edge should close.
+    # ============================================================
+    msg_4 = "Also, I'm tired of Python. It's too slow. I dislike it now."
+    print(f"\nUser: {msg_4}")
+    await agent.process_interaction(msg_4)
+    print_graph_snapshot("AFTER MESSAGE 4")
+    # EXPECTED:
+    # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
+    # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
 
 
 if __name__ == "__main__":
