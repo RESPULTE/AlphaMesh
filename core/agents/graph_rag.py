@@ -1,6 +1,14 @@
-from typing import Any, Dict, List, Literal
+"""
+Evolving Knowledge Graph RAG System
+Refactored for:
+1. Strict Property vs. Node separation (Fixing the 'John is a node' error).
+2. Modeling Learning Progress (Concepts, Skills, Goals).
+3. No Raw Chat Storage (Privacy focused).
+"""
 
-# Preserving strict imports as requested
+from typing import Any, Dict, List, Literal, Optional
+
+# Preserving strict imports
 from core.services import service_manager
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -8,375 +16,409 @@ from langchain_neo4j import Neo4jGraph
 from pydantic import BaseModel, Field
 
 # ============================================================================
-# 1. Structured Schema Definitions (Pydantic)
+# 1. Strict Schema Definitions
 # ============================================================================
-# These schemas enforce the strict typology of the graph to prevent hallucinations.
 
-# Define allowed Node Labels to keep the graph clean
+# ALLOWED NODE TYPES
+# We intentionally REMOVED 'Person' to prevent the user from being duplicated.
+# If the user mentions "Elon Musk", that can be a 'KeyFigure' or generic 'Entity',
+# but the User themselves is handled via properties.
 AllowedNodeLabels = Literal[
-    "User",
-    "Concept",
-    "Technology",
-    "Skill",
-    "Project",
-    "Organization",
-    "Location",
-    "Person",
+    "Concept",  # e.g., "Graph Databases", "Python"
+    "Skill",  # e.g., "System Design", "Prompt Engineering"
+    "Goal",  # e.g., "Build a RAG Agent"
+    "Resource",  # e.g., "Neo4j Documentation"
+    "Project",  # e.g., "My Chatbot"
+    "Inquiry",  # Abstracted question/topic of interest
 ]
 
-# Define allowed Relationship Types to ensure traversability
+# ALLOWED RELATIONSHIP TYPES
 AllowedRelTypes = Literal[
-    "INTERESTED_IN",
-    "WORKS_ON",
-    "HAS_SKILL",
-    "USES_TECHNOLOGY",
-    "LOCATED_IN",
-    "EMPLOYED_BY",
-    "RELATED_TO",
-    "MENTIONED",
+    "INTERESTED_IN",  # User -> Concept
+    "LEARNING",  # User -> Skill (implies active study)
+    "MASTERED",  # User -> Skill (implies competence)
+    "WORKING_ON",  # User -> Project
+    "HAS_GOAL",  # User -> Goal
+    "RELATED_TO",  # Concept -> Concept
+    "REQUIRES",  # Goal -> Skill
 ]
+
+
+class UserProfileUpdate(BaseModel):
+    """
+    Captures INTRINSIC attributes of the user.
+    These become PROPERTIES of the :User node, not separate nodes.
+    """
+
+    name: Optional[str] = Field(None, description="The user's stated name.")
+    role: Optional[str] = Field(
+        None, description="Professional role (e.g., 'Backend Engineer')."
+    )
+    experience_level: Optional[str] = Field(
+        None, description="e.g., 'Junior', 'Senior', 'Beginner'."
+    )
+    learning_style: Optional[str] = Field(
+        None, description="e.g., 'Visual', 'Hands-on'."
+    )
+    current_focus: Optional[str] = Field(
+        None, description="What they are currently focused on generally."
+    )
 
 
 class GraphNode(BaseModel):
-    """Represents a Node in the Knowledge Graph."""
+    """Represents an EXTRINSIC entity (Concept, Skill, etc.)."""
 
-    id: str = Field(
-        description="Unique identifier for the node (usually the name in lowercase)."
-    )
-    label: AllowedNodeLabels = Field(description="The primary label of the node.")
+    id: str = Field(description="Unique identifier (lowercase name).")
+    label: AllowedNodeLabels = Field(description="The category of the node.")
     properties: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Attributes of the node (e.g., proficiency, status).",
+        description="Metadata (e.g., {'difficulty': 'Hard', 'status': 'Active'}).",
     )
 
 
 class GraphRelationship(BaseModel):
-    """Represents a directed Relationship between two nodes."""
+    """Represents the connection between User and Concepts, or Concept to Concept."""
 
-    source_node_id: str = Field(description="The ID of the source node.")
-    target_node_id: str = Field(description="The ID of the target node.")
-    type: AllowedRelTypes = Field(description="The type of relationship.")
+    source: str = Field(description="Source node ID. Use 'CURRENT_USER' for the user.")
+    target: str = Field(description="Target node ID. Use 'CURRENT_USER' for the user.")
+    type: AllowedRelTypes = Field(description="Relationship type.")
     properties: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Attributes of the relationship (e.g., strength, date).",
+        description="Edge attributes (e.g., {'confidence': 0.8, 'date': '2023-10-10'}).",
     )
 
 
 class KnowledgeGraphUpdate(BaseModel):
-    """The structured output container for the extraction process."""
+    """The complete payload to update the User's Knowledge Graph."""
 
+    user_attributes: UserProfileUpdate = Field(
+        description="Updates to the User's own profile properties."
+    )
     nodes: List[GraphNode] = Field(
-        description="List of entities identified in the conversation."
+        default_factory=list, description="New concepts, skills, or goals."
     )
     relationships: List[GraphRelationship] = Field(
-        description="List of relationships identified. Always link the 'User' if the info pertains to them."
+        default_factory=list,
+        description="Connections identifying structure and progress.",
     )
 
 
 # ============================================================================
-# 2. Knowledge Extractor (Structured)
+# 2. Strategic Knowledge Extractor
 # ============================================================================
 
 
 class KnowledgeExtractor:
     """
-    Uses LLM with Structured Output to extract precise graph updates.
+    Distinguishes between User Attributes (Properties) and Knowledge Entities (Nodes).
     """
 
     def __init__(self, llm):
-        # We enforce the schema using the bind_tools or with_structured_output paradigm
         self.llm = llm.with_structured_output(KnowledgeGraphUpdate)
 
     async def extract_knowledge(self, chat_history: List[Any]) -> KnowledgeGraphUpdate:
-        """
-        Extracts entities and relationships based on the conversation history.
-        Uses the last few messages to maintain context resolution.
-        """
 
-        system_prompt = """You are a top-tier Knowledge Graph Engineer.
-Your goal is to extract structured knowledge from a conversation to build a user profile and domain graph.
-
-RULES:
-1. **Focus on the User**: Identify who the user is, what they work on, what they know, and what they want.
-2. **Ignore Small Talk**: Do not extract entities for greetings, polite filler, or generic statements.
-3. **Resolution**: If the user says "I work on *it*", look at the assistant's previous message to resolve "it".
-4. **Consistency**: Use consistent naming (e.g., "Python" not "python" or "Python 3").
-5. **Privacy**: Do NOT extract the raw message content. Only extract the facts.
-
-When extracting the User, always use the ID 'user_core' (or the specific user name if known) and Label 'User'.
-"""
-
-        # We format the history into a string for the extraction context
+        # We only analyze the recent context to keep extraction focused
+        recent_messages = chat_history[-4:]
         formatted_history = "\n".join(
-            [
-                f"{msg.type.upper()}: {msg.content}" for msg in chat_history[-4:]
-            ]  # Look at last 4 messages
+            [f"{m.type.upper()}: {m.content}" for m in recent_messages]
         )
 
-        extraction_prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_prompt),
-                (
-                    "human",
-                    f"Analyze this interaction and extract knowledge:\n\n{formatted_history}",
-                ),
-            ]
+        system_prompt = """You are a Knowledge Graph Architect building a 'Learning Profile' for a user.
+
+YOUR GOAL:
+Map the user's conversation into a structured graph comprising:
+1. **User Properties (Intrinsic)**: Things the user IS (Name, Role, Experience). 
+   - Example: "I'm John" -> User Property `name="John"`. Do NOT make a Node.
+2. **Concepts & Skills (Extrinsic)**: Things the user interacts WITH.
+   - Example: "I'm learning Neo4j" -> Node `Neo4j` (Concept).
+3. **Relationships**: How the user relates to concepts (LEARNING, MASTERED, INTERESTED_IN).
+
+CRITICAL RULES:
+- **NO CHAT LOGS**: Do not store the raw message text. Abstract it into concepts or goals.
+- **The 'John' Rule**: If the user gives their name, it is a PROPERTY of the User node. NOT a separate Person node.
+- **Relationship Directions**: 
+  - User -> Concept (INTERESTED_IN)
+  - Project -> Requires -> Skill
+- **Inquiry Handling**: If the user asks a complex question, create an `:Inquiry` node with a summary topic, not the full text.
+
+Analyze the following interaction:
+"""
+
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", system_prompt), ("human", formatted_history)]
         )
 
         try:
-            # The chain automatically returns a KnowledgeGraphUpdate object
-            chain = extraction_prompt | self.llm
-            result: KnowledgeGraphUpdate = await chain.ainvoke({})
-            return result
+            chain = prompt | self.llm
+            return await chain.ainvoke({})
         except Exception as e:
             print(f"Extraction Error: {e}")
-            return KnowledgeGraphUpdate(nodes=[], relationships=[])
+            return KnowledgeGraphUpdate(
+                user_attributes=UserProfileUpdate(), nodes=[], relationships=[]
+            )
 
 
 # ============================================================================
-# 3. Graph Manager
+# 3. Graph Manager (The Storage Engine)
 # ============================================================================
 
 
 class GraphManager:
-    """Manages Neo4j operations using optimized Cypher queries."""
+    """
+    Handles the physical storage of nodes and properties.
+    Separates 'User Property Updates' from 'Graph Topology Updates'.
+    """
 
     def __init__(self, graph: Neo4jGraph):
         self.graph = graph
         self._initialize_schema()
 
     def _initialize_schema(self):
-        """Create constraints to ensure data integrity."""
-        # Note: In production, specific label constraints are better than generic ones.
-        queries = [
+        """Ensures the graph is optimized for this schema."""
+        constraints = [
             "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
             "CREATE CONSTRAINT concept_id IF NOT EXISTS FOR (c:Concept) REQUIRE c.id IS UNIQUE",
-            "CREATE INDEX entity_id IF NOT EXISTS FOR (n:Entity) ON (n.id)",
+            "CREATE CONSTRAINT skill_id IF NOT EXISTS FOR (s:Skill) REQUIRE s.id IS UNIQUE",
+            "CREATE INDEX node_id IF NOT EXISTS FOR (n:Entity) ON (n.id)",
         ]
-        for q in queries:
+        for q in constraints:
             try:
                 self.graph.query(q)
-            except Exception as e:
-                # Ignore if constraint already exists
+            except Exception:
                 pass
 
-    def upsert_knowledge(self, knowledge: KnowledgeGraphUpdate):
+    def update_graph(self, user_id: str, knowledge: KnowledgeGraphUpdate):
         """
-        Batch updates the graph using UNWIND for performance.
-        Handles both Nodes and Relationships.
+        Orchestrates the update:
+        1. Update User Properties (SET)
+        2. Merge Nodes (MERGE)
+        3. Merge Relationships (MERGE)
         """
-        if not knowledge.nodes and not knowledge.relationships:
-            return
 
-        # 1. Upsert Nodes
-        # We convert the Pydantic models to dicts
-        nodes_data = [
-            {"id": n.id, "label": n.label, "props": n.properties}
-            for n in knowledge.nodes
-        ]
+        # 1. Update User Properties
+        # Filter out None values to avoid overwriting existing data with nulls
+        user_props = {
+            k: v
+            for k, v in knowledge.user_attributes.model_dump().items()
+            if v is not None
+        }
 
-        # Dynamic Cypher usually requires APOC for dynamic labels,
-        # but to stay standard, we can handle the User distinct from generic concepts if needed.
-        # Here is a generic approach dealing with dynamic labels is tricky in pure Cypher params.
-        # We will iterate node types to handle labels safely.
+        if user_props:
+            self.graph.query(
+                """
+                MERGE (u:User {id: $user_id})
+                SET u += $props, u.last_active = timestamp()
+                """,
+                {"user_id": user_id, "props": user_props},
+            )
 
-        for node in nodes_data:
-            # Sanitize label to prevent injection (though Pydantic validates this via Literal)
-            label = node["label"]
+        # 2. Upsert Nodes
+        for node in knowledge.nodes:
+            # We explicitly prevent 'User' or 'Person' labels coming from the generic node list
+            # to ensure the "John is a node" error never recurs.
+            if node.label in ["User", "Person"]:
+                continue
+
             query = f"""
-            MERGE (n:{label} {{id: $id}})
+            MERGE (n:{node.label} {{id: $id}})
             ON CREATE SET n += $props, n.created_at = timestamp()
             ON MATCH SET n += $props, n.updated_at = timestamp()
             """
-            self.graph.query(query, {"id": node["id"], "props": node["props"]})
+            self.graph.query(query, {"id": node.id, "props": node.properties})
 
-        # 2. Upsert Relationships
-        # We assume nodes exist (created above) or will be created loosely.
+        # 3. Upsert Relationships
         for rel in knowledge.relationships:
-            rel_type = rel.type
+            # Resolve 'CURRENT_USER' placeholder to actual ID
+            source = user_id if rel.source == "CURRENT_USER" else rel.source
+            target = user_id if rel.target == "CURRENT_USER" else rel.target
+
+            # Skip self-loops if extraction failed
+            if source == target:
+                continue
+
             query = f"""
-            MATCH (s {{id: $source_id}})
-            MATCH (t {{id: $target_id}})
-            MERGE (s)-[r:{rel_type}]->(t)
+            MATCH (s {{id: $source}})
+            MATCH (t {{id: $target}})
+            MERGE (s)-[r:{rel.type}]->(t)
             ON CREATE SET r += $props, r.created_at = timestamp()
             ON MATCH SET r += $props, r.updated_at = timestamp()
             """
             try:
                 self.graph.query(
-                    query,
-                    {
-                        "source_id": rel.source_node_id,
-                        "target_id": rel.target_node_id,
-                        "props": rel.properties,
-                    },
+                    query, {"source": source, "target": target, "props": rel.properties}
                 )
             except Exception as e:
-                print(f"Error creating relationship {rel_type}: {e}")
+                print(f"Rel Error ({rel.type}): {e}")
 
-    def get_user_context(self, user_id: str) -> str:
+    def get_user_learning_state(self, user_id: str) -> str:
         """
-        Retrieves the immediate neighborhood of the User node.
+        Retrieves a semantic summary of the user's graph.
+        Focuses on what they are learning, working on, and their goals.
         """
         query = """
-        MATCH (u:User {id: $user_id})-[r]->(n)
-        RETURN type(r) as relationship, n.id as entity, labels(n) as labels
-        LIMIT 50
+        MATCH (u:User {id: $user_id})
+        
+        // Get User Properties
+        WITH u
+        
+        // Get Active Interests & Skills
+        OPTIONAL MATCH (u)-[r1:INTERESTED_IN|LEARNING|MASTERED]->(c)
+        WITH u, collect(c.id + ' (' + type(r1) + ')') as interests
+        
+        // Get Goals
+        OPTIONAL MATCH (u)-[:HAS_GOAL]->(g:Goal)
+        WITH u, interests, collect(g.id) as goals
+        
+        // Get Current Projects
+        OPTIONAL MATCH (u)-[:WORKING_ON]->(p:Project)
+        WITH u, interests, goals, collect(p.id) as projects
+        
+        RETURN u {.*, id: null} as profile, interests, goals, projects
         """
-        result = self.graph.query(query, {"user_id": user_id})
 
-        if not result:
-            return "No prior context known about the user."
+        data = self.graph.query(query, {"user_id": user_id})
+        if not data:
+            return "New User."
 
-        context_str = "Known User Context:\n"
-        for row in result:
-            # Clean up labels list
-            lbl = (
-                [l for l in row["labels"] if l != "Entity"][0]
-                if row["labels"]
-                else "Entity"
-            )
-            context_str += f"- User {row['relationship']} {row['entity']} ({lbl})\n"
+        record = data[0]
 
-        return context_str
+        # Format for LLM Context
+        context = "User Profile:\n"
+        for k, v in record["profile"].items():
+            if k not in ["created_at", "last_active"]:
+                context += f"- {k}: {v}\n"
+
+        context += (
+            f"\nLearning Journey:\n- Concepts: {', '.join(record['interests'])}\n"
+        )
+        context += f"- Active Goals: {', '.join(record['goals'])}\n"
+        context += f"- Projects: {', '.join(record['projects'])}\n"
+
+        return context
 
 
 # ============================================================================
-# 4. Main Evolving Agent
+# 4. Main Agent Controller
 # ============================================================================
 
 
 class EvolvingGraphRAGAgent:
-    """
-    Main controller.
-    1. Fetches Graph Context.
-    2. Chats with User (using History + Context).
-    3. Extracts new info (Structured).
-    4. Updates Graph (No raw history stored).
-    """
-
     def __init__(self, graph: Neo4jGraph, llm, user_id: str = "user_core"):
         self.user_id = user_id
-
-        # Services
         self.graph = graph
         self.llm = llm
 
-        # Components
         self.graph_manager = GraphManager(self.graph)
         self.extractor = KnowledgeExtractor(self.llm)
-
-        # In-memory history (NOT stored in graph)
         self.chat_history: List[Any] = []
 
     async def process_interaction(self, user_input: str) -> str:
-        """Full pipeline execution."""
+        # 1. Get Graph Context (The User's "State")
+        user_state = self.graph_manager.get_user_learning_state(self.user_id)
 
-        # 1. Retrieve Dynamic Context
-        user_context = self.graph_manager.get_user_context(self.user_id)
+        # 2. Generate Response (Using State + History)
+        response = await self._generate_response(user_input, user_state)
 
-        # 2. Update memory temporarily for the response generation
-        temp_history = self.chat_history + [HumanMessage(content=user_input)]
-
-        # 3. Generate Response
-        response_content = await self._generate_response(
-            user_input, user_context, temp_history
-        )
-
-        # 4. Update memory officially
+        # 3. Update History (In-memory only)
         self.chat_history.append(HumanMessage(content=user_input))
-        self.chat_history.append(AIMessage(content=response_content))
+        self.chat_history.append(AIMessage(content=response))
 
-        # 5. Extract and Evolve Graph (Background Task ideally)
-        # We pass the full history so the LLM can resolve references
-        knowledge_update = await self.extractor.extract_knowledge(self.chat_history)
+        # 4. Evolve Graph (Extract & Update)
+        # We pass the history so the LLM understands "it", "that", etc.
+        knowledge = await self.extractor.extract_knowledge(self.chat_history)
 
-        # 6. Inject the 'User' anchor if missing from extraction
-        # (Ensures attributes are linked to the specific ID of this session)
-        self._enforce_user_anchor(knowledge_update)
+        # 5. Post-Process: Anchor relationships to the User
+        self._anchor_knowledge_to_user(knowledge)
 
-        print(
-            f"DEBUG: Extracted {len(knowledge_update.nodes)} nodes, {len(knowledge_update.relationships)} rels."
-        )
+        # 6. Commit to DB
+        self.graph_manager.update_graph(self.user_id, knowledge)
 
-        # 7. Persist to Graph
-        self.graph_manager.upsert_knowledge(knowledge_update)
+        return response
 
-        return response_content
-
-    async def _generate_response(
-        self, user_input: str, context: str, history: List[Any]
-    ) -> str:
-        """
-        Generates the actual chat response using context.
-        """
-        system_msg = f"""You are a helpful AI assistant.
+    async def _generate_response(self, user_input: str, user_state: str) -> str:
+        system_msg = f"""You are a personalized AI tutor.
         
-CONTEXT FROM KNOWLEDGE GRAPH:
-{context}
+USER STATE (Knowledge Graph):
+{user_state}
 
 INSTRUCTIONS:
-- Use the context to personalize the conversation.
-- If the user asks about something in the context, refer to it.
-- Do not explicitly mention "I found this in the database". act naturally.
+- Adapt your difficulty level based on the user's 'experience_level' and 'mastered' skills.
+- If the user has a Goal, help them towards it.
+- If the user mentions a Project, ask about its progress.
+- Do NOT explicitly say "According to your graph...". Be natural.
 """
-        # We only keep the last 10 messages for the chat generation to fit context window
-        recent_history = history[-10:] if len(history) > 10 else history
-
-        messages = [SystemMessage(content=system_msg)] + recent_history
-
+        messages = (
+            [SystemMessage(content=system_msg)]
+            + self.chat_history[-6:]
+            + [HumanMessage(content=user_input)]
+        )
         response = await self.llm.ainvoke(messages)
         return response.content
 
-    def _enforce_user_anchor(self, knowledge: KnowledgeGraphUpdate):
+    def _anchor_knowledge_to_user(self, knowledge: KnowledgeGraphUpdate):
         """
-        Helper to ensure that if the LLM extracted 'User' generic node,
-        it is mapped to our session's actual user_id.
+        Ensures relationships meant for the user are correctly ID'd.
+        The LLM is prompted to use 'CURRENT_USER', but we double check.
         """
-        for node in knowledge.nodes:
-            if node.label == "User":
-                node.id = self.user_id  # Overwrite generic ID with actual session ID
-
+        # If the LLM inferred "user" or "me" as a source/target, normalize it.
         for rel in knowledge.relationships:
-            # If the extraction logic used a generic name for user, align it
-            # This logic depends on the LLM outputting a consistent ID for 'self'
-            # Simpler approach: If the prompt instructs to use 'user_core', it aligns naturally.
-            if rel.source_node_id.lower() in ["user", "me", "i"]:
-                rel.source_node_id = self.user_id
-            if rel.target_node_id.lower() in ["user", "me", "i"]:
-                rel.target_node_id = self.user_id
+            if rel.source.lower() in ["user", "me", "self", "current_user"]:
+                rel.source = "CURRENT_USER"  # Handled in GraphManager
+            if rel.target.lower() in ["user", "me", "self", "current_user"]:
+                rel.target = "CURRENT_USER"
 
 
 # ============================================================================
-# Example Execution
+# Example Usage
 # ============================================================================
 
 
 async def main():
-    # 1. Setup
-    # Assumes service_manager is configured in your environment
+    # Setup
     graph = service_manager.get_graph()
     llm = service_manager.get_agent()
 
+    # Initialize Agent
     agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_12345")
 
-    # 2. Simulate Chat
-    inputs = [
-        "Hi, I'm John. I work as a Python Backend Engineer.",
-        "I am currently looking into Neo4j for a project.",
-        "Does the system know what my tech stack is?",
-        "I also enjoy hiking in my free time.",
-    ]
+    # Scenario: User introducing themselves and their goals
+    # interactions = [
+    #     "Hi, I'm John. I'm a Senior Backend Dev.",
+    #     "I want to build a Chatbot using Neo4j.",
+    #     "I already know Python pretty well, but I'm new to Graph Theory.",
+    #     "What should I learn first?",
+    # ]
 
-    for inp in inputs:
-        print(f"\nUser: {inp}")
-        response = await agent.process_interaction(inp)
-        print(f"Assistant: {response}")
+    interactions = ["What do you know about me?"]
 
-    # 3. Verify Graph State (Direct Query)
-    print("\n--- Graph Verification ---")
-    result = graph.query("MATCH (n)-[r]->(m) RETURN n.id, type(r), m.id")
-    for r in result:
-        print(f"{r['n.id']} --[{r['type(r)']}]--> {r['m.id']}")
+    print(f"{'='*50}\nSTARTING INTERACTION\n{'='*50}")
+
+    for msg in interactions:
+        print(f"\nUser: {msg}")
+        resp = await agent.process_interaction(msg)
+        print(f"Assistant: {resp}")
+
+    # Verify the Graph Structure
+    print(f"\n{'='*50}\nGRAPH STATE VERIFICATION\n{'='*50}")
+
+    # Check User Properties (Should have name='John', role='Senior Backend Dev')
+    user_node = graph.query("MATCH (u:User {id: 'user_12345'}) RETURN u")
+    print("User Node Properties:", user_node)
+
+    # Check Concepts & Relationships
+    # Should see:
+    # (User)-[:MASTERED]->(Python)
+    # (User)-[:INTERESTED_IN]->(Graph Theory)
+    # (User)-[:HAS_GOAL]->(Build Chatbot)
+    rels = graph.query(
+        """
+        MATCH (u:User {id: 'user_12345'})-[r]->(n) 
+        RETURN type(r) as relation, n.id as entity, labels(n) as type
+    """
+    )
+    for r in rels:
+        print(f"User --[{r['relation']}]--> {r['entity']} ({r['type'][0]})")
 
 
 if __name__ == "__main__":
