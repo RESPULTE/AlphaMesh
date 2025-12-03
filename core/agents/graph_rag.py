@@ -25,7 +25,6 @@ AllowedNodeLabels = Literal[
     "Skill",  # System Design
     "Preference",  # Detailed, Brief, Visual (Abstract nodes for styles)
     "Goal",  # Build a Chatbot
-    "Project",  # My Side Project
 ]
 
 # ALLOWED RELATIONSHIP TYPES
@@ -33,6 +32,7 @@ AllowedRelTypes = Literal[
     "HAS_PREFERENCE",  # User -> Preference (Exclusive: User usually has 1 active style)
     "INTERESTED_IN",  # User -> Concept (Stateful: Can change to DISLIKES)
     "DISLIKES",  # User -> Concept
+    "RELATED_TO",  # Concept -> Concept (New: For sub-aspects like Docker -> Containers)
 ]
 
 # --- DYNAMIC BEHAVIOR CONFIGURATION ---
@@ -48,7 +48,7 @@ RELATIONSHIP_BEHAVIOR = {
     # Ex: If User "DISLIKES" App Dev, close "INTERESTED_IN" App Dev.
     "INTERESTED_IN": "ENTITY_STATE",
     "DISLIKES": "ENTITY_STATE",
-    "MENTIONED": "STANDARD",
+    "RELATED_TO": "STANDARD",
 }
 
 # Grouping conflicting types for Entity State logic
@@ -57,34 +57,38 @@ CONFLICTING_REL_GROUPS = {"SENTIMENT": ["INTERESTED_IN", "DISLIKES"]}
 
 
 class UserProfileUpdate(BaseModel):
-    """Intrinsic properties of the User node (Name, Role)."""
-
     name: Optional[str] = None
     role: Optional[str] = None
     experience_level: Optional[str] = None
 
 
 class GraphNode(BaseModel):
-    """Extrinsic Entities."""
-
     id: str = Field(description="Unique ID (lowercase).")
     label: AllowedNodeLabels
     properties: Dict[str, Any] = Field(default_factory=dict)
 
 
 class GraphRelationship(BaseModel):
-    """Temporal Relationship Update."""
-
-    source: str = Field(description="Source ID ('CURRENT_USER' for user).")
+    source: str = Field(description="Source ID.")
     target: str = Field(description="Target ID.")
     type: AllowedRelTypes
     properties: Dict[str, Any] = Field(default_factory=dict)
+    weight: int = Field(default=1, description="Importance score. Default is 1.")
 
 
 class KnowledgeGraphUpdate(BaseModel):
     user_attributes: UserProfileUpdate
     nodes: List[GraphNode]
     relationships: List[GraphRelationship]
+
+
+# ============================================================================
+# 2. Temporal Knowledge Extractor
+# ============================================================================
+
+# ============================================================================
+# 2. Temporal Knowledge Extractor
+# ============================================================================
 
 
 # ============================================================================
@@ -100,40 +104,42 @@ class KnowledgeExtractor:
         self, conversation: List[Any], existing_entities: str
     ) -> KnowledgeGraphUpdate:
         """
-        Extracts new knowledge while respecting existing entity IDs.
+        Extracts new knowledge and reinforcements of existing knowledge.
         """
-        # We look at the last few messages to catch context changes
+        recent_interaction = conversation[-2:]
         formatted_history = "\n".join(
-            [f"{m.type.upper()}: {m.content}" for m in conversation[-4:]]
+            [f"{m.type.upper()}: {m.content}" for m in recent_interaction]
         )
 
         system_prompt = f"""You are a Temporal Knowledge Graph Architect.
-        Your goal is to capture the *current state* of the user's mind and update the graph.
+Your goal is to map the conversation to a graph, capturing both User Intent and **Learned Concepts**.
 
-        ### EXISTING GRAPH NODES (Use these IDs to prevent duplicates):
-        {existing_entities}
+### EXISTING GRAPH NODES:
+{existing_entities}
 
-        ### RULES:
-        1. **Entity Resolution (CRITICAL)**: Check the 'EXISTING GRAPH NODES' list above. 
-        - If the user mentions "Python" and the list contains `python development`, YOU MUST use `id="python development"`.
-        - Always map new mentions to existing IDs if they refer to the same concept.
-        - Only create a NEW `id` if the concept is genuinely new.
+### RULES:
+1. **Analyze the Assistant's Answer**: 
+   - If the Assistant explains a specific detail about a topic, extract it as a new Concept and link it using 'RELATED_TO'.
+   - Example: AI says "Docker uses Containers." -> 
+     Nodes: [Docker, Containers]
+     Rels: [Docker -> RELATED_TO -> Containers]
 
-        2. **Detect Changes**: 
-        - If the user says "I used to like X, but now I hate it", output a `DISLIKES` relationship to the *existing* X node. 
-        - The system will automatically archive the old `INTERESTED_IN` relationship.
+2. **Strict Directionality**:
+   - 'DISLIKES', 'INTERESTED_IN', 'HAS_PREFERENCE' **MUST** always start with 'CURRENT_USER'.
+   - NEVER say "Python DISLIKES Docker". 
+   - Use 'RELATED_TO' for concept-to-concept links.
 
-        3. **Avoid Redundancy**: 
-        - If the user repeats a known fact (e.g., "I like Python" and the graph already has `INTERESTED_IN` -> `python development`), return an empty list.
-        - Only output *deltas* (new info or state changes).
+3. **Scoring & Priority**:
+   - If a topic is discussed *again*, **OUTPUT THE RELATIONSHIP AGAIN**. The database will increment the score.
 
-        4. **User Anchor**: Use 'CURRENT_USER' as the ID for the user.
+4. **Entity Resolution**:
+   - Use the 'EXISTING GRAPH NODES' list to reuse IDs.
 
-        ### RELATIONSHIP TYPES:
-        - HAS_PREFERENCE: For communication styles (Brief, Detailed, Code-Only).
-        - INTERESTED_IN / DISLIKES: For concepts/topics.
-        - MENTIONED: any relevant details that is of lesser priority
-        """
+### RELATIONSHIP TYPES:
+- HAS_PREFERENCE: User -> Preference Style (e.g., Brief).
+- INTERESTED_IN / DISLIKES: User -> Concept (e.g., Python).
+- RELATED_TO: Concept -> Concept (e.g., Docker -> Containers).
+"""
         prompt = ChatPromptTemplate.from_messages(
             [("system", system_prompt), ("human", formatted_history)]
         )
@@ -152,12 +158,12 @@ class KnowledgeExtractor:
 # ============================================================================
 
 
-class TemporalGraphManager:
-    """
-    Manages graph updates with Time-Travel capabilities.
-    Automatically 'closes' old relationships based on behavior configuration.
-    """
+# ============================================================================
+# 3. Temporal Graph Manager (The Dynamic Engine)
+# ============================================================================
 
+
+class TemporalGraphManager:
     def __init__(self, graph: Neo4jGraph):
         self.graph = graph
         self._initialize_schema()
@@ -166,7 +172,6 @@ class TemporalGraphManager:
         constraints = [
             "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
             "CREATE INDEX node_id IF NOT EXISTS FOR (n:Entity) ON (n.id)",
-            # Index for performance on checking active relationships
             "CREATE INDEX rel_end_date IF NOT EXISTS FOR ()-[r:HAS_PREFERENCE]-() ON (r.end_date)",
         ]
         for q in constraints:
@@ -176,10 +181,19 @@ class TemporalGraphManager:
                 pass
 
     def update_graph(self, user_id: str, knowledge: KnowledgeGraphUpdate):
-        """
-        Transactional update wrapper.
-        """
-        # 1. Update User Properties
+        # 1. ALWAYS Ensure User Node Exists
+        # We do this outside the 'if user_props' block to guarantee the node exists
+        # even if no new attributes (name/role) were extracted in this turn.
+        self.graph.query(
+            """
+            MERGE (u:User {id: $user_id})
+            ON CREATE SET u.created_at = datetime(), u.last_active = datetime()
+            ON MATCH SET u.last_active = datetime()
+            """,
+            {"user_id": user_id},
+        )
+
+        # 2. Update User Properties (if any)
         user_props = {
             k: v
             for k, v in knowledge.user_attributes.model_dump().items()
@@ -187,11 +201,11 @@ class TemporalGraphManager:
         }
         if user_props:
             self.graph.query(
-                "MERGE (u:User {id: $user_id}) SET u += $props, u.last_active = datetime()",
+                "MATCH (u:User {id: $user_id}) SET u += $props",
                 {"user_id": user_id, "props": user_props},
             )
 
-        # 2. Upsert Nodes (Standard MERGE)
+        # 3. Upsert Nodes
         for node in knowledge.nodes:
             if node.label == "User":
                 continue
@@ -202,67 +216,65 @@ class TemporalGraphManager:
             """
             self.graph.query(query, {"id": node.id, "props": node.properties})
 
-        # 3. Handle Temporal Relationships
+        # 4. Handle Relationships
         for rel in knowledge.relationships:
             self._upsert_temporal_relationship(user_id, rel)
 
     def get_known_entities(self) -> str:
-        """
-        Retrieves a list of all existing nodes (excluding the User) to help
-        the LLM perform entity resolution (Canonicalization).
-        """
-        query = """
-        MATCH (n) 
-        WHERE NOT 'User' IN labels(n)
-        RETURN n.id as id, labels(n) as labels
-        LIMIT 100
-        """
+        """Retrieves existing nodes for entity resolution."""
         try:
-            results = self.graph.query(query)
-
-            print(f"   Existing Entities: {results}")
-
+            results = self.graph.query(
+                "MATCH (n) WHERE NOT 'User' IN labels(n) RETURN n.id, labels(n) LIMIT 100"
+            )
             if not results:
                 return "No existing entities."
-
-            # Format: "- python development (Concept)"
-            entities = []
-            for row in results:
-                lbl = row["labels"][0] if row["labels"] else "Entity"
-                entities.append(f"- {row['id']} ({lbl})")
-
-            return "\n".join(entities)
-        except Exception as e:
-            print(f"Error fetching entities: {e}")
-            return "Error fetching entities."
+            return "\n".join([f"- {r['n.id']} ({r['labels(n)'][0]})" for r in results])
+        except Exception:
+            return ""
 
     def _upsert_temporal_relationship(self, user_id: str, rel: GraphRelationship):
-        """
-        The core logic for handling state changes dynamically.
-        """
-        source = user_id if rel.source == "CURRENT_USER" else rel.source
-        target = user_id if rel.target == "CURRENT_USER" else rel.target
+        # --- FIX: Strict Directionality Enforcement ---
+        # These types MUST start from the User. If LLM says "Python DISLIKES Docker", we correct it or ignore it.
+        USER_CENTRIC_RELS = {
+            "INTERESTED_IN",
+            "DISLIKES",
+            "HAS_PREFERENCE",
+            "LEARNING",
+            "MASTERED",
+            "WORKING_ON",
+        }
+
+        if rel.type in USER_CENTRIC_RELS:
+            source = user_id  # Force source to be User
+            target = rel.target
+        else:
+            # For Concept-to-Concept (RELATED_TO), trust the extraction
+            source = user_id if rel.source == "CURRENT_USER" else rel.source
+            target = user_id if rel.target == "CURRENT_USER" else rel.target
+
+        # Prevent self-loops (User -> User) or Nulls
+        if source == target or not target:
+            return
 
         behavior = RELATIONSHIP_BEHAVIOR.get(rel.type, "STANDARD")
 
-        # LOGIC BRANCH 1: Exclusive Category (e.g., Preference Style)
-        # "User can have only ONE active 'HAS_PREFERENCE' relationship total."
-        if behavior == "EXCLUSIVE_CATEGORY":
-            print("Exclusive Category Behavior:")
-            print(f"Closing all active '{rel.type}' relationships for {source}.")
+        # Check if this exact relationship already exists and is active (Score Boosting)
+        if self._is_relationship_active(source, target, rel.type):
+            print(
+                f"   [Scoring] Boosting weight for existing rel: {source} -[{rel.type}]-> {target}"
+            )
+            self._increment_weight(source, target, rel.type)
+            return
 
+        # LOGIC BRANCH 1: Exclusive Category
+        if behavior == "EXCLUSIVE_CATEGORY":
             self._close_category_relationships(source, rel.type)
             self._create_new_active_relationship(
                 source, target, rel.type, rel.properties
             )
 
-        # LOGIC BRANCH 2: Entity State (e.g., Interest vs Dislike)
-        # "User can have only ONE active sentiment towards 'App Dev'."
+        # LOGIC BRANCH 2: Entity State
         elif behavior == "ENTITY_STATE":
-            print("Entity State Behavior:")
-            print(f"Closing all active '{rel.type}' relationships for {target}.")
-
-            # Determine which types conflict with this one (e.g., INTERESTED_IN conflicts with DISLIKES)
             conflicting_types = self._get_conflicting_types(rel.type)
             self._close_entity_state_relationships(source, target, conflicting_types)
             self._create_new_active_relationship(
@@ -271,88 +283,77 @@ class TemporalGraphManager:
 
         # LOGIC BRANCH 3: Standard (Accumulative)
         else:
-            print("Standard Behavior:")
-            print(f"Creating new '{rel.type}' relationship for {source} -> {target}.")
             self._create_new_active_relationship(
                 source, target, rel.type, rel.properties
             )
 
+    def _is_relationship_active(self, source: str, target: str, rel_type: str) -> bool:
+        query = f"""
+        MATCH (s {{id: $source}})-[r:{rel_type}]->(t {{id: $target}})
+        WHERE r.end_date IS NULL
+        RETURN count(r) > 0 as exists
+        """
+        res = self.graph.query(query, {"source": source, "target": target})
+        return res[0]["exists"]
+
+    def _increment_weight(self, source: str, target: str, rel_type: str):
+        query = f"""
+        MATCH (s {{id: $source}})-[r:{rel_type}]->(t {{id: $target}})
+        WHERE r.end_date IS NULL
+        SET r.weight = coalesce(r.weight, 1) + 1, r.updated_at = datetime()
+        """
+        self.graph.query(query, {"source": source, "target": target})
+
+    def _create_new_active_relationship(
+        self, source: str, target: str, rel_type: str, props: dict
+    ):
+        # Initial weight is 1
+        query = f"""
+        MATCH (s {{id: $source}})
+        MATCH (t {{id: $target}})
+        MERGE (s)-[r:{rel_type}]->(t)
+        ON CREATE SET r += $props, r.start_date = datetime(), r.end_date = null, r.weight = 1
+        ON MATCH SET r.end_date = null, r.weight = coalesce(r.weight, 1) + 1
+        """
+        self.graph.query(query, {"source": source, "target": target, "props": props})
+
     def _get_conflicting_types(self, rel_type: str) -> List[str]:
-        """Finds all relationship types that conflict with the new one."""
         for group in CONFLICTING_REL_GROUPS.values():
             if rel_type in group:
-                print(f"Conflict Group: {group}")
                 return group
-        return [rel_type]  # Default: conflicts with itself
+        return [rel_type]
 
     def _close_category_relationships(self, source_id: str, rel_type: str):
-        """Closes ANY active relationship of this type from the source."""
-        query = f"""
-        MATCH (s {{id: $source}})-[r:{rel_type}]->()
-        WHERE r.end_date IS NULL
-        SET r.end_date = datetime()
-        """
+        query = f"MATCH (s {{id: $source}})-[r:{rel_type}]->() WHERE r.end_date IS NULL SET r.end_date = datetime()"
         self.graph.query(query, {"source": source_id})
 
     def _close_entity_state_relationships(
         self, source_id: str, target_id: str, types: List[str]
     ):
-        """Closes active relationships of specific types between specific nodes."""
-        # Dynamic type matching in Cypher requires listing or APOC.
-        # We'll stick to a WHERE clause for safety without APOC.
         types_str = "|".join([f"`{t}`" for t in types])
-        query = f"""
-        MATCH (s {{id: $source}})-[r:{types_str}]->(t {{id: $target}})
-        WHERE r.end_date IS NULL
-        SET r.end_date = datetime()
-        """
+        query = f"MATCH (s {{id: $source}})-[r:{types_str}]->(t {{id: $target}}) WHERE r.end_date IS NULL SET r.end_date = datetime()"
         self.graph.query(query, {"source": source_id, "target": target_id})
 
-    def _create_new_active_relationship(
-        self, source: str, target: str, rel_type: str, props: dict
-    ):
-        """Creates the new relationship with start_date = now and end_date = null."""
-        query = f"""
-        MATCH (s {{id: $source}})
-        MATCH (t {{id: $target}})
-        CREATE (s)-[r:{rel_type}]->(t)
-        SET r += $props, r.start_date = datetime(), r.end_date = null
-        """
-        self.graph.query(query, {"source": source, "target": target, "props": props})
-
     def get_current_user_state(self, user_id: str) -> str:
-        """
-        Fetches ONLY active relationships (where end_date is null).
-        """
         query = """
         MATCH (u:User {id: $user_id})
-        
-        // Active Preferences
-        OPTIONAL MATCH (u)-[r1:HAS_PREFERENCE]->(p:Preference)
-        WHERE r1.end_date IS NULL
+        OPTIONAL MATCH (u)-[r1:HAS_PREFERENCE]->(p:Preference) WHERE r1.end_date IS NULL
         WITH u, collect(p.id) as preferences
         
-        // Active Interests
-        OPTIONAL MATCH (u)-[r2:INTERESTED_IN]->(c:Concept)
-        WHERE r2.end_date IS NULL
-        WITH u, preferences, collect(c.id) as interests
+        OPTIONAL MATCH (u)-[r2:INTERESTED_IN]->(c:Concept) WHERE r2.end_date IS NULL
+        WITH u, preferences, collect(c.id + ' (Score: ' + coalesce(r2.weight, 1) + ')') as interests
         
-        // Active Dislikes (Important context!)
-        OPTIONAL MATCH (u)-[r3:DISLIKES]->(d:Concept)
-        WHERE r3.end_date IS NULL
+        OPTIONAL MATCH (u)-[r3:DISLIKES]->(d:Concept) WHERE r3.end_date IS NULL
         WITH u, preferences, interests, collect(d.id) as dislikes
         
         RETURN u {.*, id:null, created_at:null, last_active:null} as profile, 
                preferences, interests, dislikes
         """
-
         data = self.graph.query(query, {"user_id": user_id})
         if not data:
             return "New User"
-
         rec = data[0]
-        return f"""Current Profile:
-Attributes: {rec['profile']}
+        return f"""Current Profile: {rec['profile']}
 Active Preferences: {rec['preferences']}
 Current Interests: {rec['interests']}
 Known Dislikes: {rec['dislikes']}"""
@@ -375,12 +376,11 @@ class EvolvingGraphRAGAgent:
         # 1. Get Current State
         state = self.manager.get_current_user_state(self.user_id)
 
-        known_entities = self.manager.get_known_entities()
-
         # 2. Generate Response
         response = await self._generate_response(user_input, state)
 
         # 3. Extract & Evolve
+        known_entities = self.manager.get_known_entities()
         knowledge = await self.extractor.extract_knowledge(
             [HumanMessage(content=user_input), AIMessage(content=response)],
             known_entities,
@@ -417,18 +417,18 @@ async def main():
     agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_evolution_demo")
 
     # 🛑 RESET GRAPH for a clean demo
-    print("🧹 Clearing Database for Demo...")
-    graph.query("MATCH (n) DETACH DELETE n")
+    # print("🧹 Clearing Database for Demo...")
+    # graph.query("MATCH (n) DETACH DELETE n")
 
-    # Helper to visualize the graph state
+    # # Helper to visualize the graph state
     def print_graph_snapshot(step_name):
         print(f"\n{'='*20} {step_name} {'='*20}")
 
         # Fetch Active Edges
         active = graph.query(
             """
-            MATCH (u:User)-[r]->(n) 
-            WHERE r.end_date IS NULL 
+            MATCH (u:User)-[r]->(n)
+            WHERE r.end_date IS NULL
             RETURN type(r) as rel, n.id as node, n.label as label
         """
         )
@@ -436,8 +436,8 @@ async def main():
         # Fetch Archived Edges
         archived = graph.query(
             """
-            MATCH (u:User)-[r]->(n) 
-            WHERE r.end_date IS NOT NULL 
+            MATCH (u:User)-[r]->(n)
+            WHERE r.end_date IS NOT NULL
             RETURN type(r) as rel, n.id as node, r.end_date as ended
         """
         )
@@ -457,57 +457,62 @@ async def main():
             )
         print("=" * 60)
 
-    # ============================================================
-    # 📨 Message 1: Initialization
-    # Setting identity, interest, and specific preference.
-    # ============================================================
-    msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
-    print(f"\nUser: {msg_1}")
-    await agent.process_interaction(msg_1)
-    print_graph_snapshot("AFTER MESSAGE 1")
-    # EXPECTED:
-    # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
-    # History: None
+    # # ============================================================
+    # # 📨 Message 1: Initialization
+    # # Setting identity, interest, and specific preference.
+    # # ============================================================
+    # msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
+    # print(f"\nUser: {msg_1}")
+    # await agent.process_interaction(msg_1)
+    # print_graph_snapshot("AFTER MESSAGE 1")
+    # # EXPECTED:
+    # # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
+    # # History: None
 
-    # ============================================================
-    # 📨 Message 2: Expansion
-    # Adding a new skill (Accumulative change).
-    # ============================================================
-    msg_2 = "I am also starting to learn Docker for containerization."
-    print(f"\nUser: {msg_2}")
-    await agent.process_interaction(msg_2)
-    print_graph_snapshot("AFTER MESSAGE 2")
-    # EXPECTED:
-    # Active: ... + LEARNING -> docker
-    # History: None
+    # # ============================================================
+    # # 📨 Message 2: Expansion
+    # # Adding a new skill (Accumulative change).
+    # # ============================================================
+    # msg_2 = "I am also starting to learn Docker for containerization. could you explain to me some details on docker?"
+    # print(f"\nUser: {msg_2}")
+    # await agent.process_interaction(msg_2)
+    # print_graph_snapshot("AFTER MESSAGE 2")
+    # # EXPECTED:
+    # # Active: ... + LEARNING -> docker
+    # # History: None
 
-    # ============================================================
-    # 📨 Message 3: Preference Shift (Conflict Type 1)
-    # Changing "Detailed" -> "Brief".
-    # The 'detailed' edge should close.
-    # ============================================================
-    msg_3 = (
-        "Actually, your answers are too long. Keep them brief and concise from now on."
-    )
-    print(f"\nUser: {msg_3}")
-    await agent.process_interaction(msg_3)
-    print_graph_snapshot("AFTER MESSAGE 3")
-    # EXPECTED:
-    # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
-    # History: HAS_PREFERENCE -> detailed
+    # # ============================================================
+    # # 📨 Message 3: Preference Shift (Conflict Type 1)
+    # # Changing "Detailed" -> "Brief".
+    # # The 'detailed' edge should close.
+    # # ============================================================
+    # msg_3 = (
+    #     "Actually, your answers are too long. Keep them brief and concise from now on."
+    # )
+    # print(f"\nUser: {msg_3}")
+    # await agent.process_interaction(msg_3)
+    # print_graph_snapshot("AFTER MESSAGE 3")
+    # # EXPECTED:
+    # # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
+    # # History: HAS_PREFERENCE -> detailed
 
-    # ============================================================
-    # 📨 Message 4: Sentiment Shift (Conflict Type 2)
-    # Changing "Love Python" -> "Dislike Python".
-    # The 'INTERESTED_IN' Python edge should close.
-    # ============================================================
-    msg_4 = "Also, I'm tired of Python. It's too slow. I dislike it now."
-    print(f"\nUser: {msg_4}")
-    await agent.process_interaction(msg_4)
-    print_graph_snapshot("AFTER MESSAGE 4")
+    # # ============================================================
+    # # 📨 Message 4: Sentiment Shift (Conflict Type 2)
+    # # Changing "Love Python" -> "Dislike Python".
+    # # The 'INTERESTED_IN' Python edge should close.
+    # # ============================================================
+    # msg_4 = "Also, I'm tired of Python. It's too slow. I fucking hate it now. same with docker, so troublesome"
+    # print(f"\nUser: {msg_4}")
+    # await agent.process_interaction(msg_4)
+    # print_graph_snapshot("AFTER MESSAGE 4")
     # EXPECTED:
     # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
     # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
+
+    msg_5 = "could you describe what you know about me?"
+    print(f"\nUser: {msg_5}")
+    await agent.process_interaction(msg_5)
+    print_graph_snapshot("AFTER MESSAGE 4")
 
 
 if __name__ == "__main__":
