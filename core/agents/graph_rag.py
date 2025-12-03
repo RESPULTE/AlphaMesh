@@ -1,463 +1,399 @@
-"""
-Evolving Graph RAG System with Neo4j and LangChain
-Continuously builds and expands knowledge graph from user interactions
-"""
-
-from datetime import datetime
+import asyncio
+import logging
+from enum import Enum
 from typing import Any, Dict, List
 
-from core.config import settings
+# Preserved existing imports
 from core.services import service_manager
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_neo4j import GraphCypherQAChain, Neo4jGraph
+from langchain_neo4j import Neo4jGraph
+
+# Pydantic for strict schema validation
 from pydantic import BaseModel, Field
 
-# ============================================================================
-# Configuration
-# ============================================================================
-
-
-class GraphRAGConfig(BaseModel):
-    """Configuration for Graph RAG system"""
-
-    neo4j_uri: str = Field(default="bolt://localhost:7687")
-    neo4j_username: str = Field(default="neo4j")
-    neo4j_password: str = Field(default="password")
-    openai_api_key: str = Field(default="")
-    model_name: str = Field(default="gpt-4")
-
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Entity and Relation Extraction
-# ============================================================================
-
-EXTRACTION_PROMPT = """You are an expert at extracting entities and relationships from conversational text.
-
-Extract the following from the conversation:
-1. Entities: People, places, organizations, concepts, topics, preferences, facts
-2. Relationships: How entities relate to each other
-3. User attributes: Any information about the user (preferences, background, goals, etc.)
-
-Format your response as JSON:
-{{
-    "entities": [
-        {{"name": "entity_name", "type": "entity_type", "properties": {{"key": "value"}}}}
-    ],
-    "relationships": [
-        {{"source": "entity1", "target": "entity2", "type": "relationship_type", "properties": {{"key": "value"}}}}
-    ],
-    "user_attributes": [
-        {{"attribute": "attribute_name", "value": "attribute_value", "context": "context"}}
-    ]
-}}
-
-Conversation to analyze:
-User: {user_message}
-Assistant: {assistant_message}
-
-Current timestamp: {timestamp}
-"""
-
-
-class KnowledgeExtractor:
-    """Extracts structured knowledge from conversations"""
-
-    def __init__(self, llm):
-        self.llm = llm
-        self.extraction_prompt = ChatPromptTemplate.from_template(EXTRACTION_PROMPT)
-
-    async def extract_knowledge(
-        self, user_message: str, assistant_message: str
-    ) -> Dict[str, Any]:
-        """Extract entities and relationships from conversation"""
-
-        prompt = self.extraction_prompt.format(
-            user_message=user_message,
-            assistant_message=assistant_message,
-            timestamp=datetime.now().isoformat(),
-        )
-
-        response = await self.llm.ainvoke(prompt)
-
-        # Parse JSON response
-        import json
-
-        try:
-            raw_text: str = response.content
-            knowledge = json.loads(
-                raw_text.removeprefix("```json\n").removesuffix("\n```")
-            )
-            print(json.dumps(knowledge, indent=2))
-
-        except json.JSONDecodeError:
-            # Fallback if JSON parsing fails
-            knowledge = {"entities": [], "relationships": [], "user_attributes": []}
-
-        return knowledge
-
-
-# ============================================================================
-# Graph Manager
+# 1. GRAPH SCHEMA (Strict Typing)
 # ============================================================================
 
 
-class GraphManager:
-    """Manages the Neo4j knowledge graph"""
+class NodeLabel(str, Enum):
+    """Allowed Node Labels to prevent hallucinated types."""
+
+    USER = "User"
+    TOPIC = "Topic"
+    SKILL = "Skill"
+    LOCATION = "Location"
+    PERSON = "Person"
+    ORGANIZATION = "Organization"
+    EVENT = "Event"
+    PREFERENCE = "Preference"
+
+
+class RelationType(str, Enum):
+    """Allowed Relationship Types to enforce graph consistency."""
+
+    INTERESTED_IN = "INTERESTED_IN"
+    HAS_SKILL = "HAS_SKILL"
+    LIVES_IN = "LIVES_IN"
+    KNOWS = "KNOWS"
+    WORKS_AT = "WORKS_AT"
+    ATTENDED = "ATTENDED"
+    DISLIKES = "DISLIKES"
+    MENTIONED = "MENTIONED"  # Fallback for weak connections
+
+
+class GraphNode(BaseModel):
+    """Represents a single node in the extraction."""
+
+    id: str = Field(
+        description="Unique identifier/name for the node (e.g., 'Python', 'New York')."
+    )
+    label: NodeLabel = Field(description="The strict type of the node.")
+    properties: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Attributes like sentiment, confidence, or specific details.",
+    )
+
+
+class GraphRelationship(BaseModel):
+    """Represents a directed relationship between two nodes."""
+
+    source_id: str = Field(description="The ID of the source node.")
+    target_id: str = Field(description="The ID of the target node.")
+    type: RelationType = Field(description="The strict relationship type.")
+    properties: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Context attributes (e.g., 'since_year', 'context').",
+    )
+
+
+class KnowledgeGraphExtraction(BaseModel):
+    """The complete structured output from the LLM."""
+
+    nodes: List[GraphNode]
+    relationships: List[GraphRelationship]
+
+
+# ============================================================================
+# 2. NEO4J SERVICE (Low-Level Operations)
+# ============================================================================
+
+
+class Neo4jService:
+    """Handles raw DB interactions with atomic merges and indexing."""
 
     def __init__(self, graph: Neo4jGraph):
         self.graph = graph
-        self._initialize_constraints()
+        self._ensure_indexes()
 
-    def _initialize_constraints(self):
-        """Create uniqueness constraints and indexes"""
-        constraints = [
-            "CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE",
+    def _ensure_indexes(self):
+        """Ensures performance indexes exist."""
+        commands = [
             "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
-            "CREATE CONSTRAINT conversation_id IF NOT EXISTS FOR (c:Conversation) REQUIRE c.id IS UNIQUE",
+            "CREATE INDEX node_id_index IF NOT EXISTS FOR (n:Topic) ON (n.id)",
+            "CREATE INDEX skill_id_index IF NOT EXISTS FOR (n:Skill) ON (n.id)",
+        ]
+        for cmd in commands:
+            try:
+                self.graph.query(cmd)
+            except Exception as e:
+                logger.warning(f"Index creation warning: {e}")
+
+    async def persist_data(self, data: KnowledgeGraphExtraction):
+        """
+        Atomically merges nodes and relationships.
+        Uses UNWIND for batch processing efficiency.
+        """
+        if not data.nodes and not data.relationships:
+            return
+
+        # 1. Merge Nodes
+        # We handle dynamic labels by grouping nodes by label first or using a generic approach with APOC
+        # simplified here: We assume ID uniqueness across labels or use a Generic Label + Specific Label
+
+        node_query = """
+        UNWIND $nodes AS n
+        MERGE (e:Entity {id: n.id})
+        ON CREATE SET e.created_at = timestamp()
+        SET e.updated_at = timestamp(),
+            e += n.properties
+        WITH e, n
+        CALL apoc.create.addLabels(e, [n.label]) YIELD node
+        RETURN count(node)
+        """
+
+        # Prepare node data dicts
+        node_params = [
+            {"id": n.id, "label": n.label.value, "properties": n.properties}
+            for n in data.nodes
         ]
 
-        for constraint in constraints:
-            try:
-                self.graph.query(constraint)
-            except Exception as e:
-                print(f"Constraint already exists or error: {e}")
-
-    def add_or_update_entity(
-        self, name: str, entity_type: str, properties: Dict[str, Any]
-    ):
-        """Add or update an entity in the graph"""
-
-        set_create = ["e.type = $entity_type", "e.created_at = timestamp()"]
-        set_match = ["e.updated_at = timestamp()"]
-
-        if properties:
-            prop_assignments = [f"e.{k} = ${k}" for k in properties]
-            set_create += prop_assignments
-            set_match += prop_assignments
-
-        create_str = ", ".join(set_create)
-        match_str = ", ".join(set_match)
-
-        query = f"""
-        MERGE (e:Entity {{name: $name}})
-        ON CREATE SET {create_str}
-        ON MATCH SET {match_str}
-        RETURN e
-        """
-
-        params = {"name": name, "entity_type": entity_type, **properties}
-        self.graph.query(query, params)
-
-    def add_relationship(
-        self, source: str, target: str, rel_type: str, properties: Dict[str, Any] = None
-    ):
-        """Add a relationship between entities"""
-
-        properties = properties or {}
-        properties["created_at"] = datetime.now().isoformat()
-
-        props_str = ", ".join([f"{k}: ${k}" for k in properties.keys()])
-
-        query = f"""
-        MATCH (s:Entity {{name: $source}})
-        MATCH (t:Entity {{name: $target}})
-        MERGE (s)-[r:{rel_type} {{{props_str}}}]->(t)
-        RETURN r
-        """
-
-        params = {"source": source, "target": target, **properties}
-
         try:
-            self.graph.query(query, params)
+            self.graph.query(node_query, {"nodes": node_params})
         except Exception as e:
-            print(f"Error creating relationship: {e}")
+            logger.error(f"Error merging nodes: {e}")
 
-    def add_user_attribute(
-        self, user_id: str, attribute: str, value: str, context: str
-    ):
-        """Add or update user attributes"""
-
-        query = """
-        MERGE (u:User {id: $user_id})
-        ON CREATE SET u.created_at = timestamp()
-        SET u.updated_at = timestamp()
-        MERGE (u)-[r:HAS_ATTRIBUTE]->(a:Attribute {name: $attribute})
-        ON CREATE SET a.value = $value, a.context = $context, a.created_at = timestamp()
-        ON MATCH SET a.value = $value, a.context = $context, a.updated_at = timestamp()
-        RETURN u, a
+        # 2. Merge Relationships
+        rel_query = """
+        UNWIND $rels AS r
+        MATCH (s:Entity {id: r.source_id})
+        MATCH (t:Entity {id: r.target_id})
+        MERGE (s)-[rel:RELATIONSHIP {type: r.type}]->(t)
+        ON CREATE SET rel.created_at = timestamp()
+        SET rel += r.properties, rel.updated_at = timestamp()
+        WITH s, t, r, rel
+        CALL apoc.refactor.setType(rel, r.type) YIELD output
+        RETURN count(output)
         """
+        # Note: Dynamic relationship types in pure Cypher require APOC or literal injection.
+        # Safe Approach: Iterate or use APOC. Here we use APOC `setType` or standard Cypher injection if strictly validated.
 
-        self.graph.query(
-            query,
-            {
-                "user_id": user_id,
-                "attribute": attribute,
-                "value": value,
-                "context": context,
-            },
-        )
+        # Since we use Enums, we can trust the types. However, MERGE doesn't accept dynamic types easily.
+        # We will do a loop for reliability in this specific implementation, or use a specific query per type.
+        # For production speed, we group by relationship type.
 
-    def store_conversation(
-        self,
-        user_id: str,
-        user_message: str,
-        assistant_message: str,
-        conversation_id: str,
-    ):
-        """Store conversation in graph"""
-
-        query = """
-        MERGE (u:User {id: $user_id})
-        MERGE (c:Conversation {id: $conversation_id})
-        ON CREATE SET c.created_at = timestamp()
-        CREATE (m:Message {
-            user_message: $user_message,
-            assistant_message: $assistant_message,
-            timestamp: timestamp()
-        })
-        MERGE (u)-[:HAD_CONVERSATION]->(c)
-        MERGE (c)-[:CONTAINS]->(m)
-        RETURN m
-        """
-
-        self.graph.query(
-            query,
-            {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "user_message": user_message,
-                "assistant_message": assistant_message,
-            },
-        )
-
-    def get_user_context(self, user_id: str) -> str:
-        """Retrieve user context from graph"""
-
-        query = """
-        MATCH (u:User {id: $user_id})-[:HAS_ATTRIBUTE]->(a:Attribute)
-        RETURN a.name AS attribute, a.value AS value, a.context AS context
-        ORDER BY a.updated_at DESC
-        LIMIT 20
-        """
-
-        results = self.graph.query(query, {"user_id": user_id})
-
-        if not results:
-            return "No user context available."
-
-        context_parts = []
-        for record in results:
-            context_parts.append(
-                f"- {record['attribute']}: {record['value']} (Context: {record['context']})"
-            )
-
-        return "User Context:\n" + "\n".join(context_parts)
-
-    def query_related_entities(self, entity_name: str, depth: int = 2) -> str:
-        """Query entities related to a given entity"""
-
-        query = f"""
-        MATCH path = (e:Entity {{name: $entity_name}})-[*1..{depth}]-(related:Entity)
-        RETURN related.name AS name, related.type AS type, 
-               [r IN relationships(path) | type(r)] AS relationships
-        LIMIT 20
-        """
-
-        results = self.graph.query(query, {"entity_name": entity_name})
-
-        if not results:
-            return f"No related entities found for {entity_name}."
-
-        context_parts = [f"Entities related to {entity_name}:"]
-        for record in results:
-            context_parts.append(
-                f"- {record['name']} ({record['type']}) via {' -> '.join(record['relationships'])}"
-            )
-
-        return "\n".join(context_parts)
+        for rel in data.relationships:
+            query = f"""
+            MATCH (s:Entity {{id: $source_id}})
+            MATCH (t:Entity {{id: $target_id}})
+            MERGE (s)-[r:{rel.type.value}]->(t)
+            ON CREATE SET r.created_at = timestamp()
+            SET r += $properties, r.updated_at = timestamp()
+            """
+            try:
+                self.graph.query(
+                    query,
+                    {
+                        "source_id": rel.source_id,
+                        "target_id": rel.target_id,
+                        "properties": rel.properties,
+                    },
+                )
+            except Exception as e:
+                logger.error(f"Error merging relationship {rel.type}: {e}")
 
 
 # ============================================================================
-# Main Graph RAG Agent
+# 3. KNOWLEDGE MEMORY (The "Write" Path)
 # ============================================================================
 
 
-class EvolvingGraphRAGAgent:
-    """Main agent that evolves understanding through graph interactions"""
+class KnowledgeGraphMemory:
+    """Handles extracting insights and persisting them to Neo4j."""
 
-    def __init__(self, config: GraphRAGConfig, user_id: str = "default_user"):
-        self.config = config
+    def __init__(self, llm, neo4j_service: Neo4jService):
+        self.llm = llm
+        self.neo4j_service = neo4j_service
+
+        # Configure the structured LLM
+        self.structured_llm = self.llm.with_structured_output(KnowledgeGraphExtraction)
+
+        self.prompt = ChatPromptTemplate.from_template(
+            """
+        You are a Knowledge Graph Architect building a digital twin of the USER.
+        
+        Your goal is to extract structured knowledge from the chat history.
+        
+        RULES:
+        1. **User-Centric**: Focus primarily on the 'User' node. Connect facts to them.
+           - If user says "I love Python", create (User)-[:INTERESTED_IN]->(Topic:Python).
+           - Do NOT create isolated facts like (Python)-[:IS_A]->(Language) unless relevant to the user's context.
+        2. **Strict Schema**: You can ONLY use the allowed NodeLabels and RelationTypes provided.
+        3. **Resolution**: Resolve "I", "me", "my" to the node ID "User_Main".
+        4. **Deduplication**: If a fact implies a stronger version of an existing one, output it to update properties.
+        
+        Existing Chat Context:
+        {history}
+        
+        Extract the nodes and relationships now.
+        """
+        )
+
+    async def extract_and_save(self, history: List[Any]):
+        """Runs in background to evolve graph."""
+        try:
+            # Format history for prompt
+            history_text = "\n".join(
+                [f"{msg.type}: {msg.content}" for msg in history[-4:]]
+            )  # Last 4 messages
+
+            chain = self.prompt | self.structured_llm
+            result: KnowledgeGraphExtraction = await chain.ainvoke(
+                {"history": history_text}
+            )
+
+            # Ensure "User_Main" is always of type User if present
+            for node in result.nodes:
+                if node.id == "User_Main":
+                    node.label = NodeLabel.USER
+
+            logger.info(
+                f"Extracted {len(result.nodes)} nodes and {len(result.relationships)} relations."
+            )
+            await self.neo4j_service.persist_data(result)
+
+        except Exception as e:
+            logger.error(f"Extraction failed: {e}")
+
+
+# ============================================================================
+# 4. GRAPH RETRIEVER (The "Read" Path)
+# ============================================================================
+
+
+class GraphRAGRetriever:
+    """Retrieves relevant context by traversing the graph."""
+
+    def __init__(self, graph: Neo4jGraph, user_id: str = "User_Main"):
+        self.graph = graph
         self.user_id = user_id
-        self.conversation_id = f"conv_{datetime.now().timestamp()}"
 
-        # Initialize components
-        self.llm = service_manager.get_agent()
+    async def get_context(self, user_query: str) -> str:
+        """
+        Performs a hybrid retrieval:
+        1. Identifies entities in the query.
+        2. Fetches the User's direct profile.
+        3. Traverses 1-hop from query entities.
+        """
 
-        self.graph = Neo4jGraph(
-            url=config.neo4j_uri,
-            username=config.neo4j_username,
-            password=config.neo4j_password,
+        # 1. Always get direct user profile (Strongest Context)
+        user_profile_query = """
+        MATCH (u:User {id: $user_id})-[r]->(n)
+        RETURN n.id as node, type(r) as rel, n.properties as props
+        LIMIT 15
+        """
+        user_data = self.graph.query(user_profile_query, {"user_id": self.user_id})
+
+        # 2. Keyword/Entity Search (Simple implementation)
+        # In a full prod system, use vector search here.
+        # For now, we use a simple case-insensitive substring match on the query.
+        # "Tell me about Python" -> matches node "Python"
+
+        entity_search_query = """
+        MATCH (n:Entity)
+        WHERE toLower($query) CONTAINS toLower(n.id) AND n.id <> $user_id
+        MATCH (n)-[r]-(m)
+        RETURN n.id as source, type(r) as rel, m.id as target
+        LIMIT 10
+        """
+        rel_data = self.graph.query(
+            entity_search_query, {"query": user_query, "user_id": self.user_id}
         )
 
-        self.graph_manager = GraphManager(self.graph)
-        self.extractor = KnowledgeExtractor(self.llm)
+        # Format Context
+        context_lines = ["**User Profile:**"]
+        for row in user_data:
+            context_lines.append(f"- User {row['rel']} {row['node']} ({row['props']})")
 
-        # Conversation history
+        if rel_data:
+            context_lines.append("\n**Relevant Topic Graph:**")
+            for row in rel_data:
+                context_lines.append(
+                    f"- {row['source']} --[{row['rel']}]--> {row['target']}"
+                )
+
+        return "\n".join(context_lines)
+
+
+# ============================================================================
+# 5. MAIN AGENT (The Orchestrator)
+# ============================================================================
+
+
+class DigitalTwinAgent:
+    """
+    Main controller.
+    1. Retrieve Context
+    2. Generate Answer
+    3. Trigger Evolution (Background)
+    """
+
+    def __init__(self):
+        self.llm = service_manager.get_agent()  # Getting LLM
+        self.graph = service_manager.get_graph()  # Getting Neo4jGraph
+
+        self.neo4j_service = Neo4jService(self.graph)
+        self.memory = KnowledgeGraphMemory(self.llm, self.neo4j_service)
+        self.retriever = GraphRAGRetriever(self.graph)
+
         self.chat_history: List[Any] = []
 
-    async def process_interaction(self, user_message: str) -> str:
-        """Process user interaction and evolve the graph"""
-
-        # 1. Get user context from graph
-        user_context = self.graph_manager.get_user_context(self.user_id)
-
-        # 2. Generate response with context
-        response = await self._generate_response(user_message, user_context)
-
-        # 3. Extract knowledge from interaction
-        knowledge = await self.extractor.extract_knowledge(user_message, response)
-
-        # 4. Update graph with extracted knowledge
-        await self._update_graph(knowledge, user_message, response)
-
-        # 5. Store conversation
-        self.graph_manager.store_conversation(
-            self.user_id, user_message, response, self.conversation_id
-        )
-
-        # 6. Update chat history
-        self.chat_history.append(HumanMessage(content=user_message))
-        self.chat_history.append(AIMessage(content=response))
-
-        return response
-
-    async def _generate_response(self, user_message: str, user_context: str) -> str:
-        """Generate contextualized response"""
-
-        system_prompt = f"""You are a helpful AI assistant with access to a knowledge graph.
+        # Answer Generation Prompt
+        self.response_prompt = ChatPromptTemplate.from_template(
+            """
+        You are a helpful AI assistant. You have access to a 'Digital Twin' graph of the user.
         
-{user_context}
-
-Use this context to provide personalized and contextual responses. 
-If the user asks about topics related to their context, incorporate that information naturally."""
-
-        messages = [
-            ("system", system_prompt),
-            *[
-                (msg.type, msg.content) for msg in self.chat_history[-10:]
-            ],  # Last 10 messages
-            ("human", user_message),
-        ]
-
-        response = await self.llm.ainvoke(messages)
-        return response.content
-
-    async def _update_graph(
-        self, knowledge: Dict[str, Any], user_message: str, assistant_message: str
-    ):
-        """Update graph with extracted knowledge"""
-
-        # Add entities
-        for entity in knowledge.get("entities", []):
-            self.graph_manager.add_or_update_entity(
-                name=entity["name"],
-                entity_type=entity["type"],
-                properties=entity.get("properties", {}),
-            )
-
-        # Add relationships
-        for rel in knowledge.get("relationships", []):
-            self.graph_manager.add_relationship(
-                source=rel["source"],
-                target=rel["target"],
-                rel_type=rel["type"],
-                properties=rel.get("properties", {}),
-            )
-
-        # Add user attributes
-        for attr in knowledge.get("user_attributes", []):
-            self.graph_manager.add_user_attribute(
-                user_id=self.user_id,
-                attribute=attr["attribute"],
-                value=attr["value"],
-                context=attr.get("context", ""),
-            )
-
-    def query_graph(self, query: str) -> str:
-        """Query the graph using Cypher"""
-
-        qa_chain = GraphCypherQAChain.from_llm(
-            llm=self.llm, graph=self.graph, verbose=True
+        Graph Context:
+        {context}
+        
+        Chat History:
+        {chat_history}
+        
+        User: {input}
+        
+        Answer the user naturally. If the context shows they know something, acknowledge it.
+        """
         )
 
-        try:
-            result = qa_chain.invoke({"query": query})
-            return result["result"]
-        except Exception as e:
-            return f"Error querying graph: {e}"
+    async def chat(self, user_message: str) -> str:
+        # 1. Retrieve
+        context = await self.retriever.get_context(user_message)
 
-    def get_user_profile(self) -> Dict[str, Any]:
-        """Get complete user profile from graph"""
+        # 2. Generate
+        # Format history for the generation model
+        history_msgs = [f"{m.type}: {m.content}" for m in self.chat_history[-5:]]
 
-        query = """
-        MATCH (u:User {id: $user_id})
-        OPTIONAL MATCH (u)-[:HAS_ATTRIBUTE]->(a:Attribute)
-        OPTIONAL MATCH (u)-[:HAD_CONVERSATION]->(c:Conversation)
-        RETURN u, 
-               collect(DISTINCT {attribute: a.name, value: a.value}) AS attributes,
-               count(DISTINCT c) AS conversation_count
-        """
+        chain = self.response_prompt | self.llm
+        response = await chain.ainvoke(
+            {
+                "context": context,
+                "chat_history": "\n".join(history_msgs),
+                "input": user_message,
+            }
+        )
 
-        result = self.graph.query(query, {"user_id": self.user_id})
+        ai_message = response.content
 
-        if result:
-            return result[0]
-        return {}
+        # 3. Update State
+        self.chat_history.append(HumanMessage(content=user_message))
+        self.chat_history.append(AIMessage(content=ai_message))
+
+        # 4. Evolve Graph (Background Task)
+        # In a web server (FastAPI), utilize BackgroundTasks. Here we await for simplicity.
+        await self.memory.extract_and_save(self.chat_history)
+
+        return ai_message
 
 
 # ============================================================================
-# Example Usage
+# EXECUTION
 # ============================================================================
 
 
 async def main():
-    """Example usage of the Evolving Graph RAG system"""
+    print("Initializing Digital Twin System...")
+    agent = DigitalTwinAgent()
 
-    # Configuration
-    config = GraphRAGConfig(
-        neo4j_uri=settings.NEO4J_URL,
-        neo4j_username=settings.NEO4J_USERNAME,
-        neo4j_password=settings.NEO4J_PASSWORD,
-        openai_api_key=settings.GOOGLE_API_KEY,
-        model_name=settings.LLM_MODEL,
-    )
-
-    # Initialize agent
-    agent = EvolvingGraphRAGAgent(config, user_id="user_123")
-
-    # Simulate conversation
-    conversations = [
-        "Hi! I'm a software engineer interested in machine learning.",
-        "I'm currently working on a project involving natural language processing.",
-        "Can you tell me about graph databases?",
-        "What do you remember about my interests?",
+    # Simulate a user session
+    inputs = [
+        "Hi, I am a data scientist living in Malaysia.",
+        "I specialize in Python and LangChain.",
+        "What do you know about my tech stack?",
+        "I'm also learning Rust now, it's difficult but cool.",
+        "Where do I live again?",
     ]
 
-    for user_msg in conversations:
-        print(f"\n{'='*60}")
-        print(f"User: {user_msg}")
-        response = await agent.process_interaction(user_msg)
-        print(f"Assistant: {response}")
-
-    # Query the graph
-    print(f"\n{'='*60}")
-    print("User Profile:")
-    profile = agent.get_user_profile()
-    print(profile)
+    for inp in inputs:
+        print(f"\nUser: {inp}")
+        response = await agent.chat(inp)
+        print(f"Agent: {response}")
+        print("-" * 50)
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
