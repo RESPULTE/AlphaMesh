@@ -6,10 +6,11 @@ from typing import List, Optional, Tuple, Union
 
 import pandas as pd
 from core.agents.concept_resolver import build_concept_resolver
+from core.config import settings
 from edgar import Company, set_identity
 
 # --- CONFIGURATION ---
-USER_AGENT = "FinancialResearchBot student@university.edu"
+USER_AGENT = "FundamentalAnalysisBot yeapzing@utar.edu.my"
 ALL_STATEMENT_TYPE = ["income", "balance", "cashflow"]
 DEFAULT_YEARS = 5
 
@@ -22,6 +23,7 @@ class FinancialDatabase:
 
         self._init_db()
         set_identity(USER_AGENT)
+        settings
 
     def _get_connection(self):
         return sqlite3.connect(self.db_name)
@@ -451,7 +453,7 @@ if __name__ == "__main__":
     print(
         db.get_concept(
             company,
-            ["us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax"],
+            ["RevenueFromContractWithCustomerExcludingAssessedTax"],
             start_year=2021,
             end_year=2024,
         )

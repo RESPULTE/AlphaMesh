@@ -1,7 +1,8 @@
-from edgar import set_identity
+from core.config import settings
+from edgar import Company, MultiFinancials
+from edgar.xbrl import XBRLS
 
 # --- CONFIGURATION ---
-USER_AGENT = "FinancialResearchBot student@university.edu"
 
 
 def benchmark(func, *args, **kwargs):
@@ -15,9 +16,6 @@ def benchmark(func, *args, **kwargs):
 
 
 def xbrl_func():
-
-    from edgar import Company
-    from edgar.xbrl import XBRLS
 
     # Get multiple filings for trend analysis
     company = Company("AAPL")
@@ -41,7 +39,6 @@ def xbrl_func():
 
 
 def multi_func():
-    from edgar import Company, MultiFinancials
 
     # Get multiple years of 10-K filings
     company = Company("AAPL")
@@ -63,6 +60,6 @@ def multi_func():
 
 # --- EXAMPLE USAGE ---
 if __name__ == "__main__":
-    set_identity(USER_AGENT)
+    settings
     benchmark(xbrl_func)
     benchmark(multi_func)
