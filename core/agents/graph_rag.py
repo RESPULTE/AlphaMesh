@@ -29,7 +29,6 @@ AllowedNodeLabels = Literal[
 
 # ALLOWED RELATIONSHIP TYPES
 AllowedRelTypes = Literal[
-    "HAS_PREFERENCE",  # User -> Preference (Exclusive: User usually has 1 active style)
     "INTERESTED_IN",  # User -> Concept (Stateful: Can change to DISLIKES)
     "DISLIKES",  # User -> Concept
     "RELATED_TO",  # Concept -> Concept (New: For sub-aspects like Docker -> Containers)
@@ -39,10 +38,8 @@ AllowedRelTypes = Literal[
 # This dictates how the Graph Manager handles updates.
 # NOTHING is hardcoded in the logic; it follows these rules.
 RELATIONSHIP_BEHAVIOR = {
-    # Rule: "EXCLUSIVE_CATEGORY"
     # Meaning: User can only have ONE active relationship of this type to ANY node.
     # Ex: If User sets "Brief" preference, close "Detailed" preference.
-    "HAS_PREFERENCE": "EXCLUSIVE_CATEGORY",
     # Rule: "ENTITY_STATE"
     # Meaning: User can only have ONE active relationship to a SPECIFIC node.
     # Ex: If User "DISLIKES" App Dev, close "INTERESTED_IN" App Dev.
@@ -91,11 +88,6 @@ class KnowledgeGraphUpdate(BaseModel):
 # ============================================================================
 
 
-# ============================================================================
-# 2. Temporal Knowledge Extractor
-# ============================================================================
-
-
 class KnowledgeExtractor:
     def __init__(self, llm):
         self.llm = llm.with_structured_output(KnowledgeGraphUpdate)
@@ -112,33 +104,33 @@ class KnowledgeExtractor:
         )
 
         system_prompt = f"""You are a Temporal Knowledge Graph Architect.
-Your goal is to map the conversation to a graph, capturing both User Intent and **Learned Concepts**.
+    Your goal is to map the conversation to a graph, capturing both User Intent and **Learned Concepts**.
 
-### EXISTING GRAPH NODES:
-{existing_entities}
+    ### EXISTING GRAPH NODES:
+    {existing_entities}
 
-### RULES:
-1. **Analyze the Assistant's Answer**: 
-   - If the Assistant explains a specific detail about a topic, extract it as a new Concept and link it using 'RELATED_TO'.
-   - Example: AI says "Docker uses Containers." -> 
-     Nodes: [Docker, Containers]
-     Rels: [Docker -> RELATED_TO -> Containers]
+    ### RULES:
+    1. **Implicit Interest (Crucial)**: 
+    - If the user asks about or mentions a Concept (e.g., "How does Docker work?"), assume they are **INTERESTED_IN** it.
+    - Create a relationship: `CURRENT_USER -> INTERESTED_IN -> Docker`.
+    - **Exception**: If the user explicitly says they hate/dislike it, use `DISLIKES` instead.
 
-2. **Strict Directionality**:
-   - 'DISLIKES', 'INTERESTED_IN', 'HAS_PREFERENCE' **MUST** always start with 'CURRENT_USER'.
-   - NEVER say "Python DISLIKES Docker". 
-   - Use 'RELATED_TO' for concept-to-concept links.
+    2. **Analyze the Assistant's Answer**: 
+    - If the Assistant explains a specific detail about a topic, extract it as a new Concept and link it using 'RELATED_TO'.
+    - Example: AI says "Docker uses Containers." -> 
+        Nodes: [Docker, Containers]
+        Rels: [Docker -> RELATED_TO -> Containers]
 
-3. **Scoring & Priority**:
-   - If a topic is discussed *again*, **OUTPUT THE RELATIONSHIP AGAIN**. The database will increment the score.
+    3. **Strict Directionality**:
+    - 'DISLIKES', 'INTERESTED_IN', 'HAS_PREFERENCE' **MUST** always start with 'CURRENT_USER'.
+    - NEVER say "Python DISLIKES Docker". 
+    - Use 'RELATED_TO' for concept-to-concept links.
 
-4. **Entity Resolution**:
-   - Use the 'EXISTING GRAPH NODES' list to reuse IDs.
+    4. **Scoring & Priority**:
+    - If a topic is discussed *again*, **OUTPUT THE RELATIONSHIP AGAIN**. The database will increment the score.
 
-### RELATIONSHIP TYPES:
-- HAS_PREFERENCE: User -> Preference Style (e.g., Brief).
-- INTERESTED_IN / DISLIKES: User -> Concept (e.g., Python).
-- RELATED_TO: Concept -> Concept (e.g., Docker -> Containers).
+    5. **Entity Resolution**:
+    - Use the 'EXISTING GRAPH NODES' list to reuse IDs.
 """
         prompt = ChatPromptTemplate.from_messages(
             [("system", system_prompt), ("human", formatted_history)]
@@ -151,11 +143,6 @@ Your goal is to map the conversation to a graph, capturing both User Intent and 
             return KnowledgeGraphUpdate(
                 user_attributes=UserProfileUpdate(), nodes=[], relationships=[]
             )
-
-
-# ============================================================================
-# 3. Temporal Graph Manager (The Dynamic Engine)
-# ============================================================================
 
 
 # ============================================================================
@@ -266,15 +253,8 @@ class TemporalGraphManager:
             self._increment_weight(source, target, rel.type)
             return
 
-        # LOGIC BRANCH 1: Exclusive Category
-        if behavior == "EXCLUSIVE_CATEGORY":
-            self._close_category_relationships(source, rel.type)
-            self._create_new_active_relationship(
-                source, target, rel.type, rel.properties
-            )
-
         # LOGIC BRANCH 2: Entity State
-        elif behavior == "ENTITY_STATE":
+        if behavior == "ENTITY_STATE":
             conflicting_types = self._get_conflicting_types(rel.type)
             self._close_entity_state_relationships(source, target, conflicting_types)
             self._create_new_active_relationship(
@@ -417,18 +397,18 @@ async def main():
     agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_evolution_demo")
 
     # 🛑 RESET GRAPH for a clean demo
-    # print("🧹 Clearing Database for Demo...")
-    # graph.query("MATCH (n) DETACH DELETE n")
+    print("🧹 Clearing Database for Demo...")
+    graph.query("MATCH (n) DETACH DELETE n")
 
-    # # Helper to visualize the graph state
+    # Helper to visualize the graph state
     def print_graph_snapshot(step_name):
         print(f"\n{'='*20} {step_name} {'='*20}")
 
         # Fetch Active Edges
         active = graph.query(
             """
-            MATCH (u:User)-[r]->(n)
-            WHERE r.end_date IS NULL
+            MATCH (u:User)-[r]->(n) 
+            WHERE r.end_date IS NULL 
             RETURN type(r) as rel, n.id as node, n.label as label
         """
         )
@@ -436,8 +416,8 @@ async def main():
         # Fetch Archived Edges
         archived = graph.query(
             """
-            MATCH (u:User)-[r]->(n)
-            WHERE r.end_date IS NOT NULL
+            MATCH (u:User)-[r]->(n) 
+            WHERE r.end_date IS NOT NULL 
             RETURN type(r) as rel, n.id as node, r.end_date as ended
         """
         )
@@ -457,61 +437,61 @@ async def main():
             )
         print("=" * 60)
 
-    # # ============================================================
-    # # 📨 Message 1: Initialization
-    # # Setting identity, interest, and specific preference.
-    # # ============================================================
-    # msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
-    # print(f"\nUser: {msg_1}")
-    # await agent.process_interaction(msg_1)
-    # print_graph_snapshot("AFTER MESSAGE 1")
-    # # EXPECTED:
-    # # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
-    # # History: None
+    # ============================================================
+    # 📨 Message 1: Initialization
+    # Setting identity, interest, and specific preference.
+    # ============================================================
+    msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
+    print(f"\nUser: {msg_1}")
+    await agent.process_interaction(msg_1)
+    print_graph_snapshot("AFTER MESSAGE 1")
+    # EXPECTED:
+    # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
+    # History: None
 
-    # # ============================================================
-    # # 📨 Message 2: Expansion
-    # # Adding a new skill (Accumulative change).
-    # # ============================================================
-    # msg_2 = "I am also starting to learn Docker for containerization. could you explain to me some details on docker?"
-    # print(f"\nUser: {msg_2}")
-    # await agent.process_interaction(msg_2)
-    # print_graph_snapshot("AFTER MESSAGE 2")
-    # # EXPECTED:
-    # # Active: ... + LEARNING -> docker
-    # # History: None
+    # ============================================================
+    # 📨 Message 2: Expansion
+    # Adding a new skill (Accumulative change).
+    # ============================================================
+    msg_2 = "I am also starting to learn Docker for containerization. could you explain to me some details on docker?"
+    print(f"\nUser: {msg_2}")
+    await agent.process_interaction(msg_2)
+    print_graph_snapshot("AFTER MESSAGE 2")
+    # EXPECTED:
+    # Active: ... + LEARNING -> docker
+    # History: None
 
-    # # ============================================================
-    # # 📨 Message 3: Preference Shift (Conflict Type 1)
-    # # Changing "Detailed" -> "Brief".
-    # # The 'detailed' edge should close.
-    # # ============================================================
-    # msg_3 = (
-    #     "Actually, your answers are too long. Keep them brief and concise from now on."
-    # )
-    # print(f"\nUser: {msg_3}")
-    # await agent.process_interaction(msg_3)
-    # print_graph_snapshot("AFTER MESSAGE 3")
-    # # EXPECTED:
-    # # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
-    # # History: HAS_PREFERENCE -> detailed
+    # ============================================================
+    # 📨 Message 3: Preference Shift (Conflict Type 1)
+    # Changing "Detailed" -> "Brief".
+    # The 'detailed' edge should close.
+    # ============================================================
+    msg_3 = (
+        "Actually, your answers are too long. Keep them brief and concise from now on."
+    )
+    print(f"\nUser: {msg_3}")
+    await agent.process_interaction(msg_3)
+    print_graph_snapshot("AFTER MESSAGE 3")
+    # EXPECTED:
+    # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
+    # History: HAS_PREFERENCE -> detailed
 
-    # # ============================================================
-    # # 📨 Message 4: Sentiment Shift (Conflict Type 2)
-    # # Changing "Love Python" -> "Dislike Python".
-    # # The 'INTERESTED_IN' Python edge should close.
-    # # ============================================================
-    # msg_4 = "Also, I'm tired of Python. It's too slow. I fucking hate it now. same with docker, so troublesome"
-    # print(f"\nUser: {msg_4}")
-    # await agent.process_interaction(msg_4)
-    # print_graph_snapshot("AFTER MESSAGE 4")
+    # ============================================================
+    # 📨 Message 4: Sentiment Shift (Conflict Type 2)
+    # Changing "Love Python" -> "Dislike Python".
+    # The 'INTERESTED_IN' Python edge should close.
+    # ============================================================
+    msg_4 = "Also, I'm tired of Python. It's too slow. I fucking hate it now. same with docker, so troublesome"
+    print(f"\nUser: {msg_4}")
+    await agent.process_interaction(msg_4)
+    print_graph_snapshot("AFTER MESSAGE 4")
     # EXPECTED:
     # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
     # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
 
     msg_5 = "could you describe what you know about me?"
-    print(f"\nUser: {msg_5}")
-    await agent.process_interaction(msg_5)
+    print(f"\nUser: {msg_4}")
+    await agent.process_interaction(msg_4)
     print_graph_snapshot("AFTER MESSAGE 4")
 
 
