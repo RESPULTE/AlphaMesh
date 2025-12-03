@@ -33,9 +33,6 @@ AllowedRelTypes = Literal[
     "HAS_PREFERENCE",  # User -> Preference (Exclusive: User usually has 1 active style)
     "INTERESTED_IN",  # User -> Concept (Stateful: Can change to DISLIKES)
     "DISLIKES",  # User -> Concept
-    "LEARNING",  # User -> Skill
-    "MASTERED",  # User -> Skill
-    "WORKING_ON",  # User -> Project
 ]
 
 # --- DYNAMIC BEHAVIOR CONFIGURATION ---
@@ -51,16 +48,12 @@ RELATIONSHIP_BEHAVIOR = {
     # Ex: If User "DISLIKES" App Dev, close "INTERESTED_IN" App Dev.
     "INTERESTED_IN": "ENTITY_STATE",
     "DISLIKES": "ENTITY_STATE",
-    "LEARNING": "ENTITY_STATE",
-    "MASTERED": "ENTITY_STATE",
+    "MENTIONED": "STANDARD",
 }
 
 # Grouping conflicting types for Entity State logic
 # If a new rel is in this group, close ALL other active rels in this group for that target.
-CONFLICTING_REL_GROUPS = {
-    "SENTIMENT": ["INTERESTED_IN", "DISLIKES"],
-    "PROFICIENCY": ["LEARNING", "MASTERED"],
-}
+CONFLICTING_REL_GROUPS = {"SENTIMENT": ["INTERESTED_IN", "DISLIKES"]}
 
 
 class UserProfileUpdate(BaseModel):
