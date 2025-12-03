@@ -98,9 +98,8 @@ class KnowledgeExtractor:
         """
         Extracts new knowledge and reinforcements of existing knowledge.
         """
-        recent_interaction = conversation[-2:]
         formatted_history = "\n".join(
-            [f"{m.type.upper()}: {m.content}" for m in recent_interaction]
+            [f"{m.type.upper()}: {m.content}" for m in conversation]
         )
 
         system_prompt = f"""You are a Temporal Knowledge Graph Architect.
@@ -315,28 +314,46 @@ class TemporalGraphManager:
         self.graph.query(query, {"source": source_id, "target": target_id})
 
     def get_current_user_state(self, user_id: str) -> str:
+        """
+        Fetches active relationships, SORTED by weight (Priority).
+        """
         query = """
         MATCH (u:User {id: $user_id})
-        OPTIONAL MATCH (u)-[r1:HAS_PREFERENCE]->(p:Preference) WHERE r1.end_date IS NULL
+        
+        // 1. Active Preferences (Sorted by Weight DESC, then Recency)
+        OPTIONAL MATCH (u)-[r1:HAS_PREFERENCE]->(p:Preference) 
+        WHERE r1.end_date IS NULL
+        WITH u, p, r1 ORDER BY r1.weight DESC, r1.start_date DESC
         WITH u, collect(p.id) as preferences
         
-        OPTIONAL MATCH (u)-[r2:INTERESTED_IN]->(c:Concept) WHERE r2.end_date IS NULL
-        WITH u, preferences, collect(c.id + ' (Score: ' + coalesce(r2.weight, 1) + ')') as interests
+        // 2. Active Interests (Sorted by Weight DESC - Highest Priority First)
+        OPTIONAL MATCH (u)-[r2:INTERESTED_IN]->(c:Concept) 
+        WHERE r2.end_date IS NULL
+        WITH u, preferences, c, r2 ORDER BY r2.weight DESC
+        // Format: "ConceptName [Priority: 5]"
+        WITH u, preferences, collect(c.id + ' [Priority: ' + coalesce(r2.weight, 1) + ']') as interests
         
-        OPTIONAL MATCH (u)-[r3:DISLIKES]->(d:Concept) WHERE r3.end_date IS NULL
+        // 3. Known Dislikes
+        OPTIONAL MATCH (u)-[r3:DISLIKES]->(d:Concept) 
+        WHERE r3.end_date IS NULL
         WITH u, preferences, interests, collect(d.id) as dislikes
         
         RETURN u {.*, id:null, created_at:null, last_active:null} as profile, 
                preferences, interests, dislikes
         """
         data = self.graph.query(query, {"user_id": user_id})
+
         if not data:
-            return "New User"
+            return "New User (No history yet)."
+
         rec = data[0]
-        return f"""Current Profile: {rec['profile']}
-Active Preferences: {rec['preferences']}
-Current Interests: {rec['interests']}
-Known Dislikes: {rec['dislikes']}"""
+
+        # We format this string to be very clear for the LLM
+        return f"""User Profile & Context:
+- Attributes: {rec['profile']}
+- Communication Preferences: {', '.join(rec['preferences'])}
+- Active Interests (Sorted by Priority): {', '.join(rec['interests'])}
+- Dislikes (Do not mention): {', '.join(rec['dislikes'])}"""
 
 
 # ============================================================================
@@ -370,15 +387,24 @@ class EvolvingGraphRAGAgent:
         return response
 
     async def _generate_response(self, user_input: str, state: str) -> str:
-        system_msg = f"""You are a helpful assistant.
-        
-        USER'S CURRENT CONTEXT:
-        {state}
+        system_msg = f"""You are a helpful AI assistant with access to a personalized Knowledge Graph.
 
-        NOTE:
-        - If the user has 'Dislikes', do NOT suggest those topics.
-        - Adapt to their 'Active Preferences' (e.g., if 'brief', be concise).
-        """
+USER CONTEXT:
+{state}
+
+INSTRUCTIONS:
+1. **Prioritize High-Value Topics**: 
+   - Look at the 'Active Interests' list. Items with higher `[Priority: X]` scores are more important to the user.
+   - Focus your examples and analogies around these high-priority concepts.
+   
+2. **Respect Constraints**:
+   - Never mention topics listed in 'Dislikes'.
+   - Adapt your tone based on 'Communication Preferences'.
+
+3. **Be Natural**: 
+   - Do not say "I see you have a priority 5 interest in Python". 
+   - Instead, say "Since you're deeply into Python..." or use Python code snippets naturally.
+"""
         messages = [SystemMessage(content=system_msg)] + [
             HumanMessage(content=user_input)
         ]
@@ -396,103 +422,103 @@ async def main():
     llm = service_manager.get_agent()
     agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_evolution_demo")
 
-    # 🛑 RESET GRAPH for a clean demo
-    print("🧹 Clearing Database for Demo...")
-    graph.query("MATCH (n) DETACH DELETE n")
+    # # 🛑 RESET GRAPH for a clean demo
+    # print("🧹 Clearing Database for Demo...")
+    # graph.query("MATCH (n) DETACH DELETE n")
 
-    # Helper to visualize the graph state
-    def print_graph_snapshot(step_name):
-        print(f"\n{'='*20} {step_name} {'='*20}")
+    # # Helper to visualize the graph state
+    # def print_graph_snapshot(step_name):
+    #     print(f"\n{'='*20} {step_name} {'='*20}")
 
-        # Fetch Active Edges
-        active = graph.query(
-            """
-            MATCH (u:User)-[r]->(n) 
-            WHERE r.end_date IS NULL 
-            RETURN type(r) as rel, n.id as node, n.label as label
-        """
-        )
+    #     # Fetch Active Edges
+    #     active = graph.query(
+    #         """
+    #         MATCH (u:User)-[r]->(n)
+    #         WHERE r.end_date IS NULL
+    #         RETURN type(r) as rel, n.id as node, n.label as label
+    #     """
+    #     )
 
-        # Fetch Archived Edges
-        archived = graph.query(
-            """
-            MATCH (u:User)-[r]->(n) 
-            WHERE r.end_date IS NOT NULL 
-            RETURN type(r) as rel, n.id as node, r.end_date as ended
-        """
-        )
+    #     # Fetch Archived Edges
+    #     archived = graph.query(
+    #         """
+    #         MATCH (u:User)-[r]->(n)
+    #         WHERE r.end_date IS NOT NULL
+    #         RETURN type(r) as rel, n.id as node, r.end_date as ended
+    #     """
+    #     )
 
-        print("🟢 ACTIVE STATE:")
-        if not active:
-            print("   (Empty)")
-        for row in active:
-            print(f"   (User) --[{row['rel']}]--> ({row['node']}) [{row['label']}]")
+    #     print("🟢 ACTIVE STATE:")
+    #     if not active:
+    #         print("   (Empty)")
+    #     for row in active:
+    #         print(f"   (User) --[{row['rel']}]--> ({row['node']}) [{row['label']}]")
 
-        print("\n🔴 HISTORY (Archived):")
-        if not archived:
-            print("   (None)")
-        for row in archived:
-            print(
-                f"   (User) --[{row['rel']}]--> ({row['node']}) [Ended: {row['ended']}]"
-            )
-        print("=" * 60)
+    #     print("\n🔴 HISTORY (Archived):")
+    #     if not archived:
+    #         print("   (None)")
+    #     for row in archived:
+    #         print(
+    #             f"   (User) --[{row['rel']}]--> ({row['node']}) [Ended: {row['ended']}]"
+    #         )
+    #     print("=" * 60)
 
-    # ============================================================
-    # 📨 Message 1: Initialization
-    # Setting identity, interest, and specific preference.
-    # ============================================================
-    msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
-    print(f"\nUser: {msg_1}")
-    await agent.process_interaction(msg_1)
-    print_graph_snapshot("AFTER MESSAGE 1")
-    # EXPECTED:
-    # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
-    # History: None
+    # # ============================================================
+    # # 📨 Message 1: Initialization
+    # # Setting identity, interest, and specific preference.
+    # # ============================================================
+    # msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
+    # print(f"\nUser: {msg_1}")
+    # await agent.process_interaction(msg_1)
+    # print_graph_snapshot("AFTER MESSAGE 1")
+    # # EXPECTED:
+    # # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
+    # # History: None
 
-    # ============================================================
-    # 📨 Message 2: Expansion
-    # Adding a new skill (Accumulative change).
-    # ============================================================
-    msg_2 = "I am also starting to learn Docker for containerization. could you explain to me some details on docker?"
-    print(f"\nUser: {msg_2}")
-    await agent.process_interaction(msg_2)
-    print_graph_snapshot("AFTER MESSAGE 2")
-    # EXPECTED:
-    # Active: ... + LEARNING -> docker
-    # History: None
+    # # ============================================================
+    # # 📨 Message 2: Expansion
+    # # Adding a new skill (Accumulative change).
+    # # ============================================================
+    # msg_2 = "I am also starting to learn Docker for containerization. could you explain to me some details on docker?"
+    # print(f"\nUser: {msg_2}")
+    # await agent.process_interaction(msg_2)
+    # print_graph_snapshot("AFTER MESSAGE 2")
+    # # EXPECTED:
+    # # Active: ... + LEARNING -> docker
+    # # History: None
 
-    # ============================================================
-    # 📨 Message 3: Preference Shift (Conflict Type 1)
-    # Changing "Detailed" -> "Brief".
-    # The 'detailed' edge should close.
-    # ============================================================
-    msg_3 = (
-        "Actually, your answers are too long. Keep them brief and concise from now on."
-    )
-    print(f"\nUser: {msg_3}")
-    await agent.process_interaction(msg_3)
-    print_graph_snapshot("AFTER MESSAGE 3")
-    # EXPECTED:
-    # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
-    # History: HAS_PREFERENCE -> detailed
+    # # ============================================================
+    # # 📨 Message 3: Preference Shift (Conflict Type 1)
+    # # Changing "Detailed" -> "Brief".
+    # # The 'detailed' edge should close.
+    # # ============================================================
+    # msg_3 = (
+    #     "Actually, your answers are too long. Keep them brief and concise from now on."
+    # )
+    # print(f"\nUser: {msg_3}")
+    # await agent.process_interaction(msg_3)
+    # print_graph_snapshot("AFTER MESSAGE 3")
+    # # EXPECTED:
+    # # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
+    # # History: HAS_PREFERENCE -> detailed
 
-    # ============================================================
-    # 📨 Message 4: Sentiment Shift (Conflict Type 2)
-    # Changing "Love Python" -> "Dislike Python".
-    # The 'INTERESTED_IN' Python edge should close.
-    # ============================================================
-    msg_4 = "Also, I'm tired of Python. It's too slow. I fucking hate it now. same with docker, so troublesome"
-    print(f"\nUser: {msg_4}")
-    await agent.process_interaction(msg_4)
-    print_graph_snapshot("AFTER MESSAGE 4")
-    # EXPECTED:
-    # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
-    # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
+    # # ============================================================
+    # # 📨 Message 4: Sentiment Shift (Conflict Type 2)
+    # # Changing "Love Python" -> "Dislike Python".
+    # # The 'INTERESTED_IN' Python edge should close.
+    # # ============================================================
+    # msg_4 = "Also, I'm tired of Python. It's too slow. I fucking hate it now. same with docker, so troublesome"
+    # print(f"\nUser: {msg_4}")
+    # await agent.process_interaction(msg_4)
+    # print_graph_snapshot("AFTER MESSAGE 4")
+    # # EXPECTED:
+    # # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
+    # # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
 
-    msg_5 = "could you describe what you know about me?"
-    print(f"\nUser: {msg_4}")
-    await agent.process_interaction(msg_4)
-    print_graph_snapshot("AFTER MESSAGE 4")
+    msg_5 = "could you describe what you know about "
+    print(f"\nUser: {msg_5}")
+    await agent.process_interaction(msg_5)
+    # print_graph_snapshot("AFTER MESSAGE 4")
 
 
 if __name__ == "__main__":
