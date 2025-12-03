@@ -96,26 +96,43 @@ class KnowledgeExtractor:
     def __init__(self, llm):
         self.llm = llm.with_structured_output(KnowledgeGraphUpdate)
 
-    async def extract_knowledge(self, conversation: List[Any]) -> KnowledgeGraphUpdate:
+    async def extract_knowledge(
+        self, conversation: List[Any], existing_entities: str
+    ) -> KnowledgeGraphUpdate:
+        """
+        Extracts new knowledge while respecting existing entity IDs.
+        """
         # We look at the last few messages to catch context changes
         formatted_history = "\n".join(
-            [f"{m.type.upper()}: {m.content}" for m in conversation]
+            [f"{m.type.upper()}: {m.content}" for m in conversation[-4:]]
         )
 
-        system_prompt = """You are a Temporal Knowledge Graph Architect.
-        Your goal is to capture the *current state* of the user's mind.
+        system_prompt = f"""You are a Temporal Knowledge Graph Architect.
+        Your goal is to capture the *current state* of the user's mind and update the graph.
 
-        RULES:
-        1. **Detect Changes**: If the user says "I used to like X, but now I hate it", output a `DISLIKES` relationship. The system will automatically archive the old `INTERESTED_IN` relationship.
-        2. **Preferences**: If the user says "Give me brief answers", connect User -> `Brief` (Preference).
-        3. **User Anchor**: Use 'CURRENT_USER' as the ID for the user.
+        ### EXISTING GRAPH NODES (Use these IDs to prevent duplicates):
+        {existing_entities}
 
-        RELATIONSHIP TYPES:
+        ### RULES:
+        1. **Entity Resolution (CRITICAL)**: Check the 'EXISTING GRAPH NODES' list above. 
+        - If the user mentions "Python" and the list contains `python development`, YOU MUST use `id="python development"`.
+        - Always map new mentions to existing IDs if they refer to the same concept.
+        - Only create a NEW `id` if the concept is genuinely new.
+
+        2. **Detect Changes**: 
+        - If the user says "I used to like X, but now I hate it", output a `DISLIKES` relationship to the *existing* X node. 
+        - The system will automatically archive the old `INTERESTED_IN` relationship.
+
+        3. **Avoid Redundancy**: 
+        - If the user repeats a known fact (e.g., "I like Python" and the graph already has `INTERESTED_IN` -> `python development`), return an empty list.
+        - Only output *deltas* (new info or state changes).
+
+        4. **User Anchor**: Use 'CURRENT_USER' as the ID for the user.
+
+        ### RELATIONSHIP TYPES:
         - HAS_PREFERENCE: For communication styles (Brief, Detailed, Code-Only).
         - INTERESTED_IN / DISLIKES: For concepts/topics.
-        - LEARNING / MASTERED: For skills.
-
-        Extract the CURRENT truth. Do not worry about the past; the database handles history.
+        - MENTIONED: any relevant details that is of lesser priority
         """
         prompt = ChatPromptTemplate.from_messages(
             [("system", system_prompt), ("human", formatted_history)]
@@ -188,6 +205,36 @@ class TemporalGraphManager:
         # 3. Handle Temporal Relationships
         for rel in knowledge.relationships:
             self._upsert_temporal_relationship(user_id, rel)
+
+    def get_known_entities(self) -> str:
+        """
+        Retrieves a list of all existing nodes (excluding the User) to help
+        the LLM perform entity resolution (Canonicalization).
+        """
+        query = """
+        MATCH (n) 
+        WHERE NOT 'User' IN labels(n)
+        RETURN n.id as id, labels(n) as labels
+        LIMIT 100
+        """
+        try:
+            results = self.graph.query(query)
+
+            print(f"   Existing Entities: {results}")
+
+            if not results:
+                return "No existing entities."
+
+            # Format: "- python development (Concept)"
+            entities = []
+            for row in results:
+                lbl = row["labels"][0] if row["labels"] else "Entity"
+                entities.append(f"- {row['id']} ({lbl})")
+
+            return "\n".join(entities)
+        except Exception as e:
+            print(f"Error fetching entities: {e}")
+            return "Error fetching entities."
 
     def _upsert_temporal_relationship(self, user_id: str, rel: GraphRelationship):
         """
@@ -328,12 +375,15 @@ class EvolvingGraphRAGAgent:
         # 1. Get Current State
         state = self.manager.get_current_user_state(self.user_id)
 
+        known_entities = self.manager.get_known_entities()
+
         # 2. Generate Response
         response = await self._generate_response(user_input, state)
 
         # 3. Extract & Evolve
         knowledge = await self.extractor.extract_knowledge(
-            [HumanMessage(content=user_input), AIMessage(content=response)]
+            [HumanMessage(content=user_input), AIMessage(content=response)],
+            known_entities,
         )
         self.manager.update_graph(self.user_id, knowledge)
 
