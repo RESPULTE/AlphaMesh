@@ -1,329 +1,234 @@
-import sqlite3
-from collections.abc import Iterable
-from datetime import datetime
-from functools import lru_cache
-from typing import List, Optional, Tuple, Union
+import asyncio
+from typing import Dict, List, Literal, Optional, Union
 
+import aiosqlite
 import pandas as pd
-from core.agents.concept_resolver import build_concept_resolver
-from core.config import settings
-from edgar import Company, set_identity
+from edgar import Company, MultiFinancials, set_identity
 
 # --- CONFIGURATION ---
 USER_AGENT = "FundamentalAnalysisBot yeapzing@utar.edu.my"
-ALL_STATEMENT_TYPE = ["income", "balance", "cashflow"]
-DEFAULT_YEARS = 5
+set_identity(USER_AGENT)
+
+DB_PATH = "./data/financial_data.db"
+ALL_STATEMENT_TYPES = ["income", "balance", "cashflow"]
 
 
 class FinancialDatabase:
-    def __init__(self, db_name: str = "./data/financial_data.db"):
+    def __init__(self, db_name: str = DB_PATH):
         self.db_name = db_name
-        self._cached_existing_years = set()
-        self.concept_resolver = {}
 
-        self._init_db()
-        set_identity(USER_AGENT)
-        settings
-
-    def _get_connection(self):
-        return sqlite3.connect(self.db_name)
-
-    def _init_db(self):
-        schema_sql = """
-        CREATE TABLE IF NOT EXISTS financials (
-            company TEXT,
-            year INTEGER,
-            statement_type TEXT,
-            concept TEXT,
-            value REAL,
-            PRIMARY KEY (company, year, statement_type, concept)
-        );
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(schema_sql)
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_company_year ON financials (company, year);"
+    async def initialize(self):
+        """Async initialization of the database schema."""
+        async with aiosqlite.connect(self.db_name) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS financials (
+                    company TEXT,
+                    period_date TEXT,
+                    statement_type TEXT,
+                    label TEXT,
+                    value REAL,
+                    PRIMARY KEY (company, period_date, statement_type, label)
+                );
+            """
             )
-            conn.commit()
-
-    def get_existing_years(self, ticker: str) -> set:
-        """Returns a set of years that already exist in the database."""
-        # Invalidate cache if needed, but for this agent run we assume single session validity
-        if len(self._cached_existing_years) > 0:
-            # Note: In a real persistent app, you might want to query this every time
-            # or clear cache per ticker. For now, we query DB.
-            pass
-
-        query = "SELECT DISTINCT year FROM financials WHERE company = ?"
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (ticker,))
-            rows = cursor.fetchall()
-
-        return {row[0] for row in rows}
-
-    def _process_dataframe(
-        self, df: pd.DataFrame, ticker: str, year: int, stmt_type: str
-    ) -> pd.DataFrame:
-        """
-        Robustly transforms XBRL DataFrame to schema format.
-        """
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        # 1. Identify the specific column holding the values
-        date_columns = [c for c in df.columns if isinstance(c, str) and c[0].isdigit()]
-        if not date_columns:
-            date_columns = df.columns.tolist()
-
-        sorted_cols = sorted(date_columns, reverse=True)
-        target_col = sorted_cols[0]
-
-        # 2. Handle the Index / Concept Name
-        work_df = df.copy()
-        if isinstance(work_df.index, pd.RangeIndex) or work_df.index.name is None:
-            potential_label_cols = ["Label", "concept", "Abstract", "Item"]
-            for col in potential_label_cols:
-                if col in work_df.columns:
-                    work_df.set_index(col, inplace=True)
-                    break
-
-        # 3. Extract and Clean
-        try:
-            subset = work_df[[target_col]].copy().reset_index()
-            concept_col_name = subset.columns[0]
-            value_col_name = subset.columns[1]
-
-            subset.rename(
-                columns={concept_col_name: "concept", value_col_name: "value"},
-                inplace=True,
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_company_date ON financials (company, period_date);"
             )
-            subset["concept"] = subset["concept"].str.removeprefix("us-gaap_")
-        except KeyError:
-            return pd.DataFrame()
+            await db.commit()
 
-        subset = subset.dropna(subset=["value"])
-        subset["company"] = ticker
-        subset["year"] = year
-        subset["statement_type"] = stmt_type
-        subset["value"] = pd.to_numeric(subset["value"], errors="coerce")
-        subset = subset.dropna(subset=["value"])
-
-        return subset[["company", "year", "statement_type", "concept", "value"]]
-
-    def fetch_new_filings(
-        self, ticker: str, start_year: int, end_year: int
-    ) -> pd.DataFrame:
+    async def _fetch_edgar_data_sync(
+        self,
+        ticker: str,
+        start_year: int,
+        end_year: int,
+        form_type: Literal["10-K", "10-Q"] | List[Literal["10-K", "10-Q"]] = "10-K",
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Fetches data from Edgar API but DOES NOT save to DB.
-        Returns the data as a Pandas DataFrame.
+        Runs the blocking edgartools network requests in a separate thread.
         """
-        ticker = ticker.upper()
-        print(f"--- [API] Fetching {ticker} ({start_year} to {end_year}) ---")
 
-        # Check what we already have to avoid re-fetching inside this logic
-        # (Though the Agent usually handles the logic of what year to ask for)
-        existing_years = self.get_existing_years(ticker)
-
-        try:
-            start_dt = datetime.strptime(f"{start_year}-01-01", "%Y-%m-%d")
-            end_dt = datetime.strptime(f"{end_year}-12-31", "%Y-%m-%d")
-        except ValueError as e:
-            print(f"Date format error: {e}")
-            return pd.DataFrame()
-
-        try:
+        def _fetch():
             company = Company(ticker)
-            all_filings = company.get_filings(form="10-K")
-        except Exception as e:
-            print(f"Error fetching filings list for {ticker}: {e}")
-            return pd.DataFrame()
+            # Fetch 10-K (Annual) and 10-Q (Quarterly)
+            # Adjust 'n' based on how many years of history you need (e.g., 20 filings ≈ 5-10 years)
+            filings = company.get_filings(
+                form=[form_type], year=list(range(start_year, end_year + 1))
+            )
 
-        if not all_filings:
-            return pd.DataFrame()
+            if not filings:
+                return {}
 
-        # Filter filings
-        target_filings = []
-        for filing in all_filings:
-            f_date = datetime.strptime(str(filing.filing_date), "%Y-%m-%d")
-            if start_dt <= f_date <= end_dt:
-                target_filings.append(filing)
+            # Use the efficient MultiFinancials extraction
+            multi_financials = MultiFinancials.extract(filings)
 
-        if not target_filings:
-            print(f"No new filings found between {start_year} and {end_year}.")
-            return pd.DataFrame()
+            return {
+                "income": multi_financials.income_statement().to_dataframe(),
+                "balance": multi_financials.balance_sheet().to_dataframe(),
+                "cashflow": multi_financials.cashflow_statement().to_dataframe(),
+            }
 
-        collected_dfs = []
+        return await asyncio.to_thread(_fetch)
 
-        for filing in target_filings:
-            try:
-                filing_date = datetime.strptime(str(filing.filing_date), "%Y-%m-%d")
-                estimated_year = (
-                    filing_date.year - 1 if filing_date.month < 6 else filing_date.year
-                )
-
-                if estimated_year in existing_years:
-                    continue
-
-                print(f"   -> Processing filing for Fiscal Year {estimated_year}...")
-                xbrl = filing.xbrl()
-                if not xbrl:
-                    continue
-
-                # Process Statements
-                stats = xbrl.statements
-
-                # Helper to append to list
-                def _append_stmt(stmt, s_type):
-                    if stmt:
-                        clean = self._process_dataframe(
-                            stmt.to_dataframe(), ticker, estimated_year, s_type
-                        )
-                        if not clean.empty:
-                            collected_dfs.append(clean)
-
-                _append_stmt(stats.income_statement(), "income")
-                _append_stmt(stats.balance_sheet(), "balance")
-                _append_stmt(stats.cashflow_statement(), "cashflow")
-
-            except Exception as e:
-                print(f"   -> Failed to process filing: {e}")
-
-        if not collected_dfs:
-            return pd.DataFrame()
-
-        # Combine all new data
-        final_new_df = pd.concat(collected_dfs, ignore_index=True)
-
-        # Deduplicate
-        final_new_df.drop_duplicates(
-            subset=["company", "year", "statement_type", "concept"],
-            keep="first",
-            inplace=True,
-        )
-
-        return final_new_df
-
-    def bulk_insert_financials(self, df: pd.DataFrame):
+    def _process_statement(
+        self, df: pd.DataFrame, ticker: str, stmt_type: str
+    ) -> pd.DataFrame:
         """
-        Performs a single bulk INSERT OR REPLACE into the database.
+        Transforms the pivoted MultiFinancials dataframe into a long-format schema for DB storage.
         """
         if df is None or df.empty:
+            return pd.DataFrame()
+
+        df.drop(columns=["concept"], inplace=True)
+
+        # The MultiFinancials DF usually has dates as columns and labels as Index.
+        # We reset index so 'label' becomes a column.
+        melted = df.melt(id_vars=["label"], var_name="period_date", value_name="value")
+        melted["label"] = melted["label"].str.replace(" ", "_")
+
+        # Clean up
+        melted["company"] = ticker.upper()
+        melted["statement_type"] = stmt_type
+
+        # Convert value to numeric and drop invalids
+        melted["value"] = pd.to_numeric(melted["value"], errors="coerce")
+        melted = melted.dropna(subset=["value"])
+
+        # Convert period_date to string YYYY-MM-DD ensures consistency
+        melted["period_date"] = melted["period_date"].astype(str)
+
+        return melted[["company", "period_date", "statement_type", "label", "value"]]
+
+    async def update_financials(self, ticker: str, start_year: int, end_year: int):
+        """
+        Fetches data from Edgar and updates the database asynchronously.
+        """
+        print(f"--- [API] Fetching data for {ticker} ---")
+
+        # 1. Fetch data (Run in thread to avoid blocking)
+        try:
+            dfs_map = await self._fetch_edgar_data_sync(ticker, start_year, end_year)
+        except Exception as e:
+            print(f"Error fetching data for {ticker}: {e}")
             return
 
-        print(f"[DB] Bulk saving {len(df)} rows...")
+        if not dfs_map:
+            print(f"No financials found for {ticker}")
+            return
 
-        # Ensure correct columns
-        expected_cols = ["company", "year", "statement_type", "concept", "value"]
-        save_df = df[expected_cols].copy()
+        # 2. Process DataFrames (CPU bound, but fast enough to keep in main loop or could be threaded)
+        all_data = []
+        for stmt_type, df in dfs_map.items():
+            processed = self._process_statement(df, ticker, stmt_type)
+            if not processed.empty:
+                all_data.append(processed)
 
-        data_tuples = list(save_df.itertuples(index=False, name=None))
+        if not all_data:
+            return
 
-        query = """
-            INSERT OR REPLACE INTO financials (company, year, statement_type, concept, value)
-            VALUES (?, ?, ?, ?, ?)
+        final_df = pd.concat(all_data, ignore_index=True)
+
+        # 3. Bulk Insert into DB
+        print(f"[DB] Saving {len(final_df)} rows for {ticker}...")
+        records = list(final_df.itertuples(index=False, name=None))
+
+        async with aiosqlite.connect(self.db_name) as db:
+            await db.executemany(
+                """
+                INSERT OR REPLACE INTO financials (company, period_date, statement_type, label, value)
+                VALUES (?, ?, ?, ?, ?)
+            """,
+                records,
+            )
+            await db.commit()
+        print("[DB] Save complete.")
+
+    async def get_data(
+        self,
+        ticker: str,
+        statement_types: Union[str, List[str]] = ALL_STATEMENT_TYPES,
+        start_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Retrieves data from the database.
+        """
+        ticker = ticker.upper()
+        if isinstance(statement_types, str):
+            statement_types = [statement_types]
+
+        query = "SELECT * FROM financials WHERE company = ? AND statement_type IN ({})"
+        placeholders = ",".join(["?"] * len(statement_types))
+        query = query.format(placeholders)
+
+        params = [ticker] + statement_types
+
+        if start_date:
+            query += " AND period_date >= ?"
+            params.append(start_date)
+
+        query += " ORDER BY period_date DESC"
+
+        async with aiosqlite.connect(self.db_name) as db:
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                cols = [description[0] for description in cursor.description]
+
+        if not rows:
+            return pd.DataFrame()
+
+        return self.pivot_df(pd.DataFrame(rows, columns=cols))
+
+    def pivot_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df.pivot_table(index="label", columns="period_date", values="value")
+
+    async def search_label(
+        self, ticker: str, keywords: Union[str, List[str]]
+    ) -> pd.DataFrame:
+        """
+        Search for specific labels (rows) across the data using one or multiple keywords.
+        """
+        ticker = ticker.upper()
+
+        # Normalize input to list
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
+        if not keywords:
+            return pd.DataFrame()
+
+        # Dynamically build the OR condition: (label LIKE ? OR label LIKE ?)
+        like_conditions = " OR ".join(["label LIKE ?" for _ in keywords])
+
+        query = f"""
+            SELECT * FROM financials 
+            WHERE company = ? AND ({like_conditions})
+            ORDER BY period_date DESC
         """
 
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.executemany(query, data_tuples)
-                conn.commit()
-            print("[DB] Save complete.")
-        except Exception as e:
-            print(f"[DB] Error during bulk insert: {e}")
+        # Prepare params: Ticker first, then the keywords wrapped in wildcards
+        params = [ticker] + [f"%{k}%" for k in keywords]
 
-    def get_data(
-        self,
-        ticker: str,
-        years: Optional[List[int]] = DEFAULT_YEARS,
-        statements: Union[str, List[str]] = ALL_STATEMENT_TYPE,
-    ) -> pd.DataFrame:
-        ticker = ticker.upper()
-        query = "SELECT * FROM financials WHERE company = ?"
-        params = [ticker]
+        async with aiosqlite.connect(self.db_name) as db:
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                cols = [description[0] for description in cursor.description]
 
-        if years is None:
-            years = [DEFAULT_YEARS]
-        if isinstance(years, int):
-            years = [years]
+        return self.pivot_df(pd.DataFrame(rows, columns=cols))
 
-        placeholders = ",".join(["?"] * len(years))
-        query += f" AND year IN ({placeholders})"
-        params.extend(years)
 
-        if statements is None:
-            statements = ALL_STATEMENT_TYPE
-        if isinstance(statements, str):
-            statements = [statements]
+# --- EXAMPLE USAGE ---
+async def main():
+    db = FinancialDatabase()
+    await db.initialize()
 
-        placeholders = ",".join(["?"] * len(statements))
-        query += f" AND statement_type IN ({placeholders})"
-        params.extend(statements)
+    # Update Data (Fetch from API)
+    await db.update_financials("AAPL", 2022, 2024)
 
-        with self._get_connection() as conn:
-            df = pd.read_sql(query, conn, params=params)
+    # Retrieve Data
+    income_stmt = await db.get_data("AAPL", "income")
+    print("\n--- Retrieved Income Statement (Head) ---")
+    print(income_stmt.head())
 
-        return df
 
-    def pivot_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        return df.pivot_table(
-            index=["company", "concept"], columns="year", values="value"
-        )
-
-    def resolve_concept(self, ticker: str, concept: str) -> str | None:
-        if ticker not in self.concept_resolver:
-            all_concepts = self.get_all_concepts_for_company(ticker)
-            self.concept_resolver[ticker] = build_concept_resolver(all_concepts)
-        return self.concept_resolver[ticker](concept)
-
-    @lru_cache(maxsize=100)
-    def get_all_concepts_for_company(self, ticker: str) -> List[str]:
-        ticker = ticker.upper()
-        query = "SELECT DISTINCT concept FROM financials WHERE company = ?"
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, (ticker,))
-            rows = cursor.fetchall()
-        return [row[0] for row in rows]
-
-    def get_concept(
-        self,
-        ticker: str,
-        keyword: str | Tuple[str],
-        start_year: int | None = None,
-        end_year: int | None = None,
-        exact: bool = False,
-    ) -> pd.DataFrame:
-        ticker = ticker.upper()
-        if isinstance(keyword, Iterable) and not isinstance(keyword, str):
-            keywords = list(keyword)
-        else:
-            keywords = [keyword]
-
-        if exact:
-            clause = " OR ".join(["concept = ?" for _ in keywords])
-            params = keywords[:]
-        else:
-            clause = " OR ".join(["concept LIKE ?" for _ in keywords])
-            params = [f"%{kw}%" for kw in keywords]
-
-        query = f"SELECT * FROM financials WHERE company = ? AND ({clause})"
-        params = [ticker] + params
-
-        if start_year is not None:
-            query += " AND year >= ?"
-            params.append(start_year)
-        if end_year is not None:
-            query += " AND year <= ?"
-            params.append(end_year)
-
-        query += " ORDER BY year ASC"
-
-        with self._get_connection() as conn:
-            df = pd.read_sql(query, conn, params=params)
-
-        return self.pivot_data(df)
+if __name__ == "__main__":
+    asyncio.run(main())
