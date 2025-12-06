@@ -1,14 +1,16 @@
 import asyncio
+import json
 import logging
 import operator
 from datetime import datetime, timedelta
-from typing import Annotated, Any, Dict, List, Optional, Type
+from typing import Annotated, List, Optional, Type
 
 from core.agents.base_agent import AbstractAgent, AgentOutput
 from core.services import service_manager
-from langchain_core.messages import BaseMessage, ToolMessage
+from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 from newspaper import Article
 from pydantic import BaseModel, Field
 
@@ -21,11 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger("NewsAnalysisAgent")
 
 # --- Configuration & Toggles ---
-# Set this to True to see the specific titles of articles being ingested or retrieved.
-# Set to False to keep the logs cleaner (counts only).
 LOG_INGESTED_TITLES = True
-
-# --- Constants ---
 MAX_SEARCH_ATTEMPTS = 2
 MAX_LOOKBACK_DAYS = 30
 BATCH_SIZE = 10
@@ -45,26 +43,6 @@ class NewsAnalysisInput(BaseModel):
 class SufficiencyCheck(BaseModel):
     is_sufficient: bool = Field(description="True if context answers the question.")
     reasoning: str = Field(description="Explanation.")
-
-
-class ProcessedArticle(BaseModel):
-    """Schema for a single article processed by the LLM."""
-
-    url: str = Field(description="Original URL of the article.")
-    title: str = Field(description="Title of the article.")
-    publish_date: str = Field(description="Publication date.")
-    summary: str = Field(
-        description="Concise summary of facts relevant to the ticker/query."
-    )
-    relevance_score: int = Field(
-        description="Score 0-10. 0 is irrelevant/spam, 10 is critical info."
-    )
-
-
-class BatchArticleProcessing(BaseModel):
-    """Schema for the batch response from the LLM."""
-
-    articles: List[ProcessedArticle] = Field(description="List of processed articles.")
 
 
 # --- Internal State ---
@@ -91,10 +69,7 @@ class _OutputState(BaseModel):
 
 
 def _download_article_sync(url: str) -> Optional[str]:
-    """
-    Blocking helper to download and parse article text.
-    Returns the raw text or None if failed.
-    """
+    """Blocking helper to download and parse article text."""
     try:
         article = Article(url)
         article.download()
@@ -109,10 +84,11 @@ def _download_article_sync(url: str) -> Optional[str]:
 @tool
 async def ingest_stock_news_tool(
     ticker: str, query: str, from_date: str, to_date: str, page: int
-) -> Dict[str, Any]:
+) -> str:
     """
-    Fetches a batch of news, processes them via LLM for relevance/summary,
-    and ingests the high-quality summaries into the vector store.
+    Fetches news metadata from an API, downloads content, and ingests it directly
+    into the vector store. The vector store handles summarization and embedding.
+    Returns a JSON string with results count.
     """
     logger.info(
         f"🛠️  Tool Call: Fetching '{ticker}' | Dates: {from_date} to {to_date} | Page: {page}"
@@ -125,7 +101,7 @@ async def ingest_stock_news_tool(
         response = await loop.run_in_executor(
             None,
             lambda: service_manager.get_news_api().get_everything(
-                q=query,
+                q=ticker,
                 from_param=from_date,
                 to=to_date,
                 language="en",
@@ -137,147 +113,86 @@ async def ingest_stock_news_tool(
 
         if response.get("status") != "ok":
             logger.error(f"   ❌ API Error: {response.get('message')}")
-            return {
-                "success": False,
-                "error": response.get("message"),
-                "total_results": 0,
-            }
+            return json.dumps(
+                {"success": False, "error": response.get("message"), "total_results": 0}
+            )
 
         articles_meta = response.get("articles", [])
         total_results = response.get("totalResults", 0)
 
-        logger.info(
-            f"   -> API found {total_results} total results. Processing batch of {len(articles_meta)}."
-        )
-
         if not articles_meta:
-            return {
-                "success": True,
-                "count": 0,
-                "total_results": 0,
-                "message": "No articles found.",
-            }
+            return json.dumps(
+                {
+                    "success": True,
+                    "count": 0,
+                    "total_results": 0,
+                    "message": "No articles found.",
+                }
+            )
 
-        # 2. Download Raw Content (Parallel)
+        # 2. Download Raw Content
         logger.info(
             f"   -> Downloading raw content for {len(articles_meta)} articles..."
         )
 
-        raw_contents = []
         sem = asyncio.Semaphore(10)
 
-        async def _fetch_content(meta):
+        async def _fetch_and_ingest(meta):
             async with sem:
                 url = meta.get("url")
                 if not url:
-                    return None
+                    return False
+
+                # Download
                 text = await loop.run_in_executor(None, _download_article_sync, url)
-                if text:
-                    return {
-                        "url": url,
-                        "title": meta.get("title", "Unknown"),
-                        "date": meta.get("publishedAt", ""),
-                        "text": text[
-                            :4000
-                        ],  # Truncate to avoid context overflow if articles are huge
-                    }
-                return None
+                if not text:
+                    return False
 
-        results = await asyncio.gather(*[_fetch_content(a) for a in articles_meta])
-        valid_articles = [r for r in results if r is not None]
+                title = meta.get("title", "Unknown")
 
-        logger.info(
-            f"   -> Successfully downloaded {len(valid_articles)}/{len(articles_meta)} articles."
-        )
+                # Prepare Metadata for Vector Store
+                source_meta = {
+                    "url": url,
+                    "title": title,
+                    "source": "NewsAPI",
+                    "ticker": ticker,
+                    "publish_time": meta.get("publishedAt", ""),
+                }
 
-        if not valid_articles:
-            return {
-                "success": True,
-                "count": 0,
-                "total_results": total_results,
-                "message": "All articles failed to download or were empty.",
-            }
-
-        # 3. Batch Process with LLM
-        logger.info(f"   -> Analyzing relevance and summarizing via LLM...")
-
-        llm = service_manager.get_agent().with_structured_output(BatchArticleProcessing)
-
-        # Construct Context for LLM
-        articles_context = ""
-        for i, art in enumerate(valid_articles):
-            articles_context += (
-                f"--- ARTICLE {i} ---\n"
-                f"URL: {art['url']}\n"
-                f"Title: {art['title']}\n"
-                f"Date: {art['date']}\n"
-                f"Content: {art['text']}\n\n"
-            )
-
-        prompt = f"""You are a financial news filter.
-        Ticker: {ticker}
-        Query: {query}
-        
-        Task:
-        1. Analyze the following {len(valid_articles)} news articles.
-        2. Filter out spam, irrelevant articles, or generic market noise (Score < 5).
-        3. For relevant articles (Score >= 5), write a concise summary focusing on facts.
-        4. Return the structured list.
-
-        ARTICLES:
-        {articles_context}
-        """
-
-        try:
-            processed_batch: BatchArticleProcessing = await llm.ainvoke(prompt)
-        except Exception as e:
-            logger.error(f"   ❌ LLM Batch Processing Failed: {e}")
-            return {"success": False, "error": "LLM Processing Failed"}
-
-        # 4. Ingest Processed Results
-        ingest_count = 0
-        skipped_count = 0
-
-        for p_art in processed_batch.articles:
-            if p_art.relevance_score < 5:
-                skipped_count += 1
-                continue  # Skip low relevance
-
-            source_meta = {
-                "url": p_art.url,
-                "title": p_art.title,
-                "source": "NewsAPI (LLM Processed)",
-                "ticker": ticker,
-                "publish_time": p_art.publish_date,
-                "relevance": p_art.relevance_score,
-            }
-
-            # We ingest the LLM-generated summary, which is cleaner than raw text
-            success = service_manager.get_vector_store_manager().ingest_article(
-                raw_text=f"Summary: {p_art.summary}\nFull Title: {p_art.title}",
-                source_metadata=source_meta,
-            )
-            if success:
-                ingest_count += 1
-                if LOG_INGESTED_TITLES:
-                    logger.info(
-                        f"      + Ingested [Score {p_art.relevance_score}]: {p_art.title}"
+                # 3. Direct Ingestion (Delegating summarization to Vector Store)
+                # We set should_summarize=True so the VS pipeline creates the summary
+                success = (
+                    await service_manager.get_vector_store_manager().ingest_article(
+                        raw_text=text,
+                        source_metadata=source_meta,
+                        should_summarize=False,
                     )
+                )
+
+                if success and LOG_INGESTED_TITLES:
+                    logger.info(f"      + Ingested: {title}")
+
+                return success
+
+        results = await asyncio.gather(*[_fetch_and_ingest(a) for a in articles_meta])
+        ingest_count = sum(1 for r in results if r)
 
         logger.info(
-            f"✅ Ingestion Summary: {ingest_count} kept, {skipped_count} skipped (low relevance)."
+            f"✅ Batch Complete. Ingested {ingest_count}/{len(articles_meta)} articles."
         )
 
-        return {
-            "success": True,
-            "count": ingest_count,
-            "total_results": total_results,
-            "message": f"Processed {len(valid_articles)} articles. Ingested {ingest_count} relevant summaries.",
-        }
+        return json.dumps(
+            {
+                "success": True,
+                "count": ingest_count,
+                "total_results": total_results,
+                "message": f"Ingested {ingest_count} articles.",
+            }
+        )
 
     except Exception as e:
         logger.error(f"❌ Critical Tool Error: {e}", exc_info=True)
-        return {"success": False, "error": str(e), "count": 0, "total_results": 0}
+        return json.dumps({"success": False, "error": str(e), "total_results": 0})
 
 
 # --- Main Agent ---
@@ -287,6 +202,8 @@ class NewsAnalysisAgent(AbstractAgent):
     def __init__(self):
         super().__init__()
         self.tools = [ingest_stock_news_tool]
+        # Bind tools to the LLM to allow for future expansion and dynamic selection
+        self.llm_with_tools = service_manager.get_agent().bind_tools(self.tools)
         self._graph = self._build_graph()
 
     @property
@@ -295,16 +212,14 @@ class NewsAnalysisAgent(AbstractAgent):
 
     @property
     def description(self) -> str:
-        return "Qualitative analysis with batch LLM processing and source citations."
+        return "Qualitative analysis using bound tools and vector store ingestion."
 
     @classmethod
     def get_input_schema_class(cls) -> Type[BaseModel]:
         return NewsAnalysisInput
 
     async def run(self, input_data: NewsAnalysisInput) -> AgentOutput:
-        logger.info(
-            f"🚀 [Agent Start] Ticker: {input_data.ticker} | Query: {input_data.question}"
-        )
+        logger.info(f"🚀 [Agent Start] Ticker: {input_data.ticker}")
 
         today = datetime.now()
         fmt = "%Y-%m-%d"
@@ -328,22 +243,37 @@ class NewsAnalysisAgent(AbstractAgent):
         }
 
         final_state = await self._graph.ainvoke(initial_state)
-        output_content = final_state["messages"][-1].content
+
+        # Extract final answer
+        output_content = "No response generated."
+        if final_state["messages"]:
+            output_content = final_state["messages"][-1].content
+
         logger.info("🏁 [Agent Finish] Analysis Complete.")
         return AgentOutput(agent_name=self.name, output=output_content)
 
     def _build_graph(self):
         workflow = StateGraph(_AgentState, output_schema=_OutputState)
 
+        # Define Nodes
         workflow.add_node("retrieve", self._retrieve_news)
         workflow.add_node("evaluate_sufficiency", self._evaluate_sufficiency)
         workflow.add_node("strategize_search", self._strategize_search)
-        workflow.add_node("execute_fetch", self._execute_fetch)
+
+        # New: LLM Node to decide tool calls
+        workflow.add_node("call_tool_agent", self._call_tool_agent)
+        # New: Standard ToolNode to execute bound tools
+        workflow.add_node("execute_tools", ToolNode(self.tools))
+        # New: Node to update state based on tool output
+        workflow.add_node("process_tool_output", self._process_tool_output)
+
         workflow.add_node("generate_answer", self._generate_answer)
 
+        # Define Edges
         workflow.add_edge(START, "retrieve")
         workflow.add_edge("retrieve", "evaluate_sufficiency")
 
+        # Sufficiency Logic
         workflow.add_conditional_edges(
             "evaluate_sufficiency",
             lambda state: (
@@ -351,14 +281,21 @@ class NewsAnalysisAgent(AbstractAgent):
             ),
         )
 
+        # Strategy Logic
         workflow.add_conditional_edges(
             "strategize_search",
             lambda state: (
-                "execute_fetch" if state.needs_more_data else "generate_answer"
+                "call_tool_agent" if state.needs_more_data else "generate_answer"
             ),
         )
 
-        workflow.add_edge("execute_fetch", "retrieve")
+        # Tool Execution Flow
+        workflow.add_edge("call_tool_agent", "execute_tools")
+        workflow.add_edge("execute_tools", "process_tool_output")
+        workflow.add_edge(
+            "process_tool_output", "retrieve"
+        )  # Loop back to check what we got
+
         workflow.add_edge("generate_answer", END)
 
         return workflow.compile()
@@ -378,12 +315,15 @@ class NewsAnalysisAgent(AbstractAgent):
 
         context_pieces = []
         if docs:
-            logger.info(f"   -> Found {len(docs)} existing documents/summaries.")
+            logger.info(f"   -> Found {len(docs)} existing documents.")
             for i, doc in enumerate(docs, 1):
                 meta = doc.metadata
                 title = meta.get("title", "Unknown Title")
                 url = meta.get("url", "#")
                 pub_time = meta.get("publish_time", "Unknown Date")
+
+                # Check if this document has a summary from the ingestion pipeline
+                content = meta.get("summary", doc.page_content)
 
                 if LOG_INGESTED_TITLES:
                     logger.info(f"      > Retrieved: {title}")
@@ -393,7 +333,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     f"Title: {title}\n"
                     f"Date: {pub_time}\n"
                     f"URL: {url}\n"
-                    f"Content: {doc.page_content}\n"
+                    f"Content: {content}\n"
                 )
                 context_pieces.append(piece)
         else:
@@ -402,14 +342,14 @@ class NewsAnalysisAgent(AbstractAgent):
         return {"news_context": "\n".join(context_pieces)}
 
     async def _evaluate_sufficiency(self, state: _AgentState) -> dict:
-        logger.info(
-            "🤔 [Step: Evaluate Sufficiency] Checking if context answers the question..."
-        )
+        """
+        Separate node to check if the retrieved context is enough.
+        This replaces the internal filter logic previously in the tool.
+        """
+        logger.info("🤔 [Step: Evaluate Sufficiency]")
 
         if state.attempt_count >= MAX_SEARCH_ATTEMPTS:
-            logger.info(
-                "   -> Max attempts reached. Proceeding to answer with available data."
-            )
+            logger.info("   -> Max attempts reached. Proceeding.")
             return {"is_fully_resolved": True}
 
         if not state.news_context:
@@ -434,8 +374,7 @@ class NewsAnalysisAgent(AbstractAgent):
             )
             logger.info(f"   -> Reasoning: {result.reasoning}")
             return {"is_fully_resolved": result.is_sufficient}
-        except Exception as e:
-            logger.error(f"   -> Sufficiency check failed: {e}")
+        except Exception:
             return {"is_fully_resolved": False}
 
     def _strategize_search(self, state: _AgentState) -> dict:
@@ -448,6 +387,7 @@ class NewsAnalysisAgent(AbstractAgent):
         limit_date = today - timedelta(days=MAX_LOOKBACK_DAYS)
 
         articles_fetched = state.current_page * BATCH_SIZE
+        # We rely on 'last_total_results' being updated by _process_tool_output
         can_paginate = state.last_total_results > articles_fetched
 
         new_page = state.current_page
@@ -466,7 +406,6 @@ class NewsAnalysisAgent(AbstractAgent):
         else:
             new_page = 1
             potential_from = current_from - timedelta(days=7)
-
             if current_to.date() < today.date():
                 potential_to = current_to + timedelta(days=7)
             else:
@@ -478,13 +417,14 @@ class NewsAnalysisAgent(AbstractAgent):
                 potential_to = today
 
             if potential_from == current_from and potential_to == current_to:
-                logger.info("   -> Cannot expand search window further (hit limits).")
                 return {"needs_more_data": False}
 
             new_from = potential_from
             new_to = potential_to
             action_taken = True
-            strategy_msg = f"Expanding date range to {new_from.strftime(fmt)} - {new_to.strftime(fmt)}."
+            strategy_msg = (
+                f"Expanding range: {new_from.strftime(fmt)} to {new_to.strftime(fmt)}."
+            )
 
         if action_taken:
             logger.info(f"   -> Strategy: {strategy_msg}")
@@ -498,30 +438,49 @@ class NewsAnalysisAgent(AbstractAgent):
 
         return {"needs_more_data": False}
 
-    async def _execute_fetch(self, state: _AgentState) -> dict:
-        # Logging handled inside the tool
-        result = await ingest_stock_news_tool.ainvoke(
-            {
-                "ticker": state.ticker,
-                "query": state.query,
-                "from_date": state.search_from_date,
-                "to_date": state.search_to_date,
-                "page": state.current_page,
-            }
+    async def _call_tool_agent(self, state: _AgentState) -> dict:
+        """
+        Uses the LLM (with bound tools) to generate the specific tool call.
+        """
+        logger.info("🤖 [Step: Call Tool Agent] Invoking LLM to call tools...")
+
+        system_msg = SystemMessage(
+            content="You are a research assistant. Use the available tools to fetch data based on the user's strategy."
         )
-        return {
-            "last_total_results": result.get("total_results", 0),
-            "messages": [
-                ToolMessage(
-                    content=result.get("message", ""),
-                    tool_call_id="system",
-                    name="ingest_tool",
+
+        # Explicitly instruct the LLM to use the parameters derived from the strategy step
+        user_msg = (
+            f"Please fetch news for ticker '{state.ticker}' regarding '{state.query}'. "
+            f"Use the date range {state.search_from_date} to {state.search_to_date}. "
+            f"Fetch page {state.current_page}."
+        )
+
+        response = await self.llm_with_tools.ainvoke([system_msg, user_msg])
+        return {"messages": [response]}
+
+    def _process_tool_output(self, state: _AgentState) -> dict:
+        """
+        Parses the output of the tool execution to update internal state (specifically total_results).
+        """
+        last_message = state.messages[-1]
+
+        total_results = 0
+
+        if isinstance(last_message, ToolMessage):
+            try:
+                # The tool returns a JSON string, so we parse it
+                content_json = json.loads(last_message.content)
+                total_results = content_json.get("total_results", 0)
+                logger.info(
+                    f"   -> Tool output processed. Total API Results available: {total_results}"
                 )
-            ],
-        }
+            except Exception:
+                logger.warning("   -> Could not parse tool output JSON.")
+
+        return {"last_total_results": total_results}
 
     async def _generate_answer(self, state: _AgentState) -> dict:
-        logger.info("✍️  [Step: Generate Answer] Synthesizing final response...")
+        logger.info("✍️  [Step: Generate Answer]")
 
         has_news = len(state.news_context) > 50
 
@@ -529,12 +488,11 @@ class NewsAnalysisAgent(AbstractAgent):
             "You are a financial analyst. Answer the question based ONLY on the provided context.\n"
             "Question: '{question}'\n\n"
             "Context:\n{context}\n\n"
-            "### CITATION RULES (CRITICAL):\n"
+            "### CITATION RULES:\n"
             "1. Every factual statement must have a citation.\n"
             "2. Use the URL provided in the context blocks.\n"
-            "3. Format citations as Markdown links at the end of the relevant sentence.\n"
-            "   Example: 'Tesla shares rose 5% [Source Title](https://news.com/tesla).'\n"
-            "4. If the context is empty, state that no data was found."
+            "3. Format citations as Markdown links: [Source Title](https://...).\n"
+            "4. If context is empty, state that no data was found."
         )
 
         prompt = template.format(
@@ -550,14 +508,12 @@ if __name__ == "__main__":
 
     async def main():
         agent = NewsAnalysisAgent()
-
         input_data = NewsAnalysisInput(
             ticker="MSFT",
             question="What is the reason for the recent price drop?",
             from_date="2025-12-01",
             to_date="2025-12-05",
         )
-
         res = await agent.run(input_data)
         print("\nFINAL OUTPUT:\n", res.output)
 

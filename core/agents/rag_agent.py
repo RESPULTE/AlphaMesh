@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 from datetime import datetime
@@ -74,20 +75,6 @@ class GradeDocuments(BaseModel):
 # --- Centralized Prompts ---
 
 MANAGER_PROMPTS = {
-    # "retrieval_grader": ChatPromptTemplate.from_messages(
-    #     [
-    #         (
-    #             "system",
-    #             "You are a grader assessing relevance of a retrieved document to a user question. \n"
-    #             "If the document contains keyword(s) or semantic meaning related to the question, grade it as relevant. \n"
-    #             "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.",
-    #         ),
-    #         (
-    #             "human",
-    #             "Retrieved document: \n\n {document} \n\n User question: {query}",
-    #         ),
-    #     ]
-    # ),
     "metadata_extractor": ChatPromptTemplate.from_messages(
         [
             (
@@ -127,19 +114,12 @@ class VectorStoreManager:
 
         # --- Components ---
 
-        # # 1. Grader
-        # self._grader = MANAGER_PROMPTS[
-        #     "retrieval_grader"
-        # ] | self.llm.with_structured_output(GradeDocuments)
-
         # 2. Semantic Chunker
         self._semantic_chunker = SemanticChunker(
             embeddings=self.embeddings, breakpoint_threshold_type="percentile"
         )
 
         # 3. Ingestion Processing Chain (Parallel Execution)
-        # This replaces the separate calls in the previous version
-
         summary_chain = RunnableBranch(
             # If should_summarize is True
             (
@@ -161,44 +141,44 @@ class VectorStoreManager:
 
     # --- Pipeline Step: Ingestion ---
 
-    def _article_exists(self, url: str) -> bool:
-        """Checks if an article with this URL already exists in the vector store."""
+    async def _article_exists(self, url: str) -> bool:
+        """
+        Checks if an article with this URL already exists in the vector store.
+        Uses Async search.
+        """
         try:
-            # Note: Syntax depends on specific VectorStore (Chroma, Pinecone, etc.)
-            # We search for 1 document with this specific source URL.
-            # If your VectorStore supports .get(where=...), use that instead for speed.
-            results = self.vector_store.similarity_search(
+            # Uses asimilarity_search (Async)
+            results = await self.vector_store.asimilarity_search(
                 "check_existence", k=1, filter={"url": url}
             )
             return len(results) > 0
         except Exception:
-            # If filter fails or DB is empty, assume it doesn't exist
             return False
 
-    def ingest_article(
+    async def ingest_article(
         self,
         raw_text: str,
         source_metadata: Dict[str, Any],
         should_summarize: bool = False,
     ) -> bool:
         """
-        Ingests an article with deduplication, parallel processing, and semantic chunking.
+        Ingests an article ASYNCHRONOUSLY.
         """
         if not raw_text:
             return False
 
-        # 1. Deduplication Check
+        # 1. Deduplication Check (Async)
         url = source_metadata.get("url")
-        if url and self._article_exists(url):
-            logger.info(f"Skipping duplicate article: {url}")
-            return False
+        if url:
+            exists = await self._article_exists(url)
+            if exists:
+                logger.info(f"Skipping duplicate article: {url}")
+                return False
 
         try:
-            logger.info("Processing article (Metadata + Summary)...")
-
-            # 2. Execute Parallel Chain (Metadata & Summary)
-            # Input: {"document_content": raw_text} -> Output: Dict with keys 'fin_meta', 'summary', 'raw_text'
-            result = self._ingestion_chain.invoke(
+            # 2. Execute Parallel Chain (Metadata & Summary) - ASYNC INVOKE
+            # This allows the LLM calls to happen without blocking the loop
+            result = await self._ingestion_chain.ainvoke(
                 {"document_content": raw_text, "summarize": should_summarize}
             )
 
@@ -206,11 +186,13 @@ class VectorStoreManager:
             summary_text: str = result["summary"]
 
             # 3. Semantic Chunking
-            logger.info("Performing semantic chunking...")
-            chunks = self._semantic_chunker.create_documents([raw_text])
+            # Note: SemanticChunker.create_documents is usually synchronous but calls Embeddings API.
+            # We wrap it in to_thread to prevent it from blocking the event loop while waiting for embeddings.
+            chunks = await asyncio.to_thread(
+                self._semantic_chunker.create_documents, [raw_text]
+            )
 
             # 4. Metadata Enrichment
-
             base_metadata = {
                 **source_metadata,
                 **fin_meta.model_dump(),
@@ -228,11 +210,9 @@ class VectorStoreManager:
                 chunk.metadata = chunk_meta
                 enriched_documents.append(chunk)
 
-            # 5. Store
-            logger.info(
-                f"Storing {len(enriched_documents)} chunks for {fin_meta.ticker}..."
-            )
-            self.vector_store.add_documents(enriched_documents)
+            # 5. Store (Async Add)
+            # Uses aadd_documents
+            await self.vector_store.aadd_documents(enriched_documents)
 
             return True
 
@@ -246,25 +226,16 @@ class VectorStoreManager:
         self, query: str, filter_dict: Optional[Dict] = None
     ) -> List[Document]:
         """
-        Retrieves documents. Optionally applies metadata filters (e.g., ticker='AAPL').
+        Retrieves documents synchronously.
+        (Kept sync as requested, or can be upgraded to async if needed).
         """
-        # Note: Depending on the specific VectorStore implementation,
-        # you might need to pass filter_dict to the retriever differently.
-        # Here we assume the retriever is pre-configured or we use the vector_store directly for filtering.
-
-        raw_docs = self._retrieve_documents(query, filter_dict)
-        # filtered_docs = self.grade_documents(query, raw_docs)
-        # return filtered_docs
-        return raw_docs
+        return self._retrieve_documents(query, filter_dict)
 
     def _retrieve_documents(
         self, query: str, filter_dict: Optional[Dict] = None
     ) -> List[Document]:
         try:
-            # If the retriever supports dynamic filtering (like Chroma asRetriever search_kwargs)
             if filter_dict and hasattr(self.retriever, "search_kwargs"):
-                # This is a hacky way to inject filters dynamically;
-                # in production, use self.vector_store.similarity_search(query, filter=filter_dict)
                 documents = self.vector_store.similarity_search(
                     query, k=5, filter=filter_dict
                 )
@@ -277,31 +248,6 @@ class VectorStoreManager:
             logger.error(f"Retrieval failed: {e}")
             return []
 
-    # def grade_documents(self, query: str, documents: List[Document]) -> List[Document]:
-    #     """
-    #     Grades relevance. Returns only relevant documents.
-    #     """
-    #     if not documents or not query:
-    #         return []
-
-    #     batch_inputs = [
-    #         {"query": query, "document": doc.page_content} for doc in documents
-    #     ]
-
-    #     try:
-    #         scores = self._grader.batch(batch_inputs)
-    #     except Exception as e:
-    #         logger.error(f"Batch grading failed: {e}")
-    #         return []
-
-    #     filtered_docs = []
-    #     for doc, score in zip(documents, scores):
-    #         if score.binary_score.lower() == "yes":
-    #             filtered_docs.append(doc)
-
-    #     logger.info(f"Graded {len(documents)} docs. {len(filtered_docs)} relevant.")
-    #     return filtered_docs
-
     # --- Helpers ---
 
     def _generate_content_hash(self, content: str) -> str:
@@ -309,22 +255,22 @@ class VectorStoreManager:
 
 
 if __name__ == "__main__":
+    # Example usage requires an async loop now
     from core.services import service_manager
 
-    manager = service_manager.get_vector_store_manager()
-    # 2. Ingest
-    article_text = "Apple Inc. (AAPL) reported Q4 revenue of $89.5B..."
-    source_meta = {
-        "url": "https://finance.yahoo.com/...",
-        "source": "Yahoo Finance",
-        "publish_time": "2023-11-02",
-    }
+    async def main():
+        manager = service_manager.get_vector_store_manager()
+        article_text = "Apple Inc. (AAPL) reported Q4 revenue of $89.5B..."
+        source_meta = {
+            "url": "https://finance.yahoo.com/...",
+            "source": "Yahoo Finance",
+            "publish_time": "2023-11-02",
+        }
 
-    manager.ingest_article(article_text, source_meta)
+        # Notice the await
+        await manager.ingest_article(article_text, source_meta, should_summarize=True)
 
-    # 3. Retrieve with Filter
-    # "What was the sentiment on Apple's earnings?"
-    results = manager.retrieve("earnings sentiment", filter_dict={"ticker": "AAPL"})
-    print(f"Retrieved {len(results)} relevant documents for AAPL earnings sentiment.")
-    for doc in results:
-        print(doc.page_content)
+        results = manager.retrieve("earnings sentiment", filter_dict={"ticker": "AAPL"})
+        print(f"Retrieved {len(results)} relevant documents.")
+
+    asyncio.run(main())
