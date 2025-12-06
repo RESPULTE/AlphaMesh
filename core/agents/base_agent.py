@@ -43,6 +43,12 @@ class AbstractAgent(ABC):
         """The Pydantic model for the agent's specific input."""
         pass
 
+    @classmethod
+    @abstractmethod
+    def get_output_schema_class(self) -> Type[BaseModel]:
+        """The Pydantic model for the agent's specific input."""
+        pass
+
     @abstractmethod
     def run(self, input_data: BaseModel) -> AgentOutput:
         """

@@ -1,5 +1,7 @@
-import datetime
+import asyncio
+import logging
 import operator
+from datetime import datetime
 from typing import Annotated, Any, List, Optional, Type
 
 import pandas as pd
@@ -10,20 +12,28 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
-# --- 1. Internal Structured Output Models (The "Solution 2" Fix) ---
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("FundamentalAnalysisAgent")
+
+
+# --- 1. Internal Structured Output Models ---
 
 
 class CalculatedMetric(BaseModel):
     """
     Represents a single metric to be calculated.
-    Using this strict schema prevents parsing errors (e.g., splitting strings by '=').
     """
 
     target_metric_name: str = Field(
         description="The name of the new metric to calculate (e.g., 'net_profit_margin'). Use snake_case."
     )
     pandas_eval_expression: str = Field(
-        description="The mathematical formula compatible with pandas.eval(). Example: 'price / revenue' (Right Hand Side of the formula only)"
+        description="The mathematical formula compatible with pandas.eval(). Example: 'price / revenue'"
     )
     dependencies: List[str] = Field(
         description="A list of the base financial concepts required for this formula. Example: ['net_income', 'revenue']"
@@ -50,12 +60,15 @@ class _AgentState(BaseModel):
     # Processing
     metrics_to_fetch: Annotated[List[str], operator.add] = Field(default_factory=list)
     calculations_to_run: List[CalculatedMetric] = Field(default_factory=list)
-    financial_data: pd.DataFrame = Field(default_factory=pd.DataFrame)
+
+    # Note: We don't use Pydantic to validate the DataFrame structure deeply
+    # as it changes dynamically, but we type hint it.
+    financial_data: Any = Field(default_factory=pd.DataFrame)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
-# --- 2. Public Input Schema (Used by Orchestrator) ---
+# --- 2. Public Input Schema ---
 
 
 class FundamentalAnalysisInput(BaseModel):
@@ -73,7 +86,7 @@ class FundamentalAnalysisInput(BaseModel):
 
 class FundamentalAnalysisAgent(AbstractAgent):
     """
-    Refactored Agent using Structured Outputs for internal logic.
+    Refactored Agent using Structured Outputs and Async IO.
     """
 
     def __init__(self):
@@ -95,11 +108,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
     def get_input_schema_class(cls) -> Type[BaseModel]:
         return FundamentalAnalysisInput
 
-    def run(self, input_data: FundamentalAnalysisInput) -> AgentOutput:
-        print(f"--- [Agent: {self.name}] Started for {input_data.ticker} ---")
+    async def run(self, input_data: FundamentalAnalysisInput) -> AgentOutput:
+        logger.info(f"🚀 [Agent Start] Ticker: {input_data.ticker}")
 
         # Defaults
-        current_year = datetime.datetime.now().year
+        current_year = datetime.now().year
         s_year = input_data.start_year if input_data.start_year else (current_year - 5)
         e_year = input_data.end_year if input_data.end_year else current_year
 
@@ -114,9 +127,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "financial_data": pd.DataFrame(),
         }
 
-        final_state = self._graph.invoke(initial_state)
+        final_state = await self._graph.ainvoke(initial_state)
         output_content = final_state["messages"][-1].content
 
+        logger.info("🏁 [Agent Finish] Analysis Complete.")
         return AgentOutput(agent_name=self.name, output=output_content)
 
     def _build_graph(self):
@@ -144,29 +158,48 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         return workflow.compile()
 
+    # --- Helper: CPU/IO Bound Wrappers ---
+
+    async def _run_blocking_db(self, func, *args, **kwargs):
+        """Helper to run blocking DB calls in a thread."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+    async def _run_cpu_bound(self, func, *args, **kwargs):
+        """Helper to run blocking Pandas operations in a thread."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
     # --- Node Implementations ---
 
-    def _parser_node(self, state: _AgentState) -> dict[str, Any]:
+    async def _parser_node(self, state: _AgentState) -> dict[str, Any]:
         """
         Separates metrics into 'fetchable' (exist in DB) and 'complex' (need formulas).
         """
-        print(f"--- [Node] Parser ---")
+        logger.info("🔍 [Step: Parser] Resolving metrics against database...")
         db = service_manager.get_financial_database()
 
         to_fetch = []
-        unknown_metrics = []  # These will become dummy calculations initially
+        unknown_metrics = []
 
-        for metric in state.metrics:
-            resolved = db.resolve_concept(state.ticker, metric)
-            if resolved:
-                to_fetch.append(resolved)
-            else:
-                # We flag this as a 'calculation' needed, but we don't know the formula yet.
-                # We pass the name to the decomposer.
-                unknown_metrics.append(metric)
+        # Run resolution in thread as it might involve DB lookups
+        def _resolve_metrics():
+            f, u = [], []
+            for metric in state.metrics:
+                resolved = db.resolve_concept(state.ticker, metric)
+                if resolved:
+                    f.append(resolved)
+                else:
+                    u.append(metric)
+            return f, u
 
-        # We temporarily store unknown metrics in 'calculations_to_run' as placeholders
-        # The decomposer will replace these placeholders with real formulas.
+        to_fetch, unknown_metrics = await self._run_blocking_db(_resolve_metrics)
+
+        logger.info(
+            f"   -> Found {len(to_fetch)} direct metrics, {len(unknown_metrics)} require calculation."
+        )
+
+        # Create placeholders for unknown metrics
         placeholders = [
             CalculatedMetric(
                 target_metric_name=m, pandas_eval_expression="", dependencies=[]
@@ -176,11 +209,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         return {"metrics_to_fetch": to_fetch, "calculations_to_run": placeholders}
 
-    def _decomposer_node(self, state: _AgentState) -> dict[str, Any]:
+    async def _decomposer_node(self, state: _AgentState) -> dict[str, Any]:
         """
         Uses LLM with Structured Output to break down complex metrics into formulas.
         """
-        # Identify which metrics need formulas (those with empty expressions)
         targets = [
             c.target_metric_name
             for c in state.calculations_to_run
@@ -190,9 +222,13 @@ class FundamentalAnalysisAgent(AbstractAgent):
         if not targets:
             return {}
 
-        print(f"--- [Node] Decomposer: Deriving formulas for {targets} ---")
+        logger.info(f"🧠 [Step: Decomposer] Deriving formulas for: {targets}")
+
         db = service_manager.get_financial_database()
-        available_concepts = db.get_all_concepts_for_company(state.ticker)
+        # Blocking call to get concepts
+        available_concepts = await self._run_blocking_db(
+            db.get_all_concepts_for_company, state.ticker
+        )
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -209,113 +245,138 @@ class FundamentalAnalysisAgent(AbstractAgent):
             ]
         )
 
-        # Enforce the strict schema via tool calling/structured output
         llm = service_manager.get_agent(temperature=0)
         structured_llm = llm.with_structured_output(DecompositionPlan)
 
         chain = prompt | structured_llm
-        result: DecompositionPlan = chain.invoke({})
+        # Async Invoke
+        result: DecompositionPlan = await chain.ainvoke({})
 
         # Extract new dependencies to fetch
         new_dependencies = []
         for calc in result.calculations:
             new_dependencies.extend(calc.dependencies)
 
-        print(f"[Decomposer] Plan: {result.calculations}")
-
+        logger.info(f"   -> Plan generated with {len(result.calculations)} formulas.")
         return {
-            "calculations_to_run": result.calculations,  # Replaces the placeholders
-            "metrics_to_fetch": new_dependencies,  # Add these to the fetch list
+            "calculations_to_run": result.calculations,
+            "metrics_to_fetch": new_dependencies,
         }
 
-    def _fetch_data_node(self, state: _AgentState) -> dict[str, Any]:
-        print(f"--- [Node] Fetcher ---")
+    async def _fetch_data_node(self, state: _AgentState) -> dict[str, Any]:
+        logger.info("💾 [Step: Fetcher] Retrieving data from Financial DB...")
+
         # Unique metrics only
         metrics = list(set(state.metrics_to_fetch))
 
         if not metrics:
+            logger.warning("   -> No metrics to fetch.")
             return {}
 
         db = service_manager.get_financial_database()
-        db.update_company_data(
-            state.ticker, num_years=state.end_year - state.start_year + 1
-        )
 
-        df = db.get_concept(
-            state.ticker, metrics, state.start_year, state.end_year, exact=True
-        )
+        # Define the blocking IO operations
+        def _fetch_op():
+            # Update data (might trigger API calls)
+            db.update_company_data(
+                state.ticker, num_years=state.end_year - state.start_year + 1
+            )
+            # Query data (SQL/Pandas)
+            return db.get_concept(
+                state.ticker, metrics, state.start_year, state.end_year, exact=True
+            )
 
-        # Merge with existing if any
-        current_df = state.financial_data
-        combined_df = current_df.combine_first(df) if not current_df.empty else df
+        df = await self._run_blocking_db(_fetch_op)
 
+        # Merge with existing if any (CPU bound)
+        def _merge_op(existing, new_df):
+            if not existing.empty:
+                return existing.combine_first(new_df)
+            return new_df
+
+        combined_df = await self._run_cpu_bound(_merge_op, state.financial_data, df)
+
+        logger.info(f"   -> Data shape: {combined_df.shape}")
         return {"financial_data": combined_df}
 
-    def _calculator_node(self, state: _AgentState) -> dict[str, Any]:
+    async def _calculator_node(self, state: _AgentState) -> dict[str, Any]:
         """
         Executes the formulas using pandas eval.
         """
-        print(f"--- [Node] Calculator ---")
-        df = state.financial_data.copy()
-
-        if df.empty or not state.calculations_to_run:
+        if state.financial_data.empty or not state.calculations_to_run:
             return {}
 
-        # 1. Flatten MultiIndex for eval (Ticker, Metric) -> Metric
-        # We assume the dataframe columns are MultiIndex (Ticker, Metric)
-        # We simplify to just 'Metric' for the evaluation context
-        df_eval = df.copy()
-        try:
-            df_eval.index = [c[1] for c in df.index]  # Keep only metric name
-        except IndexError:
-            pass  # Handle cases where it might not be MultiIndex
+        logger.info("🧮 [Step: Calculator] Computing derived metrics...")
 
-        # 2. Transpose so years are rows, metrics are columns (standard for eval)
-        df_eval = df_eval.T
+        # Define the heavy calculation logic
+        def _compute(df_input, calculations, ticker):
+            df_eval = df_input.copy()
 
-        for calc in state.calculations_to_run:
+            # 1. Flatten MultiIndex for eval (Ticker, Metric) -> Metric
             try:
-                print(
-                    f"[Calculator] {calc.target_metric_name} = {calc.pandas_eval_expression}"
-                )
-                # Execute formula
-                df_eval.eval(
-                    f"{calc.target_metric_name} = {calc.pandas_eval_expression}",
-                    inplace=True,
-                )
-            except Exception as e:
-                print(f"[Calculator] Error calculating {calc.target_metric_name}: {e}")
+                df_eval.index = [c[1] for c in df_input.index]
+            except IndexError:
+                pass
 
-        # 3. Transpose back and restore structure
-        # We only care about the NEW calculated columns
-        # Filter df_eval for columns that match our calculation targets
-        calculated_cols = [
-            c.target_metric_name
-            for c in state.calculations_to_run
-            if c.target_metric_name in df_eval.columns
-        ]
+            # 2. Transpose for Eval (Rows=Years, Cols=Metrics)
+            df_eval = df_eval.T
 
-        if not calculated_cols:
-            return {}
+            # 3. Execute
+            for calc in calculations:
+                try:
+                    logger.debug(
+                        f"      Eval: {calc.target_metric_name} = {calc.pandas_eval_expression}"
+                    )
+                    df_eval.eval(
+                        f"{calc.target_metric_name} = {calc.pandas_eval_expression}",
+                        inplace=True,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"      Error calculating {calc.target_metric_name}: {e}"
+                    )
 
-        result_df = df_eval[calculated_cols].T
+            # 4. Filter & Restore
+            calculated_cols = [
+                c.target_metric_name
+                for c in calculations
+                if c.target_metric_name in df_eval.columns
+            ]
 
-        # Restore MultiIndex (Ticker, Metric)
-        result_df.index = pd.MultiIndex.from_tuples(
-            [(state.ticker, col) for col in result_df.index],
-            names=["company", "concept"],
+            if not calculated_cols:
+                return None
+
+            result_df = df_eval[calculated_cols].T
+            result_df.index = pd.MultiIndex.from_tuples(
+                [(ticker, col) for col in result_df.index],
+                names=["company", "concept"],
+            )
+
+            return result_df
+
+        # Run computation in thread
+        result_df = await self._run_cpu_bound(
+            _compute, state.financial_data, state.calculations_to_run, state.ticker
         )
 
-        final_df = state.financial_data.combine_first(result_df)
+        if result_df is not None:
+            # Merge results back
+            final_df = await self._run_cpu_bound(
+                lambda old, new: old.combine_first(new), state.financial_data, result_df
+            )
 
-        print(final_df)
-        db = service_manager.get_financial_database()
-        db.save_calculated_metric(state.ticker, result_df)
+            # Save back to DB (IO bound)
+            db = service_manager.get_financial_database()
+            await self._run_blocking_db(
+                db.save_calculated_metric, state.ticker, result_df
+            )
 
-        return {"financial_data": final_df}
+            return {"financial_data": final_df}
 
-    def _analyst_node(self, state: _AgentState) -> dict[str, Any]:
-        print(f"--- [Node] Analyst ---")
+        return {}
+
+    async def _analyst_node(self, state: _AgentState) -> dict[str, Any]:
+        logger.info("✍️  [Step: Analyst] Generating insights...")
         llm = service_manager.get_agent(temperature=0.7)
 
         data_str = (
@@ -331,5 +392,61 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "Highlight key trends, risks, and positives."
         )
 
-        response = llm.invoke(msg)
+        response = await llm.ainvoke(msg)
         return {"messages": [response]}
+
+
+if __name__ == "__main__":
+    agent = FundamentalAnalysisAgent()
+
+    # Example Usage:
+    async def main():
+        # Scenario 1: Basic metrics
+        print("--- Running Scenario 1: Basic Metrics ---")
+        input_basic = FundamentalAnalysisInput(
+            ticker="AAPL",
+            metrics=["revenue", "net_income"],
+            start_year=2020,
+            end_year=2022,
+            raw_input="What were Apple's revenues and net income from 2020 to 2022?",
+        )
+        output_basic = await agent.run(input_basic)
+        print(f"Scenario 1 Output: {output_basic.output}\n")
+
+        # Scenario 2: Complex metric (Net Profit Margin)
+        print("--- Running Scenario 2: Complex Metric (Net Profit Margin) ---")
+        input_complex = FundamentalAnalysisInput(
+            ticker="MSFT",
+            metrics=["net_profit_margin"],
+            start_year=2020,
+            end_year=2022,
+            raw_input="Calculate Microsoft's net profit margin for the last three years.",
+        )
+        output_complex = await agent.run(input_complex)
+        print(f"Scenario 2 Output: {output_complex.output}\n")
+
+        # Scenario 3: Mix of basic and complex
+        print("--- Running Scenario 3: Mixed Metrics ---")
+        input_mixed = FundamentalAnalysisInput(
+            ticker="GOOG",
+            metrics=["revenue", "gross_profit_margin"],
+            start_year=2021,
+            end_year=2023,
+            raw_input="Tell me about Google's revenue and gross profit margin from 2021 to 2023.",
+        )
+        output_mixed = await agent.run(input_mixed)
+        print(f"Scenario 3 Output: {output_mixed.output}\n")
+
+        # Scenario 4: No specific years, default to last 5
+        print("--- Running Scenario 4: Default Years ---")
+        input_default_years = FundamentalAnalysisInput(
+            ticker="AMZN",
+            metrics=["free_cash_flow"],
+            raw_input="What is Amazon's free cash flow?",
+            start_year=None,
+            end_year=None,
+        )
+        output_default_years = await agent.run(input_default_years)
+        print(f"Scenario 4 Output: {output_default_years.output}\n")
+
+    asyncio.run(main())
