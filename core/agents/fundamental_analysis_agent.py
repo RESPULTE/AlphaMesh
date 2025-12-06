@@ -108,6 +108,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
     def get_input_schema_class(cls) -> Type[BaseModel]:
         return FundamentalAnalysisInput
 
+    @classmethod
+    def get_input_schema_class(cls) -> Type[BaseModel]:
+        return AgentOutput
+
     async def run(self, input_data: FundamentalAnalysisInput) -> AgentOutput:
         logger.info(f"🚀 [Agent Start] Ticker: {input_data.ticker}")
 

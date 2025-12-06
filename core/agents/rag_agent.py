@@ -223,21 +223,21 @@ class VectorStoreManager:
     # --- Pipeline Step: Retrieval & Grading ---
 
     def retrieve(
-        self, query: str, filter_dict: Optional[Dict] = None
+        self, query: str, filter_dict: Optional[Dict] = None, k: int = 10
     ) -> List[Document]:
         """
         Retrieves documents synchronously.
         (Kept sync as requested, or can be upgraded to async if needed).
         """
-        return self._retrieve_documents(query, filter_dict)
+        return self._retrieve_documents(query, filter_dict, k=k)
 
     def _retrieve_documents(
-        self, query: str, filter_dict: Optional[Dict] = None
+        self, query: str, filter_dict: Optional[Dict] = None, k: int = 10
     ) -> List[Document]:
         try:
             if filter_dict and hasattr(self.retriever, "search_kwargs"):
                 documents = self.vector_store.similarity_search(
-                    query, k=5, filter=filter_dict
+                    query, k=k, filter=filter_dict
                 )
             else:
                 documents = self.retriever.invoke(query)
