@@ -1,4 +1,3 @@
-from core.config import settings
 from edgar import Company, MultiFinancials
 from edgar.xbrl import XBRLS
 
@@ -60,6 +59,21 @@ def multi_func():
 
 # --- EXAMPLE USAGE ---
 if __name__ == "__main__":
-    settings
-    benchmark(xbrl_func)
-    benchmark(multi_func)
+    # settings
+    # benchmark(xbrl_func)
+    # benchmark(multi_func)
+    from core.services import service_manager
+
+    # sources = service_manager.get_news_api().get_sources(language="en", country="us")
+    # lisss = []
+    # for s in sources["sources"]:
+    #     lisss.append(s["id"])
+
+    a = service_manager.get_news_api().get_everything(
+        q="AAPL AND apple",
+        from_param="2025-11-03",
+        to="2025-12-04",
+        language="en",
+        page=3,
+    )
+    print(a)

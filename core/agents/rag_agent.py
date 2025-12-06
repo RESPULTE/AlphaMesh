@@ -9,7 +9,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain_core.runnables import (
+    RunnableBranch,
+    RunnableParallel,
+    RunnablePassthrough,
+)
 from langchain_core.vectorstores import VectorStore
 
 # New Import for Semantic Chunking
@@ -70,20 +74,20 @@ class GradeDocuments(BaseModel):
 # --- Centralized Prompts ---
 
 MANAGER_PROMPTS = {
-    "retrieval_grader": ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a grader assessing relevance of a retrieved document to a user question. \n"
-                "If the document contains keyword(s) or semantic meaning related to the question, grade it as relevant. \n"
-                "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.",
-            ),
-            (
-                "human",
-                "Retrieved document: \n\n {document} \n\n User question: {query}",
-            ),
-        ]
-    ),
+    # "retrieval_grader": ChatPromptTemplate.from_messages(
+    #     [
+    #         (
+    #             "system",
+    #             "You are a grader assessing relevance of a retrieved document to a user question. \n"
+    #             "If the document contains keyword(s) or semantic meaning related to the question, grade it as relevant. \n"
+    #             "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.",
+    #         ),
+    #         (
+    #             "human",
+    #             "Retrieved document: \n\n {document} \n\n User question: {query}",
+    #         ),
+    #     ]
+    # ),
     "metadata_extractor": ChatPromptTemplate.from_messages(
         [
             (
@@ -106,7 +110,7 @@ MANAGER_PROMPTS = {
 # --- The Manager Class ---
 
 
-class FinancialVectorStoreManager:
+class VectorStoreManager:
     def __init__(
         self,
         retriever: BaseRetriever,
@@ -123,10 +127,10 @@ class FinancialVectorStoreManager:
 
         # --- Components ---
 
-        # 1. Grader
-        self._grader = MANAGER_PROMPTS[
-            "retrieval_grader"
-        ] | self.llm.with_structured_output(GradeDocuments)
+        # # 1. Grader
+        # self._grader = MANAGER_PROMPTS[
+        #     "retrieval_grader"
+        # ] | self.llm.with_structured_output(GradeDocuments)
 
         # 2. Semantic Chunker
         self._semantic_chunker = SemanticChunker(
@@ -135,11 +139,22 @@ class FinancialVectorStoreManager:
 
         # 3. Ingestion Processing Chain (Parallel Execution)
         # This replaces the separate calls in the previous version
+
+        summary_chain = RunnableBranch(
+            # If should_summarize is True
+            (
+                lambda x: x["summarize"] is True,
+                MANAGER_PROMPTS["summarizer"] | self.llm | StrOutputParser(),
+            ),
+            # Default branch (skip summary)
+            RunnablePassthrough() | (lambda x: ""),
+        )
+
         self._ingestion_chain = RunnableParallel(
             {
                 "fin_meta": MANAGER_PROMPTS["metadata_extractor"]
                 | self.llm.with_structured_output(FinancialArticleMetadata),
-                "summary": MANAGER_PROMPTS["summarizer"] | self.llm | StrOutputParser(),
+                "summary": summary_chain,
                 "raw_text": RunnablePassthrough(),
             }
         )
@@ -160,7 +175,12 @@ class FinancialVectorStoreManager:
             # If filter fails or DB is empty, assume it doesn't exist
             return False
 
-    def ingest_article(self, raw_text: str, source_metadata: Dict[str, Any]) -> bool:
+    def ingest_article(
+        self,
+        raw_text: str,
+        source_metadata: Dict[str, Any],
+        should_summarize: bool = False,
+    ) -> bool:
         """
         Ingests an article with deduplication, parallel processing, and semantic chunking.
         """
@@ -178,7 +198,9 @@ class FinancialVectorStoreManager:
 
             # 2. Execute Parallel Chain (Metadata & Summary)
             # Input: {"document_content": raw_text} -> Output: Dict with keys 'fin_meta', 'summary', 'raw_text'
-            result = self._ingestion_chain.invoke({"document_content": raw_text})
+            result = self._ingestion_chain.invoke(
+                {"document_content": raw_text, "summarize": should_summarize}
+            )
 
             fin_meta: FinancialArticleMetadata = result["fin_meta"]
             summary_text: str = result["summary"]
@@ -188,14 +210,16 @@ class FinancialVectorStoreManager:
             chunks = self._semantic_chunker.create_documents([raw_text])
 
             # 4. Metadata Enrichment
-            enriched_documents = []
+
             base_metadata = {
                 **source_metadata,
                 **fin_meta.model_dump(),
-                "summary": summary_text,
                 "ingest_timestamp": datetime.now().isoformat(),
             }
+            if should_summarize:
+                base_metadata["summary"] = summary_text
 
+            enriched_documents = []
             for i, chunk in enumerate(chunks):
                 chunk_meta = base_metadata.copy()
                 chunk_meta["chunk_index"] = i

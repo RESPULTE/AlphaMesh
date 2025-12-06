@@ -237,7 +237,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return {}
 
         db = service_manager.get_financial_database()
-        db.get_company_data(
+        db.update_company_data(
             state.ticker, num_years=state.end_year - state.start_year + 1
         )
 

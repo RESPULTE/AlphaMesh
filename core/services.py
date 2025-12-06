@@ -1,11 +1,5 @@
 # services.py
 from core.config import settings
-from langchain_chroma import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_neo4j import Neo4jGraph
-
-from core.agents.get_financial_data import FinancialDatabase
-from core.agents.rag_agent import FinancialVectorStoreManager
 
 
 class ServiceManager:
@@ -23,7 +17,9 @@ class ServiceManager:
         self._financial_db = None
         self._vector_store_manager = None
 
-    def get_agent(self, temperature=0.0) -> ChatGoogleGenerativeAI:
+    def get_agent(self, temperature=0.0):
+        from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
+
         """Initializes and returns the language model instance."""
         if self._llm is None:
             try:
@@ -40,7 +36,9 @@ class ServiceManager:
 
         return self._llm
 
-    def get_embedding_func(self) -> GoogleGenerativeAIEmbeddings:
+    def get_embedding_func(self):
+        from langchain_google_genai.embeddings import GoogleGenerativeAIEmbeddings
+
         """Initializes and returns the embedding model instance."""
         if self._embedding_func is None:
             try:
@@ -53,7 +51,9 @@ class ServiceManager:
                 raise
         return self._embedding_func
 
-    def get_graph(self) -> Neo4jGraph:
+    def get_graph(self):
+        from langchain_neo4j import Neo4jGraph
+
         """Initializes and returns the Neo4j graph instance."""
         if self._graph is None:
             try:
@@ -67,7 +67,9 @@ class ServiceManager:
                 raise
         return self._graph
 
-    def get_vector_store(self) -> Chroma:
+    def get_vector_store(self):
+        from langchain_chroma import Chroma
+
         """Initializes and returns the Chroma vector store instance."""
         if self._vector_store is None:
             try:
@@ -86,7 +88,9 @@ class ServiceManager:
         vector_store = self.get_vector_store()
         return vector_store.as_retriever()
 
-    def get_financial_database(self) -> FinancialDatabase:
+    def get_financial_database(self):
+        from core.agents.get_financial_data import FinancialDatabase
+
         if self._financial_db is None:
             try:
                 self._financial_db = FinancialDatabase()
@@ -96,10 +100,12 @@ class ServiceManager:
         return self._financial_db
 
     def get_vector_store_manager(self):
+        from core.agents.rag_agent import VectorStoreManager
+
         if self._vector_store_manager is None:
             try:
                 vector_store = self.get_vector_store()
-                self._vector_store_manager = FinancialVectorStoreManager(
+                self._vector_store_manager = VectorStoreManager(
                     vector_store.as_retriever(),
                     self.get_agent(temperature=0.0),
                     self.get_embedding_func(),
@@ -109,6 +115,11 @@ class ServiceManager:
                 print(f"Error initializing Vector Store Manager: {e}")
                 raise
         return self._vector_store_manager
+
+    def get_news_api(self):
+        from newsapi import NewsApiClient
+
+        return NewsApiClient(api_key=settings.NEWSAPI_KEY)
 
 
 service_manager = ServiceManager()

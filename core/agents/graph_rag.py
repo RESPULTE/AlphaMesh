@@ -56,7 +56,15 @@ CONFLICTING_REL_GROUPS = {"SENTIMENT": ["INTERESTED_IN", "DISLIKES"]}
 class UserProfileUpdate(BaseModel):
     name: Optional[str] = None
     role: Optional[str] = None
-    experience_level: Optional[str] = None
+    communication_style: Optional[str] = Field(
+        None, description="e.g. Brief, Detailed, with examples"
+    )
+    experience_level: Optional[str] = Field(
+        default="Beginner", description="e.g. Beginner, Intermediate, Expert"
+    )
+    learning_style: Optional[str] = Field(
+        None, description="e.g. Visual, Theoretical, Practical"
+    )
 
 
 class GraphNode(BaseModel):
@@ -70,6 +78,10 @@ class GraphRelationship(BaseModel):
     target: str = Field(description="Target ID.")
     type: AllowedRelTypes
     properties: Dict[str, Any] = Field(default_factory=dict)
+    experience_level: str = Field(
+        description="The user's understanding of the concept. Default is 'Basic'.",
+        default="Basic",
+    )
     weight: int = Field(default=1, description="Importance score. Default is 1.")
 
 
@@ -79,79 +91,12 @@ class KnowledgeGraphUpdate(BaseModel):
     relationships: List[GraphRelationship]
 
 
-# ============================================================================
-# 2. Temporal Knowledge Extractor
-# ============================================================================
-
-# ============================================================================
-# 2. Temporal Knowledge Extractor
-# ============================================================================
-
-
-class KnowledgeExtractor:
-    def __init__(self, llm):
-        self.llm = llm.with_structured_output(KnowledgeGraphUpdate)
-
-    async def extract_knowledge(
-        self, conversation: List[Any], existing_entities: str
-    ) -> KnowledgeGraphUpdate:
-        """
-        Extracts new knowledge and reinforcements of existing knowledge.
-        """
-        formatted_history = "\n".join(
-            [f"{m.type.upper()}: {m.content}" for m in conversation]
-        )
-
-        system_prompt = f"""You are a Temporal Knowledge Graph Architect.
-    Your goal is to map the conversation to a graph, capturing both User Intent and **Learned Concepts**.
-
-    ### EXISTING GRAPH NODES:
-    {existing_entities}
-
-    ### RULES:
-    1. **Implicit Interest (Crucial)**: 
-    - If the user asks about or mentions a Concept (e.g., "How does Docker work?"), assume they are **INTERESTED_IN** it.
-    - Create a relationship: `CURRENT_USER -> INTERESTED_IN -> Docker`.
-    - **Exception**: If the user explicitly says they hate/dislike it, use `DISLIKES` instead.
-
-    2. **Analyze the Assistant's Answer**: 
-    - If the Assistant explains a specific detail about a topic, extract it as a new Concept and link it using 'RELATED_TO'.
-    - Example: AI says "Docker uses Containers." -> 
-        Nodes: [Docker, Containers]
-        Rels: [Docker -> RELATED_TO -> Containers]
-
-    3. **Strict Directionality**:
-    - 'DISLIKES', 'INTERESTED_IN', 'HAS_PREFERENCE' **MUST** always start with 'CURRENT_USER'.
-    - NEVER say "Python DISLIKES Docker". 
-    - Use 'RELATED_TO' for concept-to-concept links.
-
-    4. **Scoring & Priority**:
-    - If a topic is discussed *again*, **OUTPUT THE RELATIONSHIP AGAIN**. The database will increment the score.
-
-    5. **Entity Resolution**:
-    - Use the 'EXISTING GRAPH NODES' list to reuse IDs.
-"""
-        prompt = ChatPromptTemplate.from_messages(
-            [("system", system_prompt), ("human", formatted_history)]
-        )
-
-        try:
-            return await (prompt | self.llm).ainvoke({})
-        except Exception as e:
-            print(f"Extraction Error: {e}")
-            return KnowledgeGraphUpdate(
-                user_attributes=UserProfileUpdate(), nodes=[], relationships=[]
-            )
-
-
-# ============================================================================
-# 3. Temporal Graph Manager (The Dynamic Engine)
-# ============================================================================
-
-
-class TemporalGraphManager:
-    def __init__(self, graph: Neo4jGraph):
+class GraphManager:
+    def __init__(self, graph: Neo4jGraph, llm, user_id: str = "TESTING"):
         self.graph = graph
+        self.llm = llm.with_structured_output(KnowledgeGraphUpdate)
+        self.user_id = user_id
+
         self._initialize_schema()
 
     def _initialize_schema(self):
@@ -166,7 +111,65 @@ class TemporalGraphManager:
             except Exception:
                 pass
 
-    def update_graph(self, user_id: str, knowledge: KnowledgeGraphUpdate):
+    async def update_graph(self, conversation: List[Any]) -> KnowledgeGraphUpdate:
+        """
+        Extracts new knowledge and reinforcements of existing knowledge.
+        """
+        known_entities = self.get_known_entities()
+
+        formatted_history = "\n".join(
+            [f"{m.type.upper()}: {m.content}" for m in conversation]
+        )
+
+        system_prompt = f"""
+            You are a Temporal Knowledge Graph Architect.
+            Your goal is to map the conversation to a graph, capturing both User Intent and **Learned Concepts**.
+
+            ### EXISTING GRAPH NODES:
+            {known_entities}
+
+            ### RULES:
+            1. **Implicit Interest (Crucial)**: 
+            - If the user asks about or mentions a Concept (e.g., "How does Docker work?"), assume they are **INTERESTED_IN** it.
+            - Create a relationship: `CURRENT_USER -> INTERESTED_IN -> Docker`.
+            - **Exception**: If the user explicitly says they hate/dislike it, use `DISLIKES` instead.
+
+            2. **Analyze the Assistant's Answer**: 
+            - If the Assistant explains a specific detail about a topic, extract it as a new Concept and link it using 'RELATED_TO'.
+            - Example: AI says "Docker uses Containers." -> 
+                Nodes: [Docker, Containers]
+                Rels: [Docker -> RELATED_TO -> Containers]
+
+            3. **Strict Directionality**:
+            - 'DISLIKES', 'INTERESTED_IN', 'HAS_PREFERENCE' **MUST** always start with 'CURRENT_USER'.
+            - NEVER say "Python DISLIKES Docker". 
+            - Use 'RELATED_TO' for concept-to-concept links.
+
+            4. **Scoring & Priority**:
+            - If a topic is discussed *again*, **OUTPUT THE RELATIONSHIP AGAIN**. The database will increment the score.
+
+            5. **Entity Resolution**:
+            - Use the 'EXISTING GRAPH NODES' list to reuse IDs.
+
+            6. **User Preferences (Properties)**: 
+            - If the user says "Be brief", "I like code examples", or "Explain like I'm 5", set this in `user_attributes` (e.g., `communication_style="Brief"`).
+            - Do NOT create a relationship for this.
+        """
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", system_prompt), ("human", formatted_history)]
+        )
+
+        try:
+            knowledge = await (prompt | self.llm).ainvoke({})
+        except Exception as e:
+            print(f"Extraction Error: {e}")
+            return KnowledgeGraphUpdate(
+                user_attributes=UserProfileUpdate(), nodes=[], relationships=[]
+            )
+
+        self._upsert_graph(self.user_id, knowledge)
+
+    def _upsert_graph(self, user_id: str, knowledge: KnowledgeGraphUpdate):
         # 1. ALWAYS Ensure User Node Exists
         # We do this outside the 'if user_props' block to guarantee the node exists
         # even if no new attributes (name/role) were extracted in this turn.
@@ -204,7 +207,7 @@ class TemporalGraphManager:
 
         # 4. Handle Relationships
         for rel in knowledge.relationships:
-            self._upsert_temporal_relationship(user_id, rel)
+            self._upsert_relationship(user_id, rel)
 
     def get_known_entities(self) -> str:
         """Retrieves existing nodes for entity resolution."""
@@ -218,7 +221,7 @@ class TemporalGraphManager:
         except Exception:
             return ""
 
-    def _upsert_temporal_relationship(self, user_id: str, rel: GraphRelationship):
+    def _upsert_relationship(self, user_id: str, rel: GraphRelationship):
         # --- FIX: Strict Directionality Enforcement ---
         # These types MUST start from the User. If LLM says "Python DISLIKES Docker", we correct it or ignore it.
         USER_CENTRIC_RELS = {
@@ -255,16 +258,12 @@ class TemporalGraphManager:
         # LOGIC BRANCH 2: Entity State
         if behavior == "ENTITY_STATE":
             conflicting_types = self._get_conflicting_types(rel.type)
-            self._close_entity_state_relationships(source, target, conflicting_types)
-            self._create_new_active_relationship(
-                source, target, rel.type, rel.properties
-            )
+            self._close_conflicting_relationships(source, target, conflicting_types)
+            self._create_relationship(source, target, rel.type, rel.properties)
 
         # LOGIC BRANCH 3: Standard (Accumulative)
         else:
-            self._create_new_active_relationship(
-                source, target, rel.type, rel.properties
-            )
+            self._create_relationship(source, target, rel.type, rel.properties)
 
     def _is_relationship_active(self, source: str, target: str, rel_type: str) -> bool:
         query = f"""
@@ -283,7 +282,7 @@ class TemporalGraphManager:
         """
         self.graph.query(query, {"source": source, "target": target})
 
-    def _create_new_active_relationship(
+    def _create_relationship(
         self, source: str, target: str, rel_type: str, props: dict
     ):
         # Initial weight is 1
@@ -302,35 +301,30 @@ class TemporalGraphManager:
                 return group
         return [rel_type]
 
-    def _close_category_relationships(self, source_id: str, rel_type: str):
-        query = f"MATCH (s {{id: $source}})-[r:{rel_type}]->() WHERE r.end_date IS NULL SET r.end_date = datetime()"
-        self.graph.query(query, {"source": source_id})
-
-    def _close_entity_state_relationships(
+    def _close_conflicting_relationships(
         self, source_id: str, target_id: str, types: List[str]
     ):
         types_str = "|".join([f"`{t}`" for t in types])
         query = f"MATCH (s {{id: $source}})-[r:{types_str}]->(t {{id: $target}}) WHERE r.end_date IS NULL SET r.end_date = datetime()"
         self.graph.query(query, {"source": source_id, "target": target_id})
 
-    def get_current_user_state(self, user_id: str) -> str:
+    def get_user_context(self, user_id: str) -> str:
         """
         Fetches active relationships, SORTED by weight (Priority).
+        Preferences are extracted directly from User Properties.
         """
         query = """
         MATCH (u:User {id: $user_id})
         
-        // 1. Active Preferences (Sorted by Weight DESC, then Recency)
-        OPTIONAL MATCH (u)-[r1:HAS_PREFERENCE]->(p:Preference) 
-        WHERE r1.end_date IS NULL
-        WITH u, p, r1 ORDER BY r1.weight DESC, r1.start_date DESC
-        WITH u, collect(p.id) as preferences
+        // 1. Active Preferences (From Properties)
+        // We filter the User node's properties for specific style-related keys
+        WITH u, 
+             [k IN keys(u) WHERE k IN ['communication_style', 'learning_style', 'experience_level'] | k + ": " + u[k]] AS preferences
         
-        // 2. Active Interests (Sorted by Weight DESC - Highest Priority First)
+        // 2. Active Interests (Sorted by Weight DESC)
         OPTIONAL MATCH (u)-[r2:INTERESTED_IN]->(c:Concept) 
         WHERE r2.end_date IS NULL
         WITH u, preferences, c, r2 ORDER BY r2.weight DESC
-        // Format: "ConceptName [Priority: 5]"
         WITH u, preferences, collect(c.id + ' [Priority: ' + coalesce(r2.weight, 1) + ']') as interests
         
         // 3. Known Dislikes
@@ -348,10 +342,9 @@ class TemporalGraphManager:
 
         rec = data[0]
 
-        # We format this string to be very clear for the LLM
         return f"""User Profile & Context:
 - Attributes: {rec['profile']}
-- Communication Preferences: {', '.join(rec['preferences'])}
+- Preferences (Styles): {', '.join(rec['preferences'])}
 - Active Interests (Sorted by Priority): {', '.join(rec['interests'])}
 - Dislikes (Do not mention): {', '.join(rec['dislikes'])}"""
 
@@ -362,49 +355,46 @@ class TemporalGraphManager:
 
 
 class EvolvingGraphRAGAgent:
-    def __init__(self, graph: Neo4jGraph, llm, user_id: str = "user_core"):
+    def __init__(self, graph: Neo4jGraph, llm, user_id: str = "TESTING"):
         self.user_id = user_id
         self.graph = graph
         self.llm = llm
-        self.manager = TemporalGraphManager(self.graph)
-        self.extractor = KnowledgeExtractor(self.llm)
+        self.manager = GraphManager(self.graph, llm, user_id)
 
     async def process_interaction(self, user_input: str) -> str:
         # 1. Get Current State
-        state = self.manager.get_current_user_state(self.user_id)
+        state = self.manager.get_user_context(self.user_id)
 
         # 2. Generate Response
         response = await self._generate_response(user_input, state)
 
         # 3. Extract & Evolve
-        known_entities = self.manager.get_known_entities()
-        knowledge = await self.extractor.extract_knowledge(
-            [HumanMessage(content=user_input), AIMessage(content=response)],
-            known_entities,
+
+        await self.manager.update_graph(
+            [HumanMessage(content=user_input), AIMessage(content=response)]
         )
-        self.manager.update_graph(self.user_id, knowledge)
 
         return response
 
     async def _generate_response(self, user_input: str, state: str) -> str:
         system_msg = f"""You are a helpful AI assistant with access to a personalized Knowledge Graph.
 
-USER CONTEXT:
-{state}
+        USER CONTEXT:
+        {state}
 
-INSTRUCTIONS:
-1. **Prioritize High-Value Topics**: 
-   - Look at the 'Active Interests' list. Items with higher `[Priority: X]` scores are more important to the user.
-   - Focus your examples and analogies around these high-priority concepts.
-   
-2. **Respect Constraints**:
-   - Never mention topics listed in 'Dislikes'.
-   - Adapt your tone based on 'Communication Preferences'.
+        INSTRUCTIONS:
+        1. **Prioritize High-Value Topics**: 
+        - Look at the 'Active Interests' list. Items with higher `[Priority: X]` scores are more important to the user.
+        - Focus your examples and analogies around these high-priority concepts.
+        
+        2. **Respect Constraints**:
+        - Never mention topics listed in 'Dislikes'.
+        - Adapt your tone based on 'Communication Preferences'.
 
-3. **Be Natural**: 
-   - Do not say "I see you have a priority 5 interest in Python". 
-   - Instead, say "Since you're deeply into Python..." or use Python code snippets naturally.
-"""
+        3. **Be Natural**: 
+        - Do not say "I see you have a priority 5 interest in Python". 
+        - Instead, say "Since you're deeply into Python..." or use Python code snippets naturally.
+        """
         messages = [SystemMessage(content=system_msg)] + [
             HumanMessage(content=user_input)
         ]
@@ -422,7 +412,7 @@ async def main():
     llm = service_manager.get_agent()
     agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_evolution_demo")
 
-    # # 🛑 RESET GRAPH for a clean demo
+    # 🛑 RESET GRAPH for a clean demo
     # print("🧹 Clearing Database for Demo...")
     # graph.query("MATCH (n) DETACH DELETE n")
 
@@ -511,11 +501,11 @@ async def main():
     # print(f"\nUser: {msg_4}")
     # await agent.process_interaction(msg_4)
     # print_graph_snapshot("AFTER MESSAGE 4")
-    # # EXPECTED:
-    # # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
-    # # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
+    # EXPECTED:
+    # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
+    # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
 
-    msg_5 = "could you describe what you know about "
+    msg_5 = "Could you explain more about containerization?"
     print(f"\nUser: {msg_5}")
     await agent.process_interaction(msg_5)
     # print_graph_snapshot("AFTER MESSAGE 4")
