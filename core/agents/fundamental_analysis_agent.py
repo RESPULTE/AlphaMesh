@@ -33,7 +33,7 @@ class CalculatedMetric(BaseModel):
         description="The name of the new metric to calculate (e.g., 'net_profit_margin'). Use snake_case."
     )
     pandas_eval_expression: str = Field(
-        description="The mathematical formula compatible with pandas.eval(). Example: 'price / revenue'"
+        description="The mathematical formula compatible with pandas.eval(). Example: 'net_income / revenue'"
     )
     dependencies: List[str] = Field(
         description="A list of the base financial concepts required for this formula. Example: ['net_income', 'revenue']"
@@ -86,7 +86,8 @@ class FundamentalAnalysisInput(BaseModel):
 
 class FundamentalAnalysisAgent(AbstractAgent):
     """
-    Refactored Agent using Structured Outputs and Async IO.
+    Refactored Agent using Structured Outputs and Async IO,
+    optimizing for one bulk database insert.
     """
 
     def __init__(self):
@@ -109,7 +110,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         return FundamentalAnalysisInput
 
     @classmethod
-    def get_input_schema_class(cls) -> Type[BaseModel]:
+    def get_output_schema_class(cls) -> Type[BaseModel]:
         return AgentOutput
 
     async def run(self, input_data: FundamentalAnalysisInput) -> AgentOutput:
@@ -164,13 +165,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     # --- Helper: CPU/IO Bound Wrappers ---
 
-    async def _run_blocking_db(self, func, *args, **kwargs):
-        """Helper to run blocking DB calls in a thread."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-
-    async def _run_cpu_bound(self, func, *args, **kwargs):
-        """Helper to run blocking Pandas operations in a thread."""
+    async def _run_blocking(self, func, *args, **kwargs):
+        """Helper to run blocking DB/API/Pandas calls in a thread."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
@@ -183,10 +179,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
         logger.info("🔍 [Step: Parser] Resolving metrics against database...")
         db = service_manager.get_financial_database()
 
-        to_fetch = []
-        unknown_metrics = []
-
-        # Run resolution in thread as it might involve DB lookups
         def _resolve_metrics():
             f, u = [], []
             for metric in state.metrics:
@@ -197,7 +189,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     u.append(metric)
             return f, u
 
-        to_fetch, unknown_metrics = await self._run_blocking_db(_resolve_metrics)
+        to_fetch, unknown_metrics = await self._run_blocking(_resolve_metrics)
 
         logger.info(
             f"   -> Found {len(to_fetch)} direct metrics, {len(unknown_metrics)} require calculation."
@@ -230,7 +222,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         db = service_manager.get_financial_database()
         # Blocking call to get concepts
-        available_concepts = await self._run_blocking_db(
+        available_concepts = await self._run_blocking(
             db.get_all_concepts_for_company, state.ticker
         )
 
@@ -238,13 +230,18 @@ class FundamentalAnalysisAgent(AbstractAgent):
             [
                 (
                     "system",
-                    "You are a financial quant. Decompose the requested metrics into mathematical formulas.",
+                    "You are an expert financial quant. Your task is to build a calculation dependency tree.\n"
+                    "Start by decomposing the requested target metric into a mathematical formula.\n"
+                    "If the constituents of that formula are not in the available database concepts, "
+                    "you must generate additional formulas to decompose those constituents.\n"
+                    "Repeat this process recursively until every final input variable exists within the available database concepts.",
                 ),
                 (
                     "human",
                     f"Available Database Concepts: {available_concepts}\n\n"
-                    f"Metrics to decompose: {targets}\n\n"
-                    "Provide a calculation plan using ONLY the available concepts.",
+                    f"Target Metric to decompose: {targets}\n\n"
+                    "Output the calculation plan as a set of step-by-step formulas.\n"
+                    "Ensure that the final level of the decomposition uses ONLY the available concepts.",
                 ),
             ]
         )
@@ -268,44 +265,59 @@ class FundamentalAnalysisAgent(AbstractAgent):
         }
 
     async def _fetch_data_node(self, state: _AgentState) -> dict[str, Any]:
-        logger.info("💾 [Step: Fetcher] Retrieving data from Financial DB...")
+        logger.info("💾 [Step: Fetcher] Retrieving and caching data...")
+        db = service_manager.get_financial_database()
 
         # Unique metrics only
         metrics = list(set(state.metrics_to_fetch))
 
-        if not metrics:
-            logger.warning("   -> No metrics to fetch.")
-            return {}
-
-        db = service_manager.get_financial_database()
-
-        # Define the blocking IO operations
-        def _fetch_op():
-            # Update data (might trigger API calls)
-            db.update_company_data(
-                state.ticker, num_years=state.end_year - state.start_year + 1
+        # 1. Fetch New Data (Network IO)
+        # Fetch for the entire date range to ensure DB completeness
+        def _fetch_new():
+            return db.fetch_new_filings(
+                state.ticker, state.start_year, state.end_year + 1
             )
-            # Query data (SQL/Pandas)
+
+        new_data_df = await self._run_blocking(_fetch_new)
+
+        if not new_data_df.empty:
+            logger.info(f"   -> Fetched {len(new_data_df)} new data points from API.")
+        else:
+            logger.info("   -> No new data found from API.")
+
+        # 2. Fetch Existing Data (Disk IO)
+        def _fetch_existing():
             return db.get_concept(
                 state.ticker, metrics, state.start_year, state.end_year, exact=True
             )
 
-        df = await self._run_blocking_db(_fetch_op)
+        existing_data_df = await self._run_blocking(_fetch_existing)
+        logger.info(f"   -> Found {existing_data_df.shape} existing data points.")
 
-        # Merge with existing if any (CPU bound)
-        def _merge_op(existing, new_df):
-            if not existing.empty:
-                return existing.combine_first(new_df)
-            return new_df
+        # 3. Combine Data for Agent State (CPU Bound)
+        pivoted_new_df = pd.DataFrame()
+        if not new_data_df.empty:
+            # We must pivot the new data before combining with existing pivoted data
+            pivoted_new_df = await self._run_blocking(db.pivot_data, new_data_df)
 
-        combined_df = await self._run_cpu_bound(_merge_op, state.financial_data, df)
+        combined_df = existing_data_df
+        if not pivoted_new_df.empty:
+            if combined_df.empty:
+                combined_df = pivoted_new_df
+            else:
+                # Use combine_first to take existing data over new data if years overlap
+                combined_df = combined_df.combine_first(pivoted_new_df)
 
-        logger.info(f"   -> Data shape: {combined_df.shape}")
+        # 4. Bulk Save New Data (Disk IO) - SINGLE TRANSACTION
+        if not new_data_df.empty:
+            await self._run_blocking(db.bulk_insert_financials, new_data_df)
+
+        logger.info(f"   -> Final Data Shape for Agent: {combined_df.shape}")
         return {"financial_data": combined_df}
 
     async def _calculator_node(self, state: _AgentState) -> dict[str, Any]:
         """
-        Executes the formulas using pandas eval.
+        Executes the formulas using pandas eval and saves the results.
         """
         if state.financial_data.empty or not state.calculations_to_run:
             return {}
@@ -316,21 +328,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
         def _compute(df_input, calculations, ticker):
             df_eval = df_input.copy()
 
-            # 1. Flatten MultiIndex for eval (Ticker, Metric) -> Metric
+            # 1. Flatten MultiIndex and Transpose
             try:
                 df_eval.index = [c[1] for c in df_input.index]
             except IndexError:
                 pass
-
-            # 2. Transpose for Eval (Rows=Years, Cols=Metrics)
             df_eval = df_eval.T
 
-            # 3. Execute
+            # 2. Execute
             for calc in calculations:
                 try:
-                    logger.debug(
-                        f"      Eval: {calc.target_metric_name} = {calc.pandas_eval_expression}"
-                    )
                     df_eval.eval(
                         f"{calc.target_metric_name} = {calc.pandas_eval_expression}",
                         inplace=True,
@@ -340,13 +347,12 @@ class FundamentalAnalysisAgent(AbstractAgent):
                         f"      Error calculating {calc.target_metric_name}: {e}"
                     )
 
-            # 4. Filter & Restore
+            # 3. Filter & Restore to MultiIndex Pivot
             calculated_cols = [
                 c.target_metric_name
                 for c in calculations
                 if c.target_metric_name in df_eval.columns
             ]
-
             if not calculated_cols:
                 return None
 
@@ -355,29 +361,47 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 [(ticker, col) for col in result_df.index],
                 names=["company", "concept"],
             )
-
             return result_df
 
         # Run computation in thread
-        result_df = await self._run_cpu_bound(
+        result_df = await self._run_blocking(
             _compute, state.financial_data, state.calculations_to_run, state.ticker
         )
 
         if result_df is not None:
-            # Merge results back
-            final_df = await self._run_cpu_bound(
-                lambda old, new: old.combine_first(new), state.financial_data, result_df
-            )
+            # Merge results back into the state data
+            final_df = state.financial_data.combine_first(result_df)
 
-            # Save back to DB (IO bound)
+            # Convert calculated pivoted metrics to long format for DB save
+            db_save_df = self._melt_calculated(result_df, state.ticker)
+
+            # Save calculated metrics (Bulk IO) - The second potential transaction
             db = service_manager.get_financial_database()
-            await self._run_blocking_db(
-                db.save_calculated_metric, state.ticker, result_df
-            )
+            await self._run_blocking(db.bulk_insert_financials, db_save_df)
 
             return {"financial_data": final_df}
 
         return {}
+
+    def _melt_calculated(self, df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """Helper to convert pivoted calculated metrics back to long format for DB save."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # 1. Reset index so 'concept' becomes a column
+        work_df = df.copy().reset_index()
+
+        # 2. Melt (Unpivot) the DataFrame
+        melted = work_df.melt(
+            id_vars=["company", "concept"], var_name="year", value_name="value"
+        )
+
+        # 3. Clean and Add Metadata
+        melted.dropna(subset=["value", "year"], inplace=True)
+        melted["company"] = ticker
+        melted["statement_type"] = "calculated"
+
+        return melted[["company", "year", "statement_type", "concept", "value"]]
 
     async def _analyst_node(self, state: _AgentState) -> dict[str, Any]:
         logger.info("✍️  [Step: Analyst] Generating insights...")
@@ -389,18 +413,28 @@ class FundamentalAnalysisAgent(AbstractAgent):
             else "No data."
         )
 
-        msg = (
-            f"Analyze the following financial data for {state.ticker}.\n"
-            f"Data:\n{data_str}\n\n"
-            f"User Question: {state.messages[0].content}\n"
-            "Highlight key trends, risks, and positives."
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an expert financial analyst. Your task is to provide a concise and insightful quantitative analysis based ONLY on the provided financial data and the user's question. Focus on trends, year-over-year changes, and comparative analysis of the metrics. Your output must be a professional and easy-to-read report. Highlight key trends, risks, and positives.",
+                ),
+                (
+                    "human",
+                    f"Analyze the following financial data for {state.ticker}.\n"
+                    f"Data:\n{data_str}\n\n"
+                    f"User Question: {state.messages[0].content}",
+                ),
+            ]
         )
 
-        response = await llm.ainvoke(msg)
+        response = await llm.ainvoke(prompt.format_prompt())
         return {"messages": [response]}
 
 
 if __name__ == "__main__":
+    # Note: Requires service_manager and FinancialDatabase mock/implementation to run.
+    # The following is for demonstration of the flow structure.
     agent = FundamentalAnalysisAgent()
 
     # Example Usage:
@@ -429,28 +463,4 @@ if __name__ == "__main__":
         output_complex = await agent.run(input_complex)
         print(f"Scenario 2 Output: {output_complex.output}\n")
 
-        # Scenario 3: Mix of basic and complex
-        print("--- Running Scenario 3: Mixed Metrics ---")
-        input_mixed = FundamentalAnalysisInput(
-            ticker="GOOG",
-            metrics=["revenue", "gross_profit_margin"],
-            start_year=2021,
-            end_year=2023,
-            raw_input="Tell me about Google's revenue and gross profit margin from 2021 to 2023.",
-        )
-        output_mixed = await agent.run(input_mixed)
-        print(f"Scenario 3 Output: {output_mixed.output}\n")
-
-        # Scenario 4: No specific years, default to last 5
-        print("--- Running Scenario 4: Default Years ---")
-        input_default_years = FundamentalAnalysisInput(
-            ticker="AMZN",
-            metrics=["free_cash_flow"],
-            raw_input="What is Amazon's free cash flow?",
-            start_year=None,
-            end_year=None,
-        )
-        output_default_years = await agent.run(input_default_years)
-        print(f"Scenario 4 Output: {output_default_years.output}\n")
-
-    asyncio.run(main())
+    asyncio.run(main())  # Uncomment to test with actual setup
