@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Annotated, List, Optional, Type
 
 import pandas as pd
-from core.agents.base_agent import AbstractAgent, AgentOutput
+from core.agents.base_agent import AbstractAgent
 from core.services import service_manager  # Assuming this still handles LLM retrieval
 
 # Import the new database class
@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # --- 1. Internal Structured Output Models ---
+# ! only support 10-k as of now
 
 
 class CalculatedMetric(BaseModel):
@@ -42,34 +43,10 @@ class DecompositionPlan(BaseModel):
 class FundamentalAnalysisOutput(BaseModel):
     """The structured output expected from the Fundamental Analysis Agent."""
 
-    detailed_analysis: str
-    data: pd.DataFrame = Field(default_factory=pd.DataFrame)
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-
-class _AgentState(BaseModel):
-    """Internal state for the agent workflow."""
-
-    # Inputs
-    query: str
-    ticker: str
-    metrics: List[str]
-    start_date: datetime
-    end_date: datetime
-
-    # Processing
-    metrics_to_fetch: Annotated[List[str], operator.add] = Field(default_factory=list)
-    calculations_to_run: List[CalculatedMetric] = Field(default_factory=list)
-
-    # Financial Data: Index=Label, Columns=Date
+    detailed_analysis: Optional[str] = None
     financial_data: pd.DataFrame = Field(default_factory=pd.DataFrame)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    output: Optional[str] = ""
-
-
-# --- 2. Public Input Schema ---
 
 
 class FundamentalAnalysisInput(BaseModel):
@@ -92,6 +69,17 @@ class FundamentalAnalysisInput(BaseModel):
         if isinstance(v, datetime) or v is None:
             return v
         return datetime.strptime(v, "%Y-%m-%d")
+
+
+class _AgentState(FundamentalAnalysisInput, FundamentalAnalysisOutput):
+    """Internal state for the agent workflow."""
+
+    # Processing
+    metrics_to_fetch: Annotated[List[str], operator.add] = Field(default_factory=list)
+    calculations_to_run: List[CalculatedMetric] = Field(default_factory=list)
+
+
+# --- 2. Public Input Schema ---
 
 
 # --- 3. The Agent Class ---
@@ -126,22 +114,24 @@ class FundamentalAnalysisAgent(AbstractAgent):
     def get_output_schema_class(cls) -> Type[BaseModel]:
         return FundamentalAnalysisOutput
 
-    async def run(self, input_data: FundamentalAnalysisInput) -> AgentOutput:
+    async def run(
+        self, input_data: FundamentalAnalysisInput
+    ) -> FundamentalAnalysisOutput:
         """Async entry point for the agent."""
         print(f"--- [Agent: {self.name}] Started for {input_data.ticker} ---")
 
         # Ensure DB is initialized
         await self.db.initialize()
 
-        retval: FundamentalAnalysisOutput = await self._graph.ainvoke(input_data)
+        retval = await self._graph.ainvoke(input_data)
 
-        return AgentOutput(agent_name=self.name, output=retval.detailed_analysis)
+        return FundamentalAnalysisOutput(
+            detailed_analysis=retval["detailed_analysis"],
+            financial_data=retval["financial_data"],
+        )
 
     def _build_graph(self):
-        workflow = StateGraph(
-            _AgentState,
-            output_schema=self.get_output_schema_class(),
-        )
+        workflow = StateGraph(_AgentState)
 
         workflow.add_node("parser", self._parser_node)
         workflow.add_node("decomposer", self._decomposer_node)
@@ -177,9 +167,12 @@ class FundamentalAnalysisAgent(AbstractAgent):
         # In a real app, you might want to check if data exists before updating to save time,
         # but here we update to ensure freshness/availability.
         sd = state.start_date
-        ed = state.end_date
+        ed = state.end_date.replace(month=12, day=31)
 
-        await self.db.update_financials(state.ticker, sd.year, ed.year)
+        # * ONLY SUPPORTING 10K for now, in the future, will inher user request for which form to query
+        await self.db.update_financials(
+            state.ticker, list(range(sd.year, ed.year + 1)), "10-K"
+        )
 
         to_fetch = []
         unknown_metrics = []
@@ -260,7 +253,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     "1. Use precise labels from the 'Available Concepts' list.\n"
                     "2. DO NOT use any labels other than the provided ones.\n"
                     "3. CRITICAL: In the 'pandas_eval_expression' AND 'target_metric_name', replace all spaces in the variable names with underscores '_'.\n"
-                    "   Example: If available concept is 'Gross Profit', use 'Gross_Profit' in the formula.\n",
+                    "   Example: If available concept is 'Gross Profit', use 'Gross_Profit' in the formula.\n"
+                    "4. If a formula requires the market price of the stock, use 'stock_price' as the name for that component.\n",
                 ),
                 (
                     "human",
@@ -302,32 +296,66 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return {}
 
         price = pd.DataFrame()
-        for i, m in enumerate(metrics_to_query):
-            if "price" in m.lower():
-                price = await self.db.get_price_data(
-                    state.ticker, state.start_date, state.end_date, "yearly"
-                )
-                del metrics_to_query[i]
 
-        # Filter strictly for the requested labels if possible, or just keep all.
-        # Since get_data gets entire statements usually, we might have more than we need, which is fine.
-        # However, to be precise:
+        # Separate price metrics from financial metrics to fetch them differently
+        price_metrics = []
+        financial_metrics = []
+        for m in metrics_to_query:
+            if "price" in m.lower():
+                price_metrics.append(m)
+            else:
+                financial_metrics.append(m)
+
+        if price_metrics:
+            # Fetch yearly price data (Returns Index=Date, Columns=Metrics)
+            price = await self.db.get_price_data(
+                state.ticker, state.start_date, state.end_date, "yearly"
+            )
+            # ! hard coded
+            price = price.loc[:, ["stock_price"]]
+
+        # Filter strictly for the requested labels if possible
         filtered_df = await self.db.search_label(
-            state.ticker, metrics_to_query, state.start_date, state.end_date
+            state.ticker, financial_metrics, state.start_date, state.end_date
         )
 
-        # Merge with existing if any
+        # Merge with existing state data if any
         current_df = state.financial_data
 
-        # Simple merge strategy: if current_df is empty, take new one.
         if current_df.empty:
             combined_df = filtered_df
         else:
             # combine_first aligns on index (label) and columns (date)
             combined_df = current_df.combine_first(filtered_df)
 
+        # Process Price Data Alignment
         if not price.empty:
-            combined_df = pd.concat([combined_df, price.T], axis=1)
+            # If we have existing financial data, we must align the price dates (index)
+            # to the financial data columns (dates) by matching the Year.
+            if not combined_df.empty:
+                actual_date = combined_df.columns.copy()
+                financial_years = [int(d.split("-")[0]) for d in actual_date]
+
+                # Create a new index for price data based on matching years
+                new_index = []
+                for price_date in price.index:
+                    # If we find a matching year in financials, use the financial date
+                    if price_date.year in financial_years:
+                        new_index.append(
+                            actual_date[financial_years.index(price_date.year)]
+                        )
+                    else:
+                        # Otherwise keep the original price date
+                        new_index.append(price_date)
+
+                price.index = new_index
+
+            # Transpose Price: Now Index=Metrics, Columns=Dates
+            price_t = price.T
+
+            # Concatenate along axis=0 to add the price rows to the financial rows
+            # This relies on the columns (Dates) now matching.
+            combined_df = pd.concat([combined_df, price_t], axis=0)
 
         return {"financial_data": combined_df}
 
@@ -382,7 +410,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def _analyst_node(self, state: _AgentState) -> FundamentalAnalysisOutput:
         print(f"--- [Node] Analyst ---")
-        llm = service_manager.get_agent(temperature=0.7)
 
         # Format dataframe for readability
         data_str = (
@@ -394,15 +421,18 @@ class FundamentalAnalysisAgent(AbstractAgent):
         msg = (
             f"Analyze the following financial data for {state.ticker}.\n"
             f"Data (Rows=Metrics, Cols=Dates):\n{data_str}\n\n"
-            f"User Question: {state.query}\n"
-            "Highlight key trends, risks, and positives."
+            f"User Question: {state.query}\n\n"
+            "### Analysis Instructions:\n"
+            "1. Highlight key trends, risks, and positives.\n"
+            "2. **Number Formatting:** When citing numbers from the data, you MUST automatically convert "
+            "scientific notation (e.g., 1.5e9) or large raw integers into human-readable denominations "
+            "(Million, Billion, Trillion). For example, convert '1.5e9' to '1.5 Billion'."
         )
 
         # Use ainvoke for async LLM call
-        response = await llm.ainvoke(msg)
-        return FundamentalAnalysisOutput(
-            detailed_analysis=response.content, data=state.financial_data
-        )
+        response = await service_manager.get_agent(temperature=0.7).ainvoke(msg)
+
+        return {"detailed_analysis": response.content}
 
 
 if __name__ == "__main__":
@@ -414,26 +444,30 @@ if __name__ == "__main__":
     async def main():
         # Scenario 1: Basic metrics
         print("--- Running Scenario 1: Basic Metrics ---")
-        input_basic = FundamentalAnalysisInput(
-            ticker="AAPL",
-            metrics=["market cap"],
-            start_date="2020-01-01",
-            end_date="2022-01-01",
-            query="What were Apple's revenues and net income from 2020 to 2022?",
-        )
-        output_basic = await agent.run(input_basic)
-        print(f"Scenario 1 Output: {output_basic.output}\n")
+        # input_basic = FundamentalAnalysisInput(
+        #     ticker="AAPL",
+        #     metrics=["total market capitalization"],
+        #     start_date="2020-01-01",
+        #     end_date="2022-01-01",
+        #     query="What were Apple's market cap from 2020 to 2022?",
+        # )
+        # output_basic = await agent.run(input_basic)
+        # print(
+        #     f"Scenario 1 Output: {output_basic.detailed_analysis}\n\n\n{output_basic.financial_data}"
+        # )
 
         # Scenario 2: Complex metric (Net Profit Margin)
-        # print("--- Running Scenario 2: Complex Metric (Net Profit Margin) ---")
-        # input_complex = FundamentalAnalysisInput(
-        #     ticker="MSFT",
-        #     metrics=["net_profit_margin", "free cash flow"],
-        #     start_year=2020,
-        #     end_year=2022,
-        #     query="Analyse MSFT's net profit margin and free cash flow from 2020 to 2022.",
-        # )
-        # output_complex = await agent.run(input_complex)
-        # print(f"Scenario 2 Output: {output_complex.output}\n")
+        print("--- Running Scenario 2: Complex Metric (Net Profit Margin) ---")
+        input_complex = FundamentalAnalysisInput(
+            ticker="MSFT",
+            metrics=["net_profit_margin", "free cash flow"],
+            start_date="2020-01-01",
+            end_date="2022-12-31",
+            query="Analyse MSFT's net profit margin and free cash flow from 2020 to 2022.",
+        )
+        output_complex = await agent.run(input_complex)
+        print(
+            f"Scenario 1 Output: {output_complex.detailed_analysis}\n\n\n{output_complex.financial_data}"
+        )
 
     asyncio.run(main())  # Uncomment to test with actual setup

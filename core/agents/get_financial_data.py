@@ -334,8 +334,164 @@ class FinancialDatabase:
             index="label", columns=["period_date", "form_type"], values="value"
         )
 
-    # (Other methods like search_label, get_labels, get_price_data can be added here,
-    # updated to optionally accept a `form_types` parameter for filtering)
+    async def get_price_data(
+        self,
+        ticker: str,
+        start: str = None,
+        end: str = None,
+        interval: Literal["daily", "monthly", "quarterly", "yearly"] = "daily",
+    ) -> pd.DataFrame:
+        """
+        Get OHLCV price data for a ticker at daily, monthly, quarterly, or yearly frequency.
+
+        Parameters
+        ----------
+        ticker : str
+            Stock ticker symbol, e.g. "AAPL"
+        start : str, optional
+            Start date in "YYYY-MM-DD" format. If None, Yahoo default is used.
+        end : str, optional
+            End date in "YYYY-MM-DD" format. If None, Yahoo default is used.
+        interval : str
+            One of: "daily", "monthly", "quarterly", "yearly"
+
+        Returns
+        -------
+        pd.DataFrame
+            Resampled OHLCV price data.
+        """
+
+        import yfinance as yf
+
+        def _data_fetcher():
+            # Normalize interval string
+            preiod = interval.lower()
+
+            # Yahoo supports daily and monthly directly
+            if preiod == "daily":
+                base = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
+
+            elif preiod == "monthly":
+                base = yf.Ticker(ticker).history(start=start, end=end, interval="1mo")
+
+            # For quarterly and yearly, download daily then resample
+            elif preiod in ("quarterly", "yearly"):
+                base = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
+
+                rule = "Q" if preiod == "quarterly" else "Y"
+
+                base = base.resample(rule).agg(
+                    {
+                        "Open": "first",
+                        "High": "max",
+                        "Low": "min",
+                        "Close": "last",
+                        "Volume": "sum",
+                    }
+                )
+
+            else:
+                raise ValueError(
+                    "interval must be: 'daily', 'monthly', 'quarterly', or 'yearly'"
+                )
+            base = base.dropna(how="all")
+            if not base.empty:
+                base["stock_price"] = (base["High"] + base["Low"]) / 2
+                rename_mapping = {
+                    "Open": "stock_price_open",
+                    "High": "stock_price_high",
+                    "Low": "stock_price_low",
+                    "Close": "stock_price_close",
+                    "Volume": "stock_price_volume",
+                }
+                base = base.rename(columns=rename_mapping)
+
+            # Drop empty rows (occurs if date range is too tight)
+            return base
+
+        df = await asyncio.to_thread(_data_fetcher)
+        return df
+
+    def pivot_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df.pivot_table(index="label", columns="period_date", values="value")
+
+    async def get_labels(self, ticker: str) -> List[str]:
+        """
+        Efficiently retrieves all unique labels available for a specific ticker
+        using a distinct SQL query.
+        """
+        ticker = ticker.upper()
+        query = (
+            "SELECT DISTINCT label FROM financials WHERE company = ? ORDER BY label ASC"
+        )
+
+        async with aiosqlite.connect(self.db_name) as db:
+            async with db.execute(query, (ticker,)) as cursor:
+                rows = await cursor.fetchall()
+
+        # Flatten list of tuples: [('Label A',), ('Label B',)] -> ['Label A', 'Label B']
+        return [row[0] for row in rows]
+
+    async def search_label(
+        self,
+        ticker: str,
+        keywords: Union[str, List[str]],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Search for specific labels (rows) across the data using one or multiple keywords,
+        with optional date filtering.
+        """
+        ticker = ticker.upper()
+
+        if start_date:
+            start_date = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+
+        if end_date:
+            end_date = pd.to_datetime(end_date).strftime("%Y-%m-%d")
+
+        # Normalize keywords into a list
+        if isinstance(keywords, str):
+            keywords = [keywords]
+
+        if not keywords:
+            return pd.DataFrame()
+
+        conditions = ["company = ?"]
+        params = [ticker]
+
+        label_conditions = " OR ".join(["label LIKE ?" for _ in keywords])
+        conditions.append(f"({label_conditions})")
+        params.extend([f"%{k}%" for k in keywords])
+
+        # Date filters
+        if start_date:
+            conditions.append("period_date >= ?")
+            params.append(start_date)
+
+        if end_date:
+            conditions.append("period_date <= ?")
+            params.append(end_date)
+
+        # Final SQL
+        where_clause = " AND ".join(conditions)
+
+        query = f"""
+            SELECT * FROM financials
+            WHERE {where_clause}
+            ORDER BY period_date DESC
+        """
+
+        async with aiosqlite.connect(self.db_name) as db:
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                cols = [description[0] for description in cursor.description]
+
+        if not rows:
+            return pd.DataFrame()
+
+        return self.pivot_df(pd.DataFrame(rows, columns=cols))
 
 
 # --- EXAMPLE USAGE: SMART UPDATE WORKFLOW ---
