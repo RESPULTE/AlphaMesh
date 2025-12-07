@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Optional
 
@@ -6,32 +7,24 @@ from pydantic import BaseModel, Field, field_validator
 
 class BaseAgentInput(BaseModel):
     """
-    Common input schema for all financial agents.
-    Standardizes ticker, query, and date handling.
+    The unified input schema shared by the Orchestrator and all Sub-Agents.
     """
 
-    ticker: str = Field(description="The stock ticker symbol (e.g., AAPL, NVDA).")
-    query: str = Field(
-        description="The user's original query or a specific sub-question."
+    query: str = Field(description="The original user query for context.")
+    ticker: str = Field(description="The stock ticker symbol (e.g., AAPL).")
+    metrics: List[str] = Field(
+        default_factory=list,
+        description="List of financial metrics to analyze (if applicable).",
     )
-    metrics: Optional[List[str]] = Field(
-        description="List of financial metrics to analyze."
-    )
-
     start_date: Optional[datetime] = Field(
-        default=None,
-        description="Start date for the analysis window (format: YYYY-MM-DD).",
+        default=None, description="Start date (format: YYYY-MM-DD)."
     )
     end_date: Optional[datetime] = Field(
-        default=None,
-        description="End date for the analysis window (format: YYYY-MM-DD).",
+        default=None, description="End date (format: YYYY-MM-DD)."
     )
 
     @field_validator("start_date", "end_date", mode="before")
     def parse_dates(cls, v):
-        """
-        Universal date parser that handles strings, datetimes, and None.
-        """
         if v is None:
             return None
         if isinstance(v, datetime):
@@ -40,9 +33,23 @@ class BaseAgentInput(BaseModel):
             try:
                 return datetime.strptime(v, "%Y-%m-%d")
             except ValueError:
-                # Fallback for LLMs that might output ISO format or others
-                try:
-                    return datetime.fromisoformat(v)
-                except ValueError:
-                    raise ValueError(f"Date must be in YYYY-MM-DD format, got: {v}")
+                return datetime.fromisoformat(v)
         return v
+
+
+class BaseAgentOutput(BaseModel, ABC):
+    """
+    An abstract base class for agent outputs. It enforces that each output
+    type must know how to format itself into a string for the final LLM analyst.
+    """
+
+    agent_name: str = Field(
+        description="The name of the agent that produced this output."
+    )
+
+    @abstractmethod
+    def get_llm_context_str(self) -> str:
+        """
+        Formats the output's data into a string suitable for an LLM context.
+        """
+        raise NotImplementedError

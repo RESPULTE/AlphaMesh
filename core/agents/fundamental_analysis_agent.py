@@ -5,7 +5,7 @@ from typing import Annotated, List, Optional, Type
 
 import pandas as pd
 from core.agents.base_agent import AbstractAgent
-from core.agents.models import BaseAgentInput
+from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.services import service_manager
 from get_financial_data import FinancialDatabase
 from langchain_core.prompts import ChatPromptTemplate
@@ -31,15 +31,22 @@ class DecompositionPlan(BaseModel):
     calculations: List[CalculatedMetric]
 
 
-class FundamentalAnalysisOutput(BaseModel):
-    """
-    REFACTORED: This model now serves as a data container for the Orchestrator.
-    The 'detailed_analysis' field is removed as analysis is now centralized.
-    """
+class FundamentalAnalysisOutput(BaseAgentOutput):
+    """Data container for the Fundamental Analysis Agent."""
 
+    agent_name: str = "fundamentals_agent"
     financial_data: Optional[pd.DataFrame] = Field(default=None)
-
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def get_llm_context_str(self) -> str:
+        """Formats the DataFrame into a readable string for the analyst LLM."""
+        if self.financial_data is None or self.financial_data.empty:
+            return "### REPORT FROM fundamentals_agent\nNo financial data was found or calculated."
+
+        header = "### REPORT FROM fundamentals_agent (Quantitative Financial Data)\n"
+        # Using to_string() is effective for LLM consumption
+        data_str = self.financial_data.to_string(max_rows=20, float_format="%.2f")
+        return f"{header}Data (Rows=Metrics, Columns=Dates):\n{data_str}"
 
 
 class _AgentState(BaseAgentInput):

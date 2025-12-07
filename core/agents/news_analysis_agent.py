@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Annotated, List, Optional, Type
 
 from core.agents.base_agent import AbstractAgent
-from core.agents.models import BaseAgentInput
+from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.services import service_manager
 from langchain_core.messages import BaseMessage
 from langchain_core.tools import tool
@@ -42,15 +42,30 @@ class CitedSource(BaseModel):
     page_content: str = Field(description="The content of the article.")
 
 
-class NewsAnalysisOutput(BaseModel):
-    """
-    REFACTORED: This model now serves as a data container for the Orchestrator.
-    The 'detailed_analysis' field is removed as analysis is now centralized.
-    """
+class NewsAnalysisOutput(BaseAgentOutput):
+    """Data container for the News Analysis Agent."""
 
+    agent_name: str = "news_agent"
     sources: List[CitedSource] = Field(
         description="The list of raw source articles gathered by the agent."
     )
+
+    def get_llm_context_str(self) -> str:
+        """Formats the list of sources into a numbered, citable block for the analyst LLM."""
+        if not self.sources:
+            return "### REPORT FROM news_agent\nNo relevant news articles were found."
+
+        header = "### REPORT FROM news_agent (Qualitative News Analysis)\n"
+        # Format each source with its citation ID prominently displayed
+        formatted_sources = "\n".join(
+            [
+                f"[{s.source_id}] Title: {s.title}\n"
+                f"    URL: {s.url}\n"
+                f'    Content Snippet: "{s.page_content[:300]}..."'
+                for s in self.sources
+            ]
+        )
+        return header + formatted_sources
 
 
 # --- Internal State ---
