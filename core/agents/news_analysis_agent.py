@@ -36,11 +36,13 @@ BATCH_SIZE = 10
 # --- Input Schema ---
 class NewsAnalysisInput(BaseModel):
     ticker: str = Field(description="The stock ticker symbol (e.g., AAPL).")
-    question: str = Field(description="The search-optimized question.")
-    from_date: Optional[str] = Field(
+    query: str = Field(description="The search-optimized question.")
+    search_from_date: Optional[str] = Field(
         default=None, description="Start date (YYYY-MM-DD)."
     )
-    to_date: Optional[str] = Field(default=None, description="End date (YYYY-MM-DD).")
+    search_to_date: Optional[str] = Field(
+        default=None, description="End date (YYYY-MM-DD)."
+    )
 
 
 # --- Structured Outputs ---
@@ -251,31 +253,31 @@ class NewsAnalysisAgent(AbstractAgent):
     async def run(self, input_data: NewsAnalysisInput) -> StructuredNewsAnalysis:
         logger.info(f"🚀 [Agent Start] Ticker: {input_data.ticker}")
 
-        # ... (Date setup logic remains the same) ...
-        today = datetime.now()
-        fmt = "%Y-%m-%d"
-        t_date = input_data.to_date if input_data.to_date else today.strftime(fmt)
-        f_date = (
-            input_data.from_date
-            if input_data.from_date
-            else (today - timedelta(days=7)).strftime(fmt)
-        )
+        # # ... (Date setup logic remains the same) ...
+        # today = datetime.now()
+        # fmt = "%Y-%m-%d"
+        # t_date = input_data.to_date if input_data.to_date else today.strftime(fmt)
+        # f_date = (
+        #     input_data.from_date
+        #     if input_data.from_date
+        #     else (today - timedelta(days=7)).strftime(fmt)
+        # )
 
-        initial_state = {
-            "ticker": input_data.ticker,
-            "query": input_data.question,
-            "search_from_date": f_date,
-            "search_to_date": t_date,
-            "current_page": 1,
-            "last_total_results": 0,
-            "attempt_count": 0,
-            "latest_retrieved": None,
-            "messages": [],
-            "news_context": [],
-            "sufficiency_reasoning": "",
-        }
+        # initial_state = {
+        #     "ticker": input_data.ticker,
+        #     "query": input_data.question,
+        #     "search_from_date": f_date,
+        #     "search_to_date": t_date,
+        #     "current_page": 1,
+        #     "last_total_results": 0,
+        #     "attempt_count": 0,
+        #     "latest_retrieved": None,
+        #     "messages": [],
+        #     "news_context": [],
+        #     "sufficiency_reasoning": "",
+        # }
 
-        retval = await self._graph.ainvoke(initial_state)
+        retval = await self._graph.ainvoke(input_data)
 
         return StructuredNewsAnalysis(
             agent_name=self.name,
@@ -283,10 +285,18 @@ class NewsAnalysisAgent(AbstractAgent):
             sources=retval["sources"],
         )
 
+    def _parse_input(self, state: NewsAnalysisInput) -> _AgentState:
+        return _AgentState(**state.model_dump())
+
     def _build_graph(self):
-        workflow = StateGraph(_AgentState, output_schema=StructuredNewsAnalysis)
+        workflow = StateGraph(
+            _AgentState,
+            output_schema=self.get_output_schema_class(),
+            input_schema=self.get_input_schema_class(),
+        )
 
         # Define Nodes
+        workflow.add_node("parse_input", self._parse_input)
         workflow.add_node("retrieve", self._retrieve_news)
         workflow.add_node("evaluate_sufficiency", self._evaluate_sufficiency)
         workflow.add_node("strategize_search", self._strategize_search)
@@ -297,7 +307,8 @@ class NewsAnalysisAgent(AbstractAgent):
         workflow.add_node("generate_answer", self._generate_answer)
 
         # Define Edges
-        workflow.add_edge(START, "retrieve")
+        workflow.add_edge(START, "parse_input")
+        workflow.add_edge("parse_input", "retrieve")
         workflow.add_edge("retrieve", "evaluate_sufficiency")
 
         # Sufficiency Logic (With the dictionary fix from the previous step)
@@ -335,7 +346,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
     # --- Node Implementations ---
 
-    async def _retrieve_news(self, state: _AgentState) -> dict:
+    async def _retrieve_news(self, state: _AgentState) -> _AgentState:
         logger.info(
             f"🔍 [Step: Retrieve] Checking vector store (Attempt {state.attempt_count})..."
         )
@@ -363,15 +374,6 @@ class NewsAnalysisAgent(AbstractAgent):
                 pub_time = meta.get("publish_time", "Unknown Date")
                 content = meta.get("summary", doc.page_content)
 
-                # Format clearly with the ID so the LLM can reference it
-                piece = (
-                    f"--- ARTICLE [{i}] ---\n"
-                    f"Source ID: {i}\n"
-                    f"Title: {title}\n"
-                    f"Date: {pub_time}\n"
-                    f"URL: {url}\n"
-                    f"Content: {content}\n"
-                )
                 context_pieces.append(
                     CitedSource(source_id=i, title=title, url=url, page_content=content)
                 )
@@ -685,9 +687,9 @@ if __name__ == "__main__":
         agent = NewsAnalysisAgent()
         input_data = NewsAnalysisInput(
             ticker="AAPL",
-            question="reason for price drop Apple",
-            from_date="2025-12-01",
-            to_date="2025-12-05",
+            query="reason for price drop Apple",
+            search_from_date="2025-12-01",
+            search_to_date="2025-12-05",
         )
         res = await agent.run(input_data)
         print("\nFINAL OUTPUT:\n", res.detailed_analysis)
