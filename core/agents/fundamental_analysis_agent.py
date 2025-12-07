@@ -1,18 +1,18 @@
 import asyncio
 import difflib
 import operator
-from datetime import datetime
 from typing import Annotated, List, Optional, Type
 
 import pandas as pd
 from core.agents.base_agent import AbstractAgent
+from core.agents.models import BaseAgentInput
 from core.services import service_manager  # Assuming this still handles LLM retrieval
 
 # Import the new database class
 from get_financial_data import FinancialDatabase
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 # --- 1. Internal Structured Output Models ---
 # ! only support 10-k as of now
@@ -49,29 +49,7 @@ class FundamentalAnalysisOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
-class FundamentalAnalysisInput(BaseModel):
-    """Input schema for the Fundamental Analysis Agent."""
-
-    query: str = Field(description="The original user query for context.")
-
-    ticker: str = Field(description="The stock ticker symbol (e.g., AAPL).")
-    metrics: List[str] = Field(description="List of financial metrics to analyze.")
-
-    start_date: Optional[datetime] = Field(
-        default=None, description="Start date (str, format: YYYY-MM-DD)."
-    )
-    end_date: Optional[datetime] = Field(
-        default=None, description="End date (str, format: YYYY-MM-DD)."
-    )
-
-    @field_validator("start_date", "end_date", mode="before")
-    def parse_dates(cls, v):
-        if isinstance(v, datetime) or v is None:
-            return v
-        return datetime.strptime(v, "%Y-%m-%d")
-
-
-class _AgentState(FundamentalAnalysisInput, FundamentalAnalysisOutput):
+class _AgentState(BaseAgentInput, FundamentalAnalysisOutput):
     """Internal state for the agent workflow."""
 
     # Processing
@@ -107,16 +85,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
         )
 
     @classmethod
-    def get_input_schema_class(cls) -> Type[BaseModel]:
-        return FundamentalAnalysisInput
-
-    @classmethod
     def get_output_schema_class(cls) -> Type[BaseModel]:
         return FundamentalAnalysisOutput
 
-    async def run(
-        self, input_data: FundamentalAnalysisInput
-    ) -> FundamentalAnalysisOutput:
+    async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
         """Async entry point for the agent."""
         print(f"--- [Agent: {self.name}] Started for {input_data.ticker} ---")
 
@@ -458,7 +430,7 @@ if __name__ == "__main__":
 
         # Scenario 2: Complex metric (Net Profit Margin)
         print("--- Running Scenario 2: Complex Metric (Net Profit Margin) ---")
-        input_complex = FundamentalAnalysisInput(
+        input_complex = BaseAgentInput(
             ticker="MSFT",
             metrics=["net_profit_margin", "free cash flow"],
             start_date="2020-01-01",

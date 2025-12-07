@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Annotated, List, Optional, Type
 
 from core.agents.base_agent import AbstractAgent
+from core.agents.models import BaseAgentInput
 from core.services import service_manager
 from langchain_core.messages import (
     BaseMessage,
@@ -29,20 +30,8 @@ logger = logging.getLogger("NewsAnalysisAgent")
 # --- Configuration & Toggles ---
 LOG_INGESTED_TITLES = True
 MAX_SEARCH_ATTEMPTS = 2
-MAX_LOOKBACK_DAYS = 30
+MAX_LOOKBACK_DAYS = 29
 BATCH_SIZE = 10
-
-
-# --- Input Schema ---
-class NewsAnalysisInput(BaseModel):
-    ticker: str = Field(description="The stock ticker symbol (e.g., AAPL).")
-    query: str = Field(description="The search-optimized question.")
-    search_from_date: Optional[str] = Field(
-        default=None, description="Start date (YYYY-MM-DD)."
-    )
-    search_to_date: Optional[str] = Field(
-        default=None, description="End date (YYYY-MM-DD)."
-    )
 
 
 # --- Structured Outputs ---
@@ -58,7 +47,7 @@ class CitedSource(BaseModel):
     page_content: str = Field(description="The content of the article.")
 
 
-class StructuredNewsAnalysis(BaseModel):
+class NewsAnalysisOutput(BaseModel):
     detailed_analysis: str = Field(
         description="A comprehensive, multi-paragraph markdown report answering the user's question with inline citations. [1], [1][2] and etc."
     )
@@ -68,13 +57,7 @@ class StructuredNewsAnalysis(BaseModel):
 
 
 # --- Internal State ---
-class _AgentState(BaseModel):
-    # ... (existing fields)
-    ticker: str
-    query: str
-    search_from_date: str
-    search_to_date: str
-
+class _AgentState(BaseAgentInput):
     current_page: int = 1
     last_total_results: int = 0
     attempt_count: int = 0
@@ -243,14 +226,10 @@ class NewsAnalysisAgent(AbstractAgent):
         return "Qualitative analysis using bound tools and vector store ingestion."
 
     @classmethod
-    def get_input_schema_class(cls) -> Type[BaseModel]:
-        return NewsAnalysisInput
-
-    @classmethod
     def get_output_schema_class(cls) -> Type[BaseModel]:
-        return StructuredNewsAnalysis
+        return NewsAnalysisOutput
 
-    async def run(self, input_data: NewsAnalysisInput) -> StructuredNewsAnalysis:
+    async def run(self, input_data: BaseAgentInput) -> NewsAnalysisOutput:
         logger.info(f"🚀 [Agent Start] Ticker: {input_data.ticker}")
 
         # # ... (Date setup logic remains the same) ...
@@ -266,8 +245,8 @@ class NewsAnalysisAgent(AbstractAgent):
         # initial_state = {
         #     "ticker": input_data.ticker,
         #     "query": input_data.question,
-        #     "search_from_date": f_date,
-        #     "search_to_date": t_date,
+        #     "start_date": f_date,
+        #     "end_date": t_date,
         #     "current_page": 1,
         #     "last_total_results": 0,
         #     "attempt_count": 0,
@@ -279,21 +258,20 @@ class NewsAnalysisAgent(AbstractAgent):
 
         retval = await self._graph.ainvoke(input_data)
 
-        return StructuredNewsAnalysis(
+        return NewsAnalysisOutput(
             agent_name=self.name,
             detailed_analysis=retval["detailed_analysis"],
             sources=retval["sources"],
         )
 
-    def _parse_input(self, state: NewsAnalysisInput) -> _AgentState:
-        return _AgentState(**state.model_dump())
+    def _parse_input(self, state: BaseAgentInput) -> _AgentState:
+        if (datetime.now() - state.start_date) > timedelta(days=MAX_LOOKBACK_DAYS):
+            state.start_date = datetime.now() - timedelta(days=MAX_LOOKBACK_DAYS)
+
+        return state.model_dump().copy()
 
     def _build_graph(self):
-        workflow = StateGraph(
-            _AgentState,
-            output_schema=self.get_output_schema_class(),
-            input_schema=self.get_input_schema_class(),
-        )
+        workflow = StateGraph(_AgentState)
 
         # Define Nodes
         workflow.add_node("parse_input", self._parse_input)
@@ -407,7 +385,7 @@ class NewsAnalysisAgent(AbstractAgent):
         now = datetime.now()
         latest = state.latest_retrieved
         try:
-            current_from = datetime.strptime(state.search_from_date, fmt)
+            current_from = state.start_date
             limit_date = now - timedelta(days=MAX_LOOKBACK_DAYS)
             days_searched_depth = (now - current_from).days
             hit_max_lookback = current_from <= limit_date
@@ -501,8 +479,8 @@ class NewsAnalysisAgent(AbstractAgent):
         logger.info("🧠 [Step: Strategize] Calculating next search parameters...")
 
         fmt = "%Y-%m-%d"
-        current_from = datetime.strptime(state.search_from_date, fmt)
-        current_to = datetime.strptime(state.search_to_date, fmt)
+        current_from = state.start_date
+        current_to = state.end_date
         today = datetime.now()
         limit_date = today - timedelta(days=MAX_LOOKBACK_DAYS)
 
@@ -551,8 +529,8 @@ class NewsAnalysisAgent(AbstractAgent):
             return {
                 "needs_more_data": True,
                 "current_page": new_page,
-                "search_from_date": new_from.strftime(fmt),
-                "search_to_date": new_to.strftime(fmt),
+                "start_date": new_from,
+                "end_date": new_to.strftime(fmt),
                 "attempt_count": state.attempt_count + 1,
             }
 
@@ -574,7 +552,7 @@ class NewsAnalysisAgent(AbstractAgent):
         # We explicitly guide the LLM using the state calculated in the previous 'strategize' node
         user_msg = (
             f"Please execute the search strategy for ticker '{state.ticker}'. "
-            f"Use Date Range: {state.search_from_date} to {state.search_to_date}. "
+            f"Use Date Range: {state.start_date} to {state.end_date}. "
             f"Page: {state.current_page}."
         )
 
@@ -628,7 +606,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         return {"messages": output_messages, "last_total_results": total_results}
 
-    async def _generate_answer(self, state: _AgentState) -> StructuredNewsAnalysis:
+    async def _generate_answer(self, state: _AgentState) -> NewsAnalysisOutput:
         logger.info("✍️  [Step: Generate Answer]")
 
         # 1. FIX: Check if we actually have context
@@ -669,13 +647,13 @@ class NewsAnalysisAgent(AbstractAgent):
         try:
             retval = await service_manager.get_agent().ainvoke(messages)
 
-            return StructuredNewsAnalysis(
+            return NewsAnalysisOutput(
                 detailed_analysis=retval.content, sources=state.news_context
             )
         except Exception as e:
             logger.error(f"❌ Error in generation: {e}")
             # Fallback if generation fails
-            return StructuredNewsAnalysis(
+            return NewsAnalysisOutput(
                 detailed_analysis="Error generating analysis due to model failure.",
                 sources=[],
             )
@@ -685,11 +663,11 @@ if __name__ == "__main__":
 
     async def main():
         agent = NewsAnalysisAgent()
-        input_data = NewsAnalysisInput(
+        input_data = BaseAgentInput(
             ticker="AAPL",
             query="reason for price drop Apple",
-            search_from_date="2025-12-01",
-            search_to_date="2025-12-05",
+            start_date="2025-12-01",
+            end_date="2025-12-05",
         )
         res = await agent.run(input_data)
         print("\nFINAL OUTPUT:\n", res.detailed_analysis)

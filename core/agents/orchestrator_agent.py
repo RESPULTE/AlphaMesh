@@ -1,172 +1,316 @@
-from typing import List, Type
+# orchestrator_agent.py
 
-from core.agents.base_agent import AbstractAgent, AgentOutput
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Literal, Optional
+
+# --- Import Sub-Agents ---
+from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.news_analysis_agent import NewsAnalysisAgent
+
+# --- Import Core Services ---
 from core.services import service_manager
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field, field_validator
 
-# LangChain imports for Tool handling
-from langchain_core.tools import StructuredTool
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("Orchestrator")
 
-# 1. Agent Registration
-AVAILABLE_AGENTS: List[Type[AbstractAgent]] = [
-    FundamentalAnalysisAgent,
-    NewsAnalysisAgent,
-]
+
+# ==========================================
+# 1. SHARED INPUT SCHEMA
+# ==========================================
+
+
+class BaseAgentInput(BaseModel):
+    """
+    The unified input schema shared by the Orchestrator and all Sub-Agents.
+    """
+
+    query: str = Field(description="The original user query for context.")
+    ticker: str = Field(description="The stock ticker symbol (e.g., AAPL).")
+    metrics: List[str] = Field(
+        default_factory=list,
+        description="List of financial metrics to analyze (if applicable).",
+    )
+    start_date: Optional[datetime] = Field(
+        default=None, description="Start date (format: YYYY-MM-DD)."
+    )
+    end_date: Optional[datetime] = Field(
+        default=None, description="End date (format: YYYY-MM-DD)."
+    )
+
+    @field_validator("start_date", "end_date", mode="before")
+    def parse_dates(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, str):
+            try:
+                return datetime.strptime(v, "%Y-%m-%d")
+            except ValueError:
+                # Fallback for ISO or other formats LLM might spit out
+                return datetime.fromisoformat(v)
+        return v
+
+
+# ==========================================
+# 2. ORCHESTRATOR SPECIFIC MODELS
+# ==========================================
+
+
+class OrchestratorPlan(BaseAgentInput):
+    """
+    Extends the BaseInput to include routing logic.
+    The LLM fills this out to define WHAT data to pass and WHO to call.
+    """
+
+    target_agents: List[Literal["fundamentals_agent", "news_agent"]] = Field(
+        description="Which agents to activate. Select based on the user's needs."
+    )
+
+
+class OrchestratorState(BaseModel):
+    """
+    Internal state of the Orchestrator Graph.
+    """
+
+    query: str
+    plan: Optional[OrchestratorPlan] = None
+    agent_results: Dict[str, str] = Field(default_factory=dict)
+    final_answer: Optional[str] = None
+
+
+# ==========================================
+# 3. THE ORCHESTRATOR AGENT
+# ==========================================
 
 
 class OrchestratorAgent:
-    """
-    Refactored Orchestrator using Native Tool Calling (Solution 2).
-    This ensures input schemas are strictly enforced by the LLM.
-    """
-
     def __init__(self):
         self._llm = service_manager.get_agent(temperature=0)
-        # Convert your Agent classes into LangChain Tools
-        self._tools = [
-            self._create_tool_for_agent(agent_cls) for agent_cls in AVAILABLE_AGENTS
-        ]
-        # Bind the tools to the LLM immediately
-        self._llm_with_tools = self._llm.bind_tools(self._tools)
-        # Map tool names back to the original Agent instances for execution logic if needed
-        self._agent_map = {agent().name: agent for agent in AVAILABLE_AGENTS}
 
-    def _create_tool_for_agent(self, agent_cls: Type[AbstractAgent]) -> StructuredTool:
-        """
-        Wraps an AbstractAgent into a LangChain StructuredTool.
-        Crucially, this passes the Pydantic 'input_schema' directly to the LLM.
-        """
-        agent_instance = agent_cls()
+        # Initialize Sub-Agents
+        # We Map Name -> Instance
+        self._agents: Dict[str, AbstractAgent] = {
+            "fundamentals_agent": FundamentalAnalysisAgent(),
+            "news_agent": NewsAnalysisAgent(),
+        }
 
-        def agent_wrapper(**kwargs):
-            """
-            The function the LLM will 'call'.
-            We instantiate the specific input model from the kwargs provided by the LLM.
-            """
-            # Validate input using the agent's strict Pydantic model
-            input_model = agent_instance.get_input_schema_class()(**kwargs)
-            return agent_instance.run(input_model)
+        self._graph = self._build_graph()
 
-        return StructuredTool.from_function(
-            func=agent_wrapper,
-            name=agent_instance.name,
-            description=agent_instance.description,
-            args_schema=agent_instance.get_input_schema_class(),
-        )
+    def _build_graph(self):
+        workflow = StateGraph(OrchestratorState)
 
-    def _run_synthesis(self, query: str, agent_outputs: List[AgentOutput]) -> str:
-        """Synthesizes the outputs from various agents into a single response."""
-        if not agent_outputs:
-            return "No relevant information could be gathered from the agents."
+        workflow.add_node("planner", self._plan_node)
+        workflow.add_node("executor", self._execute_node)
+        workflow.add_node("synthesizer", self._synthesize_node)
 
-        print("--- [Orchestrator] Aggregating Responses ---")
-        formatted_data = "\n\n".join(
-            [
-                f"## Report from {out.agent_name.upper()}\n{out.output}"
-                for out in agent_outputs
-            ]
-        )
+        workflow.add_edge(START, "planner")
 
-        prompt_template = (
-            "You are a Financial Research Lead. You have received reports from your sub-agents.\n"
-            "Synthesize these partial reports into a single, cohesive answer to the user's original question.\n\n"
-            "**Original User Question:** {original_input}\n\n"
-            "**Sub-Agent Reports:**\n{agent_data}\n\n"
-            "**Requirements:**\n"
-            "- Integrate findings seamlessly.\n"
-            "- Connect qualitative and quantitative insights.\n"
-            "- Provide a professional final answer."
-        )
-
-        prompt = ChatPromptTemplate.from_template(prompt_template)
-        synthesis_chain = prompt | self._llm
-        response = synthesis_chain.invoke(
-            {"agent_data": formatted_data, "original_input": query}
-        )
-        return response.content
-
-    def run(self, query: str) -> str:
-        """Main entry point."""
-        print(f"\n--- [Orchestrator] Analyzing query: '{query}' ---")
-
-        # 1. Ask the LLM to decide which tools to call
-        # We give it a system prompt to define its persona
-        messages = [
-            SystemMessage(
-                content="You are a financial orchestrator. Analyze the user query and call the appropriate specialist agents to gather information."
+        # Conditional logic: If plan has agents, execute. Else, skip to end (or handle error).
+        workflow.add_conditional_edges(
+            "planner",
+            lambda state: (
+                "executor" if state.plan and state.plan.target_agents else "synthesizer"
             ),
-            HumanMessage(content=query),
+            {"executor": "executor", "synthesizer": "synthesizer"},
+        )
+
+        workflow.add_edge("executor", "synthesizer")
+        workflow.add_edge("synthesizer", END)
+
+        return workflow.compile()
+
+    async def run(self, query: str) -> str:
+        """Main entry point."""
+        logger.info(f"🎼 [Orchestrator] Started. Query: {query}")
+
+        initial_state = OrchestratorState(query=query)
+        result = await self._graph.ainvoke(initial_state)
+
+        return result["final_answer"]
+
+    # --- Node Implementations ---
+
+    async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """
+        Uses LLM Structured Output to populate the BaseAgentInput
+        and decide which agents to route to.
+        Includes Date Context and Safety Defaults.
+        """
+        logger.info("🧠 [Planner] Extracting shared parameters and routing...")
+
+        # 1. Calculate Dynamic Date Context
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        one_year_ago_str = (now - timedelta(days=365)).strftime("%Y-%m-%d")
+
+        # 2. Construct Prompt with Context
+        system_prompt = (
+            "You are a Financial Orchestrator. Your job is to:\n"
+            "1. Extract core parameters (Ticker, Dates, Metrics) from the query into a standardized format.\n"
+            "2. Select the specific agents required to answer the question.\n\n"
+            "### DATE GUIDELINES (CRITICAL):\n"
+            f"- **Today's Date:** {today_str}\n"
+            f"- **'Recent' Definition:** If the user asks for 'recent' or 'latest' data without a specific year, "
+            f"set 'start_date' to {one_year_ago_str} and 'end_date' to {today_str}.\n"
+            "- **Safety:** Do NOT set 'end_date' into the future.\n\n"
+            "### AVAILABLE AGENTS:\n"
+            "- 'fundamentals_agent': For financial ratios, balance sheets, margins, FCF, valuation.\n"
+            "- 'news_agent': For qualitative analysis, recent events, sentiment, reasons for price moves.\n"
+        )
+
+        # We force the LLM to return the OrchestratorPlan schema
+        planner_llm = self._llm.with_structured_output(OrchestratorPlan)
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=state.query),
         ]
 
-        # The LLM returns a message that may contain 'tool_calls'
-        ai_msg = self._llm_with_tools.invoke(messages)
+        # 3. Invoke LLM
+        plan: OrchestratorPlan = await planner_llm.ainvoke(messages)
 
-        agent_outputs = []
+        # 4. Programmatic Safety Guards (Post-Processing)
+        # If LLM returns None for dates, we enforce the "Recent" rule or "Year-to-Date" rule here.
+        if plan.end_date is None:
+            plan.end_date = now
 
-        # 2. Check if the LLM decided to call any tools
-        if not ai_msg.tool_calls:
-            print(
-                "--- [Orchestrator] No tools selected. Returning direct response. ---"
-            )
-            return ai_msg.content
+        # Cap future dates to today
+        if plan.end_date > now:
+            plan.end_date = now
 
-        print(f"--- [Orchestrator] Plan: Executing {len(ai_msg.tool_calls)} tasks. ---")
+        if plan.start_date is None:
+            # Default to 1 year lookback if start date is missing
+            plan.start_date = plan.end_date - timedelta(days=365)
 
-        # 3. Execute the tools
-        for tool_call in ai_msg.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]  # This is the dictionary extracted by the LLM
+        # Ensure start_date is not after end_date
+        if plan.start_date > plan.end_date:
+            plan.start_date = plan.end_date - timedelta(days=365)
 
-            print(
-                f"\n>>> Calling Agent: {tool_name.upper()} with inputs: {tool_args} <<<"
-            )
-
-            # Find the wrapped tool logic
-            selected_tool = next((t for t in self._tools if t.name == tool_name), None)
-
-            if selected_tool:
-                try:
-                    # Execute the wrapper (which validates Pydantic and runs the agent)
-                    # Note: StructuredTool.invoke handles the arg passing
-                    result_output = selected_tool.invoke(tool_args)
-
-                    # Ensure the result is in AgentOutput format for synthesis
-                    # (Assuming the agent.run returns AgentOutput, but tool wrapper might return raw object.
-                    # If your agent.run returns AgentOutput, we use it directly.)
-                    if isinstance(result_output, AgentOutput):
-                        agent_outputs.append(result_output)
-                    else:
-                        # Fallback if the tool wrapper returned something else
-                        agent_outputs.append(
-                            AgentOutput(agent_name=tool_name, output=str(result_output))
-                        )
-
-                except Exception as e:
-                    agent_outputs.append(
-                        AgentOutput(
-                            agent_name=tool_name,
-                            output=f"Error executing agent '{tool_name}': {str(e)}",
-                        )
-                    )
-            else:
-                agent_outputs.append(
-                    AgentOutput(agent_name=tool_name, output="Tool not found.")
-                )
-
-        # 4. Synthesize results
-        return self._run_synthesis(query, agent_outputs)
-
-
-# Execution Block
-if __name__ == "__main__":
-    orchestrator = OrchestratorAgent()
-
-    # This should now correctly populate inputs because the LLM sees the Pydantic schema
-    print(
-        orchestrator.run(
-            "Why did NVDA rise recently, does it have anything to do with its fcf?"
+        logger.info(f"   -> Plan Target Agents: {plan.target_agents}")
+        logger.info(
+            f"   -> Date Range: {plan.start_date.date()} to {plan.end_date.date()}"
         )
-    )
+
+        return {"plan": plan}
+
+    async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """
+        Parallel execution.
+        Constructs ONE BaseAgentInput object and passes it to all selected agents.
+        """
+        logger.info("⚙️  [Executor] Running agents in parallel...")
+
+        plan = state.plan
+
+        # 1. Create the Shared Input Object
+        # We strip out the 'target_agents' field to get a pure BaseAgentInput
+        shared_input_data = BaseAgentInput(
+            query=plan.query,
+            ticker=plan.ticker,
+            metrics=plan.metrics,
+            start_date=plan.start_date,
+            end_date=plan.end_date,
+        )
+
+        tasks = []
+        active_agent_names = []
+
+        # 2. Dispatch to Agents
+        for agent_name in plan.target_agents:
+            agent_instance = self._agents.get(agent_name)
+
+            if agent_instance:
+                logger.info(f"   -> Calling {agent_name}...")
+
+                # IMPORTANT: We pass the shared_input_data directly.
+                # The agent.run() method must be typed to accept BaseAgentInput.
+                tasks.append(agent_instance.run(shared_input_data))
+                active_agent_names.append(agent_name)
+            else:
+                logger.error(f"   ❌ Agent {agent_name} not found in registry.")
+
+        # 3. Await All
+        if not tasks:
+            return {"agent_results": {}}
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 4. Process Results
+        agent_results = {}
+        for name, res in zip(active_agent_names, results):
+            if isinstance(res, Exception):
+                error_msg = f"Error: {str(res)}"
+                logger.error(f"   ❌ {name} failed: {error_msg}")
+                agent_results[name] = error_msg
+            else:
+                # We assume the agents return Pydantic models.
+                # We dump them to JSON strings for the synthesizer.
+                if isinstance(res, BaseModel):
+                    agent_results[name] = res.model_dump_json()
+                else:
+                    agent_results[name] = str(res)
+
+        return {"agent_results": agent_results}
+
+    async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """
+        Aggregates the JSON outputs from the agents into a final answer.
+        """
+        logger.info("✍️  [Synthesizer] Compiling final report...")
+
+        if not state.agent_results:
+            return {"final_answer": "No agents were executed or all failed."}
+
+        # Format context
+        reports = []
+        for name, data in state.agent_results.items():
+            reports.append(f"### REPORT FROM {name.upper()}:\n{data}\n")
+
+        combined_context = "\n".join(reports)
+
+        prompt = ChatPromptTemplate.from_template(
+            "You are a Senior Financial Analyst. Synthesize the following reports to answer the user's question.\n\n"
+            "**User Query:** {query}\n\n"
+            "**Agent Data:**\n{context}\n\n"
+            "**Instructions:**\n"
+            "1. Integrate the quantitative data and qualitative news seamlessly.\n"
+            "2. If data is missing, state it clearly.\n"
+            "3. Provide a professional Markdown response."
+        )
+
+        chain = prompt | self._llm
+        response = await chain.ainvoke(
+            {"query": state.query, "context": combined_context}
+        )
+
+        return {"final_answer": response.content}
+
+
+# --- Execution Block for Testing ---
+if __name__ == "__main__":
+
+    async def main():
+        orchestrator = OrchestratorAgent()
+
+        # Example Query
+        query = "Why did NVDA stock drop recently? Check the news and also look at its net profit margin."
+
+        print(f"\nQUERY: {query}\n" + "=" * 50)
+        final_response = await orchestrator.run(query)
+        print("\n" + "=" * 50 + "\nFINAL OUTPUT:\n" + "=" * 50)
+        print(final_response)
+
+    asyncio.run(main())
