@@ -5,10 +5,13 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Literal, Optional
 
-# --- Import Sub-Agents ---
+# --- Import Sub-Agents & Their Outputs ---
 from core.agents.base_agent import AbstractAgent
-from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
-from core.agents.news_analysis_agent import NewsAnalysisAgent
+from core.agents.fundamental_analysis_agent import (
+    FundamentalAnalysisAgent,
+    FundamentalAnalysisOutput,
+)
+from core.agents.news_analysis_agent import NewsAnalysisAgent, NewsAnalysisOutput
 
 # --- Import Core Services ---
 from core.services import service_manager
@@ -87,7 +90,8 @@ class OrchestratorState(BaseModel):
 
     query: str
     plan: Optional[OrchestratorPlan] = None
-    agent_results: Dict[str, str] = Field(default_factory=dict)
+    # REFACTORED: This now holds the raw Pydantic model outputs from the agents.
+    agent_outputs: List[Any] = Field(default_factory=list)
     final_answer: Optional[str] = None
 
 
@@ -118,13 +122,12 @@ class OrchestratorAgent:
 
         workflow.add_edge(START, "planner")
 
-        # Conditional logic: If plan has agents, execute. Else, skip to end (or handle error).
+        # Conditional logic: If plan has agents, execute. Else, skip to synthesizer.
         workflow.add_conditional_edges(
             "planner",
             lambda state: (
                 "executor" if state.plan and state.plan.target_agents else "synthesizer"
             ),
-            {"executor": "executor", "synthesizer": "synthesizer"},
         )
 
         workflow.add_edge("executor", "synthesizer")
@@ -137,9 +140,10 @@ class OrchestratorAgent:
         logger.info(f"🎼 [Orchestrator] Started. Query: {query}")
 
         initial_state = OrchestratorState(query=query)
-        result = await self._graph.ainvoke(initial_state)
+        # The final result is a state object, we extract the final_answer field
+        final_state = await self._graph.ainvoke(initial_state)
 
-        return result["final_answer"]
+        return final_state.get("final_answer", "Error: No final answer generated.")
 
     # --- Node Implementations ---
 
@@ -183,19 +187,15 @@ class OrchestratorAgent:
         plan: OrchestratorPlan = await planner_llm.ainvoke(messages)
 
         # 4. Programmatic Safety Guards (Post-Processing)
-        # If LLM returns None for dates, we enforce the "Recent" rule or "Year-to-Date" rule here.
         if plan.end_date is None:
             plan.end_date = now
 
-        # Cap future dates to today
         if plan.end_date > now:
             plan.end_date = now
 
         if plan.start_date is None:
-            # Default to 1 year lookback if start date is missing
             plan.start_date = plan.end_date - timedelta(days=365)
 
-        # Ensure start_date is not after end_date
         if plan.start_date > plan.end_date:
             plan.start_date = plan.end_date - timedelta(days=365)
 
@@ -210,13 +210,13 @@ class OrchestratorAgent:
         """
         Parallel execution.
         Constructs ONE BaseAgentInput object and passes it to all selected agents.
+        REFACTORED: Now collects raw Pydantic model outputs.
         """
         logger.info("⚙️  [Executor] Running agents in parallel...")
 
         plan = state.plan
 
         # 1. Create the Shared Input Object
-        # We strip out the 'target_agents' field to get a pure BaseAgentInput
         shared_input_data = BaseAgentInput(
             query=plan.query,
             ticker=plan.ticker,
@@ -231,12 +231,8 @@ class OrchestratorAgent:
         # 2. Dispatch to Agents
         for agent_name in plan.target_agents:
             agent_instance = self._agents.get(agent_name)
-
             if agent_instance:
                 logger.info(f"   -> Calling {agent_name}...")
-
-                # IMPORTANT: We pass the shared_input_data directly.
-                # The agent.run() method must be typed to accept BaseAgentInput.
                 tasks.append(agent_instance.run(shared_input_data))
                 active_agent_names.append(agent_name)
             else:
@@ -244,51 +240,93 @@ class OrchestratorAgent:
 
         # 3. Await All
         if not tasks:
-            return {"agent_results": {}}
+            return {"agent_outputs": []}
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 4. Process Results
-        agent_results = {}
+        # 4. Process Results and collect raw outputs
+        agent_outputs = []
         for name, res in zip(active_agent_names, results):
             if isinstance(res, Exception):
-                error_msg = f"Error: {str(res)}"
-                logger.error(f"   ❌ {name} failed: {error_msg}")
-                agent_results[name] = error_msg
+                error_msg = f"Agent '{name}' failed with error: {str(res)}"
+                logger.error(f"   ❌ {error_msg}")
+                agent_outputs.append(error_msg)  # Append error string for context
+            elif isinstance(res, BaseModel):
+                logger.info(
+                    f"   -> Received output from {name} of type {type(res).__name__}"
+                )
+                agent_outputs.append(res)  # Append the raw Pydantic model
             else:
-                # We assume the agents return Pydantic models.
-                # We dump them to JSON strings for the synthesizer.
-                if isinstance(res, BaseModel):
-                    agent_results[name] = res.model_dump_json()
-                else:
-                    agent_results[name] = str(res)
+                # Fallback for unexpected return types
+                agent_outputs.append(str(res))
 
-        return {"agent_results": agent_results}
+        return {"agent_outputs": agent_outputs}
 
     async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
         """
-        Aggregates the JSON outputs from the agents into a final answer.
+        Aggregates the raw data from agent outputs into a final, reasoned answer.
+        REFACTORED: This is now the primary reasoning and analysis step.
         """
-        logger.info("✍️  [Synthesizer] Compiling final report...")
+        logger.info("✍️  [Synthesizer] Compiling final report from raw data...")
 
-        if not state.agent_results:
+        if not state.agent_outputs:
             return {"final_answer": "No agents were executed or all failed."}
 
-        # Format context
+        # Format context from the raw Pydantic models
         reports = []
-        for name, data in state.agent_results.items():
-            reports.append(f"### REPORT FROM {name.upper()}:\n{data}\n")
+        for i, output in enumerate(state.agent_outputs):
+            report_str = f"--- Data from Report {i+1} ---\n"
+            if isinstance(output, FundamentalAnalysisOutput):
+                report_str += "Source Agent: fundamentals_agent\n"
+                if (
+                    output.financial_data is not None
+                    and not output.financial_data.empty
+                ):
+                    report_str += "Type: Financial DataFrame\n"
+                    report_str += (
+                        "Data:\n" + output.financial_data.to_string(max_rows=20) + "\n"
+                    )
+                else:
+                    report_str += "Data: No financial data was returned.\n"
+
+            elif isinstance(output, NewsAnalysisOutput):
+                report_str += "Source Agent: news_agent\n"
+                if output.sources:
+                    report_str += "Type: List of News Articles\n"
+                    # Format sources for clarity
+                    source_context = "\n".join(
+                        [
+                            f'  - Title: {s.title}\n    URL: {s.url}\n    Content Snippet: "{s.page_content[:250]}..."'
+                            for s in output.sources
+                        ]
+                    )
+                    report_str += "Data:\n" + source_context + "\n"
+                else:
+                    report_str += "Data: No news articles were found.\n"
+
+            elif isinstance(output, str):
+                # Handle error strings from the executor
+                report_str += (
+                    f"Source Agent: Execution Error\nError Details: {output}\n"
+                )
+            else:
+                # Generic fallback
+                report_str += f"Source Agent: Unknown\nData: {str(output)}\n"
+
+            reports.append(report_str)
 
         combined_context = "\n".join(reports)
 
         prompt = ChatPromptTemplate.from_template(
-            "You are a Senior Financial Analyst. Synthesize the following reports to answer the user's question.\n\n"
-            "**User Query:** {query}\n\n"
-            "**Agent Data:**\n{context}\n\n"
-            "**Instructions:**\n"
-            "1. Integrate the quantitative data and qualitative news seamlessly.\n"
-            "2. If data is missing, state it clearly.\n"
-            "3. Provide a professional Markdown response."
+            "You are a Senior Financial Analyst. Your task is to synthesize the following raw data reports from different specialized agents to provide a comprehensive answer to the user's question.\n\n"
+            "**User's Original Query:** {query}\n\n"
+            "**Raw Agent Data:**\n{context}\n\n"
+            "**Your Instructions:**\n"
+            "1. **Synthesize, Don't Summarize:** Do not just list the data. Integrate the quantitative data (financials) and qualitative data (news) into a seamless, coherent narrative.\n"
+            "2. **Address the Core Question:** Directly answer the user's query using the provided data as evidence.\n"
+            "3. **Identify Key Insights:** Highlight trends, correlations, and important figures. For example, if the user asks why a stock dropped, connect news events with financial data if possible.\n"
+            "4. **Acknowledge Missing Data:** If the data is insufficient to answer the question, state it clearly.\n"
+            "5. **Professional Formatting:** Present your final answer in well-structured Markdown. Use headings, lists, and bold text to improve readability."
         )
 
         chain = prompt | self._llm
