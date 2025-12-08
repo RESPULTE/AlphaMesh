@@ -11,8 +11,11 @@ class BaseAgentInput(BaseModel):
     """
 
     query: str = Field(description="The original user query for context.")
-    ticker: str = Field(description="The stock ticker symbol (e.g., AAPL).")
-    metrics: List[str] = Field(
+    vector_query: str = Field(
+        description="The query optimized for vector store retrieval (e.g., 'news about AAPL stock price drop')."
+    )
+    ticker: Optional[str] = Field(description="The stock ticker symbol (e.g., AAPL).")
+    metrics: Optional[List[str]] = Field(
         default_factory=list,
         description="List of financial metrics to analyze (if applicable).",
     )
@@ -45,6 +48,9 @@ class BaseAgentOutput(BaseModel, ABC):
 
     agent_name: str = Field(
         description="The name of the agent that produced this output."
+    )
+    analysis: str = Field(
+        description="The detailed analysis or primary output of the agent."
     )
 
     @abstractmethod

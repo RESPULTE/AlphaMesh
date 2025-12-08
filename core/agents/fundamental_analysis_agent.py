@@ -91,27 +91,31 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         return FundamentalAnalysisOutput(
             financial_data=final_state.get("financial_data"),
+            analysis=final_state.get("analysis"),
         )
 
     def _build_graph(self):
-        workflow = StateGraph(_AgentState)
+        workflow = StateGraph(_AgentState, output_schema=FundamentalAnalysisOutput)
 
         workflow.add_node("parser", self._parser_node)
         workflow.add_node("decomposer", self._decomposer_node)
         workflow.add_node("fetch_data", self._fetch_data_node)
         workflow.add_node("calculator", self._calculator_node)
+        workflow.add_node("analyst", self._generate_analysis)
 
         workflow.add_edge(START, "parser")
 
-        # REWRITTEN: Use direct attribute access in conditional logic
+        # Conditional: If parser found unknown metrics, go to decomposer. Else fetch data directly.
         workflow.add_conditional_edges(
             "parser",
             lambda state: "decomposer" if state.calculations_to_run else "fetch_data",
+            {"decomposer": "decomposer", "fetch_data": "fetch_data"},
         )
 
         workflow.add_edge("decomposer", "fetch_data")
         workflow.add_edge("fetch_data", "calculator")
-        workflow.add_edge("calculator", END)
+        workflow.add_edge("calculator", "analyst")
+        workflow.add_edge("analyst", END)
 
         return workflow.compile()
 
@@ -164,8 +168,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
     async def _decomposer_node(self, state: _AgentState) -> dict:
         """
         Uses LLM to decompose complex metrics into formulas based on available data.
+        Handles multi-level decomposition (e.g., Price -> FCF -> [OCF - CapEx]).
         """
-        # REWRITTEN: Use state.attribute access
         targets = [
             c.target_metric_name
             for c in state.calculations_to_run
@@ -183,17 +187,23 @@ class FundamentalAnalysisAgent(AbstractAgent):
             [
                 (
                     "system",
-                    "You are a financial quant. Decompose the requested metrics into mathematical formulas.\n"
-                    "1. Use precise labels from the 'Available Concepts' list.\n"
-                    "2. DO NOT use any labels other than the provided ones.\n"
-                    "3. CRITICAL: In 'pandas_eval_expression' and 'target_metric_name', replace spaces with underscores '_'.\n"
-                    "4. If a formula requires stock market price, use 'stock_price'.\n",
+                    "You are an expert financial quant and data engineer. Decompose the requested metrics into mathematical formulas executable in pandas.\n\n"
+                    "RULES:\n"
+                    "1. Check 'Available Concepts'. If a requested metric relies on data NOT in the list (e.g., 'Free Cash Flow'), you must create an **Intermediate Calculation** first.\n"
+                    "   - Example: For 'Price to Free Cash Flow', if 'Free Cash Flow' is missing, first define: `free_cash_flow = Cash_Flow_from_Operations - Capital_Expenditures`. Then define: `price_to_free_cash_flow = stock_price / free_cash_flow`.\n"
+                    "2. Order matters: Define the intermediate variables BEFORE using them in the final formula.\n"
+                    "3. Use precise labels from 'Available Concepts' for the base data.\n"
+                    "4. CRITICAL: In 'pandas_eval_expression' and 'target_metric_name', replace ALL spaces with underscores '_'.\n"
+                    "5. If a formula requires stock market price, use the variable 'stock_price'.\n"
+                    "6. Standard Definitions to use if specific tags are missing:\n"
+                    "   - Free Cash Flow = Net Cash provided by (used in) operating activities - Payments for (proceeds from) capital expenditures\n"
+                    "   - Working Capital = Current assets - Current liabilities\n",
                 ),
                 (
                     "human",
-                    f"Available Concepts: {available_concepts}\n\n"
+                    f"Available Concepts (Raw Data): {available_concepts}\n\n"
                     f"Metrics to decompose: {targets}\n\n"
-                    "Provide a calculation plan using ONLY the available concepts.",
+                    "Provide a calculation plan. If a metric requires a standard accounting figure not in the raw data, calculate that figure first.",
                 ),
             ]
         )
@@ -202,15 +212,25 @@ class FundamentalAnalysisAgent(AbstractAgent):
         structured_llm = llm.with_structured_output(DecompositionPlan)
         result: DecompositionPlan = await (prompt | structured_llm).ainvoke({})
 
+        # Extract dependencies (both raw data and newly created intermediates)
+        # Note: Depending on your architecture, you might need to filter 'new_dependencies'
+        # to ensure you only fetch raw data, not the intermediate metrics you just invented.
+        # usually, the fetcher will ignore metrics it can't find in the DB,
+        # but it is safer if the LLM output distinguishes between 'fetch' and 'calculate'.
+
         new_dependencies = [
             dep for calc in result.calculations for dep in calc.dependencies
         ]
+
+        # Clean up dependencies: Only fetch things that are NOT being calculated in this very plan
+        calculated_vars = {c.target_metric_name for c in result.calculations}
+        metrics_to_fetch = [d for d in new_dependencies if d not in calculated_vars]
 
         print(f"[Decomposer] Plan: {result.calculations}")
 
         return {
             "calculations_to_run": result.calculations,
-            "metrics_to_fetch": new_dependencies,
+            "metrics_to_fetch": metrics_to_fetch,
         }
 
     async def _fetch_data_node(self, state: _AgentState) -> dict:
@@ -228,7 +248,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             state.ticker, metrics_to_query, state.start_date, state.end_date
         )
 
-        if any("price" in m.lower() for m in metrics_to_query):
+        if any("stock_price" in m.lower() for m in metrics_to_query):
             price_df = await self.db.get_price_data(
                 state.ticker, state.start_date, state.end_date, "yearly"
             )
@@ -241,9 +261,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     financial_df.columns = pd.to_datetime(
                         financial_df.columns
                     ).strftime("%Y-%m-%d")
-                    financial_df = pd.concat([financial_df, price_t]).loc[
-                        ~financial_df.index.duplicated(keep="first")
-                    ]
+                    price_t.columns = financial_df.columns
+                    financial_df = pd.concat([financial_df, price_t])
 
         return {"financial_data": financial_df}
 
@@ -282,6 +301,34 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         return {"financial_data": df_eval.T}
 
+    async def _generate_analysis(self, state: _AgentState) -> FundamentalAnalysisOutput:
+        print(f"--- [Node] Analyst ---")
+
+        # Format dataframe for readability
+        data_str = (
+            state.financial_data.to_string()
+            if not state.financial_data.empty
+            else "No data found."
+        )
+
+        msg = (
+            f"Analyze the following financial data for {state.ticker}.\n"
+            f"Data (Rows=Metrics, Cols=Dates):\n{data_str}\n\n"
+            f"User Question: {state.query}\n\n"
+            "### Analysis Instructions:\n"
+            "1. Highlight key trends, risks, and positives.\n"
+            "2. **Number Formatting:** When citing numbers from the data, you MUST automatically convert "
+            "scientific notation (e.g., 1.5e9) or large raw integers into human-readable denominations "
+            "(Million, Billion, Trillion). For example, convert '1.5e9' to '1.5 Billion'."
+        )
+
+        # Use ainvoke for async LLM call
+        response = await service_manager.get_agent(temperature=0.7).ainvoke(msg)
+
+        return FundamentalAnalysisOutput(
+            financial_data=state.financial_data, analysis=response.content
+        )
+
 
 if __name__ == "__main__":
 
@@ -291,13 +338,25 @@ if __name__ == "__main__":
         print("--- Running Scenario: Complex Metric (Net Profit Margin) ---")
         input_complex = BaseAgentInput(
             ticker="MSFT",
-            metrics=["net_profit_margin", "free cash flow"],
+            metrics=["price to free cash flow"],
+            vector_query="MSFT",
             start_date="2020-01-01",
             end_date="2022-12-31",
-            query="Get MSFT's net profit margin and free cash flow from 2020 to 2022.",
+            query="Get MSFT's price to free cash flow from 2020 to 2022.",
         )
         output_complex = await agent.run(input_complex)
         print("\n--- RAW AGENT OUTPUT ---\n")
         print(output_complex.financial_data)
 
     asyncio.run(main())
+
+    # agent = FundamentalAnalysisAgent()
+    # graph = agent._graph.get_graph()
+    # png_bytes = graph.draw_mermaid_png(
+    #     frontmatter_config={"chartOrientation": "horizontal"}
+    # )
+
+    # with open("statisstical_analysis.png", "wb") as f:
+    #     f.write(png_bytes)
+
+    # print("Saved graph as graph.png")

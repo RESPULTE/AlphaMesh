@@ -8,7 +8,12 @@ from typing import Annotated, List, Optional, Type
 from core.agents.base_agent import AbstractAgent
 from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.services import service_manager
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from newspaper import Article, ArticleException
@@ -241,37 +246,69 @@ class NewsAnalysisAgent(AbstractAgent):
 
         final_state = await self._graph.ainvoke(input_data.model_dump())
 
-        return NewsAnalysisOutput(
-            sources=final_state.get("news_context", []),
-        )
+        return NewsAnalysisOutput(**final_state)
 
     def _build_graph(self):
-        workflow = StateGraph(_AgentState)
+        workflow = StateGraph(_AgentState, output_schema=NewsAnalysisOutput)
 
+        # Define Nodes
+        workflow.add_node("parse_input", self._parse_input)
         workflow.add_node("retrieve", self._retrieve_news)
         workflow.add_node("evaluate_sufficiency", self._evaluate_sufficiency)
         workflow.add_node("strategize_search", self._strategize_search)
+
+        # NEW: The combined node
         workflow.add_node("execute_search_action", self._execute_search_action)
 
-        workflow.add_edge(START, "retrieve")
+        workflow.add_node("generate_analysis", self._generate_analysis)
+
+        # Define Edges
+        workflow.add_edge(START, "parse_input")
+        workflow.add_edge("parse_input", "retrieve")
         workflow.add_edge("retrieve", "evaluate_sufficiency")
 
-        # REWRITTEN: Use direct attribute access in conditional logic
+        # Sufficiency Logic (With the dictionary fix from the previous step)
         workflow.add_conditional_edges(
             "evaluate_sufficiency",
-            lambda state: END if state.is_fully_resolved else "strategize_search",
+            lambda state: (
+                "generate_analysis" if state.is_fully_resolved else "strategize_search"
+            ),
+            {
+                "generate_analysis": "generate_analysis",
+                "strategize_search": "strategize_search",
+            },
         )
 
+        # Strategy Logic
+        # Note: We now point to 'execute_search_action' instead of 'call_tool_agent'
         workflow.add_conditional_edges(
             "strategize_search",
-            lambda state: "execute_search_action" if state.needs_more_data else END,
+            lambda state: (
+                "execute_search_action"
+                if state.needs_more_data
+                else "generate_analysis"
+            ),
+            {
+                "execute_search_action": "execute_search_action",
+                "generate_analysis": "generate_analysis",
+            },
         )
 
+        # Simplified Flow
+        # execute_search_action now loops directly back to retrieve
         workflow.add_edge("execute_search_action", "retrieve")
+
+        workflow.add_edge("generate_analysis", END)
 
         return workflow.compile()
 
     # --- Node Implementations ---
+
+    def _parse_input(self, state: BaseAgentInput) -> _AgentState:
+        if (datetime.now() - state.start_date) > timedelta(days=MAX_LOOKBACK_DAYS):
+            state.start_date = datetime.now() - timedelta(days=MAX_LOOKBACK_DAYS)
+
+        return state.model_dump().copy()
 
     async def _retrieve_news(self, state: _AgentState) -> dict:
         # REWRITTEN: Use state.attribute access
@@ -281,9 +318,9 @@ class NewsAnalysisAgent(AbstractAgent):
 
         docs = await asyncio.to_thread(
             service_manager.get_vector_store_manager().retrieve,
-            query=state.query,
+            query=state.vector_query,
             filter_dict={"ticker": state.ticker},
-            k=15,
+            k=20,
         )
 
         context_pieces = []
@@ -337,9 +374,8 @@ class NewsAnalysisAgent(AbstractAgent):
             logger.info("   -> Content saturation (15+ articles). Concluding search.")
             return {"is_fully_resolved": True}
 
-        if (
-            state.start_date
-            and (datetime.now() - state.start_date).days > MAX_LOOKBACK_DAYS
+        if state.start_date and (
+            (datetime.now() - state.start_date).days > MAX_LOOKBACK_DAYS
         ):
             logger.info("   -> Max lookback window reached. Concluding search.")
             return {"is_fully_resolved": True}
@@ -369,8 +405,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         potential_from = state.start_date - timedelta(days=7)
         if potential_from < limit_date:
-            logger.info("   -> Strategy: Date expansion limit reached. Stopping.")
-            return {"needs_more_data": False}
+            potential_from = limit_date
 
         logger.info(
             f"   -> Strategy: Expanding range to {potential_from.strftime('%Y-%m-%d')}."
@@ -382,31 +417,127 @@ class NewsAnalysisAgent(AbstractAgent):
             "attempt_count": state.attempt_count + 1,
         }
 
-    async def _execute_search_action(self, state: _AgentState) -> dict:
+    async def _execute_search_action(self, state: _AgentState) -> _AgentState:
         """
-        Executes the news search tool based on the current strategy.
+        FIXED: Generic Tool Execution Node.
+        1. Calls LLM with bound tools.
+        2. Iterates over ANY tool calls returned.
+        3. Looks up the tool in self.tool_map and executes it.
         """
-        # REWRITTEN: Use state.attribute access
-        logger.info("🤖 [Step: Execute Search Action] Running tool...")
+        logger.info("🤖 [Step: Execute Search Action] deciding and running tools...")
 
-        tool_args = {
-            "ticker": state.ticker,
-            "from_date": state.start_date.strftime("%Y-%m-%d"),
-            "to_date": state.end_date.strftime("%Y-%m-%d"),
-            "page": state.current_page,
-        }
+        # 1. Prepare LLM Call
+        system_msg = SystemMessage(
+            content="You are a research assistant. Use the available tools to fetch data based on the user's strategy."
+        )
+        # We explicitly guide the LLM using the state calculated in the previous 'strategize' node
+        user_msg = (
+            f"Please execute the search strategy for ticker '{state.ticker}'. "
+            f"Use Date Range: {state.start_date} to {state.end_date}. "
+            f"Page: {state.current_page}."
+        )
 
-        tool_output_str = await ingest_stock_news_tool.ainvoke(tool_args)
-
+        response = await self.llm_with_tools.ainvoke([system_msg, user_msg])
+        output_messages = [response]
         total_results = 0
-        try:
-            tool_output_json = json.loads(tool_output_str)
-            total_results = tool_output_json.get("total_results", 0)
-            logger.info(f"   -> Tool reported {total_results} total results available.")
-        except json.JSONDecodeError:
-            logger.error("   -> Failed to parse JSON from tool output.")
 
-        return {"last_total_results": total_results}
+        # 2. Dynamic Tool Execution
+        if response.tool_calls:
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                logger.info(f"   -> LLM selected Tool: {tool_name}")
+
+                # Retrieve the actual tool function from the map
+                selected_tool = self.tool_map.get(tool_name)
+
+                if selected_tool:
+                    try:
+                        # Execute the tool dynamically
+                        tool_output = await selected_tool.ainvoke(tool_call["args"])
+
+                        # Create the ToolMessage (Required for chat history consistency)
+                        tool_msg = ToolMessage(
+                            content=tool_output,
+                            tool_call_id=tool_call["id"],
+                            name=tool_name,
+                        )
+                        output_messages.append(tool_msg)
+
+                        # 3. Post-Processing (Attempt to parse JSON for state updates)
+                        # This logic allows specific tools to update the state variable 'last_total_results'
+                        # while ignoring others that might return plain text.
+                        try:
+                            if isinstance(tool_output, str):
+                                data = json.loads(tool_output)
+                                # Only update if the specific key exists
+                                if "total_results" in data:
+                                    total_results = data["total_results"]
+                                    logger.info(
+                                        f"   -> Extracted total_results: {total_results}"
+                                    )
+                        except json.JSONDecodeError:
+                            # Not a JSON output, or not relevant to total_results
+                            pass
+                    except Exception as e:
+                        logger.error(f"   ❌ Error executing tool {tool_name}: {e}")
+                else:
+                    logger.warning(
+                        f"   ⚠️ Tool '{tool_name}' selected by LLM but not found in tool_map."
+                    )
+
+        return {"messages": output_messages, "last_total_results": total_results}
+
+    async def _generate_analysis(self, state: _AgentState) -> NewsAnalysisOutput:
+        logger.info("✍️  [Step: Generate Answer]")
+
+        # 1. FIX: Check if we actually have context
+        # Check if the string is not empty and contains the article separator
+        has_news = len(state.news_context) > 0
+
+        # 2. FIX: specific instructions for the "System"
+        system_instructions = (
+            "You are a professional financial analyst. Your task is to produce a rigorous, "
+            "multi-facet analysis that is grounded in the provided context.\n\n"
+            "### CITATION RULES (STRICT):\n"
+            "1. Use inline citations with bracketed IDs like [1](url_1) or [1][2](url_1, url_2).\n"
+            "2. Each ID must correspond to a 'Source ID' from the provided context.\n"
+            "4. Every factual claim must have at least one citation.\n"
+            "5. Do NOT cite nonexistent or fabricated IDs.\n\n"
+            "### OUTPUT FORMAT:\n"
+            "You must output a JSON object. The 'analysis' field must contain the full "
+            "narrative report (multiple paragraphs), not just a summary or entity name."
+        )
+
+        context = "\n".join([n.model_dump_json() for n in state.news_context])
+        user_content = (
+            f"### USER QUESTION:\n'{state.query}'\n\n"
+            f"### SEARCH METADATA:\n"
+            f'Reasoning: "{state.sufficiency_reasoning}"\n\n'
+            f"### CONTEXT:\n"
+            f"{context if has_news else 'No relevant news articles found.'}\n\n"
+            f"Please generate the detailed analysis now."
+        )
+
+        # Bind the structured output schema
+
+        # 4. FIX: Pass messages instead of a single formatted string
+        messages = [
+            SystemMessage(content=system_instructions),
+            HumanMessage(content=user_content),
+        ]
+        try:
+            retval = await service_manager.get_agent().ainvoke(messages)
+
+            return NewsAnalysisOutput(
+                analysis=retval.content, sources=state.news_context
+            )
+        except Exception as e:
+            logger.error(f"❌ Error in generation: {e}")
+            # Fallback if generation fails
+            return NewsAnalysisOutput(
+                analysis="Error generating analysis due to model failure.",
+                sources=[],
+            )
 
 
 if __name__ == "__main__":
@@ -415,7 +546,8 @@ if __name__ == "__main__":
         agent = NewsAnalysisAgent()
         input_data = BaseAgentInput(
             ticker="AAPL",
-            query="reason for price drop Apple",
+            vector_query="reason price rise Apple",
+            query="why did apple's share price rise so much recently?",
             start_date="2025-12-01",
             end_date="2025-12-05",
         )
@@ -425,4 +557,17 @@ if __name__ == "__main__":
         for source in res.sources:
             print(f"- {source.title}")
 
+        print(res.analysis)
+
+        for s in res.sources:
+            print(s.model_dump_json(indent=2))
+
     asyncio.run(main())
+
+    # agent = NewsAnalysisAgent()
+    # png_bytes = agent._graph.get_graph().draw_mermaid_png()
+
+    # with open("new_analysis.png", "wb") as f:
+    #     f.write(png_bytes)
+
+    # print("Saved graph as graph.png")

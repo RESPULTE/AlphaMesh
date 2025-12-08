@@ -44,8 +44,7 @@ class OrchestratorState(BaseModel):
 
     query: str
     plan: Optional[OrchestratorPlan] = None
-    # REFACTORED: This now holds concrete implementations of BaseAgentOutput
-    agent_outputs: List[BaseAgentOutput] = Field(default_factory=list)
+    agent_outputs: dict[str, str] = Field(default_factory=dict)
     final_answer: Optional[str] = None
 
 
@@ -66,7 +65,7 @@ class OrchestratorAgent:
         workflow.add_node("planner", self._plan_node)
         workflow.add_node("executor", self._execute_node)
         # RENAMED: from _synthesize_node to _analyst_node
-        workflow.add_node("analyst", self._analyst_node)
+        workflow.add_node("analyst", self._synthesize_node)
 
         workflow.add_edge(START, "planner")
 
@@ -147,49 +146,55 @@ class OrchestratorAgent:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        agent_outputs = []
-        for res in results:
+        agent_outputs = {}
+        for name, res in zip(plan.target_agents, results):
             if isinstance(res, Exception):
                 logger.error(f"   ❌ Agent failed: {res}")
                 # Optionally create an error output object
             elif isinstance(res, BaseAgentOutput):
                 logger.info(f"   -> Received output from {res.agent_name}")
-                agent_outputs.append(res)
+                agent_outputs[name] = res.get_llm_context_str()
+                logger.info(
+                    f"   -> Agent output for {res.agent_name} : \n\n {agent_outputs[name]}... \n\n\n"
+                )
+            else:
+                logger.error(
+                    f"   ❌ Unexpected output type from agent {name}: {type(res)}"
+                )
 
         return {"agent_outputs": agent_outputs}
 
-    async def _analyst_node(self, state: OrchestratorState) -> Dict[str, Any]:
+    async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
         """
-        UPGRADED: Aggregates formatted context from agent outputs and performs
-        a critical, multi-faceted analysis with citations.
+        Aggregates the JSON outputs from the agents into a final answer.
         """
-        logger.info("✍️  [Analyst] Compiling final report from structured data...")
+        logger.info("✍️  [Synthesizer] Compiling final report...")
 
         if not state.agent_outputs:
-            return {"final_answer": "No data could be gathered by the agents."}
+            return {"final_answer": "No agents were executed or all failed."}
 
-        # DECOUPLED: Call the formatting method on each output object. No more type checking!
-        reports = [output.get_llm_context_str() for output in state.agent_outputs]
-        combined_context = "\n\n".join(reports)
+        # Format context
+        reports = []
+        for name, data in state.agent_outputs.items():
+            reports.append(f"### REPORT FROM {name.upper()}:\n{data}\n")
+
+        combined_context = "\n".join(reports)
 
         prompt = ChatPromptTemplate.from_template(
-            "You are a world-class Senior Financial Analyst. Your task is to synthesize raw data reports from specialized agents into a single, high-quality, and insightful analysis for a client. The analysis must be critical, creative, and multi-faceted.\n\n"
-            "**Client's Original Query:** {query}\n\n"
-            "--- RAW DATA REPORTS ---\n{context}\n--- END OF REPORTS ---\n\n"
-            "### YOUR INSTRUCTIONS (Follow Strictly):\n"
-            "1.  **Synthesize and Analyze:** Do not just list the data. Weave the quantitative facts (financials) and qualitative events (news) into a cohesive and insightful narrative. Identify the 'why' behind the numbers.\n"
-            "2.  **Critical Thinking:** Go beyond the obvious. Identify potential risks, opportunities, and contradictions in the data. For example, if revenue is up but margins are down, explain what that implies. If news contradicts financial performance, highlight it.\n"
-            "3.  **Address the Core Question:** Ensure your analysis directly and comprehensively answers the client's original query, using the provided data as evidence.\n"
-            "4.  **CITE YOUR SOURCES (CRITICAL):** When you mention a fact from a news article (e.g., a market event, a product announcement, a reason for a stock move), you MUST add an inline citation in the format `[source_id]`. The `source_id` is provided in the news report context (e.g., `[1]`, `[2]`).\n"
-            "    -   Example: '...the company announced a new AI chip [1], which led to a surge in investor confidence.'\n"
-            "    -   Do NOT invent sources. Only cite the IDs provided.\n"
-            "5.  **Professional Formatting:** Present the final answer in clear, well-structured Markdown. Use headings, bullet points, and bold text to enhance readability. Start with a concise executive summary."
+            "Hello! Your role is to act as a helpful Senior Financial Analyst who is great at communicating. "
+            "Your task is to review the findings from your fellow agents and present them in a clear, cohesive summary for the user. "
+            "Please start with a friendly and approachable tone.\n\n"
+            "**User's Original Question:** {query}\n\n"
+            "**Collected Agent Findings:**\n{context}\n\n"
+            "**Your Instructions:**\n"
+            "1.  **Summarize and Synthesize:** Do not just copy the findings. Your main goal is to slightly shorten and summarize the information from the 'Collected Agent Findings'. Weave them together into a single, easy-to-understand response.\n"
+            "2.  **Improve Cohesion:** Ensure your writing flows naturally. Seamlessly integrate any quantitative data with the qualitative news and analysis.\n"
+            "3.  **Strictly No New Information:** You must only use the information provided in the context above. Do not add any external knowledge or make up new facts. If specific information wasn't found, it's important to state that it's missing.\n"
+            "4.  **Final Summary:** At the very end of your response, please add a short and brief summary (just a few sentences) that recaps the most critical points of what has been found.\n"
+            "5.  **Formatting:** Use professional Markdown for your final response."
         )
 
-        # Use a more capable model for analysis
-        analyst_llm = service_manager.get_agent(temperature=1)
-        chain = prompt | analyst_llm
-
+        chain = prompt | self._llm
         response = await chain.ainvoke(
             {"query": state.query, "context": combined_context}
         )
