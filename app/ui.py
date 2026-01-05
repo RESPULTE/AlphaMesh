@@ -2,175 +2,126 @@ import asyncio
 import logging
 import threading
 import traceback
-from concurrent.futures import Future
-from datetime import datetime
-from typing import Any
+from typing import Any, Union
 
 import streamlit as st
 
-# Import the Orchestrator
-from core.agents.orchestrator_agent import OrchestratorAgent
+from core.agents.orchestrator_agent import FinalResponse, OrchestratorAgent
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AlphaMeshUI")
 
 
 class AsyncLoopThread:
-    """
-    Manages a single persistent background thread running an asyncio event loop.
-    This prevents the 'Event loop is closed' or 'Attached to a different loop' errors
-    common with gRPC/Google Gemini in Streamlit.
-    """
-
-    _loop: asyncio.AbstractEventLoop = None
-    _thread: threading.Thread = None
+    _loop = None
+    _thread = None
 
     @classmethod
-    def get_loop(cls) -> asyncio.AbstractEventLoop:
+    def get_loop(cls):
         if cls._loop is None:
             cls._loop = asyncio.new_event_loop()
             cls._thread = threading.Thread(target=cls._loop.run_forever, daemon=True)
             cls._thread.start()
-            logger.info("✅ Persistent background event loop started.")
         return cls._loop
 
     @classmethod
     def run_coroutine(cls, coro) -> Any:
-        """Submits a coroutine to the background loop and waits for the result."""
-        future: Future = asyncio.run_coroutine_threadsafe(coro, cls.get_loop())
+        import asyncio
+
+        future = asyncio.run_coroutine_threadsafe(coro, cls.get_loop())
         return future.result()
 
 
-class ChatManager:
-    """Handles the storage, retrieval, and modification of chat history."""
-
-    def __init__(self):
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-
-    def add_message(self, role: str, content: str):
-        st.session_state.messages.append(
-            {
-                "role": role,
-                "content": content,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
-
-    def delete_message(self, index: int):
-        if 0 <= index < len(st.session_state.messages):
-            st.session_state.messages.pop(index)
-            st.rerun()
-
-    def edit_message(self, index: int, new_content: str):
-        if 0 <= index < len(st.session_state.messages):
-            st.session_state.messages[index]["content"] = new_content
-            st.rerun()
-
-    def clear_history(self):
-        st.session_state.messages = []
-        st.rerun()
-
-
 class AlphaMeshUI:
-    """Main UI Class to handle rendering and agent interaction."""
-
     def __init__(self):
-        self.chat_manager = ChatManager()
         self._init_session_state()
 
     def _init_session_state(self):
-        """Initializes the Agent within the background loop thread."""
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
         if "orchestrator" not in st.session_state:
-            with st.spinner("🤖 Initializing Orchestrator on background loop..."):
-                # We MUST initialize the agent inside the background loop
-                # so that its gRPC channels are bound to that loop correctly.
-                async def init_agent():
-                    return OrchestratorAgent()
 
-                agent = AsyncLoopThread.run_coroutine(init_agent())
-                st.session_state.orchestrator = agent
+            async def init():
+                return OrchestratorAgent()
+
+            st.session_state.orchestrator = AsyncLoopThread.run_coroutine(init())
+
+    def render_response(self, response: Union[str, FinalResponse]):
+        """Custom renderer for structured response objects."""
+        if isinstance(response, str):
+            st.markdown(response)
+            return
+
+        # 1. Narrative Text
+        st.markdown(response.summary)
+
+        # 2. Tables (Quantitative Data)
+        if (
+            response.fundamental_data is not None
+            and not response.fundamental_data.empty
+        ):
+            st.markdown("### 📊 Financial Metrics")
+            st.dataframe(
+                response.fundamental_data,
+                use_container_width=True,
+                column_config={"index": "Metric"},
+            )
+
+        # 3. References (Qualitative Data)
+        if response.sources:
+            st.markdown("---")
+            st.markdown("### 📚 Sources & Citations")
+            for src in response.sources:
+                with st.expander(f"[{src.source_id}] {src.title}"):
+                    st.markdown(f"**URL:** {src.url}")
+                    st.write(src.page_content)
 
     def setup_page(self):
         st.set_page_config(page_title="AlphaMesh AI", layout="wide", page_icon="📈")
         st.title("🎼 AlphaMesh Orchestrator")
-        st.caption("Synchronized Multi-Agent Financial Intelligence")
         st.markdown("---")
 
-    def render_sidebar(self):
+    def run(self):
+        self.setup_page()
+
+        # Sidebar for management
         with st.sidebar:
-            st.header("🛠️ Chat Management")
-            if st.button("🗑️ Clear Conversation", use_container_width=True):
-                self.chat_manager.clear_history()
+            if st.button("🗑️ Clear Conversation"):
+                st.session_state.messages = []
+                st.rerun()
 
-            st.divider()
-            st.subheader("📝 Edit History")
-            messages = st.session_state.messages
-
-            if not messages:
-                st.info("No messages in history.")
-
-            for i, msg in enumerate(messages):
-                with st.expander(
-                    f"{i}: {msg['role'].upper()} - {msg['timestamp'][-8:]}"
-                ):
-                    new_txt = st.text_area(
-                        "Content", value=msg["content"], key=f"tx_{i}"
-                    )
-                    c1, c2 = st.columns(2)
-                    if c1.button("Save", key=f"sv_{i}"):
-                        self.chat_manager.edit_message(i, new_txt)
-                    if c2.button("Delete", key=f"dl_{i}", type="primary"):
-                        self.chat_manager.delete_message(i)
-
-    def render_chat(self):
-        # Display chat history
+        # Display Chat History
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+                self.render_response(msg["content"])
 
-        # Input logic
-        if prompt := st.chat_input("Analyze NVIDIA's performance this quarter..."):
-            # 1. User Message
-            self.chat_manager.add_message("user", prompt)
+        # Input
+        if prompt := st.chat_input("Analyze NVIDIA's recent performance..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            # 2. Assistant Message
             with st.chat_message("assistant"):
-                status_box = st.status("🧠 Orchestrating Agents...", expanded=True)
-
+                status = st.status("🧠 Processing...", expanded=True)
                 try:
-                    # Run the agent in the persistent background loop
                     response = AsyncLoopThread.run_coroutine(
                         st.session_state.orchestrator.run(prompt)
                     )
-
-                    status_box.update(
+                    status.update(
                         label="✅ Analysis Complete", state="complete", expanded=False
                     )
-                    st.markdown(response)
-                    self.chat_manager.add_message("assistant", response)
+
+                    self.render_response(response)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": response}
+                    )
 
                 except Exception as e:
-                    status_box.update(
-                        label="❌ Orchestrator Error", state="error", expanded=True
-                    )
-                    st.error(f"**Error:** {str(e)}")
-
-                    # Provide full traceback for debugging
-                    with st.expander("🔍 View Debugging Traceback"):
-                        st.code(traceback.format_exc())
+                    status.update(label="❌ Error", state="error")
+                    st.error(str(e))
+                    st.code(traceback.format_exc())
 
 
 def main():
-    """Application entry point."""
     ui = AlphaMeshUI()
-    ui.setup_page()
-    ui.render_sidebar()
-    ui.render_chat()
-
-
-if __name__ == "__main__":
-    main()
+    ui.run()
