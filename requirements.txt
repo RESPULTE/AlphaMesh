@@ -1,0 +1,11 @@
+streamlit
+langchain
+langchain-community
+langchain-google-genai
+chromadb
+pandas
+edgartools
+yfinance
+newspaper3k
+langchain_chroma
+langchain_neo4j

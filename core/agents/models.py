@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class BaseAgentInput(BaseModel):
@@ -26,18 +26,18 @@ class BaseAgentInput(BaseModel):
         default=None, description="End date (format: YYYY-MM-DD)."
     )
 
-    @field_validator("start_date", "end_date", mode="before")
-    def parse_dates(cls, v):
-        if v is None:
-            return None
-        if isinstance(v, datetime):
-            return v
-        if isinstance(v, str):
-            try:
-                return datetime.strptime(v, "%Y-%m-%d")
-            except ValueError:
-                return datetime.fromisoformat(v)
-        return v
+    # @field_validator("start_date", "end_date", mode="before")
+    # def parse_dates(cls, v):
+    #     if v is None:
+    #         return None
+    #     if isinstance(v, datetime):
+    #         return v
+    #     if isinstance(v, str):
+    #         try:
+    #             return datetime.strptime(v, "%Y-%m-%d")
+    #         except ValueError:
+    #             return datetime.fromisoformat(v)
+    #     return v
 
 
 class BaseAgentOutput(BaseModel, ABC):

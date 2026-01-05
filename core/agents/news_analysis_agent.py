@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import operator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Optional, Type
 
 from core.agents.base_agent import AbstractAgent
@@ -80,9 +80,7 @@ class _AgentState(BaseAgentInput):
     attempt_count: int = 0
 
     latest_retrieved: Optional[datetime] = None
-    news_context: Annotated[List[CitedSource], operator.add] = Field(
-        default_factory=list
-    )
+    news_context: List[CitedSource] = Field(default_factory=list)
 
     needs_more_data: bool = False
     is_fully_resolved: bool = False
@@ -229,16 +227,16 @@ class NewsAnalysisAgent(AbstractAgent):
         self.llm_with_tools = service_manager.get_agent().bind_tools(self.tools)
         self._graph = self._build_graph()
 
-    @property
-    def name(self) -> str:
+    @staticmethod
+    def name() -> str:
         return "news_agent"
 
-    @property
-    def description(self) -> str:
+    @staticmethod
+    def description() -> str:
         return "Gathers raw news articles and sources based on a query. Does not perform analysis."
 
-    @classmethod
-    def get_output_schema_class(cls) -> Type[BaseModel]:
+    @staticmethod
+    def get_output_schema_class() -> Type[BaseModel]:
         return NewsAnalysisOutput
 
     async def run(self, input_data: BaseAgentInput) -> NewsAnalysisOutput:
@@ -320,13 +318,13 @@ class NewsAnalysisAgent(AbstractAgent):
             service_manager.get_vector_store_manager().retrieve,
             query=state.vector_query,
             filter_dict={"ticker": state.ticker},
-            k=20,
+            k=10,
         )
 
         context_pieces = []
         current_article_count = len(state.news_context)
         start_id = current_article_count + 1
-        latest_retrieved = None
+        latest_retrieved = state.latest_retrieved
 
         if docs:
             logger.info(f"   -> Found {len(docs)} existing documents.")
@@ -336,6 +334,12 @@ class NewsAnalysisAgent(AbstractAgent):
                 url = meta.get("url", "#")
                 pub_time_str = meta.get("publish_time", "")
                 content = meta.get("summary", doc.page_content)
+
+                if url in [c.url for c in state.news_context]:
+                    logger.info(
+                        f"skipping article already in context: {title[:50]}...."
+                    )
+                    continue  # Skip already added articles
 
                 context_pieces.append(
                     CitedSource(source_id=i, title=title, url=url, page_content=content)
@@ -369,6 +373,12 @@ class NewsAnalysisAgent(AbstractAgent):
         if state.attempt_count >= MAX_SEARCH_ATTEMPTS:
             logger.info("   -> Max attempts reached. Concluding search.")
             return {"is_fully_resolved": True}
+
+        if (
+            datetime.now().replace(tzinfo=timezone.utc) - state.latest_retrieved
+        ) > timedelta(hours=12):
+            logger.info("   -> Latest retrieved article is too old. Continuing search.")
+            return {"is_fully_resolved": False}
 
         if article_count >= 15:
             logger.info("   -> Content saturation (15+ articles). Concluding search.")
@@ -433,7 +443,7 @@ class NewsAnalysisAgent(AbstractAgent):
         # We explicitly guide the LLM using the state calculated in the previous 'strategize' node
         user_msg = (
             f"Please execute the search strategy for ticker '{state.ticker}'. "
-            f"Use Date Range: {state.start_date} to {state.end_date}. "
+            f"Use Date Range: {state.start_date.strftime('%Y-%m-%d')} to {state.end_date.strftime('%Y-%m-%d')}. "
             f"Page: {state.current_page}."
         )
 

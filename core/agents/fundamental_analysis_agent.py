@@ -5,9 +5,9 @@ from typing import Annotated, List, Optional, Type
 
 import pandas as pd
 from core.agents.base_agent import AbstractAgent
+from core.agents.get_financial_data import FinancialDatabase
 from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.services import service_manager
-from get_financial_data import FinancialDatabase
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
@@ -70,16 +70,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
         self._graph = self._build_graph()
         self.db = FinancialDatabase()
 
-    @property
-    def name(self) -> str:
+    @staticmethod
+    def name() -> str:
         return "fundamentals_agent"
 
-    @property
-    def description(self) -> str:
+    @staticmethod
+    def description() -> str:
         return "Fetches and calculates quantitative financial data (ratios, statements). Returns raw data."
 
-    @classmethod
-    def get_output_schema_class(cls) -> Type[BaseModel]:
+    @staticmethod
+    def get_output_schema_class() -> Type[BaseModel]:
         return FundamentalAnalysisOutput
 
     async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
@@ -189,21 +189,31 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     "system",
                     "You are an expert financial quant and data engineer. Decompose the requested metrics into mathematical formulas executable in pandas.\n\n"
                     "RULES:\n"
-                    "1. Check 'Available Concepts'. If a requested metric relies on data NOT in the list (e.g., 'Free Cash Flow'), you must create an **Intermediate Calculation** first.\n"
-                    "   - Example: For 'Price to Free Cash Flow', if 'Free Cash Flow' is missing, first define: `free_cash_flow = Cash_Flow_from_Operations - Capital_Expenditures`. Then define: `price_to_free_cash_flow = stock_price / free_cash_flow`.\n"
-                    "2. Order matters: Define the intermediate variables BEFORE using them in the final formula.\n"
-                    "3. Use precise labels from 'Available Concepts' for the base data.\n"
-                    "4. CRITICAL: In 'pandas_eval_expression' and 'target_metric_name', replace ALL spaces with underscores '_'.\n"
-                    "5. If a formula requires stock market price, use the variable 'stock_price'.\n"
-                    "6. Standard Definitions to use if specific tags are missing:\n"
+                    "1. **Check 'Available Concepts':** If a requested metric relies on data NOT in the list (e.g., 'Free Cash Flow'), you must create an **Intermediate Calculation** first.\n"
+                    "2. **CRITICAL - UNIT CONSISTENCY (Per Share vs. Total):**\n"
+                    "   - The variable 'stock_price' represents the price of ONE share.\n"
+                    "   - You generally cannot divide 'stock_price' by a total company metric (like 'Total Revenue' or 'Total Free Cash Flow').\n"
+                    "   - If calculating a valuation ratio (e.g., 'Price to Free Cash Flow'), you MUST:\n"
+                    "       a) Identify the total metric (e.g., Free Cash Flow).\n"
+                    "       b) Identify 'Shares Outstanding' (or 'Weighted Average Shares') from the available concepts.\n"
+                    "       c) Calculate the **Per Share** metric (e.g., `fcf_per_share = free_cash_flow / shares_outstanding`).\n"
+                    "       d) Calculate the final ratio using the per-share metric (e.g., `price_to_fcf = stock_price / fcf_per_share`).\n"
+                    "3. **Order matters:** Define intermediate variables (like Total FCF, then FCF Per Share) BEFORE using them in the final formula.\n"
+                    "4. **Naming:** In 'pandas_eval_expression' and 'target_metric_name', replace ALL spaces with underscores '_'.\n"
+                    "5. **Standard Definitions** (Use these if specific tags are missing):\n"
                     "   - Free Cash Flow = Net Cash provided by (used in) operating activities - Payments for (proceeds from) capital expenditures\n"
-                    "   - Working Capital = Current assets - Current liabilities\n",
+                    "   - Working Capital = Current assets - Current liabilities\n"
+                    "   - Shares: Look for 'Weighted Average Shares', 'Common Stock Shares Outstanding', or similar.\n\n"
+                    "EXAMPLE CALCULATION PLAN (Price to Free Cash Flow):\n"
+                    "1. free_cash_flow = Cash_Flow_from_Operations - Capital_Expenditures\n"
+                    "2. free_cash_flow_per_share = free_cash_flow / Weighted_Average_Shares_Outstanding\n"
+                    "3. price_to_free_cash_flow = stock_price / free_cash_flow_per_share",
                 ),
                 (
                     "human",
                     f"Available Concepts (Raw Data): {available_concepts}\n\n"
                     f"Metrics to decompose: {targets}\n\n"
-                    "Provide a calculation plan. If a metric requires a standard accounting figure not in the raw data, calculate that figure first.",
+                    "Provide a calculation plan. Ensure you normalize total metrics to 'per share' before comparing them to 'stock_price'.",
                 ),
             ]
         )
@@ -225,8 +235,17 @@ class FundamentalAnalysisAgent(AbstractAgent):
         # Clean up dependencies: Only fetch things that are NOT being calculated in this very plan
         calculated_vars = {c.target_metric_name for c in result.calculations}
         metrics_to_fetch = [d for d in new_dependencies if d not in calculated_vars]
+        metrics_to_fetch.extend([t for t in targets if t not in calculated_vars])
 
-        print(f"[Decomposer] Plan: {result.calculations}")
+        print(f"   -> New dependencies to fetch: ")
+        for m in metrics_to_fetch:
+            print(f"      - {m}")
+
+        print(f"   -> Calculations to perform:")
+        for i, calc in enumerate(result.calculations, 1):
+            print(
+                f"      {i}. {calc.target_metric_name} = {calc.pandas_eval_expression}"
+            )
 
         return {
             "calculations_to_run": result.calculations,
@@ -262,7 +281,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
                         financial_df.columns
                     ).strftime("%Y-%m-%d")
                     price_t.columns = financial_df.columns
-                    financial_df = pd.concat([financial_df, price_t])
+
+                financial_df = pd.concat([financial_df, price_t])
 
         return {"financial_data": financial_df}
 
@@ -305,15 +325,18 @@ class FundamentalAnalysisAgent(AbstractAgent):
         print(f"--- [Node] Analyst ---")
 
         # Format dataframe for readability
-        data_str = (
-            state.financial_data.to_string()
-            if not state.financial_data.empty
-            else "No data found."
-        )
+        if state.financial_data is None or state.financial_data.empty:
+            return FundamentalAnalysisOutput(
+                financial_data=None, analysis="No data found."
+            )
+
+        human_readable = state.financial_data.map(
+            lambda x: add_units(x) if isinstance(x, (int, float)) else x
+        ).to_string()
 
         msg = (
             f"Analyze the following financial data for {state.ticker}.\n"
-            f"Data (Rows=Metrics, Cols=Dates):\n{data_str}\n\n"
+            f"Data (Rows=Metrics, Cols=Dates):\n{human_readable}\n\n"
             f"User Question: {state.query}\n\n"
             "### Analysis Instructions:\n"
             "1. Highlight key trends, risks, and positives.\n"
@@ -330,23 +353,44 @@ class FundamentalAnalysisAgent(AbstractAgent):
         )
 
 
+def add_units(x):
+    if (x > 0 and x >= 1_000_000_000) or (x < 0 and x <= -1_000_000_000):
+        return f"{x/1_000_000_000:.2f} Billion"
+    elif (x > 0 and x >= 1_000_000) or (x < 0 and x <= -1_000_000):
+        return f"{x/1_000_000:.2f} Million"
+    elif (x > 0 and x >= 1_000) or (x < 0 and x <= -1_000):
+        return f"{x/1_000:.2f} Thousand"
+
+    return f"{x:.2f}"
+
+
 if __name__ == "__main__":
 
     async def main():
         agent = FundamentalAnalysisAgent()
 
         print("--- Running Scenario: Complex Metric (Net Profit Margin) ---")
-        input_complex = BaseAgentInput(
+        input_data = BaseAgentInput(
             ticker="MSFT",
-            metrics=["price to free cash flow"],
+            metrics=["stock_price"],
             vector_query="MSFT",
             start_date="2020-01-01",
             end_date="2022-12-31",
-            query="Get MSFT's price to free cash flow from 2020 to 2022.",
+            query="Get MSFT's price from 2020 to 2022.",
         )
-        output_complex = await agent.run(input_complex)
+        output_complex = await agent.run(input_data)
         print("\n--- RAW AGENT OUTPUT ---\n")
-        print(output_complex.financial_data)
+
+        print("[analysis]")
+        print(output_complex.analysis)
+
+        print("-" * 60)
+
+        print("\n[financial_data]")
+        human_readable = output_complex.financial_data.map(
+            lambda x: add_units(x) if isinstance(x, (int, float)) else x
+        ).to_string()
+        print(human_readable)
 
     asyncio.run(main())
 

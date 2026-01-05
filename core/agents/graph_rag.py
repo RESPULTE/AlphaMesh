@@ -388,7 +388,7 @@ class EvolvingGraphRAGAgent:
         - Focus your examples and analogies around these high-priority concepts.
         
         2. **Respect Constraints**:
-        - Never mention topics listed in 'Dislikes'.
+        - Take note of the topics listed in 'Dislikes'.
         - Adapt your tone based on 'Communication Preferences'.
 
         3. **Be Natural**: 
@@ -412,103 +412,108 @@ async def main():
     llm = service_manager.get_agent()
     agent = EvolvingGraphRAGAgent(graph, llm, user_id="user_evolution_demo")
 
-    # 🛑 RESET GRAPH for a clean demo
+    # # 🛑 RESET GRAPH for a clean demo
     # print("🧹 Clearing Database for Demo...")
     # graph.query("MATCH (n) DETACH DELETE n")
 
-    # # Helper to visualize the graph state
-    # def print_graph_snapshot(step_name):
-    #     print(f"\n{'='*20} {step_name} {'='*20}")
+    # Helper to visualize the graph state
+    def print_graph_snapshot(step_name):
+        print(f"\n{'='*20} {step_name} {'='*20}")
 
-    #     # Fetch Active Edges
-    #     active = graph.query(
-    #         """
-    #         MATCH (u:User)-[r]->(n)
-    #         WHERE r.end_date IS NULL
-    #         RETURN type(r) as rel, n.id as node, n.label as label
-    #     """
-    #     )
+        # Fetch Active Edges
+        active = graph.query(
+            """
+            MATCH (u:User)-[r]->(n)
+            WHERE r.end_date IS NULL
+            RETURN type(r) as rel, n.id as node, n.label as label
+        """
+        )
 
-    #     # Fetch Archived Edges
-    #     archived = graph.query(
-    #         """
-    #         MATCH (u:User)-[r]->(n)
-    #         WHERE r.end_date IS NOT NULL
-    #         RETURN type(r) as rel, n.id as node, r.end_date as ended
-    #     """
-    #     )
+        # Fetch Archived Edges
+        archived = graph.query(
+            """
+            MATCH (u:User)-[r]->(n)
+            WHERE r.end_date IS NOT NULL
+            RETURN type(r) as rel, n.id as node, r.end_date as ended
+        """
+        )
 
-    #     print("🟢 ACTIVE STATE:")
-    #     if not active:
-    #         print("   (Empty)")
-    #     for row in active:
-    #         print(f"   (User) --[{row['rel']}]--> ({row['node']}) [{row['label']}]")
+        print("🟢 ACTIVE STATE:")
+        if not active:
+            print("   (Empty)")
+        for row in active:
+            print(f"   (User) --[{row['rel']}]--> ({row['node']}) [{row['label']}]")
 
-    #     print("\n🔴 HISTORY (Archived):")
-    #     if not archived:
-    #         print("   (None)")
-    #     for row in archived:
-    #         print(
-    #             f"   (User) --[{row['rel']}]--> ({row['node']}) [Ended: {row['ended']}]"
-    #         )
-    #     print("=" * 60)
+        print("\n🔴 HISTORY (Archived):")
+        if not archived:
+            print("   (None)")
+        for row in archived:
+            print(
+                f"   (User) --[{row['rel']}]--> ({row['node']}) [Ended: {row['ended']}]"
+            )
+        print("=" * 60)
 
-    # # ============================================================
-    # # 📨 Message 1: Initialization
-    # # Setting identity, interest, and specific preference.
-    # # ============================================================
-    # msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
-    # print(f"\nUser: {msg_1}")
-    # await agent.process_interaction(msg_1)
-    # print_graph_snapshot("AFTER MESSAGE 1")
-    # # EXPECTED:
-    # # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
-    # # History: None
+    # ============================================================
+    # 📨 Message 1: Initialization
+    # Setting identity, interest, and specific preference.
+    # ============================================================
+    msg_1 = "Hi, I'm Alex. I really love Python development. Please give me detailed, in-depth answers."
+    print(f"\nUser: {msg_1}")
+    await agent.process_interaction(msg_1)
+    print_graph_snapshot("AFTER MESSAGE 1")
+    # EXPECTED:
+    # Active: INTERESTED_IN -> python, HAS_PREFERENCE -> detailed
+    # History: None
 
-    # # ============================================================
-    # # 📨 Message 2: Expansion
-    # # Adding a new skill (Accumulative change).
-    # # ============================================================
-    # msg_2 = "I am also starting to learn Docker for containerization. could you explain to me some details on docker?"
-    # print(f"\nUser: {msg_2}")
-    # await agent.process_interaction(msg_2)
-    # print_graph_snapshot("AFTER MESSAGE 2")
-    # # EXPECTED:
-    # # Active: ... + LEARNING -> docker
-    # # History: None
+    # ============================================================
+    # 📨 Message 2: Expansion
+    # Adding a new skill (Accumulative change).
+    # ============================================================
+    msg_2 = "I am also starting to learn Docker for containerization. could you explain to me some details on docker?"
+    print(f"\nUser: {msg_2}")
+    await agent.process_interaction(msg_2)
+    print_graph_snapshot("AFTER MESSAGE 2")
+    # EXPECTED:
+    # Active: ... + LEARNING -> docker
+    # History: None
 
-    # # ============================================================
-    # # 📨 Message 3: Preference Shift (Conflict Type 1)
-    # # Changing "Detailed" -> "Brief".
-    # # The 'detailed' edge should close.
-    # # ============================================================
-    # msg_3 = (
-    #     "Actually, your answers are too long. Keep them brief and concise from now on."
-    # )
-    # print(f"\nUser: {msg_3}")
-    # await agent.process_interaction(msg_3)
-    # print_graph_snapshot("AFTER MESSAGE 3")
-    # # EXPECTED:
-    # # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
-    # # History: HAS_PREFERENCE -> detailed
+    # ============================================================
+    # 📨 Message 3: Preference Shift (Conflict Type 1)
+    # Changing "Detailed" -> "Brief".
+    # The 'detailed' edge should close.
+    # ============================================================
+    msg_3 = (
+        "Actually, your answers are too long. Keep them brief and concise from now on."
+    )
+    print(f"\nUser: {msg_3}")
+    await agent.process_interaction(msg_3)
+    print_graph_snapshot("AFTER MESSAGE 3")
+    # EXPECTED:
+    # Active: HAS_PREFERENCE -> brief, INTERESTED_IN -> python, LEARNING -> docker
+    # History: HAS_PREFERENCE -> detailed
 
-    # # ============================================================
-    # # 📨 Message 4: Sentiment Shift (Conflict Type 2)
-    # # Changing "Love Python" -> "Dislike Python".
-    # # The 'INTERESTED_IN' Python edge should close.
-    # # ============================================================
-    # msg_4 = "Also, I'm tired of Python. It's too slow. I fucking hate it now. same with docker, so troublesome"
-    # print(f"\nUser: {msg_4}")
-    # await agent.process_interaction(msg_4)
-    # print_graph_snapshot("AFTER MESSAGE 4")
+    # ============================================================
+    # 📨 Message 4: Sentiment Shift (Conflict Type 2)
+    # Changing "Love Python" -> "Dislike Python".
+    # The 'INTERESTED_IN' Python edge should close.
+    # ============================================================
+    msg_4 = "Also, I'm tired of Python. It's too slow. I hate it now. same with docker, so troublesome"
+    print(f"\nUser: {msg_4}")
+    await agent.process_interaction(msg_4)
+    print_graph_snapshot("AFTER MESSAGE 4")
     # EXPECTED:
     # Active: DISLIKES -> python, HAS_PREFERENCE -> brief, LEARNING -> docker
     # History: HAS_PREFERENCE -> detailed, INTERESTED_IN -> python
 
-    msg_5 = "Could you explain more about containerization?"
+    msg_5 = "I really, really hate python"
     print(f"\nUser: {msg_5}")
     await agent.process_interaction(msg_5)
-    # print_graph_snapshot("AFTER MESSAGE 4")
+    print_graph_snapshot("AFTER MESSAGE 4")
+
+    msg_6 = "could you tell me what you know about me, from the most importance to least detail?"
+    print(f"\nUser: {msg_6}")
+    response = await agent.process_interaction(msg_6)
+    print(response)
 
 
 if __name__ == "__main__":

@@ -178,12 +178,14 @@ class VectorStoreManager:
         try:
             # 2. Execute Parallel Chain (Metadata & Summary) - ASYNC INVOKE
             # This allows the LLM calls to happen without blocking the loop
-            result = await self._ingestion_chain.ainvoke(
-                {"document_content": raw_text, "summarize": should_summarize}
-            )
 
-            fin_meta: FinancialArticleMetadata = result["fin_meta"]
-            summary_text: str = result["summary"]
+            summary_text = ""
+            if should_summarize:
+                result = await self._ingestion_chain.ainvoke(
+                    {"document_content": raw_text, "summarize": should_summarize}
+                )
+
+                summary_text: str = result["summary"]
 
             # 3. Semantic Chunking
             # Note: SemanticChunker.create_documents is usually synchronous but calls Embeddings API.
@@ -195,7 +197,6 @@ class VectorStoreManager:
             # 4. Metadata Enrichment
             base_metadata = {
                 **source_metadata,
-                **fin_meta.model_dump(),
                 "ingest_timestamp": datetime.now().isoformat(),
             }
             if should_summarize:
@@ -259,18 +260,30 @@ if __name__ == "__main__":
     from core.services import service_manager
 
     async def main():
-        manager = service_manager.get_vector_store_manager()
-        article_text = "Apple Inc. (AAPL) reported Q4 revenue of $89.5B..."
-        source_meta = {
-            "url": "https://finance.yahoo.com/...",
-            "source": "Yahoo Finance",
-            "publish_time": "2023-11-02",
-        }
+        # article_text = "Apple Inc. (AAPL) reported Q4 revenue of $89.5B..."
+        # source_meta = {
+        #     "url": "https://finance.yahoo.com/...",
+        #     "source": "Yahoo Finance",
+        #     "publish_time": "2023-11-02",
+        # }
 
         # Notice the await
-        await manager.ingest_article(article_text, source_meta, should_summarize=True)
+        # await manager.ingest_article(article_text, source_meta, should_summarize=True)
 
+        manager = service_manager.get_vector_store_manager()
         results = manager.retrieve("earnings sentiment", filter_dict={"ticker": "AAPL"})
         print(f"Retrieved {len(results)} relevant documents.")
+
+        for r in results:
+            print("MetaData: ")
+
+            for k, v in r.metadata.items():
+                print(f"\t{k}: {v}")
+            print("\n")
+
+            print("Content: ")
+            print(r.page_content)
+            print("=" * 60)
+            print("\n\n")
 
     asyncio.run(main())

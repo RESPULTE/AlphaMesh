@@ -25,21 +25,21 @@ class AbstractAgent(ABC):
     def __init__(self):
         pass
 
-    @property
+    @staticmethod
     @abstractmethod
-    def name(self) -> str:
+    def name() -> str:
         """The name of the agent."""
         pass
 
-    @property
+    @staticmethod
     @abstractmethod
-    def description(self) -> str:
+    def description() -> str:
         """A description of what the agent is good for."""
         pass
 
-    @classmethod
+    @staticmethod
     @abstractmethod
-    def get_output_schema_class(self) -> Type[BaseModel]:
+    def get_output_schema_class() -> Type[BaseModel]:
         """The Pydantic model for the agent's specific input."""
         pass
 
