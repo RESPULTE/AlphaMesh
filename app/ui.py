@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import threading
 import traceback
@@ -7,6 +8,11 @@ from typing import Any, Union
 
 import pandas as pd
 import streamlit as st
+
+# Silence gRPC internal logging
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+# Optional: Force gRPC to use a specific polling strategy (mostly for linux, but helps consistency)
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
 
 from core.agents.orchestrator_agent import FinalResponse, OrchestratorAgent
 
@@ -39,13 +45,27 @@ class AsyncLoopThread:
     @classmethod
     def get_loop(cls):
         if cls._loop is None:
-            cls._loop = asyncio.new_event_loop()
-            cls._thread = threading.Thread(target=cls._loop.run_forever, daemon=True)
+            # Ensure we are using the default policy for Windows (Proactor)
+            try:
+                # This ensures the loop is created with the correct Windows policy
+                cls._loop = asyncio.new_event_loop()
+            except AttributeError:
+                cls._loop = asyncio.SelectorEventLoop()
+
+            def start_loop(loop):
+                # Critical: Set the loop for this specific background thread
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            cls._thread = threading.Thread(
+                target=start_loop, args=(cls._loop,), daemon=True
+            )
             cls._thread.start()
         return cls._loop
 
     @classmethod
     def run_coroutine(cls, coro) -> Any:
+        # Use the established loop
         future = asyncio.run_coroutine_threadsafe(coro, cls.get_loop())
         return future.result()
 
