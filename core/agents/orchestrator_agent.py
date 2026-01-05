@@ -4,8 +4,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Type
 
 import pandas as pd
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
@@ -30,7 +30,7 @@ AVAILABLE_AGENTS: List[Type[AbstractAgent]] = [
 
 
 class FinalResponse(BaseModel):
-    """The structured output returned to the UI."""
+    """The structured output returned to the UI for professional rendering."""
 
     summary: str
     fundamental_data: Optional[pd.DataFrame] = None
@@ -46,14 +46,14 @@ class OrchestratorPlan(BaseAgentInput):
         description="True if query needs agent tools."
     )
     final_answer: Optional[str] = Field(
-        default=None, description="Direct answer if no agents needed."
+        default=None, description="Direct answer if no agents needed (e.g. greetings)."
     )
 
 
 class OrchestratorState(BaseModel):
-    query: str
+    # Changed from query: str to messages: List[BaseMessage]
+    messages: List[BaseMessage] = Field(default_factory=list)
     plan: Optional[OrchestratorPlan] = None
-    # Store raw output objects to preserve DataFrames and Source lists
     agent_outputs: Dict[str, BaseAgentOutput] = Field(default_factory=dict)
     final_response: Optional[FinalResponse] = None
 
@@ -69,9 +69,11 @@ class OrchestratorAgent:
     def _router(self, state: OrchestratorState) -> str:
         if state.plan.final_answer is not None:
             return "END"
-        if state.plan.request_requires_agents:
-            return "Execute_Selected_Agents"
-        return "portfolio_analyst"
+        return (
+            "Execute_Selected_Agents"
+            if state.plan.request_requires_agents
+            else "portfolio_analyst"
+        )
 
     def _build_graph(self):
         workflow = StateGraph(OrchestratorState)
@@ -93,38 +95,41 @@ class OrchestratorAgent:
         workflow.add_edge("portfolio_analyst", END)
         return workflow.compile()
 
-    async def run(self, query: str) -> FinalResponse:
-        logger.info(f"🎼 [Orchestrator] Started: {query}")
-        initial_state = OrchestratorState(query=query)
+    async def run(self, messages: List[BaseMessage]) -> FinalResponse:
+        """Entry point accepting a list of LangChain messages."""
+        initial_state = OrchestratorState(messages=messages)
         final_state = await self._graph.ainvoke(initial_state)
 
         if final_state.get("final_response"):
             return final_state["final_response"]
 
-        # Fallback for direct LLM answers (simple greetings)
         return FinalResponse(
-            summary=final_state["plan"].final_answer or "No response generated."
+            summary=final_state["plan"].final_answer
+            or "I couldn't process that request."
         )
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        logger.info("🧠 [Planner] Planning route...")
         now = datetime.now()
         available_agents_desc = ", ".join(
             [f"{a.name()}: {a.description()}" for a in AVAILABLE_AGENTS]
         )
 
         system_prompt = (
-            "You are a Financial Orchestrator. Decide which agents to call.\n"
+            "You are a Financial Orchestrator. Review the chat history and decide which agents to call.\n"
             f"AVAILABLE AGENTS: {available_agents_desc}\n"
-            "If the query is a greeting or trivial, provide a 'final_answer' and set request_requires_agents=False."
+            "If the user's latest message is a greeting or doesn't require data, provide 'final_answer'.\n"
+            "If the latest message refers to a company mentioned earlier (e.g., 'its revenue'), "
+            "ensure you extract the correct ticker from history."
         )
 
         planner_llm = self._llm.with_structured_output(OrchestratorPlan)
+
+        # We pass the full message history to the planner
         plan: OrchestratorPlan = await planner_llm.ainvoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=state.query)]
+            [SystemMessage(content=system_prompt)] + state.messages
         )
 
-        # Date normalization
+        # Default date logic
         if plan.end_date is None:
             plan.end_date = now
         if plan.start_date is None:
@@ -133,7 +138,6 @@ class OrchestratorAgent:
         return {"plan": plan}
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        logger.info("⚙️  [Executor] Running agents...")
         plan = state.plan
         shared_input = BaseAgentInput(**plan.model_dump())
 
@@ -144,48 +148,48 @@ class OrchestratorAgent:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        outputs = {}
-        for name, res in zip(plan.target_agents, results):
-            if not isinstance(res, Exception):
-                outputs[name] = res
+        outputs = {
+            name: res
+            for name, res in zip(plan.target_agents, results)
+            if not isinstance(res, Exception)
+        }
         return {"agent_outputs": outputs}
 
     async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        logger.info("✍️  [Synthesizer] Compiling report...")
-
-        # 1. Prepare context for the LLM
         context_parts = []
         fundamental_df = None
         news_sources = []
 
         for name, output in state.agent_outputs.items():
             context_parts.append(output.get_llm_context_str())
-
-            # Extract structured data for the FinalResponse
             if name == "fundamentals_agent":
                 fundamental_df = getattr(output, "financial_data", None)
             if name == "news_agent":
                 news_sources = getattr(output, "sources", [])
 
-        prompt = ChatPromptTemplate.from_template(
-            "You are a Senior Financial Analyst. Synthesize the findings below into a narrative report.\n"
-            "User Question: {query}\n\n"
-            "Findings:\n{context}\n\n"
-            "Instructions:\n"
-            "1. Focus on a narrative summary. DO NOT create markdown tables (they will be added separately).\n"
-            "2. Preserve ALL in-text citations like [1] or [2].\n"
-            "3. End with a 2-sentence 'Bottom Line' summary."
+        # Using MessagesPlaceholder to inject the history into the synthesis
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are a Senior Financial Analyst. Write a cohesive narrative summary based on findings.\n"
+                    "**IMPORTANT**: Use numeric in-text citations like [1], [2].\n"
+                    "Findings:\n{context}",
+                ),
+                MessagesPlaceholder(variable_name="history"),
+                ("human", "Produce the final analysis based on our conversation."),
+            ]
         )
 
         chain = prompt | self._llm
         response = await chain.ainvoke(
-            {"query": state.query, "context": "\n".join(context_parts)}
+            {"history": state.messages, "context": "\n".join(context_parts)}
         )
 
-        final_resp = FinalResponse(
-            summary=response.content,
-            fundamental_data=fundamental_df,
-            sources=news_sources,
-        )
-
-        return {"final_response": final_resp}
+        return {
+            "final_response": FinalResponse(
+                summary=response.content,
+                fundamental_data=fundamental_df,
+                sources=news_sources,
+            )
+        }
