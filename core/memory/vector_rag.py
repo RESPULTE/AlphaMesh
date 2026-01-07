@@ -160,10 +160,19 @@ class VectorStoreManager:
         raw_text: str,
         source_metadata: Dict[str, Any],
         should_summarize: bool = False,
+        graph_entities: List[Dict] = None,
     ) -> bool:
         """
         Ingests an article ASYNCHRONOUSLY.
         """
+        if graph_entities:
+            source_metadata["entity_ids"] = [
+                e.get("ticker") for e in graph_entities if e.get("ticker")
+            ]
+            source_metadata["concepts"] = [
+                e.get("name") for e in graph_entities if e.get("label") == "Concept"
+            ]
+
         if not raw_text:
             return False
 
@@ -227,10 +236,20 @@ class VectorStoreManager:
         self, query: str, filter_dict: Optional[Dict] = None, k: int = 10
     ) -> List[Document]:
         """
-        Retrieves documents synchronously.
-        (Kept sync as requested, or can be upgraded to async if needed).
+        Retrieves documents using the 'Flesh' (Vector) layer.
+        If filter_dict contains graph-derived keys, they are used for hard-filtering.
         """
-        return self._retrieve_documents(query, filter_dict, k=k)
+        # Logic to transform simple filters into Chroma-compatible 'where' clauses
+        # e.g., {'ticker': 'AAPL'} -> {'ticker': {'$eq': 'AAPL'}}
+        formatted_filter = {}
+        if filter_dict:
+            for key, val in filter_dict.items():
+                if isinstance(val, list):
+                    formatted_filter[key] = {"$in": val}
+                else:
+                    formatted_filter[key] = val
+
+        return self._retrieve_documents(query, formatted_filter, k=k)
 
     def _retrieve_documents(
         self, query: str, filter_dict: Optional[Dict] = None, k: int = 10

@@ -100,7 +100,7 @@ class ServiceManager:
         return self._financial_db
 
     def get_vector_store_manager(self):
-        from core.agents.rag_agent import VectorStoreManager
+        from core.memory.vector_rag import VectorStoreManager
 
         if self._vector_store_manager is None:
             try:
