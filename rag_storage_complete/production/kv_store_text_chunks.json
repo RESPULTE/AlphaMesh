@@ -1,0 +1,44 @@
+{
+  "chunk-d37bc6ac3cd25d13c06338dc96f8a107": {
+    "tokens": 9,
+    "content": "Natural language processing enables computers to understand text.",
+    "chunk_order_index": 0,
+    "full_doc_id": "doc-d37bc6ac3cd25d13c06338dc96f8a107",
+    "file_path": "nlp_guide.txt",
+    "llm_cache_list": [
+      "default:extract:1deb1166334e99df41e6e6995478298f",
+      "default:extract:ace947e36897a239081da4d569ece9ff"
+    ],
+    "create_time": 1769941322,
+    "update_time": 1769941329,
+    "_id": "chunk-d37bc6ac3cd25d13c06338dc96f8a107"
+  },
+  "chunk-fb2729cddb96774ad959fb428ab86671": {
+    "tokens": 9,
+    "content": "Machine learning is a subset of artificial intelligence.",
+    "chunk_order_index": 0,
+    "full_doc_id": "doc-fb2729cddb96774ad959fb428ab86671",
+    "file_path": "ml_intro.txt",
+    "llm_cache_list": [
+      "default:extract:b9ae08c6f9e592716ab4145e221fc337",
+      "default:extract:de830d2badddb6bdce405eb07ed8634b"
+    ],
+    "create_time": 1769941322,
+    "update_time": 1769941328,
+    "_id": "chunk-fb2729cddb96774ad959fb428ab86671"
+  },
+  "chunk-5636732821e410841de2e2f114a641b3": {
+    "tokens": 9,
+    "content": "Deep learning uses neural networks with multiple layers.",
+    "chunk_order_index": 0,
+    "full_doc_id": "doc-5636732821e410841de2e2f114a641b3",
+    "file_path": "dl_basics.txt",
+    "llm_cache_list": [
+      "default:extract:be224aa6945d18e7c389a61997f8a63a",
+      "default:extract:c4aa58ca0c46068e38b64655b8c3b1ae"
+    ],
+    "create_time": 1769941330,
+    "update_time": 1769941334,
+    "_id": "chunk-5636732821e410841de2e2f114a641b3"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "doc-d37bc6ac3cd25d13c06338dc96f8a107": {
+    "content": "Natural language processing enables computers to understand text.",
+    "file_path": "nlp_guide.txt",
+    "create_time": 1769941322,
+    "update_time": 1769941322,
+    "_id": "doc-d37bc6ac3cd25d13c06338dc96f8a107"
+  },
+  "doc-fb2729cddb96774ad959fb428ab86671": {
+    "content": "Machine learning is a subset of artificial intelligence.",
+    "file_path": "ml_intro.txt",
+    "create_time": 1769941322,
+    "update_time": 1769941322,
+    "_id": "doc-fb2729cddb96774ad959fb428ab86671"
+  },
+  "doc-5636732821e410841de2e2f114a641b3": {
+    "content": "Deep learning uses neural networks with multiple layers.",
+    "file_path": "dl_basics.txt",
+    "create_time": 1769941322,
+    "update_time": 1769941322,
+    "_id": "doc-5636732821e410841de2e2f114a641b3"
+  }
+}
