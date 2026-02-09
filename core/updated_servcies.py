@@ -147,7 +147,7 @@ class ServiceManager:
         """
         if self._rag_system is None:
             try:
-                from .memory.light_rag import RAGSystem
+                from .memory.light_rag_test import RAGSystem
 
                 # Create RAG system
                 self._rag_system = RAGSystem(
