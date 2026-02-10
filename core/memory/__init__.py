@@ -1,12 +1,26 @@
-# core/memory/__init__.py
 """
-Financial Knowledge Memory Module.
+Financial Memory Module — public interface.
 
-Provides Graphiti-based memory with dual-namespace architecture:
-- GLOBAL namespace for shared financial knowledge
-- User-specific namespaces for personal data and preferences
+Provides a dual-namespace LightRAG-based memory system with:
+  - Global workspace: shared financial domain knowledge (no PII)
+  - User workspaces: personal financial context per user
+  - Cross-namespace linking via direct Neo4j edges
 """
 
-from core.memory.graphiti_memory import FinancialKnowledgeMemory
+from core.memory.lightrag_memory import FinancialMemory
+from core.memory.models import (
+    GLOBAL_ENTITY_TYPES,
+    USER_ENTITY_TYPES,
+    IngestionResult,
+    IngestionStatus,
+    QueryResult,
+)
 
-__all__ = ["FinancialKnowledgeMemory"]
+__all__ = [
+    "FinancialMemory",
+    "IngestionResult",
+    "IngestionStatus",
+    "QueryResult",
+    "GLOBAL_ENTITY_TYPES",
+    "USER_ENTITY_TYPES",
+]
