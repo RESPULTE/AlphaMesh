@@ -1,0 +1,28 @@
+{
+  "doc-0f9c7856f7e11f310305499c4a2a6c76": {
+    "entity_names": [
+      "Stock Market",
+      "S&P 500",
+      "United States",
+      "Investopedia",
+      "topic"
+    ],
+    "count": 5,
+    "create_time": 1770730109,
+    "update_time": 1770730109,
+    "_id": "doc-0f9c7856f7e11f310305499c4a2a6c76"
+  },
+  "doc-3184adb261ce5149defc77598a9ab0cd": {
+    "entity_names": [
+      "User",
+      "Investment Amount",
+      "Assistant",
+      "Portfolio",
+      "S&P 500 Index Fund"
+    ],
+    "count": 5,
+    "create_time": 1770730142,
+    "update_time": 1770730142,
+    "_id": "doc-3184adb261ce5149defc77598a9ab0cd"
+  }
+}

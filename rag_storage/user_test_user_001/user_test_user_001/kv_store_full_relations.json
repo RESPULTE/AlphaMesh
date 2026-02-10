@@ -1,0 +1,62 @@
+{
+  "doc-0f9c7856f7e11f310305499c4a2a6c76": {
+    "relation_pairs": [
+      [
+        "S&P 500",
+        "Stock Market"
+      ],
+      [
+        "S&P 500",
+        "topic"
+      ],
+      [
+        "Investopedia",
+        "S&P 500"
+      ],
+      [
+        "S&P 500",
+        "United States"
+      ]
+    ],
+    "count": 4,
+    "create_time": 1770730109,
+    "update_time": 1770730109,
+    "_id": "doc-0f9c7856f7e11f310305499c4a2a6c76"
+  },
+  "doc-3184adb261ce5149defc77598a9ab0cd": {
+    "relation_pairs": [
+      [
+        "S&P 500 Index Fund",
+        "User"
+      ],
+      [
+        "Portfolio",
+        "User"
+      ],
+      [
+        "Investment Amount",
+        "S&P 500 Index Fund"
+      ],
+      [
+        "Assistant",
+        "S&P 500 Index Fund"
+      ],
+      [
+        "Assistant",
+        "Investment Amount"
+      ],
+      [
+        "Investment Amount",
+        "User"
+      ],
+      [
+        "Assistant",
+        "User"
+      ]
+    ],
+    "count": 7,
+    "create_time": 1770730142,
+    "update_time": 1770730142,
+    "_id": "doc-3184adb261ce5149defc77598a9ab0cd"
+  }
+}

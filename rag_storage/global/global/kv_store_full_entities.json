@@ -1,0 +1,24 @@
+{
+  "doc-bfe8baa1e1922c70b74c23bf2289b2b0": {
+    "entity_names": [
+      "S&P 500",
+      "S&P 500 Index Fund"
+    ],
+    "count": 2,
+    "create_time": 1770730119,
+    "update_time": 1770730119,
+    "_id": "doc-bfe8baa1e1922c70b74c23bf2289b2b0"
+  },
+  "doc-6faf0626766468759548069ffa506155": {
+    "entity_names": [
+      "United States",
+      "Largest Companies",
+      "S&P 500",
+      "Stock Performance"
+    ],
+    "count": 4,
+    "create_time": 1770730126,
+    "update_time": 1770730126,
+    "_id": "doc-6faf0626766468759548069ffa506155"
+  }
+}

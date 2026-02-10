@@ -1,0 +1,34 @@
+{
+  "doc-bfe8baa1e1922c70b74c23bf2289b2b0": {
+    "relation_pairs": [
+      [
+        "S&P 500",
+        "S&P 500 Index Fund"
+      ]
+    ],
+    "count": 1,
+    "create_time": 1770730119,
+    "update_time": 1770730119,
+    "_id": "doc-bfe8baa1e1922c70b74c23bf2289b2b0"
+  },
+  "doc-6faf0626766468759548069ffa506155": {
+    "relation_pairs": [
+      [
+        "S&P 500",
+        "Stock Performance"
+      ],
+      [
+        "Largest Companies",
+        "S&P 500"
+      ],
+      [
+        "S&P 500",
+        "United States"
+      ]
+    ],
+    "count": 3,
+    "create_time": 1770730126,
+    "update_time": 1770730126,
+    "_id": "doc-6faf0626766468759548069ffa506155"
+  }
+}

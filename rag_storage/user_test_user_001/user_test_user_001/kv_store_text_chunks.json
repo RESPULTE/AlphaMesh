@@ -1,0 +1,30 @@
+{
+  "chunk-0f9c7856f7e11f310305499c4a2a6c76": {
+    "tokens": 48,
+    "content": "[Metadata: {'source': 'investopedia', 'topic': 'stock market'}]\n\nThe S&P 500 is a stock market index tracking the stock performance of 500 of the largest companies listed on stock exchanges in the United States.",
+    "chunk_order_index": 0,
+    "full_doc_id": "doc-0f9c7856f7e11f310305499c4a2a6c76",
+    "file_path": "unknown_source",
+    "llm_cache_list": [
+      "default:extract:ba3680bc3815c98d4910cb6ad3b352cb",
+      "default:extract:f9c2ee5ea87502e0f1131790f99e37f2"
+    ],
+    "create_time": 1770730093,
+    "update_time": 1770730097,
+    "_id": "chunk-0f9c7856f7e11f310305499c4a2a6c76"
+  },
+  "chunk-3184adb261ce5149defc77598a9ab0cd": {
+    "tokens": 76,
+    "content": "[Period: 2026-02-10T14:00:00 to 2026-02-10T14:05:00]\n\nUser: I want to start investing in the S&P 500 index fund.\nAssistant: That's a diversified choice! How much are you planning to invest?\nUser: I have about $5000 in my savings for this.",
+    "chunk_order_index": 0,
+    "full_doc_id": "doc-3184adb261ce5149defc77598a9ab0cd",
+    "file_path": "unknown_source",
+    "llm_cache_list": [
+      "default:extract:a7762960bdaa0cae8ba5764ad37aefe6",
+      "default:extract:0b1a39467bba8e53df6823ba1af66a17"
+    ],
+    "create_time": 1770730126,
+    "update_time": 1770730131,
+    "_id": "chunk-3184adb261ce5149defc77598a9ab0cd"
+  }
+}

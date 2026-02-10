@@ -1,0 +1,36 @@
+{
+  "doc-6faf0626766468759548069ffa506155": {
+    "status": "processed",
+    "chunks_count": 1,
+    "chunks_list": [
+      "chunk-6faf0626766468759548069ffa506155"
+    ],
+    "content_summary": "The S&P 500 is a stock market index tracking the stock performance of 500 of the largest companies listed on stock exchanges in the United States.",
+    "content_length": 146,
+    "created_at": "2026-02-10T13:28:09.697108+00:00",
+    "updated_at": "2026-02-10T13:28:46.022046+00:00",
+    "file_path": "unknown_source",
+    "track_id": "insert_20260210_212809_4d23585c",
+    "metadata": {
+      "processing_start_time": 1770730109,
+      "processing_end_time": 1770730126
+    }
+  },
+  "doc-bfe8baa1e1922c70b74c23bf2289b2b0": {
+    "status": "processed",
+    "chunks_count": 1,
+    "chunks_list": [
+      "chunk-bfe8baa1e1922c70b74c23bf2289b2b0"
+    ],
+    "content_summary": "S&P 500 index fund",
+    "content_length": 18,
+    "created_at": "2026-02-10T13:28:29.937361+00:00",
+    "updated_at": "2026-02-10T13:28:39.674713+00:00",
+    "file_path": "unknown_source",
+    "track_id": "insert_20260210_212829_57833954",
+    "metadata": {
+      "processing_start_time": 1770730109,
+      "processing_end_time": 1770730119
+    }
+  }
+}

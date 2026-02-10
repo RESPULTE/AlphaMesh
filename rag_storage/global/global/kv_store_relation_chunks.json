@@ -1,0 +1,38 @@
+{
+  "S&P 500<SEP>S&P 500 Index Fund": {
+    "chunk_ids": [
+      "chunk-bfe8baa1e1922c70b74c23bf2289b2b0"
+    ],
+    "count": 1,
+    "create_time": 1770730116,
+    "update_time": 1770730116,
+    "_id": "S&P 500<SEP>S&P 500 Index Fund"
+  },
+  "S&P 500<SEP>United States": {
+    "chunk_ids": [
+      "chunk-6faf0626766468759548069ffa506155"
+    ],
+    "count": 1,
+    "create_time": 1770730120,
+    "update_time": 1770730120,
+    "_id": "S&P 500<SEP>United States"
+  },
+  "S&P 500<SEP>Stock Performance": {
+    "chunk_ids": [
+      "chunk-6faf0626766468759548069ffa506155"
+    ],
+    "count": 1,
+    "create_time": 1770730122,
+    "update_time": 1770730122,
+    "_id": "S&P 500<SEP>Stock Performance"
+  },
+  "Largest Companies<SEP>S&P 500": {
+    "chunk_ids": [
+      "chunk-6faf0626766468759548069ffa506155"
+    ],
+    "count": 1,
+    "create_time": 1770730124,
+    "update_time": 1770730124,
+    "_id": "Largest Companies<SEP>S&P 500"
+  }
+}
