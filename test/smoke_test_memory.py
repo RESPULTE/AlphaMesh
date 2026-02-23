@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 logging.getLogger("cognee").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-
+import cognee   
 
 async def run_smoke_test() -> None:
     from core.memory import (
@@ -41,6 +41,12 @@ async def run_smoke_test() -> None:
         GLOBAL_NODESET_NAME,
     )
     from cognee.modules.search.types import SearchType
+
+    # Remove all data files
+    await cognee.prune.prune_data()
+
+    # Remove everything (graph, vector, metadata, cache)
+    await cognee.prune.prune_system(metadata=True)
 
     USER_A = "alice@alphamese.ai"
     USER_B = "bob@alphamese.ai"
@@ -60,6 +66,7 @@ async def run_smoke_test() -> None:
     print(f"{SEP}\n")
 
     memory = FinancialMemorySystem()
+
 
     # ------------------------------------------------------------------
     # 1. Initialize
@@ -143,10 +150,7 @@ async def run_smoke_test() -> None:
             )
             print(f"      Ans : {len(results)} chunks found.")
             for i, r in enumerate(results):
-                # Clean up the output string to easily see the text
                 text_snippet = str(r).replace("\\n", " ").strip()
-                if len(text_snippet) > 150:
-                    text_snippet = text_snippet[:147] + "..."
                 print(f"            [{i+1}] {text_snippet}")
         except Exception as exc:
             print(f"      ERR : {type(exc).__name__}: {exc}")
