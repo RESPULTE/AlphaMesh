@@ -37,6 +37,8 @@ from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
     get_or_create_user_nodeset,
     get_user_nodeset_names,
+    get_user_nodeset_name,
+    GLOBAL_NODESET_NAME
 )
 from core.memory.pipeline_tasks import build_financial_pipeline
 
@@ -184,10 +186,10 @@ class FinancialMemorySystem:
     # Ingestion helpers — cognee.add() handles dataset creation internally
     # ------------------------------------------------------------------
 
-    async def _add_to_cognee(self, text: str) -> None:
+    async def _add_to_cognee(self, text: str, node_set: list[str] | None = None) -> None:
         """Internal: call cognee.add() and propagate errors with typed exceptions."""
         try:
-            await cognee.add(text, dataset_name=DATASET_NAME)
+            await cognee.add(text, dataset_name=DATASET_NAME, node_set=node_set)
         except Exception as exc:
             raise IngestionError(str(exc)) from exc
 
@@ -226,7 +228,8 @@ class FinancialMemorySystem:
             "Ingesting conversation for '%s' (%d messages, %d chars).",
             user_email, len(messages), len(text),
         )
-        await self._add_to_cognee(text)
+        nodeset_name = get_user_nodeset_name(user_email)
+        await self._add_to_cognee(text, node_set=[nodeset_name])
 
     async def ingest_news(
         self,
@@ -271,7 +274,8 @@ class FinancialMemorySystem:
             "Ingesting %d news articles (%s, %d chars total).",
             len(text_blocks), "GLOBAL" if is_global else "USER", len(combined),
         )
-        await self._add_to_cognee(combined)
+        node_set = [GLOBAL_NODESET_NAME] if is_global else None
+        await self._add_to_cognee(combined, node_set=node_set)
 
     async def ingest_financial_report(
         self,
@@ -304,7 +308,8 @@ class FinancialMemorySystem:
         logger.info(
             "Ingesting %s report for %s (%d chars).", report_type, ticker.upper(), len(text)
         )
-        await self._add_to_cognee(text)
+        node_set = [GLOBAL_NODESET_NAME] if is_global else None
+        await self._add_to_cognee(text, node_set=node_set)
 
     # ------------------------------------------------------------------
     # Batch ingestion
@@ -343,7 +348,11 @@ class FinancialMemorySystem:
                 try:
                     if item.user_email:
                         await self.get_user_context(item.user_email)
-                    await self._add_to_cognee(item.content)
+                        ns_name = get_user_nodeset_name(item.user_email)
+                        await self._add_to_cognee(item.content, node_set=[ns_name])
+                    else:
+                        await self._add_to_cognee(item.content, node_set=[GLOBAL_NODESET_NAME])
+                    
                     success_count += 1
                     logger.debug("Batch item %d ingested (%d chars).", idx, len(item.content))
                 except Exception as exc:
@@ -366,23 +375,22 @@ class FinancialMemorySystem:
     # Cognify
     # ------------------------------------------------------------------
 
-    async def cognify_user(
+    async def cognify(
         self,
-        user_email: str,
         run_in_background: bool = False,
         chunks_per_batch: int = 100,
         chunk_size: Optional[int] = None,
     ) -> Any:
         """
-        Run cognify with the custom financial pipeline.
+        Run cognify over the entire dataset with the custom financial pipeline.
 
         Uses:
           - FinancialKnowledgeGraph as the graph_model (via build_financial_pipeline)
-          - Per-user custom prompt injected
+          - Constant system prompt injected
           - assign_nodeset_from_target task inserted after entity extraction
+            to read the correct user NodeSet from the document lineage.
 
         Args:
-            user_email:         Authenticated user's email.
             run_in_background:  If True, returns immediately (fire-and-forget).
             chunks_per_batch:   Batching parameter.
             chunk_size:         Max tokens per chunk (auto if None).
@@ -393,11 +401,10 @@ class FinancialMemorySystem:
         self._require_initialized()
 
         logger.info(
-            "Starting cognify for user '%s' (background=%s).", user_email, run_in_background
+            "Starting global cognify for all ingested data (background=%s).", run_in_background
         )
 
         tasks = await build_financial_pipeline(
-            user_email=user_email,
             chunks_per_batch=chunks_per_batch,
             chunk_size=chunk_size,
         )
@@ -412,32 +419,28 @@ class FinancialMemorySystem:
                 datasets=DATASET_NAME,
                 pipeline_name="financial_cognify_pipeline",
             )
-            logger.info("Cognify completed for user '%s'.", user_email)
+            logger.info("Global cognify completed.")
             return result
         except Exception as exc:
-            raise MemorySystemError(f"Cognify failed for '{user_email}': {exc}") from exc
+            raise MemorySystemError(f"Cognify failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Memify
     # ------------------------------------------------------------------
 
-    async def memify_user(self, user_email: str) -> Any:
+    async def memify(self) -> Any:
         """
         Run Cognee's memify for the shared dataset.
-
-        Args:
-            user_email: Authenticated user's email (ensures their NodeSet exists).
         """
         self._require_initialized()
-        await self.get_user_context(user_email)
 
-        logger.info("Starting memify for user '%s'.", user_email)
+        logger.info("Starting memify for global dataset.")
         try:
             result = await cognee.memify(datasets=DATASET_NAME)
-            logger.info("Memify completed for user '%s'.", user_email)
+            logger.info("Memify completed for global dataset.")
             return result
         except Exception as exc:
-            raise MemorySystemError(f"Memify failed for '{user_email}': {exc}") from exc
+            raise MemorySystemError(f"Memify failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Query — strictly filtered per user

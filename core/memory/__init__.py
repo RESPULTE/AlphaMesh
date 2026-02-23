@@ -30,7 +30,7 @@ from core.memory.graph_models import (
 
 from cognee.modules.engine.models.node_set import NodeSet
 
-from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT, build_cognify_prompt
+from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 
 from core.memory.pipeline_tasks import assign_nodeset_from_target, build_financial_pipeline
 
@@ -72,7 +72,6 @@ __all__ = [
     "FinancialKnowledgeGraph",
     # Prompts
     "FINANCIAL_COGNIFY_SYSTEM_PROMPT",
-    "build_cognify_prompt",
     # Pipeline
     "assign_nodeset_from_target",
     "build_financial_pipeline",

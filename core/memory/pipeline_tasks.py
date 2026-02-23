@@ -48,10 +48,9 @@ from core.memory.graph_models import (
 )
 from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
-    get_or_create_user_nodeset,
     GLOBAL_NODESET_NAME,
 )
-from core.memory.prompts import build_cognify_prompt
+from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +62,6 @@ logger = logging.getLogger(__name__)
 
 async def assign_nodeset_from_target(
     data_chunks: List[DocumentChunk],
-    user_nodeset: NodeSet,
     global_nodeset: NodeSet,
 ) -> List[DocumentChunk]:
     """
@@ -74,12 +72,14 @@ async def assign_nodeset_from_target(
     For every FinancialBaseDataPoint entity in each chunk's `contains` list:
       1. Read target_nodeset; raise MissingTargetNodeSetError if absent
       2. Validate value is GLOBAL or USER; raise InvalidTargetNodeSetError otherwise
-      3. Resolve to actual NodeSet DataPoint
+      3. Resolve to actual NodeSet DataPoint:
+          - If GLOBAL: use the provided global_nodeset
+          - If USER: use the document-level User NodeSet that was stored on the
+                     chunk's document during ingestion.
       4. Assign belongs_to_set = [resolved_nodeset]
 
     Args:
         data_chunks:    List of DocumentChunk objects populated by extract_graph_from_data.
-        user_nodeset:   The current user's NodeSet (USER_<hash>).
         global_nodeset: The shared GLOBAL NodeSet.
 
     Returns:
@@ -88,7 +88,7 @@ async def assign_nodeset_from_target(
     Raises:
         MissingTargetNodeSetError:  If any entity is missing target_nodeset.
         InvalidTargetNodeSetError:  If any entity has an illegal target_nodeset value.
-        NodeSetResolutionError:     Safety net if NodeSet object is None.
+        NodeSetResolutionError:     Safety net if NodeSet object is None or not found on document.
         TypeError: If data_chunks is not a list.
     """
     if not isinstance(data_chunks, list):
@@ -101,6 +101,15 @@ async def assign_nodeset_from_target(
     user_count = 0
 
     for chunk_idx, chunk in enumerate(data_chunks):
+        # Determine the user nodeset from the document's belongs_to_set (set during ingestion)
+        # The document was placed in a node_set via update_node_set() during classify_documents
+        document_nodesets = getattr(chunk.is_part_of, "belongs_to_set", []) or []
+        user_nodeset_candidates = [
+            ns for ns in document_nodesets if isinstance(ns, NodeSet) and ns.name != GLOBAL_NODESET_NAME
+        ]
+        doc_user_nodeset: Optional[NodeSet] = user_nodeset_candidates[0] if user_nodeset_candidates else None
+        doc_is_global = any(isinstance(ns, NodeSet) and ns.name == GLOBAL_NODESET_NAME for ns in document_nodesets)
+
         entities = getattr(chunk, "contains", None)
         if not entities:
             logger.debug("Chunk %d has no entities — skipping.", chunk_idx)
@@ -144,8 +153,24 @@ async def assign_nodeset_from_target(
                 resolved: NodeSet = global_nodeset
                 global_count += 1
             elif raw_target == NodeSetTarget.USER:
-                resolved = user_nodeset
-                user_count += 1
+                if doc_user_nodeset is not None:
+                    resolved = doc_user_nodeset
+                    user_count += 1
+                elif doc_is_global:
+                    # An LLM hallucination: it flagged a GLOBAL document's entity as USER.
+                    # We gracefully fallback to GLOBAL to prevent exposing it to a non-existent user.
+                    logger.warning(
+                        "LLM flagged entity %s as USER, but document is GLOBAL. "
+                        "Overriding to GLOBAL NodeSet.", entity_type
+                    )
+                    resolved = global_nodeset
+                    global_count += 1
+                    entity.target_nodeset = NodeSetTarget.GLOBAL
+                else:
+                    raise NodeSetResolutionError(
+                        f"Cannot resolve USER NodeSet for entity {entity_type} in chunk {chunk.id}: "
+                        "parent document has no user NodeSet assigned."
+                    )
             else:
                 raise InvalidTargetNodeSetError(entity_type, str(raw_target))
 
@@ -172,7 +197,6 @@ async def assign_nodeset_from_target(
 
 
 async def build_financial_pipeline(
-    user_email: str,
     chunks_per_batch: int = 100,
     chunk_size: Optional[int] = None,
 ) -> list[Task]:
@@ -180,7 +204,7 @@ async def build_financial_pipeline(
     Build the custom cognify task list for the financial memory system.
 
     Inserts `assign_nodeset_from_target` between extract_graph_from_data and
-    summarize_text. NodeSets are pre-created here so they're in cache.
+    summarize_text.
 
     Task order:
         1. classify_documents
@@ -191,19 +215,14 @@ async def build_financial_pipeline(
         6. add_data_points
 
     Args:
-        user_email:       Authenticated user's email for NodeSet resolution.
         chunks_per_batch: Batch size for tasks that support batching.
         chunk_size:       Max tokens per chunk (auto-detected if None).
 
     Returns:
         List of Task objects in execution order.
     """
-    # Pre-fetch nodesets — ensures they exist in graph and cache
+    # Pre-fetch global nodeset to ensure it's in cache
     global_nodeset = await get_or_create_global_nodeset()
-    _, user_nodeset = await get_or_create_user_nodeset(user_email)
-
-    # Build per-user extraction prompt
-    custom_prompt = build_cognify_prompt(user_email)
 
     # Cognee config for embed_triplets
     cognify_config = get_cognify_config()
@@ -219,13 +238,12 @@ async def build_financial_pipeline(
         Task(
             extract_graph_from_data,
             graph_model=FinancialKnowledgeGraph,
-            custom_prompt=custom_prompt,
+            custom_prompt=FINANCIAL_COGNIFY_SYSTEM_PROMPT,
             task_config={"batch_size": chunks_per_batch},
         ),
         # Our custom post-processing task
         Task(
             assign_nodeset_from_target,
-            user_nodeset=user_nodeset,
             global_nodeset=global_nodeset,
         ),
         Task(
@@ -240,7 +258,7 @@ async def build_financial_pipeline(
     ]
 
     logger.info(
-        "Built financial pipeline for user '%s' with %d tasks.",
-        user_email, len(tasks),
+        "Built global financial pipeline with %d tasks.",
+        len(tasks),
     )
     return tasks

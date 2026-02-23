@@ -125,14 +125,11 @@ async def run_smoke_test() -> None:
     print("      > User B data ingested.\n")
 
     # ------------------------------------------------------------------
-    # 5. Cognify both users
+    # 5. Cognify
     # ------------------------------------------------------------------
-    print("[5/5] Running cognify for both users (requires LLM_API_KEY) …")
-    print(f"      > Cognifying {USER_A}...")
-    await memory.cognify_user(user_email=USER_A, chunks_per_batch=20)
-    print(f"      > Cognifying {USER_B}...")
-    await memory.cognify_user(user_email=USER_B, chunks_per_batch=20)
-    print("      > Cognify complete for both users.\n")
+    print("[5/5] Running single-pass cognify for all data (requires LLM_API_KEY) …")
+    await memory.cognify(chunks_per_batch=20)
+    print("      > Cognify complete for all data.\n")
 
     print(f"{SEP}")
     print("  VERIFYING ISOLATION AND KNOWLEDGE GRAPH")

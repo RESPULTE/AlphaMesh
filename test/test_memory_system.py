@@ -46,7 +46,7 @@ from core.memory.nodeset_manager import (
     get_user_nodeset_names,
 )
 from core.memory.pipeline_tasks import assign_nodeset_from_target
-from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT, build_cognify_prompt
+from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 from cognee.modules.engine.models.node_set import NodeSet
 
 
@@ -59,9 +59,20 @@ def make_nodeset(name: str) -> NodeSet:
     return NodeSet(id=uuid4(), name=name)
 
 
-def make_chunk_with_entity(entity) -> MagicMock:
+def make_chunk_with_entity(entity, user_ns: NodeSet = None, global_ns: NodeSet = None) -> MagicMock:
     chunk = MagicMock()
     chunk.contains = [entity]
+    
+    # Mock the document's belongs_to_set, which is populated during classify_documents
+    doc_mock = MagicMock()
+    doc_node_sets = []
+    if global_ns:
+        doc_node_sets.append(global_ns)
+    if user_ns:
+        doc_node_sets.append(user_ns)
+    doc_mock.belongs_to_set = doc_node_sets
+    chunk.is_part_of = doc_mock
+    
     return chunk
 
 
@@ -112,13 +123,13 @@ class TestHashUserEmail:
 class TestAssignNodesetMissing:
     @pytest.mark.asyncio
     async def test_missing_target_nodeset_raises(self):
-        entity = Company(ticker="AAPL", name="Apple Inc.", target_nodeset=None)
+        entity = Company.model_construct(ticker="AAPL", name="Apple Inc.", target_nodeset=None, belongs_to_set=None)
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
-        chunk = make_chunk_with_entity(entity)
+        chunk = make_chunk_with_entity(entity, user_ns)
 
         with pytest.raises(MissingTargetNodeSetError) as exc_info:
-            await assign_nodeset_from_target([chunk], user_ns, global_ns)
+            await assign_nodeset_from_target([chunk], global_ns)
 
         assert "Company" in str(exc_info.value)
 
@@ -140,9 +151,10 @@ class TestAssignNodesetInvalid:
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
+        chunk = make_chunk_with_entity(entity, user_ns)
 
         with pytest.raises(InvalidTargetNodeSetError) as exc_info:
-            await assign_nodeset_from_target([make_chunk_with_entity(entity)], user_ns, global_ns)
+            await assign_nodeset_from_target([chunk], global_ns)
 
         assert "PUBLIC" in str(exc_info.value)
 
@@ -157,9 +169,10 @@ class TestAssignNodesetInvalid:
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
+        chunk = make_chunk_with_entity(entity, user_ns)
 
         with pytest.raises(InvalidTargetNodeSetError):
-            await assign_nodeset_from_target([make_chunk_with_entity(entity)], user_ns, global_ns)
+            await assign_nodeset_from_target([chunk], global_ns)
 
 
 # ---------------------------------------------------------------------------
@@ -170,12 +183,12 @@ class TestAssignNodesetInvalid:
 class TestAssignNodesetGlobal:
     @pytest.mark.asyncio
     async def test_global_enum_routes_to_global_nodeset(self):
-        entity = Company(ticker="MSFT", name="Microsoft", target_nodeset=NodeSetTarget.GLOBAL)
+        entity = Company.model_construct(ticker="MSFT", name="Microsoft", target_nodeset=NodeSetTarget.GLOBAL, belongs_to_set=None)
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
-        chunk = make_chunk_with_entity(entity)
+        chunk = make_chunk_with_entity(entity, user_ns, global_ns)
 
-        result = await assign_nodeset_from_target([chunk], user_ns, global_ns)
+        result = await assign_nodeset_from_target([chunk], global_ns)
 
         assert entity.belongs_to_set == [global_ns]
         assert result == [chunk]
@@ -192,8 +205,9 @@ class TestAssignNodesetGlobal:
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
+        chunk = make_chunk_with_entity(entity, user_ns, global_ns)
 
-        await assign_nodeset_from_target([make_chunk_with_entity(entity)], user_ns, global_ns)
+        await assign_nodeset_from_target([chunk], global_ns)
         assert entity.belongs_to_set == [global_ns]
 
 
@@ -205,13 +219,14 @@ class TestAssignNodesetGlobal:
 class TestAssignNodesetUser:
     @pytest.mark.asyncio
     async def test_user_enum_routes_to_user_nodeset(self):
-        entity = UserConversation(
-            role="user", content="What is AAPL P/E?", target_nodeset=NodeSetTarget.USER
+        entity = UserConversation.model_construct(
+            role="user", content="What is AAPL P/E?", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
+        chunk = make_chunk_with_entity(entity, user_ns)
 
-        await assign_nodeset_from_target([make_chunk_with_entity(entity)], user_ns, global_ns)
+        await assign_nodeset_from_target([chunk], global_ns)
         assert entity.belongs_to_set == [user_ns]
 
     @pytest.mark.asyncio
@@ -226,9 +241,23 @@ class TestAssignNodesetUser:
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
+        chunk = make_chunk_with_entity(entity, user_ns)
 
-        await assign_nodeset_from_target([make_chunk_with_entity(entity)], user_ns, global_ns)
+        await assign_nodeset_from_target([chunk], global_ns)
         assert entity.belongs_to_set == [user_ns]
+
+    @pytest.mark.asyncio
+    async def test_user_target_but_global_document_overrides(self):
+        """If LLM flags entity as USER but document is GLOBAL, should override to GLOBAL."""
+        entity = Company.model_construct(ticker="AAPL", name="Apple Inc.", target_nodeset=NodeSetTarget.USER, belongs_to_set=None)
+        global_ns = make_nodeset(GLOBAL_NODESET_NAME)
+        # Pass only global_ns to the chunk to simulate a public document
+        chunk = make_chunk_with_entity(entity, global_ns=global_ns)
+
+        await assign_nodeset_from_target([chunk], global_ns)
+        # Should be overridden to GLOBAL since document is GLOBAL
+        assert entity.belongs_to_set == [global_ns]
+        assert entity.target_nodeset == NodeSetTarget.GLOBAL
 
 
 # ---------------------------------------------------------------------------
@@ -239,28 +268,28 @@ class TestAssignNodesetUser:
 class TestAssignNodesetMixed:
     @pytest.mark.asyncio
     async def test_mixed_entities_routed_correctly(self):
-        entity_global = Company(ticker="GOOG", name="Alphabet", target_nodeset=NodeSetTarget.GLOBAL)
-        entity_user = UserConversation(
-            role="user", content="Buy Google?", target_nodeset=NodeSetTarget.USER
+        entity_global = Company.model_construct(ticker="GOOG", name="Alphabet", target_nodeset=NodeSetTarget.GLOBAL, belongs_to_set=None)
+        entity_user = UserConversation.model_construct(
+            role="user", content="Buy Google?", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
 
-        chunk = MagicMock()
+        chunk = make_chunk_with_entity(entity_global, user_ns, global_ns)
         chunk.contains = [entity_global, entity_user]
 
-        await assign_nodeset_from_target([chunk], user_ns, global_ns)
+        await assign_nodeset_from_target([chunk], global_ns)
         assert entity_global.belongs_to_set == [global_ns]
         assert entity_user.belongs_to_set == [user_ns]
 
     @pytest.mark.asyncio
     async def test_empty_contains_returns_unchanged(self):
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
         chunk = MagicMock()
         chunk.contains = []
+        chunk.is_part_of = MagicMock()
 
-        result = await assign_nodeset_from_target([chunk], user_ns, global_ns)
+        result = await assign_nodeset_from_target([chunk], global_ns)
         assert result == [chunk]
 
     @pytest.mark.asyncio
@@ -268,45 +297,18 @@ class TestAssignNodesetMixed:
         """Non-FinancialBaseDataPoint items in contains are silently skipped."""
         non_financial = MagicMock()  # not a FinancialBaseDataPoint
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
         chunk = MagicMock()
         chunk.contains = [non_financial]
+        chunk.is_part_of = MagicMock()
 
-        result = await assign_nodeset_from_target([chunk], user_ns, global_ns)
+        result = await assign_nodeset_from_target([chunk], global_ns)
         assert result == [chunk]
 
     @pytest.mark.asyncio
     async def test_non_list_input_raises(self):
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
         with pytest.raises(TypeError):
-            await assign_nodeset_from_target("not a list", user_ns, global_ns)  # type: ignore
-
-
-# ---------------------------------------------------------------------------
-# 7. Prompt building
-# ---------------------------------------------------------------------------
-
-
-class TestPromptBuilding:
-    def test_base_prompt_contains_rules(self):
-        assert "GLOBAL" in FINANCIAL_COGNIFY_SYSTEM_PROMPT
-        assert "USER" in FINANCIAL_COGNIFY_SYSTEM_PROMPT
-        assert "target_nodeset" in FINANCIAL_COGNIFY_SYSTEM_PROMPT
-
-    def test_user_prompt_includes_email(self):
-        prompt = build_cognify_prompt("alice@example.com")
-        assert "alice@example.com" in prompt
-        assert "GLOBAL" in prompt
-
-    def test_prompt_normalizes_email_case(self):
-        assert build_cognify_prompt("Alice@Example.COM") == build_cognify_prompt("alice@example.com")
-
-    def test_invalid_email_raises(self):
-        with pytest.raises(ValueError):
-            build_cognify_prompt("")
-        with pytest.raises(ValueError):
-            build_cognify_prompt(None)  # type: ignore
+            await assign_nodeset_from_target("not a list", global_ns)  # type: ignore
 
 
 # ---------------------------------------------------------------------------
