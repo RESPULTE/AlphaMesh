@@ -3,6 +3,9 @@ from typing import Any, Type, get_args, get_origin
 
 from pydantic import BaseModel, Field
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 class AgentInput(BaseModel):
     """Base schema for agent inputs."""

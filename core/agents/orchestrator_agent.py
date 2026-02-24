@@ -18,10 +18,9 @@ from core.agents.news_analysis_agent import CitedSource, NewsAnalysisAgent
 # --- Import Core Services ---
 from core.services import service_manager
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("Orchestrator")
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 AVAILABLE_AGENTS: List[Type[AbstractAgent]] = [
     FundamentalAnalysisAgent,

@@ -11,6 +11,9 @@ from core.services import service_manager
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 # --- 1. Internal Structured Output Models ---
 
@@ -84,7 +87,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
         """Async entry point for the agent."""
-        print(f"--- [Agent: {self.name}] Started for {input_data.ticker} ---")
+        logger.info(f"--- [Agent: {self.name}] Started for {input_data.ticker} ---")
         await self.db.initialize()
 
         final_state = await self._graph.ainvoke(input_data.model_dump())
@@ -126,7 +129,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         Checks which metrics are raw DB columns vs. which need to be calculated.
         """
         # REWRITTEN: Use state.attribute access
-        print(f"--- [Node] Parser ---")
+        logger.info(f"--- [Node] Parser ---")
 
         await self.db.update_financials(
             state.ticker,
@@ -148,7 +151,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 )
                 if close_matches:
                     found_label = close_matches[0]
-                    print(f"Resolving '{metric}' to fuzzy match '{found_label}'")
+                    logger.info(f"Resolving '{metric}' to fuzzy match '{found_label}'")
                     to_fetch.append(found_label)
                 else:
                     unknown_metrics.append(metric.replace(" ", "_"))
@@ -179,7 +182,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         if not targets:
             return {}
 
-        print(f"--- [Node] Decomposer: Deriving formulas for {targets} ---")
+        logger.info(f"--- [Node] Decomposer: Deriving formulas for {targets} ---")
 
         available_concepts = await self.db.get_labels(state.ticker)
 
@@ -237,13 +240,13 @@ class FundamentalAnalysisAgent(AbstractAgent):
         metrics_to_fetch = [d for d in new_dependencies if d not in calculated_vars]
         metrics_to_fetch.extend([t for t in targets if t not in calculated_vars])
 
-        print(f"   -> New dependencies to fetch: ")
+        logger.info(f"   -> New dependencies to fetch: ")
         for m in metrics_to_fetch:
-            print(f"      - {m}")
+            logger.info(f"      - {m}")
 
-        print(f"   -> Calculations to perform:")
+        logger.info(f"   -> Calculations to perform:")
         for i, calc in enumerate(result.calculations, 1):
-            print(
+            logger.info(
                 f"      {i}. {calc.target_metric_name} = {calc.pandas_eval_expression}"
             )
 
@@ -257,7 +260,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         Retrieves the actual data values from the database.
         """
         # REWRITTEN: Use state.attribute access
-        print(f"--- [Node] Fetcher ---")
+        logger.info(f"--- [Node] Fetcher ---")
         metrics_to_query = list(set(state.metrics_to_fetch))
 
         if not metrics_to_query:
@@ -291,7 +294,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         Executes the formulas from the decomposer using pandas eval.
         """
         # REWRITTEN: Use state.attribute access
-        print(f"--- [Node] Calculator ---")
+        logger.info(f"--- [Node] Calculator ---")
         df = state.financial_data
         calculations = state.calculations_to_run
 
@@ -304,25 +307,25 @@ class FundamentalAnalysisAgent(AbstractAgent):
             try:
                 expr = calc.pandas_eval_expression
                 target = calc.target_metric_name
-                print(f"[Calculator] {target} = {expr}")
+                logger.info(f"[Calculator] {target} = {expr}")
 
                 missing_deps = [
                     d for d in calc.dependencies if d not in df_eval.columns
                 ]
                 if missing_deps:
-                    print(
+                    logger.warning(
                         f"[Calculator] Warning: Missing dependencies for {target}: {missing_deps}"
                     )
                     continue
 
                 df_eval.eval(f"{target} = {expr}", inplace=True)
             except Exception as e:
-                print(f"[Calculator] Error calculating {calc.target_metric_name}: {e}")
+                logger.error(f"[Calculator] Error calculating {calc.target_metric_name}: {e}")
 
         return {"financial_data": df_eval.T}
 
     async def _generate_analysis(self, state: _AgentState) -> FundamentalAnalysisOutput:
-        print(f"--- [Node] Analyst ---")
+        logger.info(f"--- [Node] Analyst ---")
 
         # Format dataframe for readability
         if state.financial_data is None or state.financial_data.empty:
@@ -369,7 +372,7 @@ if __name__ == "__main__":
     async def main():
         agent = FundamentalAnalysisAgent()
 
-        print("--- Running Scenario: Complex Metric (Net Profit Margin) ---")
+        logger.info("--- Running Scenario: Complex Metric (Net Profit Margin) ---")
         input_data = BaseAgentInput(
             ticker="MSFT",
             metrics=["stock_price"],
@@ -379,18 +382,18 @@ if __name__ == "__main__":
             query="Get MSFT's price from 2020 to 2022.",
         )
         output_complex = await agent.run(input_data)
-        print("\n--- RAW AGENT OUTPUT ---\n")
+        logger.info("\n--- RAW AGENT OUTPUT ---\n")
 
-        print("[analysis]")
-        print(output_complex.analysis)
+        logger.info("[analysis]")
+        logger.info(output_complex.analysis)
 
-        print("-" * 60)
+        logger.info("-" * 60)
 
-        print("\n[financial_data]")
+        logger.info("\n[financial_data]")
         human_readable = output_complex.financial_data.map(
             lambda x: add_units(x) if isinstance(x, (int, float)) else x
         ).to_string()
-        print(human_readable)
+        logger.info(human_readable)
 
     asyncio.run(main())
 
@@ -403,4 +406,4 @@ if __name__ == "__main__":
     # with open("statisstical_analysis.png", "wb") as f:
     #     f.write(png_bytes)
 
-    # print("Saved graph as graph.png")
+    # logger.info("Saved graph as graph.png")

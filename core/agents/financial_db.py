@@ -4,6 +4,9 @@ from typing import Dict, List, Literal, Optional, Set, Tuple, TypeAlias, Union
 import aiosqlite
 import pandas as pd
 from edgar import Company, MultiFinancials, set_identity
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 # --- TYPE DEFINITIONS AND CONFIGURATION ---
 
@@ -53,7 +56,7 @@ class FinancialDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_company_form_date ON financials (company, form_type, period_date);"
             )
             await db.commit()
-            print("[DB] Database initialized successfully.")
+            logger.info("[DB] Database initialized successfully.")
 
     # --- 1. CORE DATA FETCHING AND PROCESSING ---
 
@@ -62,10 +65,10 @@ class FinancialDatabase:
     ) -> None:
         uncoverd_periods = await self.find_uncovered_periods(ticker, period, form_type)
         if len(uncoverd_periods) == 0:
-            print(f"All periods for {ticker} are already covered.")
+            logger.info(f"All periods for {ticker} are already covered.")
             return
 
-        print(f"Uncovered periods: {uncoverd_periods}")
+        logger.info(f"Uncovered periods: {uncoverd_periods}")
 
         await self.fetch_and_store_period(ticker, uncoverd_periods, form_type)
 
@@ -82,23 +85,23 @@ class FinancialDatabase:
             form_type: The type of form to fetch ('10-K' or '10-Q').
         """
         if not periods:
-            print("No periods specified to fetch.")
+            logger.warning("No periods specified to fetch.")
             return
 
         # Extract all unique years required for the API call
         years = sorted(list(set(p if isinstance(p, int) else p[0] for p in periods)))
 
-        print(f"--- [API] Fetching {form_type} data for {ticker} for years {years} ---")
+        logger.info(f"--- [API] Fetching {form_type} data for {ticker} for years {years} ---")
 
         # 1. Fetch data from EDGAR in a separate thread
         try:
             dfs_map = await self._fetch_edgar_data_sync(ticker, years, form_type)
         except Exception as e:
-            print(f"Error fetching data for {ticker}: {e}")
+            logger.error(f"Error fetching data for {ticker}: {e}")
             return
 
         if not any(not df.empty for df in dfs_map.values()):
-            print(f"No financials found for {ticker} in years {years}")
+            logger.warning(f"No financials found for {ticker} in years {years}")
             return
 
         # 2. Process and combine the dataframes
@@ -139,7 +142,7 @@ class FinancialDatabase:
                     all_data.append(processed)
 
         if not all_data:
-            print(f"No data found for the specific periods {periods} after filtering.")
+            logger.warning(f"No data found for the specific periods {periods} after filtering.")
             return
 
         final_df = pd.concat(all_data, ignore_index=True)
@@ -227,7 +230,7 @@ class FinancialDatabase:
         if df.empty:
             return
 
-        print(f"[DB] Saving {len(df)} rows for {df['company'].iloc[0]}...")
+        logger.info(f"[DB] Saving {len(df)} rows for {df['company'].iloc[0]}...")
         records = list(df.itertuples(index=False, name=None))
 
         async with aiosqlite.connect(self.db_name) as db:
@@ -239,7 +242,7 @@ class FinancialDatabase:
                 records,
             )
             await db.commit()
-        print("[DB] Save complete.")
+        logger.info("[DB] Save complete.")
 
     # --- 2. PERIOD COVERAGE CHECKS ---
 
@@ -510,19 +513,19 @@ async def smart_update_workflow():
         (2023, 2),  # Q2 2023 report
         (2022, 4),  # Q4 2022 report
     ]
-    print(f"--- Starting Smart Update for {TICKER} ---")
-    print(f"Desired periods: {desired_periods}")
+    logger.info(f"--- Starting Smart Update for {TICKER} ---")
+    logger.info(f"Desired periods: {desired_periods}")
 
     await db.update_financials(TICKER, desired_periods, "10-Q")
 
     # 4. Demonstrate retrieving the data with filtering
-    print("\n--- Retrieving 2022 & 2021 Annual (10-K) Data Only ---")
+    logger.info("\n--- Retrieving 2022 & 2021 Annual (10-K) Data Only ---")
     annual_data = await db.get_data(TICKER, form_types=["10-K"])
-    print(annual_data.head())
+    logger.info(annual_data.head())
 
-    print("\n--- Retrieving 2023 Quarterly (10-Q) Data Only ---")
+    logger.info("\n--- Retrieving 2023 Quarterly (10-Q) Data Only ---")
     quarterly_data = await db.get_data(TICKER, form_types=["10-Q"])
-    print(quarterly_data.head())
+    logger.info(quarterly_data.head())
 
 
 if __name__ == "__main__":

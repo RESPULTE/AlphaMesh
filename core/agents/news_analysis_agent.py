@@ -20,12 +20,9 @@ from newspaper import Article, ArticleException
 from pydantic import BaseModel, Field
 
 # --- Logging Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("NewsAnalysisAgent")
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 # --- Configuration & Toggles ---
 LOG_INGESTED_TITLES = True
@@ -562,15 +559,15 @@ if __name__ == "__main__":
             end_date="2025-12-05",
         )
         res = await agent.run(input_data)
-        print("\n--- RAW AGENT OUTPUT ---\n")
-        print(f"Found {len(res.sources)} sources:")
+        logger.info("\n--- RAW AGENT OUTPUT ---\n")
+        logger.info(f"Found {len(res.sources)} sources:")
         for source in res.sources:
-            print(f"- {source.title}")
+            logger.info(f"- {source.title}")
 
-        print(res.analysis)
+        logger.info(res.analysis)
 
         for s in res.sources:
-            print(s.model_dump_json(indent=2))
+            logger.info(s.model_dump_json(indent=2))
 
     asyncio.run(main())
 
@@ -580,4 +577,4 @@ if __name__ == "__main__":
     # with open("new_analysis.png", "wb") as f:
     #     f.write(png_bytes)
 
-    # print("Saved graph as graph.png")
+    # logger.info("Saved graph as graph.png")

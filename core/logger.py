@@ -18,9 +18,9 @@ def get_logger(name: str = __name__, level: int = logging.INFO) -> logging.Logge
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
 
-    # Create formatter with filename, line number, and message
+    # Create formatter with filename, function name, line number, and message
     formatter = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s",
+        fmt="%(asctime)s [%(levelname)s] [%(filename)s:%(funcName)s:%(lineno)d] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     ch.setFormatter(formatter)
