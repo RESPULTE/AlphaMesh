@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from asyncio import Lock
 from typing import List
-from uuid import uuid5, UUID
+from uuid import NAMESPACE_OID, uuid5
 
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.tasks.storage.add_data_points import add_data_points as cognee_add_dp
@@ -41,9 +42,6 @@ logger = logging.getLogger(__name__)
 
 DATASET_NAME = "alphamese_financial"
 GLOBAL_NODESET_NAME = "GLOBAL"
-
-# Stable namespace UUID for deterministic NodeSet node IDs
-_NODESET_UUID_NAMESPACE = UUID("f47ac10b-58cc-4372-a567-0e02b2c3d479")
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +83,46 @@ def get_user_nodeset_name(user_email: str) -> str:
 # ---------------------------------------------------------------------------
 
 _nodeset_cache: dict[str, NodeSet] = {}
+_nodeset_lock = Lock()
+
+
+def _normalize_nodeset_name(name: str) -> str:
+    """
+    Canonicalize NodeSet names so all code paths refer to one logical node.
+
+    Rules:
+      - Strip whitespace
+      - "global" (any case) -> "GLOBAL"
+      - "user_<hash>" (any case) -> "USER_<hash>"
+      - Everything else kept as-is after stripping
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"Invalid nodeset name type: {type(name)!r}")
+
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("NodeSet name must be a non-empty string.")
+
+    upper = normalized.upper()
+    if upper == GLOBAL_NODESET_NAME:
+        return GLOBAL_NODESET_NAME
+
+    if upper.startswith("USER_"):
+        return f"USER_{normalized[5:].lower()}"
+
+    return normalized
+
+
+def _cognee_nodeset_id(name: str):
+    """
+    Build NodeSet id with Cognee's exact algorithm used in classify_documents:
+      generate_node_id(f"NodeSet:{name}")
+
+    This guarantees our manually-created NodeSet IDs match NodeSet IDs created
+    by `cognee.add(..., node_set=[...])`, preventing duplicate GLOBAL/USER nodes.
+    """
+    normalized_input = f"NodeSet:{name}".lower().replace(" ", "_").replace("'", "")
+    return uuid5(NAMESPACE_OID, normalized_input)
 
 
 # ---------------------------------------------------------------------------
@@ -129,20 +167,26 @@ async def get_or_create_nodeset(name: str) -> NodeSet:
     Raises:
         NodeSetCreationError: On any failure.
     """
-    if name in _nodeset_cache:
-        return _nodeset_cache[name]
+    canonical_name = _normalize_nodeset_name(name)
 
-    # Deterministic UUID so the same NodeSet always has the same graph node ID
-    stable_id = uuid5(_NODESET_UUID_NAMESPACE, f"nodeset:{name}")
+    if canonical_name in _nodeset_cache:
+        return _nodeset_cache[canonical_name]
 
-    try:
-        nodeset = NodeSet(id=stable_id, name=name)
-        await cognee_add_dp(data_points=[nodeset])
-        _nodeset_cache[name] = nodeset
-        logger.info("NodeSet '%s' persisted/verified (id=%s).", name, stable_id)
-        return nodeset
-    except Exception as exc:
-        raise NodeSetCreationError(name, str(exc)) from exc
+    # Lock prevents duplicate writes in concurrent ingestion startup paths.
+    async with _nodeset_lock:
+        if canonical_name in _nodeset_cache:
+            return _nodeset_cache[canonical_name]
+
+        stable_id = _cognee_nodeset_id(canonical_name)
+
+        try:
+            nodeset = NodeSet(id=stable_id, name=canonical_name)
+            await cognee_add_dp(data_points=[nodeset])
+            _nodeset_cache[canonical_name] = nodeset
+            logger.info("NodeSet '%s' persisted/verified (id=%s).", canonical_name, stable_id)
+            return nodeset
+        except Exception as exc:
+            raise NodeSetCreationError(canonical_name, str(exc)) from exc
 
 
 async def get_or_create_global_nodeset() -> NodeSet:

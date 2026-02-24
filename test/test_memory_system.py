@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
+from uuid import NAMESPACE_OID, uuid4, uuid5
 
 import pytest
 
@@ -44,6 +44,7 @@ from core.memory.nodeset_manager import (
     get_user_nodeset_name,
     hash_user_email,
     get_user_nodeset_names,
+    get_or_create_nodeset,
 )
 from core.memory.pipeline_tasks import assign_nodeset_from_target
 from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
@@ -113,6 +114,23 @@ class TestHashUserEmail:
         assert len(names) == 2
         assert GLOBAL_NODESET_NAME in names
         assert get_user_nodeset_name("alice@example.com") in names
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_nodeset_uses_cognee_compatible_id_and_normalized_name(self):
+        captured = {}
+
+        async def fake_add_data_points(*, data_points):
+            captured["nodeset"] = data_points[0]
+            return None
+
+        expected_id = uuid5(NAMESPACE_OID, "nodeset:global")
+        with patch("core.memory.nodeset_manager.cognee_add_dp", side_effect=fake_add_data_points):
+            ns = await get_or_create_nodeset("  global  ")
+
+        assert ns.name == GLOBAL_NODESET_NAME
+        assert ns.id == expected_id
+        assert captured["nodeset"].name == GLOBAL_NODESET_NAME
+        assert captured["nodeset"].id == expected_id
 
 
 # ---------------------------------------------------------------------------

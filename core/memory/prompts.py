@@ -36,7 +36,6 @@ data privacy and access. Use the following rules without exception:
     * Macroeconomic data, interest rates, indices — any public information
 
   Set target_nodeset = "USER" for:
-    * Conversation messages: anything the user said or the assistant replied
     * The user's personal investment preferences, goals, risk tolerance
     * User-specific portfolio holdings, trade decisions, watchlists
     * Private annotations or notes the user made about any topic

@@ -31,7 +31,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 logging.getLogger("cognee").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-import cognee   
+import cognee
+
 
 async def run_ingestion(memory, user_a, user_b, sep):
     # ------------------------------------------------------------------
@@ -56,12 +57,18 @@ async def run_ingestion(memory, user_a, user_b, sep):
     await memory.ingest_conversation(
         user_email=user_a,
         messages=[
-            {"role": "user", "content": "I just invested heavily in NeuroCure Therapeutics ($NCT)."},
+            {
+                "role": "user",
+                "content": "I just invested heavily in NeuroCure Therapeutics ($NCT).",
+            },
             {
                 "role": "assistant",
                 "content": "NeuroCure ($NCT) is focused on Alzheimer's treatments. They have a Phase 3 trial reading out in Q4.",
             },
-            {"role": "user", "content": "My target price for $NCT is $150 if the trial succeeds."},
+            {
+                "role": "user",
+                "content": "My target price for $NCT is $150 if the trial succeeds.",
+            },
         ],
     )
     print("      > User A data ingested.\n")
@@ -73,12 +80,18 @@ async def run_ingestion(memory, user_a, user_b, sep):
     await memory.ingest_conversation(
         user_email=user_b,
         messages=[
-            {"role": "user", "content": "I am looking at buying commercial real estate via the VNO REIT."},
+            {
+                "role": "user",
+                "content": "I am looking at buying commercial real estate via the VNO REIT.",
+            },
             {
                 "role": "assistant",
                 "content": "Vornado Realty Trust (VNO) has significant exposure to NYC office space.",
             },
-            {"role": "user", "content": "Yes, I plan to hold VNO for the 7% dividend yield."},
+            {
+                "role": "user",
+                "content": "Yes, I plan to hold VNO for the 7% dividend yield.",
+            },
         ],
     )
     print("      > User B data ingested.\n")
@@ -96,25 +109,23 @@ async def run_ingestion(memory, user_a, user_b, sep):
 
 
 async def run_smoke_test() -> None:
-    from core.memory import (
-        FinancialMemorySystem,
-        hash_user_email,
-        get_user_nodeset_name,
-        GLOBAL_NODESET_NAME,
-    )
     from cognee.modules.search.types import SearchType
 
-    # # Remove all data files
-    # await cognee.prune.prune_data()
+    from core.memory import (
+        GLOBAL_NODESET_NAME,
+        FinancialMemorySystem,
+        get_user_nodeset_name,
+        hash_user_email,
+    )
 
-    # # Remove everything (graph, vector, metadata, cache)
-    # await cognee.prune.prune_system(metadata=True)
+    # Remove all data files
+    await cognee.prune.prune_data()
+
+    # Remove everything (graph, vector, metadata, cache)
+    await cognee.prune.prune_system(metadata=True)
 
     USER_A = "alice@alphamese.ai"
     USER_B = "bob@alphamese.ai"
-
-    HASH_A = hash_user_email(USER_A)
-    HASH_B = hash_user_email(USER_B)
 
     SEP = "=" * 60
     print(f"\n{SEP}")
@@ -129,7 +140,6 @@ async def run_smoke_test() -> None:
 
     memory = FinancialMemorySystem()
 
-
     # ------------------------------------------------------------------
     # 1. Initialize
     # ------------------------------------------------------------------
@@ -137,7 +147,7 @@ async def run_smoke_test() -> None:
     await memory.initialize()
     print("      > Initialized.\n")
 
-    # await run_ingestion(memory, USER_A, USER_B, SEP)
+    await run_ingestion(memory, USER_A, USER_B, SEP)
 
     async def execute_query(user: str, prompt: str) -> None:
         print(f"  [Q] User: {user}")
@@ -146,7 +156,7 @@ async def run_smoke_test() -> None:
             results = await memory.query(
                 user_email=user,
                 query_text=prompt,
-                search_type=SearchType.GRAPH_COMPLETION_COT,
+                search_type=SearchType.GRAPH_COMPLETION,
                 top_k=3,
             )
             print(f"      Ans : {len(results)} chunks found.")
