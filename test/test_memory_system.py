@@ -37,7 +37,6 @@ from core.memory.graph_models import (
     FinancialReport,
     News,
     NodeSetTarget,
-    UserConversation,
 )
 from core.memory.nodeset_manager import (
     GLOBAL_NODESET_NAME,
@@ -237,8 +236,8 @@ class TestAssignNodesetGlobal:
 class TestAssignNodesetUser:
     @pytest.mark.asyncio
     async def test_user_enum_routes_to_user_nodeset(self):
-        entity = UserConversation.model_construct(
-            role="user", content="What is AAPL P/E?", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
+        entity = Company.model_construct(
+            ticker="AAPL", name="Apple Inc.", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
@@ -250,12 +249,12 @@ class TestAssignNodesetUser:
     @pytest.mark.asyncio
     async def test_user_lowercase_string_coercion(self):
         """LLM may return lowercase "user" — must be coerced."""
-        entity = UserConversation.model_construct(
-            id=uuid4(), role="assistant", content="The P/E ratio is 30.",
+        entity = Company.model_construct(
+            id=uuid4(), ticker="MSFT", name="Microsoft",
             target_nodeset="user",
             created_at=0, updated_at=0, ontology_valid=False,
             version=1, topological_rank=0, metadata={"index_fields": []},
-            type="UserConversation", belongs_to_set=None,
+            type="Company", belongs_to_set=None,
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
@@ -287,8 +286,8 @@ class TestAssignNodesetMixed:
     @pytest.mark.asyncio
     async def test_mixed_entities_routed_correctly(self):
         entity_global = Company.model_construct(ticker="GOOG", name="Alphabet", target_nodeset=NodeSetTarget.GLOBAL, belongs_to_set=None)
-        entity_user = UserConversation.model_construct(
-            role="user", content="Buy Google?", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
+        entity_user = Company.model_construct(
+            ticker="GOOGL", name="Alphabet C", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")

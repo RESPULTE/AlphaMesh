@@ -67,19 +67,6 @@ class FinancialBaseDataPoint(Entity):
 # ---------------------------------------------------------------------------
 
 
-class UserConversation(FinancialBaseDataPoint):
-    """A single message turn in a user's conversation. Always USER-scoped."""
-
-    role: Literal["user", "assistant", "system"] = "user"
-    content: str
-    session_id: Optional[str] = None
-    timestamp: Optional[str] = None
-    topics_mentioned: Optional[List[str]] = None
-
-    metadata: dict = {"index_fields": ["content"]}
-    model_config = {"arbitrary_types_allowed": True}
-
-
 class Company(FinancialBaseDataPoint):
     """A publicly traded company or investment entity."""
 
@@ -151,7 +138,6 @@ class FinancialReport(FinancialBaseDataPoint):
 # ---------------------------------------------------------------------------
 
 FinancialBaseDataPoint.model_rebuild()
-UserConversation.model_rebuild()
 Company.model_rebuild()
 News.model_rebuild()
 FinancialConcept.model_rebuild()
@@ -170,7 +156,7 @@ class FinancialKnowledgeGraph(BaseModel):
     """
 
     entities: List[
-        Union[UserConversation, Company, News, FinancialConcept, FinancialReport]
+        Union[Company, News, FinancialConcept, FinancialReport]
     ] = Field(
         default_factory=list,
         description=(

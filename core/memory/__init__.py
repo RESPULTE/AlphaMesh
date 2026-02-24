@@ -20,7 +20,6 @@ from core.memory.nodeset_manager import (
 from core.memory.graph_models import (
     NodeSetTarget,
     FinancialBaseDataPoint,
-    UserConversation,
     Company,
     News,
     FinancialConcept,
@@ -64,7 +63,6 @@ __all__ = [
     # Graph models
     "NodeSetTarget",
     "FinancialBaseDataPoint",
-    "UserConversation",
     "Company",
     "News",
     "FinancialConcept",

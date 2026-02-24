@@ -18,7 +18,6 @@ content and assign each entity to the correct data access scope.
 
 === ENTITY TYPES ===
 You may extract the following entity types:
-  - UserConversation  : A message turn (user or assistant) in a conversation
   - Company           : A publicly traded company or investment vehicle
   - News              : A financial news article or market event
   - FinancialConcept  : A financial term, definition, or educational concept
