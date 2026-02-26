@@ -501,6 +501,7 @@ class FinancialMemorySystem:
                 node_type=NodeSet,
                 node_name=nodeset_names,  # EXACTLY ["GLOBAL", "USER_<hash>"]
                 top_k=top_k,
+                only_context=True,
             )
             result_list = results or []
             logger.info(

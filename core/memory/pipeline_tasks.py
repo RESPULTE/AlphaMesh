@@ -19,6 +19,7 @@ Pipeline insertion order:
 """
 
 from __future__ import annotations
+import uuid
 
 import logging
 from typing import List, Optional
@@ -54,7 +55,7 @@ from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-
+import hashlib
 
 # ---------------------------------------------------------------------------
 # Post-processing task: process_global_influences
@@ -119,6 +120,9 @@ async def process_global_influences(
 # ---------------------------------------------------------------------------
 # Post-processing task: assign_nodeset_from_target
 # ---------------------------------------------------------------------------
+
+def get_canonical_id(name: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, name.upper()))
 
 
 async def assign_nodesets(
@@ -225,6 +229,13 @@ async def assign_nodesets(
                 entity_type, entity.id, resolved.name,
             )
 
+
+            if hasattr(entity, "ticker"):
+                entity.id = get_canonical_id(entity.ticker)
+
+            elif hasattr(entity, "name"):
+                entity.id = get_canonical_id(entity.name)
+
     logger.info(
         "assign_nodesets: %d entities (%d GLOBAL, %d USER) across %d chunks.",
         total_entities, global_count, user_count, len(data_chunks),
@@ -245,11 +256,9 @@ async def add_data_points_with_custom_edges(
     Wrapper task for `add_data_points` that unpacks the combined payload (data_chunks, custom_edges)
     from previous tasks and passes `custom_edges` correctly.
     """
-    logger.info("add_data_points_with_custom_edges: %d chunks, %d custom edges.", len(payload[0]), len(payload[1]))
-    logger.info("add_data_points_with_custom_edges: %s", payload)
     
-    data_chunks, custom_edges = payload
-    return await add_data_points(data_chunks, custom_edges=custom_edges, embed_triplets=embed_triplets)
+    # data_chunks, custom_edges = payload
+    return await add_data_points(payload, embed_triplets=embed_triplets)
 
 async def build_financial_pipeline(
     chunks_per_batch: int = 100,
@@ -293,7 +302,6 @@ async def build_financial_pipeline(
         Task(
             extract_graph_from_data,
             graph_model=FinancialKnowledgeGraph,
-            custom_prompt=FINANCIAL_COGNIFY_SYSTEM_PROMPT,
             task_config={"batch_size": chunks_per_batch},
         ),
         # Process global influences and remove them from entities
@@ -302,9 +310,9 @@ async def build_financial_pipeline(
             assign_nodesets,
             global_nodeset=global_nodeset,
         ),
-        Task(
-            process_global_influences,
-        ),
+        # Task(
+        #     process_global_influences,
+        # ),
         # Task(
         #     summarize_text,
         #     task_config={"batch_size": chunks_per_batch},

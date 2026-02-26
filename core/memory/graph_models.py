@@ -148,7 +148,8 @@ class FinancialKnowledgeGraph(BaseModel):
             GlobalEvent, 
             MacroTrend, 
             InvestmentThesis,
-            GlobalInfluence
+            # GlobalInfluence,
+            Entity,
         ]
     ] = Field(
         default_factory=list,
