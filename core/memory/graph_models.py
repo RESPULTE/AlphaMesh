@@ -14,6 +14,7 @@ Architecture:
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
@@ -126,12 +127,21 @@ class InvestmentThesis(DataPoint):
     thesis_id: str
     summary: str
     status: Literal["Active", "Dormant", "Archived"]
+    created_at: datetime
     metadata: dict = {"index_fields": ["summary"]}
 
-    # Edges Definition per standard Cognee implementation
+    # Relationship fields (using SkipValidation[Any] to avoid forward reference issues)
+    # targets: Connects to Company or Sector nodes.
     targets: SkipValidation[Any] = None
+    # supported_by: Connects to any other global nodes.
     supported_by: SkipValidation[Any] = None
+    # threatened_by: Connects to any other global nodes.
     threatened_by: SkipValidation[Any] = None
+
+    # Cognee Edge structures dictating how edge properties are attached:
+    # - User NodeSet -> Thesis (Edge: `HoldsThesis`, property: `conviction_level`)
+    #   Note: Do NOT create a distinct "User" Node; the user is represented as a Cognee NodeSet natively.
+    # - Thesis -> GlobalEvent/MacroTrend (Edges: `SupportedBy` / `ThreatenedBy`, properties: `weight`, `added_on`)
 
     model_config = {"arbitrary_types_allowed": True}
 

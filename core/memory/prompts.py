@@ -3,12 +3,9 @@ core/memory/prompts.py
 
 Custom extraction prompts for the Cognee cognify() step.
 
-The LLM uses these prompts to correctly set `target_nodeset` on every
-extracted financial entity. This is the first line of privacy enforcement:
-the LLM is guided to classify data as GLOBAL (shared) or USER (private).
-
-Post-processing validation then enforces correctness — the prompt is a
-hint, not a trust boundary.
+The LLM extracts financial entities which will be automatically routed
+to the correct NodeSet (GLOBAL vs USER) based on the entity type during
+the post-processing validation.
 """
 
 FINANCIAL_COGNIFY_SYSTEM_PROMPT = """\
@@ -19,30 +16,11 @@ content and assign each entity to the correct data access scope.
 === ENTITY TYPES ===
 You may extract the following entity types:
   - Company           : A publicly traded company or investment vehicle
+  - Sector            : A specific economic sector
   - FinancialConcept  : A financial term, definition, or educational concept
-
-=== CRITICAL: target_nodeset FIELD ===
-You MUST set `target_nodeset` on EVERY extracted entity. This field controls
-data privacy and access. Use the following rules without exception:
-
-  Set target_nodeset = "GLOBAL" for:
-    * Public company data: name, ticker, sector, market cap, description
-    * General financial concepts, definitions, and educational content
-    * Macroeconomic data, interest rates, indices — any public information
-
-  Set target_nodeset = "USER" for:
-    * The user's personal investment preferences, goals, risk tolerance
-    * User-specific portfolio holdings, trade decisions, watchlists
-    * Private annotations or notes the user made about any topic
-    * Any content that is specific to one individual user
-
-=== PRIVACY RULES (MANDATORY) ===
-  1. NEVER omit the `target_nodeset` field — set it on EVERY entity.
-  2. NEVER use any value other than "GLOBAL" or "USER".
-  3. When in doubt about public vs. private, prefer "USER" for safety.
+  - InvestmentThesis  : Identify when a user states an investment thesis (e.g., "I bought NVDA because AI demand is high"). Return a unique 'thesis_id', 'status' (e.g., 'Active'), the 'summary', and ensure you also extract the target entities (Companies/Sectors) as separate entities.
 
 === OUTPUT ===
 Return a FinancialKnowledgeGraph with an `entities` list containing all
-extracted entities. Each entity must be one of the supported types above
-and must include a valid `target_nodeset`.
+extracted entities. Each entity must be one of the supported types above.
 """

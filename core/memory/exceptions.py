@@ -31,33 +31,7 @@ class NodeSetResolutionError(MemorySystemError):
         )
 
 
-class InvalidTargetNodeSetError(MemorySystemError):
-    """
-    Raised during post-processing when an entity's target_nodeset value is not
-    one of the allowed values: 'GLOBAL' or 'USER'.
-    """
 
-    def __init__(self, entity_type: str, actual_value: str) -> None:
-        self.entity_type = entity_type
-        self.actual_value = actual_value
-        super().__init__(
-            f"Entity '{entity_type}' has invalid target_nodeset='{actual_value}'. "
-            f"Allowed values are 'GLOBAL' and 'USER'."
-        )
-
-
-class MissingTargetNodeSetError(MemorySystemError):
-    """
-    Raised during post-processing when an entity is missing the required
-    target_nodeset field entirely.
-    """
-
-    def __init__(self, entity_type: str) -> None:
-        self.entity_type = entity_type
-        super().__init__(
-            f"Entity '{entity_type}' is missing required field 'target_nodeset'. "
-            f"The LLM must set this field to 'GLOBAL' or 'USER' during cognify."
-        )
 
 
 class DatasetInitError(MemorySystemError):
