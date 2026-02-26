@@ -83,20 +83,6 @@ class Company(FinancialBaseDataPoint):
     model_config = {"arbitrary_types_allowed": True}
 
 
-class News(FinancialBaseDataPoint):
-    """A financial news article or market event."""
-
-    headline: str
-    summary: Optional[str] = None
-    source: Optional[str] = None
-    url: Optional[str] = None
-    published_at: Optional[str] = None
-    sentiment: Optional[Literal["positive", "neutral", "negative"]] = None
-    tickers_mentioned: Optional[List[str]] = None
-    topics: Optional[List[str]] = None
-
-    metadata: dict = {"index_fields": ["headline", "summary"]}
-    model_config = {"arbitrary_types_allowed": True}
 
 
 class FinancialConcept(FinancialBaseDataPoint):
@@ -117,20 +103,6 @@ class FinancialConcept(FinancialBaseDataPoint):
     model_config = {"arbitrary_types_allowed": True}
 
 
-class FinancialReport(FinancialBaseDataPoint):
-    """An SEC filing or financial report (10-K, 10-Q, etc.). Usually GLOBAL."""
-
-    ticker: str
-    report_type: Literal["10-K", "10-Q", "8-K", "annual", "quarterly", "earnings", "other"]
-    period: Optional[str] = None
-    filing_date: Optional[str] = None
-    fiscal_year: Optional[int] = None
-    content: str
-    key_metrics: Optional[dict] = None
-    highlights: Optional[List[str]] = None
-
-    metadata: dict = {"index_fields": ["content", "ticker"]}
-    model_config = {"arbitrary_types_allowed": True}
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +111,7 @@ class FinancialReport(FinancialBaseDataPoint):
 
 FinancialBaseDataPoint.model_rebuild()
 Company.model_rebuild()
-News.model_rebuild()
 FinancialConcept.model_rebuild()
-FinancialReport.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +126,7 @@ class FinancialKnowledgeGraph(BaseModel):
     """
 
     entities: List[
-        Union[Company, News, FinancialConcept, FinancialReport]
+        Union[Company, FinancialConcept]
     ] = Field(
         default_factory=list,
         description=(

@@ -19,9 +19,7 @@ content and assign each entity to the correct data access scope.
 === ENTITY TYPES ===
 You may extract the following entity types:
   - Company           : A publicly traded company or investment vehicle
-  - News              : A financial news article or market event
   - FinancialConcept  : A financial term, definition, or educational concept
-  - FinancialReport   : An SEC filing, 10-K, 10-Q, earnings release, etc.
 
 === CRITICAL: target_nodeset FIELD ===
 You MUST set `target_nodeset` on EVERY extracted entity. This field controls
@@ -29,8 +27,6 @@ data privacy and access. Use the following rules without exception:
 
   Set target_nodeset = "GLOBAL" for:
     * Public company data: name, ticker, sector, market cap, description
-    * SEC filings and financial reports (10-K, 10-Q, 8-K) — public records
-    * Public financial news and market events
     * General financial concepts, definitions, and educational content
     * Macroeconomic data, interest rates, indices — any public information
 

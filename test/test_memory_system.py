@@ -34,8 +34,6 @@ from core.memory.graph_models import (
     Company,
     FinancialConcept,
     FinancialKnowledgeGraph,
-    FinancialReport,
-    News,
     NodeSetTarget,
 )
 from core.memory.nodeset_manager import (
@@ -160,11 +158,11 @@ class TestAssignNodesetInvalid:
     @pytest.mark.asyncio
     async def test_invalid_string_raises(self):
         """model_construct bypasses Pydantic so we can inject illegal LLM output."""
-        entity = News.model_construct(
-            id=uuid4(), headline="Fed hikes", target_nodeset="PUBLIC",
+        entity = Company.model_construct(
+            id=uuid4(), ticker="AAPL", name="Apple Inc.", target_nodeset="PUBLIC",
             created_at=0, updated_at=0, ontology_valid=False,
             version=1, topological_rank=0, metadata={"index_fields": []},
-            type="News", belongs_to_set=None,
+            type="Company", belongs_to_set=None,
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
@@ -213,12 +211,12 @@ class TestAssignNodesetGlobal:
     @pytest.mark.asyncio
     async def test_global_raw_string_coercion(self):
         """LLM may return raw "GLOBAL" string — must be coerced and accepted."""
-        entity = FinancialReport.model_construct(
-            id=uuid4(), ticker="TSLA", report_type="10-K",
-            content="Annual report.", target_nodeset="GLOBAL",
+        entity = Company.model_construct(
+            id=uuid4(), ticker="TSLA", name="Tesla Inc.",
+            target_nodeset="GLOBAL",
             created_at=0, updated_at=0, ontology_valid=False,
             version=1, topological_rank=0, metadata={"index_fields": []},
-            type="FinancialReport", belongs_to_set=None,
+            type="Company", belongs_to_set=None,
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")

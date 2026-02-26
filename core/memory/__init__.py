@@ -21,9 +21,7 @@ from core.memory.graph_models import (
     NodeSetTarget,
     FinancialBaseDataPoint,
     Company,
-    News,
     FinancialConcept,
-    FinancialReport,
     FinancialKnowledgeGraph,
 )
 
@@ -64,9 +62,7 @@ __all__ = [
     "NodeSetTarget",
     "FinancialBaseDataPoint",
     "Company",
-    "News",
     "FinancialConcept",
-    "FinancialReport",
     "FinancialKnowledgeGraph",
     # Prompts
     "FINANCIAL_COGNIFY_SYSTEM_PROMPT",
