@@ -19,26 +19,22 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 import cognee
-from cognee.modules.engine.operations.setup import setup as cognee_setup
 from cognee.modules.engine.models.node_set import NodeSet
-from cognee.modules.search.types import SearchType
 from cognee.modules.pipelines import run_pipeline
-from cognee.modules.pipelines.layers.pipeline_execution_mode import get_pipeline_executor
-
-from core.memory.exceptions import (
-    DatasetInitError,
-    IngestionError,
-    QueryError,
-    MemorySystemError,
+from cognee.modules.pipelines.layers.pipeline_execution_mode import (
+    get_pipeline_executor,
 )
+from cognee.modules.search.types import SearchType
+
+from core.memory.exceptions import IngestionError, MemorySystemError, QueryError
 from core.memory.nodeset_manager import (
     DATASET_NAME,
-    initialize_cognee,
+    GLOBAL_NODESET_NAME,
     get_or_create_global_nodeset,
     get_or_create_user_nodeset,
-    get_user_nodeset_names,
     get_user_nodeset_name,
-    GLOBAL_NODESET_NAME
+    get_user_nodeset_names,
+    initialize_cognee,
 )
 from core.memory.pipeline_tasks import build_financial_pipeline
 
@@ -53,6 +49,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class UserMemoryContext:
     """Cached resolution of a user's NodeSet context."""
+
     user_email: str
     nodeset_name: str
     user_nodeset: NodeSet
@@ -79,6 +76,7 @@ class IngestionItem:
         user_email: If set, this item belongs to a specific user (creates their NodeSet).
                     If None, treated as shared GLOBAL data.
     """
+
     content: str
     data_type: str = "text"
     user_email: Optional[str] = None
@@ -135,7 +133,8 @@ class FinancialMemorySystem:
         self._initialized = True
         logger.info(
             "FinancialMemorySystem ready. Dataset='%s', GLOBAL NodeSet id=%s.",
-            DATASET_NAME, self._global_nodeset.id,
+            DATASET_NAME,
+            self._global_nodeset.id,
         )
 
     def _require_initialized(self) -> None:
@@ -186,12 +185,99 @@ class FinancialMemorySystem:
     # Ingestion helpers — cognee.add() handles dataset creation internally
     # ------------------------------------------------------------------
 
-    async def _add_to_cognee(self, text: str, node_set: list[str] | None = None) -> None:
+    async def _add_to_cognee(
+        self, text: str, node_set: list[str] | None = None
+    ) -> None:
         """Internal: call cognee.add() and propagate errors with typed exceptions."""
         try:
             await cognee.add(text, dataset_name=DATASET_NAME, node_set=node_set)
         except Exception as exc:
             raise IngestionError(str(exc)) from exc
+
+    async def ingest_news(
+        self,
+        articles: List[dict],
+        is_global: bool = True,
+    ) -> None:
+        """
+        Ingest financial news articles.
+
+        Args:
+            articles:  List of dicts with 'headline' and 'summary' keys.
+            is_global: True (default) = shared GLOBAL data.
+
+        Raises:
+            IngestionError: On Cognee failure.
+            ValueError: If articles list is empty or yields no valid content.
+        """
+        self._require_initialized()
+
+        if not articles:
+            raise ValueError("articles must be a non-empty list.")
+
+        text_blocks: list[str] = []
+        for art in articles:
+            headline = art.get("headline", "")
+            summary = art.get("summary", "")
+            if not headline and not summary:
+                logger.warning("Skipping article with no headline or summary.")
+                continue
+            parts = [f"HEADLINE: {headline}", f"SUMMARY: {summary}"]
+            if art.get("source"):
+                parts.append(f"SOURCE: {art['source']}")
+            if art.get("published_at"):
+                parts.append(f"DATE: {art['published_at']}")
+            text_blocks.append("\n".join(parts))
+
+        if not text_blocks:
+            raise ValueError("No valid articles after filtering.")
+
+        combined = "\n\n---\n\n".join(text_blocks)
+        logger.info(
+            "Ingesting %d news articles (%s, %d chars total).",
+            len(text_blocks),
+            "GLOBAL" if is_global else "USER",
+            len(combined),
+        )
+        node_set = [GLOBAL_NODESET_NAME] if is_global else None
+        await self._add_to_cognee(combined, node_set=node_set)
+
+    async def ingest_financial_report(
+        self,
+        ticker: str,
+        report_type: str,
+        content: str,
+        period: Optional[str] = None,
+        is_global: bool = True,
+    ) -> None:
+        """
+        Ingest an SEC filing or financial report.
+
+        Args:
+            ticker:      Stock ticker (e.g. "AAPL").
+            report_type: "10-K", "10-Q", "8-K", "annual", "quarterly", "earnings".
+            content:     Full text or summary of the report.
+            period:      Reporting period (e.g. "Q3 2024").
+            is_global:   True for public SEC filings (default).
+        """
+        self._require_initialized()
+
+        if not ticker or not content:
+            raise ValueError("ticker and content are required.")
+
+        header = f"FINANCIAL REPORT\nTICKER: {ticker.upper()}\nTYPE: {report_type}\n"
+        if period:
+            header += f"PERIOD: {period}\n"
+        text = header + "\n" + content
+
+        logger.info(
+            "Ingesting %s report for %s (%d chars).",
+            report_type,
+            ticker.upper(),
+            len(text),
+        )
+        node_set = [GLOBAL_NODESET_NAME] if is_global else None
+        await self._add_to_cognee(text, node_set=node_set)
 
     async def ingest_conversation(
         self,
@@ -220,17 +306,20 @@ class FinancialMemorySystem:
         # Ensure the user's NodeSet is pre-created before cognify runs
         await self.get_user_context(user_email)
 
-        lines = [f"[{msg.get('role', 'unknown').upper()}]: {msg.get('content', '')}"
-                 for msg in messages]
+        lines = [
+            f"[{msg.get('role', 'unknown').upper()}]: {msg.get('content', '')}"
+            for msg in messages
+        ]
         text = "\n".join(lines)
 
         logger.info(
             "Ingesting conversation for '%s' (%d messages, %d chars).",
-            user_email, len(messages), len(text),
+            user_email,
+            len(messages),
+            len(text),
         )
         nodeset_name = get_user_nodeset_name(user_email)
         await self._add_to_cognee(text, node_set=[nodeset_name])
-
 
     # ------------------------------------------------------------------
     # Batch ingestion
@@ -272,10 +361,14 @@ class FinancialMemorySystem:
                         ns_name = get_user_nodeset_name(item.user_email)
                         await self._add_to_cognee(item.content, node_set=[ns_name])
                     else:
-                        await self._add_to_cognee(item.content, node_set=[GLOBAL_NODESET_NAME])
-                    
+                        await self._add_to_cognee(
+                            item.content, node_set=[GLOBAL_NODESET_NAME]
+                        )
+
                     success_count += 1
-                    logger.debug("Batch item %d ingested (%d chars).", idx, len(item.content))
+                    logger.debug(
+                        "Batch item %d ingested (%d chars).", idx, len(item.content)
+                    )
                 except Exception as exc:
                     errors.append((idx, exc))
                     logger.error("Batch item %d failed: %s", idx, exc)
@@ -322,7 +415,8 @@ class FinancialMemorySystem:
         self._require_initialized()
 
         logger.info(
-            "Starting global cognify for all ingested data (background=%s).", run_in_background
+            "Starting global cognify for all ingested data (background=%s).",
+            run_in_background,
         )
 
         tasks = await build_financial_pipeline(
