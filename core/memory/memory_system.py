@@ -100,6 +100,7 @@ class FinancialMemorySystem:
         self._initialized = False
         self._global_nodeset: Optional[NodeSet] = None
         self._user_context_cache: dict[str, UserMemoryContext] = {}
+        self.graph_client: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Initialization
@@ -129,6 +130,9 @@ class FinancialMemorySystem:
 
         # Ensure GLOBAL NodeSet exists in the graph
         self._global_nodeset = await get_or_create_global_nodeset()
+
+        # Initialize the graph client to attach on self
+        self.graph_client = cognee.infrastructure.engine.get_engine().graph
 
         self._initialized = True
         logger.info(
@@ -439,23 +443,6 @@ class FinancialMemorySystem:
         except Exception as exc:
             raise MemorySystemError(f"Cognify failed: {exc}") from exc
 
-    # ------------------------------------------------------------------
-    # Memify
-    # ------------------------------------------------------------------
-
-    async def memify(self) -> Any:
-        """
-        Run Cognee's memify for the shared dataset.
-        """
-        self._require_initialized()
-
-        logger.info("Starting memify for global dataset.")
-        try:
-            result = await cognee.memify(datasets=DATASET_NAME)
-            logger.info("Memify completed for global dataset.")
-            return result
-        except Exception as exc:
-            raise MemorySystemError(f"Memify failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Query — strictly filtered per user
@@ -524,3 +511,110 @@ class FinancialMemorySystem:
 
         except Exception as exc:
             raise QueryError(str(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # Graph Edge Property and State Triggers
+    # ------------------------------------------------------------------
+
+    async def adjust_edge_property(
+        self,
+        source_id: str,
+        target_id: str,
+        edge_label: str,
+        property_name: str,
+        delta: float,
+        min_val: float = 0.0,
+        max_val: float = 1.0,
+    ) -> float:
+        """
+        Gracefully increments or decrements a property of a graph edge.
+        Clamps the updated value strictly between min_val and max_val.
+
+        Designed for Multi-Agent systems: agents provide continuous feedback (e.g., +0.05 or -0.1)
+        on relationship strength, and this handles the boundary controls deterministically.
+
+        Args:
+            graph_client: The Cognee graph engine adapter client.
+            source_id: Node ID of the relationship source.
+            target_id: Node ID of the relationship target.
+            edge_label: The relationship type (e.g., 'HoldsThesis', 'SupportedBy').
+            property_name: The edge property to adjust (e.g., 'conviction_level').
+            delta: Float value to add to the existing property value (can be negative).
+            min_val: Hard lower bound for the property.
+            max_val: Hard upper bound for the property.
+
+        Returns:
+            The newly calculated and clamped property value as a float.
+            Returns 0.0 if the edge was not found or execution failed but didn't crash.
+        """
+        self._require_initialized()
+        graph_client = self.graph_client
+
+        logger.info(
+            "Adjusting '%s' for edge '%s' between '%s' and '%s' by delta %.2f.",
+            property_name,
+            edge_label,
+            source_id,
+            target_id,
+            delta,
+        )
+
+        # Cypher implementation applying boundary controls
+        # Uses type(e) to check edge label safely.
+        query = f"""
+        MATCH (s {{id: $source_id}})-[e]->(t {{id: $target_id}})
+        WHERE type(e) = $edge_label
+        WITH e, coalesce(e.{property_name}, 0.0) AS current_val
+        WITH e, current_val, current_val + $delta AS raw_new_val
+        WITH e,
+             CASE
+                WHEN raw_new_val < $min_val THEN $min_val
+                WHEN raw_new_val > $max_val THEN $max_val
+                ELSE raw_new_val
+             END AS final_val
+        SET e.{property_name} = final_val
+        RETURN final_val AS new_val
+        """
+        params = {
+            "source_id": source_id,
+            "target_id": target_id,
+            "edge_label": edge_label,
+            "delta": float(delta),
+            "min_val": float(min_val),
+            "max_val": float(max_val),
+        }
+
+        try:
+            # Resolving the execution method defensively based on typical Cognee adapter shapes
+            execute_fn = None
+            if hasattr(graph_client, "graph") and hasattr(graph_client.graph, "execute"):
+                execute_fn = graph_client.graph.execute
+            elif hasattr(graph_client, "execute"):
+                execute_fn = graph_client.execute
+
+            if not execute_fn:
+                logger.warning("Provided graph_client lacks an execute() method for Cypher queries.")
+                return 0.0
+
+            results = await execute_fn(query, params)
+
+            # Simple parse to return the updated value safely
+            if results and isinstance(results, list) and len(results) > 0:
+                first_record = results[0]
+                if isinstance(first_record, dict) and "new_val" in first_record:
+                    return float(first_record["new_val"])
+                # Fallback for adapters returning simple tuples or scalars
+                return float(first_record) if first_record is not None else 0.0
+
+            logger.warning(
+                "Edge '%s' not found between '%s' and '%s' for property update.",
+                edge_label,
+                source_id,
+                target_id,
+            )
+            return 0.0
+
+        except Exception as exc:
+            logger.error("Failed to adjust edge property %s: %s", property_name, exc)
+            raise MemorySystemError(f"Edge property adjustment failed: {exc}") from exc
+
