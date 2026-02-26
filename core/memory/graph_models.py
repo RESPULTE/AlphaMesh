@@ -15,9 +15,9 @@ Architecture:
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Literal, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SkipValidation
 
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.engine.models import Entity
@@ -72,12 +72,7 @@ class Company(FinancialBaseDataPoint):
 
     ticker: str
     name: str
-    sector: Optional[str] = None
-    industry: Optional[str] = None
-    exchange: Optional[str] = None
     description: Optional[str] = None
-    market_cap_usd: Optional[float] = None
-    country: Optional[str] = None
 
     metadata: dict = {"index_fields": ["name", "ticker", "description"]}
     model_config = {"arbitrary_types_allowed": True}
@@ -105,6 +100,70 @@ class FinancialConcept(FinancialBaseDataPoint):
 
 
 
+class Sector(FinancialBaseDataPoint):
+    """A specific economic sector."""
+    name: str
+
+class Industry(FinancialBaseDataPoint):
+    """A specific industry within a sector."""
+    name: str
+
+class GlobalEvent(FinancialBaseDataPoint):
+    """A significant global event."""
+    name: str
+    description: Optional[str] = None
+
+class MacroTrend(FinancialBaseDataPoint):
+    """A macroeconomic trend."""
+    name: str
+    description: Optional[str] = None
+
+class InvestmentThesis(DataPoint):
+    """
+    An individual's or agent's structured investment thesis.
+    Links to targeted Entities (Companies/Sectors), and supporting/threatening events.
+    """
+    thesis_id: str
+    summary: str
+    status: Literal["Active", "Dormant", "Archived"]
+    metadata: dict = {"index_fields": ["summary"]}
+
+    # Edges Definition per standard Cognee implementation
+    targets: SkipValidation[Any] = None
+    supported_by: SkipValidation[Any] = None
+    threatened_by: SkipValidation[Any] = None
+
+    model_config = {"arbitrary_types_allowed": True}
+
+
+'''
+example of custom edge (relationship) between entities
+
+from cognee.infrastructure.engine import Edge
+from core.memory.graph_models import InvestmentThesis, Company
+# 1. Instantiate the Target Node
+nvidia_node = Company(
+    ticker="NVDA",
+    name="NVIDIA Corp",
+    sector="Technology",
+    description="Leading designer of AI accelerators."
+)
+# 2. Instantiate the Investment Thesis Node
+thesis = InvestmentThesis(
+    thesis_id="TH-NVDA-AI-2026",
+    summary="NVIDIA will continue to dominate the AI accelerator market due to its CUDA moat.",
+    status="Active"
+)
+# 3. Attach the target using Edge syntax
+# You assign a tuple consisting of the Edge object and the target node(s).
+thesis.targets = [
+    (Edge(relationship_type="TARGETS"), nvidia_node)
+]
+# You can also use this same pattern for supported_by and threatened_by edges:
+# thesis.supported_by = [(Edge(relationship_type="SUPPORTED_BY", weights=1.0), macro_trend_node)]
+'''
+
+
 # ---------------------------------------------------------------------------
 # Rebuild all models (required for forward references)
 # ---------------------------------------------------------------------------
@@ -112,6 +171,11 @@ class FinancialConcept(FinancialBaseDataPoint):
 FinancialBaseDataPoint.model_rebuild()
 Company.model_rebuild()
 FinancialConcept.model_rebuild()
+Sector.model_rebuild()
+Industry.model_rebuild()
+GlobalEvent.model_rebuild()
+MacroTrend.model_rebuild()
+InvestmentThesis.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +190,15 @@ class FinancialKnowledgeGraph(BaseModel):
     """
 
     entities: List[
-        Union[Company, FinancialConcept]
+        Union[
+            Company, 
+            FinancialConcept, 
+            Sector, 
+            Industry, 
+            GlobalEvent, 
+            MacroTrend, 
+            InvestmentThesis
+        ]
     ] = Field(
         default_factory=list,
         description=(
