@@ -4,7 +4,7 @@ core/memory/graph_models.py
 Custom Cognee DataPoint models for the financial AI assistant domain.
 
 Architecture:
-  - All entities inherit from FinancialBaseDataPoint
+  - All entities inherit from Entity
   - `target_nodeset`: string enum set by the LLM during cognify ("GLOBAL" or "USER")
   - `belongs_to_set`: inherited from DataPoint; assigned in post-processing to an
                      actual NodeSet DataPoint — NEVER by the LLM
@@ -25,50 +25,17 @@ from cognee.modules.engine.models import Entity
 
 
 # ---------------------------------------------------------------------------
-# NodeSet target enum — only two legal values
-# ---------------------------------------------------------------------------
-
-
-class NodeSetTarget(str, Enum):
-    GLOBAL = "GLOBAL"
-    USER = "USER"
-
-
-# ---------------------------------------------------------------------------
 # Base for all financial domain entities
 # ---------------------------------------------------------------------------
 
-
-class FinancialBaseDataPoint(Entity):
-    """
-    Abstract base for every financial entity type.
-
-    Adds:
-        target_nodeset  — populated by the LLM during cognify.
-                          Allowed: NodeSetTarget.GLOBAL | NodeSetTarget.USER
-                          Post-processing validates this and assigns belongs_to_set.
-    """
-
-    target_nodeset: Optional[NodeSetTarget] = Field(
-        default=None,
-        description=(
-            "REQUIRED: Set to 'GLOBAL' for public/shared data, "
-            "or 'USER' for private per-user data. "
-            "Populated by the LLM during entity extraction."
-        ),
-    )
-    # `belongs_to_set` is inherited from DataPoint as Optional[List[DataPoint]]
-    # Assigned by the post-processing task — never by the LLM.
-
-
-
+USER_SPECIFIC_ENTITIES = ["InvestmentThesis"]
 
 # ---------------------------------------------------------------------------
 # Domain DataPoint models
 # ---------------------------------------------------------------------------
 
 
-class Company(FinancialBaseDataPoint):
+class Company(Entity):
     """A publicly traded company or investment entity."""
 
     ticker: str
@@ -80,7 +47,7 @@ class Company(FinancialBaseDataPoint):
 
 
 
-class FinancialConcept(FinancialBaseDataPoint):
+class FinancialConcept(Entity):
     """A financial concept, term, or educational definition. Always GLOBAL."""
 
     name: str
@@ -97,7 +64,7 @@ class FinancialConcept(FinancialBaseDataPoint):
     metadata: dict = {"index_fields": ["name", "definition"]}
 
 
-class GlobalEntity(FinancialBaseDataPoint):
+class GlobalEntity(Entity):
     """A global entity."""
     name: str
     description: Optional[str] = None
@@ -113,8 +80,6 @@ class GlobalEvent(GlobalEntity):
 
 class MacroTrend(GlobalEntity):
     """A macroeconomic trend."""
-
-VALID_GLOBAL_INFLUENCE_TYPES = ["Company", "Sector", "GlobalEvent", "MacroTrend"]
 
 class GlobalInfluence(DataPoint):
     """
@@ -154,7 +119,7 @@ class InvestmentThesis(DataPoint):
 # Rebuild all models (required for forward references)
 # ---------------------------------------------------------------------------
 
-FinancialBaseDataPoint.model_rebuild()
+Entity.model_rebuild()
 Company.model_rebuild()
 FinancialConcept.model_rebuild()
 Sector.model_rebuild()
@@ -188,8 +153,7 @@ class FinancialKnowledgeGraph(BaseModel):
     ] = Field(
         default_factory=list,
         description=(
-            "All extracted financial entities. "
-            "Each MUST have target_nodeset set to 'GLOBAL' or 'USER'."
+            "All extracted financial entities."
         ),
     )
 

@@ -18,8 +18,6 @@ from core.memory.nodeset_manager import (
 )
 
 from core.memory.graph_models import (
-    NodeSetTarget,
-    FinancialBaseDataPoint,
     Company,
     FinancialConcept,
     FinancialKnowledgeGraph,
@@ -29,14 +27,12 @@ from cognee.modules.engine.models.node_set import NodeSet
 
 from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 
-from core.memory.pipeline_tasks import assign_nodeset_from_target, build_financial_pipeline
+from core.memory.pipeline_tasks import assign_nodesets, build_financial_pipeline
 
 from core.memory.exceptions import (
     MemorySystemError,
     NodeSetCreationError,
     NodeSetResolutionError,
-    InvalidTargetNodeSetError,
-    MissingTargetNodeSetError,
     DatasetInitError,
     IngestionError,
     QueryError,
@@ -59,7 +55,6 @@ __all__ = [
     # Cognee built-in NodeSet
     "NodeSet",
     # Graph models
-    "NodeSetTarget",
     "FinancialBaseDataPoint",
     "Company",
     "FinancialConcept",
@@ -67,14 +62,12 @@ __all__ = [
     # Prompts
     "FINANCIAL_COGNIFY_SYSTEM_PROMPT",
     # Pipeline
-    "assign_nodeset_from_target",
+    "assign_nodesets",
     "build_financial_pipeline",
     # Exceptions
     "MemorySystemError",
     "NodeSetCreationError",
     "NodeSetResolutionError",
-    "InvalidTargetNodeSetError",
-    "MissingTargetNodeSetError",
     "DatasetInitError",
     "IngestionError",
     "QueryError",

@@ -6,15 +6,14 @@ Custom Cognee pipeline task and pipeline builder for the financial memory system
 Pipeline insertion order:
     1. classify_documents
     2. extract_chunks_from_documents
-    3. extract_graph_from_data      ← LLM sets target_nodeset on each entity
-    4. assign_nodeset_from_target   ← OUR TASK: validates & resolves belongs_to_set
+    3. extract_graph_from_data
+    4. assign_nodesets              ← OUR TASK: validates & resolves belongs_to_set
     5. summarize_text
     6. add_data_points
 
-`assign_nodeset_from_target` is the enforcement layer that:
-  - Raises MissingTargetNodeSetError if target_nodeset is absent
-  - Raises InvalidTargetNodeSetError if value is not GLOBAL or USER
-  - Resolves target_nodeset to the actual Cognee NodeSet DataPoint
+`assign_nodesets` is the enforcement layer that:
+  - Automatically identifies USER vs GLOBAL entities via USER_SPECIFIC_ENTITIES
+  - Resolves to the actual Cognee NodeSet DataPoint
   - Assigns belongs_to_set = [resolved_nodeset_datapoint]
   - Never silently passes invalid data downstream
 """
@@ -40,18 +39,12 @@ from cognee.modules.cognify.config import get_cognify_config
 from cognee.infrastructure.engine import Edge
 from cognee.infrastructure.databases.graph import get_graph_engine
 from core.memory.exceptions import (
-    InvalidTargetNodeSetError,
-    MissingTargetNodeSetError,
     NodeSetResolutionError,
 )
 from core.memory.graph_models import (
-    Company,
-    FinancialBaseDataPoint,
     FinancialKnowledgeGraph,
-    InvestmentThesis,
-    NodeSetTarget,
-    Sector,
     GlobalInfluence,
+    USER_SPECIFIC_ENTITIES,
 )
 from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
@@ -108,8 +101,14 @@ async def process_global_influences(
                 if inf.evidence is not None:
                     props["evidence"] = str(inf.evidence) if not isinstance(inf.evidence, str) else inf.evidence
 
+                logger.info("Processing global influence: %s -> %s", inf.source_id, inf.target_id)
                 all_custom_edges.append(
-                    (str(inf.source_id), str(inf.target_id), str(inf.relationship_name), props)
+                    (
+                        next((e.id for e in entities if getattr(e, "name", None) == inf.source_id), str(inf.source_id)),
+                        next((e.id for e in entities if getattr(e, "name", None) == inf.target_id), str(inf.target_id)),
+                        str(inf.relationship_name),
+                        props,
+                    )
                 )
 
     logger.info("Extracted %d global influence custom edges.", len(all_custom_edges))
@@ -122,7 +121,7 @@ async def process_global_influences(
 # ---------------------------------------------------------------------------
 
 
-async def assign_nodeset_from_target(
+async def assign_nodesets(
     data_chunks: List[DocumentChunk],
     global_nodeset: NodeSet,
 ) -> List[DocumentChunk]:
@@ -131,26 +130,23 @@ async def assign_nodeset_from_target(
 
     Runs AFTER extract_graph_from_data, BEFORE summarize_text.
 
-    For every FinancialBaseDataPoint entity in each chunk's `contains` list:
-      1. Read target_nodeset; raise MissingTargetNodeSetError if absent
-      2. Validate value is GLOBAL or USER; raise InvalidTargetNodeSetError otherwise
-      3. Resolve to actual NodeSet DataPoint:
+    For every entity in each chunk's `contains` list:
+      1. Check if the entity type belongs to USER_SPECIFIC_ENTITIES.
+      2. Resolve to actual NodeSet DataPoint:
           - If GLOBAL: use the provided global_nodeset
           - If USER: use the document-level User NodeSet that was stored on the
                      chunk's document during ingestion.
-      4. Assign belongs_to_set = [resolved_nodeset]
+      3. Assign belongs_to_set = [resolved_nodeset]
 
     Args:
-        payload: Tuple containing (List of DocumentChunk objects, list of custom edges).
+        data_chunks: List of DocumentChunk objects.
         global_nodeset: The shared GLOBAL NodeSet.
 
     Returns:
-        tuple[List[DocumentChunk], list]: The same data_chunks list with `belongs_to_set` populated on all entities, and custom edges.
+        List[DocumentChunk]: The same data_chunks list with `belongs_to_set` populated on all entities.
 
     Raises:
-        MissingTargetNodeSetError:  If any entity is missing target_nodeset.
-        InvalidTargetNodeSetError:  If any entity has an illegal target_nodeset value.
-        NodeSetResolutionError:     Safety net if NodeSet object is None or not found on document.
+        NodeSetResolutionError: Safety net if NodeSet object is None or not found on document.
         TypeError: If data_chunks is not a list.
     """
 
@@ -190,57 +186,39 @@ async def assign_nodeset_from_target(
             chunk.contains = entities
 
         for entity in entities:
-            if not isinstance(entity, FinancialBaseDataPoint):
-                logger.debug(
-                    "Skipping non-financial entity of type %s.", type(entity).__name__
-                )
-                continue
+    
 
             entity_type = type(entity).__name__
             total_entities += 1
 
-            # Step 1: Check target_nodeset is present
-            raw_target = entity.target_nodeset
-            if raw_target is None:
-                raise MissingTargetNodeSetError(entity_type)
+            # Determine Target based on entity type
+            is_user_entity = entity_type in USER_SPECIFIC_ENTITIES
 
-            # Step 2: Coerce raw string from LLM to enum (LLM may return "GLOBAL"/"USER")
-            if isinstance(raw_target, str):
-                try:
-                    raw_target = NodeSetTarget(raw_target.strip().upper())
-                except ValueError:
-                    raise InvalidTargetNodeSetError(entity_type, str(raw_target))
-
-            # Step 3: Resolve to actual NodeSet object
-            if raw_target == NodeSetTarget.GLOBAL:
+            # Resolve to actual NodeSet object
+            if not is_user_entity:
                 resolved: NodeSet = global_nodeset
                 global_count += 1
-            elif raw_target == NodeSetTarget.USER:
+            else:
                 if doc_user_nodeset is not None:
                     resolved = doc_user_nodeset
                     user_count += 1
                 elif doc_is_global:
-                    # An LLM hallucination: it flagged a GLOBAL document's entity as USER.
-                    # We gracefully fallback to GLOBAL to prevent exposing it to a non-existent user.
                     logger.warning(
-                        "LLM flagged entity %s as USER, but document is GLOBAL. "
+                        "Entity %s is USER specific, but document is GLOBAL. "
                         "Overriding to GLOBAL NodeSet.", entity_type
                     )
                     resolved = global_nodeset
                     global_count += 1
-                    entity.target_nodeset = NodeSetTarget.GLOBAL
                 else:
                     raise NodeSetResolutionError(
                         f"Cannot resolve USER NodeSet for entity {entity_type} in chunk {chunk.id}: "
                         "parent document has no user NodeSet assigned."
                     )
-            else:
-                raise InvalidTargetNodeSetError(entity_type, str(raw_target))
-
+            
             if resolved is None:
-                raise NodeSetResolutionError(str(raw_target))
+                raise NodeSetResolutionError(f"Failed to resolve NodeSet for {entity_type}")
 
-            # Step 4: Assign belongs_to_set
+            # Assign belongs_to_set
             entity.belongs_to_set = [resolved]
             logger.debug(
                 "Entity %s (id=%s) → belongs_to_set='%s'.",
@@ -248,7 +226,7 @@ async def assign_nodeset_from_target(
             )
 
     logger.info(
-        "assign_nodeset_from_target: %d entities (%d GLOBAL, %d USER) across %d chunks.",
+        "assign_nodesets: %d entities (%d GLOBAL, %d USER) across %d chunks.",
         total_entities, global_count, user_count, len(data_chunks),
     )
     return data_chunks
@@ -287,7 +265,7 @@ async def build_financial_pipeline(
         1. classify_documents
         2. extract_chunks_from_documents
         3. extract_graph_from_data  (FinancialKnowledgeGraph + custom_prompt)
-        4. assign_nodeset_from_target  ← OUR STEP
+        4. assign_nodesets  ← OUR STEP
         5. summarize_text
         6. add_data_points
 
@@ -321,7 +299,7 @@ async def build_financial_pipeline(
         # Process global influences and remove them from entities
         # Our custom post-processing task
         Task(
-            assign_nodeset_from_target,
+            assign_nodesets,
             global_nodeset=global_nodeset,
         ),
         Task(

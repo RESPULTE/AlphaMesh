@@ -3,15 +3,12 @@ test/test_memory_system.py
 
 Unit tests for the AlphaMesh multi-tenant financial memory system.
 
-Tests (24 total):
+Tests:
   1. NodeSet hashing determinism
-  2-3. assign_nodeset_from_target — missing target_nodeset
-  4-5. assign_nodeset_from_target — invalid target_nodeset
-  6-7. assign_nodeset_from_target — valid GLOBAL routing (enum + raw string)
-  8-9. assign_nodeset_from_target — valid USER routing (enum + raw string)
-  10-12. assign_nodeset_from_target — mixed/edge cases
-  13-16. Prompt building
-  17-20. Query isolation
+  2-3. assign_nodesets — valid GLOBAL routing
+  4-5. assign_nodesets — valid USER routing
+  6-8. assign_nodesets — mixed/edge cases
+  9-12. Query isolation
 
 No live LLM or DB required — external I/O is mocked.
 """
@@ -25,8 +22,6 @@ from uuid import NAMESPACE_OID, uuid4, uuid5
 import pytest
 
 from core.memory.exceptions import (
-    InvalidTargetNodeSetError,
-    MissingTargetNodeSetError,
     NodeSetResolutionError,
     QueryError,
 )
@@ -34,7 +29,7 @@ from core.memory.graph_models import (
     Company,
     FinancialConcept,
     FinancialKnowledgeGraph,
-    NodeSetTarget,
+    InvestmentThesis,
 )
 from core.memory.nodeset_manager import (
     GLOBAL_NODESET_NAME,
@@ -43,7 +38,7 @@ from core.memory.nodeset_manager import (
     get_user_nodeset_names,
     get_or_create_nodeset,
 )
-from core.memory.pipeline_tasks import assign_nodeset_from_target
+from core.memory.pipeline_tasks import assign_nodesets
 from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 from cognee.modules.engine.models.node_set import NodeSet
 
@@ -131,148 +126,57 @@ class TestHashUserEmail:
 
 
 # ---------------------------------------------------------------------------
-# 2. assign_nodeset_from_target — missing target_nodeset
-# ---------------------------------------------------------------------------
-
-
-class TestAssignNodesetMissing:
-    @pytest.mark.asyncio
-    async def test_missing_target_nodeset_raises(self):
-        entity = Company.model_construct(ticker="AAPL", name="Apple Inc.", target_nodeset=None, belongs_to_set=None)
-        global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
-        chunk = make_chunk_with_entity(entity, user_ns)
-
-        with pytest.raises(MissingTargetNodeSetError) as exc_info:
-            await assign_nodeset_from_target([chunk], global_ns)
-
-        assert "Company" in str(exc_info.value)
-
-
-# ---------------------------------------------------------------------------
-# 3. assign_nodeset_from_target — invalid target_nodeset
-# ---------------------------------------------------------------------------
-
-
-class TestAssignNodesetInvalid:
-    @pytest.mark.asyncio
-    async def test_invalid_string_raises(self):
-        """model_construct bypasses Pydantic so we can inject illegal LLM output."""
-        entity = Company.model_construct(
-            id=uuid4(), ticker="AAPL", name="Apple Inc.", target_nodeset="PUBLIC",
-            created_at=0, updated_at=0, ontology_valid=False,
-            version=1, topological_rank=0, metadata={"index_fields": []},
-            type="Company", belongs_to_set=None,
-        )
-        global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
-        chunk = make_chunk_with_entity(entity, user_ns)
-
-        with pytest.raises(InvalidTargetNodeSetError) as exc_info:
-            await assign_nodeset_from_target([chunk], global_ns)
-
-        assert "PUBLIC" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_empty_string_raises(self):
-        entity = FinancialConcept.model_construct(
-            id=uuid4(), name="P/E ratio", definition="Price-to-earnings.",
-            target_nodeset="",
-            created_at=0, updated_at=0, ontology_valid=False,
-            version=1, topological_rank=0, metadata={"index_fields": []},
-            type="FinancialConcept", belongs_to_set=None,
-        )
-        global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
-        chunk = make_chunk_with_entity(entity, user_ns)
-
-        with pytest.raises(InvalidTargetNodeSetError):
-            await assign_nodeset_from_target([chunk], global_ns)
-
-
-# ---------------------------------------------------------------------------
-# 4. assign_nodeset_from_target — valid GLOBAL routing
+# 2. assign_nodesets — valid GLOBAL routing
 # ---------------------------------------------------------------------------
 
 
 class TestAssignNodesetGlobal:
     @pytest.mark.asyncio
-    async def test_global_enum_routes_to_global_nodeset(self):
-        entity = Company.model_construct(ticker="MSFT", name="Microsoft", target_nodeset=NodeSetTarget.GLOBAL, belongs_to_set=None)
+    async def test_global_entity_routes_to_global_nodeset(self):
+        entity = Company.model_construct(ticker="MSFT", name="Microsoft", belongs_to_set=None)
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
         chunk = make_chunk_with_entity(entity, user_ns, global_ns)
 
-        result = await assign_nodeset_from_target([chunk], global_ns)
+        result = await assign_nodesets([chunk], global_ns)
 
         assert entity.belongs_to_set == [global_ns]
         assert result == [chunk]
 
-    @pytest.mark.asyncio
-    async def test_global_raw_string_coercion(self):
-        """LLM may return raw "GLOBAL" string — must be coerced and accepted."""
-        entity = Company.model_construct(
-            id=uuid4(), ticker="TSLA", name="Tesla Inc.",
-            target_nodeset="GLOBAL",
-            created_at=0, updated_at=0, ontology_valid=False,
-            version=1, topological_rank=0, metadata={"index_fields": []},
-            type="Company", belongs_to_set=None,
-        )
-        global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
-        chunk = make_chunk_with_entity(entity, user_ns, global_ns)
-
-        await assign_nodeset_from_target([chunk], global_ns)
-        assert entity.belongs_to_set == [global_ns]
-
 
 # ---------------------------------------------------------------------------
-# 5. assign_nodeset_from_target — valid USER routing
+# 3. assign_nodesets — valid USER routing
 # ---------------------------------------------------------------------------
 
 
 class TestAssignNodesetUser:
     @pytest.mark.asyncio
-    async def test_user_enum_routes_to_user_nodeset(self):
-        entity = Company.model_construct(
-            ticker="AAPL", name="Apple Inc.", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
+    async def test_user_entity_routes_to_user_nodeset(self):
+        import datetime
+        entity = InvestmentThesis.model_construct(
+            thesis_id="T1", summary="test", status="Active", created_at=datetime.datetime.now(), targets=[], belongs_to_set=None
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
         chunk = make_chunk_with_entity(entity, user_ns)
 
-        await assign_nodeset_from_target([chunk], global_ns)
+        await assign_nodesets([chunk], global_ns)
         assert entity.belongs_to_set == [user_ns]
 
     @pytest.mark.asyncio
-    async def test_user_lowercase_string_coercion(self):
-        """LLM may return lowercase "user" — must be coerced."""
-        entity = Company.model_construct(
-            id=uuid4(), ticker="MSFT", name="Microsoft",
-            target_nodeset="user",
-            created_at=0, updated_at=0, ontology_valid=False,
-            version=1, topological_rank=0, metadata={"index_fields": []},
-            type="Company", belongs_to_set=None,
+    async def test_user_entity_with_no_user_doc(self):
+        """User-specific entity in a GLOBAL document triggers warning and drops down to GLOBAL (or raises). """
+        import datetime
+        entity = InvestmentThesis.model_construct(
+            thesis_id="T2", summary="test", status="Active", created_at=datetime.datetime.now(), targets=[], belongs_to_set=None
         )
-        global_ns = make_nodeset(GLOBAL_NODESET_NAME)
-        user_ns = make_nodeset("USER_abc123def456ab")
-        chunk = make_chunk_with_entity(entity, user_ns)
-
-        await assign_nodeset_from_target([chunk], global_ns)
-        assert entity.belongs_to_set == [user_ns]
-
-    @pytest.mark.asyncio
-    async def test_user_target_but_global_document_overrides(self):
-        """If LLM flags entity as USER but document is GLOBAL, should override to GLOBAL."""
-        entity = Company.model_construct(ticker="AAPL", name="Apple Inc.", target_nodeset=NodeSetTarget.USER, belongs_to_set=None)
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         # Pass only global_ns to the chunk to simulate a public document
         chunk = make_chunk_with_entity(entity, global_ns=global_ns)
 
-        await assign_nodeset_from_target([chunk], global_ns)
+        await assign_nodesets([chunk], global_ns)
         # Should be overridden to GLOBAL since document is GLOBAL
         assert entity.belongs_to_set == [global_ns]
-        assert entity.target_nodeset == NodeSetTarget.GLOBAL
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +187,10 @@ class TestAssignNodesetUser:
 class TestAssignNodesetMixed:
     @pytest.mark.asyncio
     async def test_mixed_entities_routed_correctly(self):
-        entity_global = Company.model_construct(ticker="GOOG", name="Alphabet", target_nodeset=NodeSetTarget.GLOBAL, belongs_to_set=None)
-        entity_user = Company.model_construct(
-            ticker="GOOGL", name="Alphabet C", target_nodeset=NodeSetTarget.USER, belongs_to_set=None
+        entity_global = Company.model_construct(ticker="GOOG", name="Alphabet", belongs_to_set=None)
+        import datetime
+        entity_user = InvestmentThesis.model_construct(
+            thesis_id="T3", summary="test", status="Active", created_at=datetime.datetime.now(), targets=[], belongs_to_set=None
         )
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         user_ns = make_nodeset("USER_abc123def456ab")
@@ -293,7 +198,7 @@ class TestAssignNodesetMixed:
         chunk = make_chunk_with_entity(entity_global, user_ns, global_ns)
         chunk.contains = [entity_global, entity_user]
 
-        await assign_nodeset_from_target([chunk], global_ns)
+        await assign_nodesets([chunk], global_ns)
         assert entity_global.belongs_to_set == [global_ns]
         assert entity_user.belongs_to_set == [user_ns]
 
@@ -304,7 +209,7 @@ class TestAssignNodesetMixed:
         chunk.contains = []
         chunk.is_part_of = MagicMock()
 
-        result = await assign_nodeset_from_target([chunk], global_ns)
+        result = await assign_nodesets([chunk], global_ns)
         assert result == [chunk]
 
     @pytest.mark.asyncio
@@ -316,14 +221,14 @@ class TestAssignNodesetMixed:
         chunk.contains = [non_financial]
         chunk.is_part_of = MagicMock()
 
-        result = await assign_nodeset_from_target([chunk], global_ns)
+        result = await assign_nodesets([chunk], global_ns)
         assert result == [chunk]
 
     @pytest.mark.asyncio
     async def test_non_list_input_raises(self):
         global_ns = make_nodeset(GLOBAL_NODESET_NAME)
         with pytest.raises(TypeError):
-            await assign_nodeset_from_target("not a list", global_ns)  # type: ignore
+            await assign_nodesets("not a list", global_ns)  # type: ignore
 
 
 # ---------------------------------------------------------------------------
