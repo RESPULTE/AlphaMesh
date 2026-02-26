@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from typing import List, Optional
+from core.memory.graph_models import GlobalEntity
 
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.modules.pipelines.tasks.task import Task
@@ -36,15 +37,21 @@ from cognee.tasks.summarization import summarize_text
 from cognee.tasks.storage import add_data_points
 from cognee.modules.cognify.config import get_cognify_config
 
+from cognee.infrastructure.engine import Edge
+from cognee.infrastructure.databases.graph import get_graph_engine
 from core.memory.exceptions import (
     InvalidTargetNodeSetError,
     MissingTargetNodeSetError,
     NodeSetResolutionError,
 )
 from core.memory.graph_models import (
+    Company,
     FinancialBaseDataPoint,
     FinancialKnowledgeGraph,
+    InvestmentThesis,
     NodeSetTarget,
+    Sector,
+    GlobalInfluence,
 )
 from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
@@ -53,6 +60,61 @@ from core.memory.nodeset_manager import (
 from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+
+# ---------------------------------------------------------------------------
+# Post-processing task: process_global_influences
+# ---------------------------------------------------------------------------
+
+
+async def process_global_influences(
+    data_chunks: List[DocumentChunk],
+) -> tuple[List[DocumentChunk], list]:
+    """
+    Extracts GlobalInfluence models, turns them into edges, and removes them from the parsed entities list
+    so they don't get saved as standard node entities. Returns the modified chunks and a list of custom edges.
+    """
+    
+    all_custom_edges = []
+    
+    for chunk in data_chunks:
+        entities = getattr(chunk, "contains", None)
+        
+        # Unpack FinancialKnowledgeGraph if necessary
+        if isinstance(entities, FinancialKnowledgeGraph):
+            entities = getattr(entities, "entities", [])
+            chunk.contains = entities
+
+        if not entities or not isinstance(entities, list):
+            continue
+            
+        influences = [e for e in entities if isinstance(e, GlobalInfluence)]
+        logger.info("Found %d global influences in chunk %s.", len(influences), chunk.id)
+
+
+        # Keep only non-influences
+        chunk.contains = [e for e in entities if not isinstance(e, GlobalInfluence)]
+        
+        if influences:
+            for inf in influences:
+                props = {}
+                if inf.weight is not None:
+                    try:
+                        props["weight"] = float(inf.weight)
+                    except (ValueError, TypeError):
+                        pass
+                
+                if inf.evidence is not None:
+                    props["evidence"] = str(inf.evidence) if not isinstance(inf.evidence, str) else inf.evidence
+
+                all_custom_edges.append(
+                    (str(inf.source_id), str(inf.target_id), str(inf.relationship_name), props)
+                )
+
+    logger.info("Extracted %d global influence custom edges.", len(all_custom_edges))
+            
+    return (data_chunks, all_custom_edges)
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +141,11 @@ async def assign_nodeset_from_target(
       4. Assign belongs_to_set = [resolved_nodeset]
 
     Args:
-        data_chunks:    List of DocumentChunk objects populated by extract_graph_from_data.
+        payload: Tuple containing (List of DocumentChunk objects, list of custom edges).
         global_nodeset: The shared GLOBAL NodeSet.
 
     Returns:
-        The same data_chunks list with `belongs_to_set` populated on all entities.
+        tuple[List[DocumentChunk], list]: The same data_chunks list with `belongs_to_set` populated on all entities, and custom edges.
 
     Raises:
         MissingTargetNodeSetError:  If any entity is missing target_nodeset.
@@ -91,6 +153,7 @@ async def assign_nodeset_from_target(
         NodeSetResolutionError:     Safety net if NodeSet object is None or not found on document.
         TypeError: If data_chunks is not a list.
     """
+
     if not isinstance(data_chunks, list):
         raise TypeError(
             f"assign_nodeset_from_target: expected list[DocumentChunk], got {type(data_chunks)}"
@@ -196,6 +259,20 @@ async def assign_nodeset_from_target(
 # ---------------------------------------------------------------------------
 
 
+async def add_data_points_with_custom_edges(
+    payload: tuple[List[DocumentChunk], list],
+    embed_triplets: bool = False,
+) -> List[DocumentChunk]:
+    """
+    Wrapper task for `add_data_points` that unpacks the combined payload (data_chunks, custom_edges)
+    from previous tasks and passes `custom_edges` correctly.
+    """
+    logger.info("add_data_points_with_custom_edges: %d chunks, %d custom edges.", len(payload[0]), len(payload[1]))
+    logger.info("add_data_points_with_custom_edges: %s", payload)
+    
+    data_chunks, custom_edges = payload
+    return await add_data_points(data_chunks, custom_edges=custom_edges, embed_triplets=embed_triplets)
+
 async def build_financial_pipeline(
     chunks_per_batch: int = 100,
     chunk_size: Optional[int] = None,
@@ -241,17 +318,21 @@ async def build_financial_pipeline(
             custom_prompt=FINANCIAL_COGNIFY_SYSTEM_PROMPT,
             task_config={"batch_size": chunks_per_batch},
         ),
+        # Process global influences and remove them from entities
         # Our custom post-processing task
         Task(
             assign_nodeset_from_target,
             global_nodeset=global_nodeset,
         ),
         Task(
-            summarize_text,
-            task_config={"batch_size": chunks_per_batch},
+            process_global_influences,
         ),
+        # Task(
+        #     summarize_text,
+        #     task_config={"batch_size": chunks_per_batch},
+        # ),
         Task(
-            add_data_points,
+            add_data_points_with_custom_edges,
             embed_triplets=embed_triplets,
             task_config={"batch_size": chunks_per_batch},
         ),

@@ -132,8 +132,7 @@ class FinancialMemorySystem:
         self._global_nodeset = await get_or_create_global_nodeset()
 
         # Initialize the graph client to attach on self
-        self.graph_client = cognee.infrastructure.engine.get_engine().graph
-
+        self.graph_client = await cognee.infrastructure.databases.graph.get_graph_engine()
         self._initialized = True
         logger.info(
             "FinancialMemorySystem ready. Dataset='%s', GLOBAL NodeSet id=%s.",

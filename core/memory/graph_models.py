@@ -20,7 +20,7 @@ from typing import Any, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, SkipValidation
 
-from cognee.infrastructure.engine import DataPoint
+from cognee.infrastructure.engine import DataPoint, Edge
 from cognee.modules.engine.models import Entity
 
 
@@ -60,7 +60,7 @@ class FinancialBaseDataPoint(Entity):
     # `belongs_to_set` is inherited from DataPoint as Optional[List[DataPoint]]
     # Assigned by the post-processing task — never by the LLM.
 
-    model_config = {"arbitrary_types_allowed": True}
+
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +76,6 @@ class Company(FinancialBaseDataPoint):
     description: Optional[str] = None
 
     metadata: dict = {"index_fields": ["name", "ticker", "description"]}
-    model_config = {"arbitrary_types_allowed": True}
 
 
 
@@ -96,28 +95,40 @@ class FinancialConcept(FinancialBaseDataPoint):
     examples: Optional[List[str]] = None
 
     metadata: dict = {"index_fields": ["name", "definition"]}
-    model_config = {"arbitrary_types_allowed": True}
 
 
+class GlobalEntity(FinancialBaseDataPoint):
+    """A global entity."""
+    name: str
+    description: Optional[str] = None
+    related_to: list["GlobalEntity"]
 
 
-class Sector(FinancialBaseDataPoint):
+class Sector(GlobalEntity):
     """A specific economic sector."""
-    name: str
 
-class Industry(FinancialBaseDataPoint):
-    """A specific industry within a sector."""
-    name: str
 
-class GlobalEvent(FinancialBaseDataPoint):
+class GlobalEvent(GlobalEntity):
     """A significant global event."""
-    name: str
-    description: Optional[str] = None
 
-class MacroTrend(FinancialBaseDataPoint):
+class MacroTrend(GlobalEntity):
     """A macroeconomic trend."""
-    name: str
-    description: Optional[str] = None
+
+VALID_GLOBAL_INFLUENCE_TYPES = ["Company", "Sector", "GlobalEvent", "MacroTrend"]
+
+class GlobalInfluence(DataPoint):
+    """
+    Extracts named influence relationships between global entities.
+    Examples: POSITIVE_AFFECT, NEGATIVE_AFFECT, INCREASES_RISK.
+    """
+    source_id: str
+    target_id: str
+    relationship_name: str
+    weight: Optional[float] = None
+    evidence: Optional[str] = None
+
+    metadata: dict = {"index_fields": ["source_id", "target_id", "relationship_name"]}
+
 
 class InvestmentThesis(DataPoint):
     """
@@ -132,46 +143,11 @@ class InvestmentThesis(DataPoint):
 
     # Relationship fields (using SkipValidation[Any] to avoid forward reference issues)
     # targets: Connects to Company or Sector nodes.
-    targets: SkipValidation[Any] = None
-    # supported_by: Connects to any other global nodes.
-    supported_by: SkipValidation[Any] = None
-    # threatened_by: Connects to any other global nodes.
-    threatened_by: SkipValidation[Any] = None
-
-    # Cognee Edge structures dictating how edge properties are attached:
-    # - User NodeSet -> Thesis (Edge: `HoldsThesis`, property: `conviction_level`)
-    #   Note: Do NOT create a distinct "User" Node; the user is represented as a Cognee NodeSet natively.
-    # - Thesis -> GlobalEvent/MacroTrend (Edges: `SupportedBy` / `ThreatenedBy`, properties: `weight`, `added_on`)
-
-    model_config = {"arbitrary_types_allowed": True}
+    targets: list["Company"]
 
 
-'''
-example of custom edge (relationship) between entities
 
-from cognee.infrastructure.engine import Edge
-from core.memory.graph_models import InvestmentThesis, Company
-# 1. Instantiate the Target Node
-nvidia_node = Company(
-    ticker="NVDA",
-    name="NVIDIA Corp",
-    sector="Technology",
-    description="Leading designer of AI accelerators."
-)
-# 2. Instantiate the Investment Thesis Node
-thesis = InvestmentThesis(
-    thesis_id="TH-NVDA-AI-2026",
-    summary="NVIDIA will continue to dominate the AI accelerator market due to its CUDA moat.",
-    status="Active"
-)
-# 3. Attach the target using Edge syntax
-# You assign a tuple consisting of the Edge object and the target node(s).
-thesis.targets = [
-    (Edge(relationship_type="TARGETS"), nvidia_node)
-]
-# You can also use this same pattern for supported_by and threatened_by edges:
-# thesis.supported_by = [(Edge(relationship_type="SUPPORTED_BY", weights=1.0), macro_trend_node)]
-'''
+
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +158,10 @@ FinancialBaseDataPoint.model_rebuild()
 Company.model_rebuild()
 FinancialConcept.model_rebuild()
 Sector.model_rebuild()
-Industry.model_rebuild()
 GlobalEvent.model_rebuild()
 MacroTrend.model_rebuild()
 InvestmentThesis.model_rebuild()
+GlobalInfluence.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -204,10 +180,10 @@ class FinancialKnowledgeGraph(BaseModel):
             Company, 
             FinancialConcept, 
             Sector, 
-            Industry, 
             GlobalEvent, 
             MacroTrend, 
-            InvestmentThesis
+            InvestmentThesis,
+            GlobalInfluence
         ]
     ] = Field(
         default_factory=list,
@@ -217,7 +193,7 @@ class FinancialKnowledgeGraph(BaseModel):
         ),
     )
 
-    model_config = {"arbitrary_types_allowed": True}
+
 
 
 FinancialKnowledgeGraph.model_rebuild()
