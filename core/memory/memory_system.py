@@ -25,7 +25,6 @@ from cognee.modules.pipelines.layers.pipeline_execution_mode import (
     get_pipeline_executor,
 )
 from cognee.modules.search.types import SearchType
-
 from core.memory.exceptions import IngestionError, MemorySystemError, QueryError
 from core.memory.nodeset_manager import (
     DATASET_NAME,
@@ -37,6 +36,8 @@ from core.memory.nodeset_manager import (
     initialize_cognee,
 )
 from core.memory.pipeline_tasks import build_financial_pipeline
+from core.memory.entity_merger import run_entity_merging_neo4j
+from cognee.infrastructure.databases.graph import get_graph_engine
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ class FinancialMemorySystem:
         self._global_nodeset = await get_or_create_global_nodeset()
 
         # Initialize the graph client to attach on self
-        self.graph_client = await cognee.infrastructure.databases.graph.get_graph_engine()
+        self.graph_client = await get_graph_engine()
         self._initialized = True
         logger.info(
             "FinancialMemorySystem ready. Dataset='%s', GLOBAL NodeSet id=%s.",
@@ -437,11 +438,11 @@ class FinancialMemorySystem:
                 datasets=DATASET_NAME,
                 pipeline_name="financial_cognify_pipeline",
             )
-            logger.info("Global cognify completed.")
+            logger.info("Global cognify completed. Running Neo4j entity deduplication.")
+            await run_entity_merging_neo4j(self.graph_client)
             return result
         except Exception as exc:
             raise MemorySystemError(f"Cognify failed: {exc}") from exc
-
 
     # ------------------------------------------------------------------
     # Query — strictly filtered per user
@@ -453,6 +454,7 @@ class FinancialMemorySystem:
         query_text: str,
         search_type: SearchType = SearchType.GRAPH_COMPLETION,
         top_k: int = 10,
+        only_context: bool = False,
     ) -> List[Any]:
         """
         Query the knowledge graph with strict NodeSet isolation.
@@ -501,7 +503,7 @@ class FinancialMemorySystem:
                 node_type=NodeSet,
                 node_name=nodeset_names,  # EXACTLY ["GLOBAL", "USER_<hash>"]
                 top_k=top_k,
-                only_context=True,
+                only_context=only_context,
             )
             result_list = results or []
             logger.info(
@@ -587,13 +589,19 @@ class FinancialMemorySystem:
         try:
             # Resolving the execution method defensively based on typical Cognee adapter shapes
             execute_fn = None
-            if hasattr(graph_client, "graph") and hasattr(graph_client.graph, "execute"):
-                execute_fn = graph_client.graph.execute
+            if hasattr(graph_client, "query"):
+                execute_fn = graph_client.query
             elif hasattr(graph_client, "execute"):
                 execute_fn = graph_client.execute
+            elif hasattr(graph_client, "graph") and hasattr(
+                graph_client.graph, "execute"
+            ):
+                execute_fn = graph_client.graph.execute
 
             if not execute_fn:
-                logger.warning("Provided graph_client lacks an execute() method for Cypher queries.")
+                logger.warning(
+                    "Provided graph_client lacks a query() or execute() method for Cypher queries."
+                )
                 return 0.0
 
             results = await execute_fn(query, params)
@@ -617,4 +625,3 @@ class FinancialMemorySystem:
         except Exception as exc:
             logger.error("Failed to adjust edge property %s: %s", property_name, exc)
             raise MemorySystemError(f"Edge property adjustment failed: {exc}") from exc
-

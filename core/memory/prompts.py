@@ -38,7 +38,7 @@ Categorize every identified concept into one of the following specific entity ty
    - **CRITICAL TRIGGER:** If the user mentions *any* intent to **buy, sell, hold, or short** a stock, asset, or sector, you MUST create an `InvestmentThesis` entity.
    - Summarize the reasoning in the `summary` field.
    - Set the `status` to "Active".
-   - Link the relevant `Company` or `Sector` entities in the `targets` field.
+   - Link the relevant `Company` or `Sector` entities. Always link it to existing entities. Only create a new entity when no relevant existing ones can be found 
 
 ### RELATIONSHIPS & INFLUENCE (GlobalInfluence)
 All global entities (Sectors, Events, Trends, FinancialConcepts, and generic GlobalEntities) can influence each other. You must capture these dynamics using the `GlobalInfluence` entity.

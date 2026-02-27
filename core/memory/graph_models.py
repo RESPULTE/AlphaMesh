@@ -15,14 +15,11 @@ Architecture:
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
-from typing import Any, List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, SkipValidation
-
-from cognee.infrastructure.engine import DataPoint, Edge
+from cognee.infrastructure.engine import DataPoint
 from cognee.modules.engine.models import Entity
-
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Base for all financial domain entities
@@ -40,11 +37,8 @@ class Company(Entity):
 
     ticker: str
     name: str
-    description: Optional[str] = None
 
     metadata: dict = {"index_fields": ["name", "ticker", "description"]}
-
-
 
 
 class FinancialConcept(Entity):
@@ -54,8 +48,14 @@ class FinancialConcept(Entity):
     definition: str
     category: Optional[
         Literal[
-            "valuation", "technical_analysis", "fundamental_analysis",
-            "macroeconomics", "risk", "derivatives", "portfolio_management", "other",
+            "valuation",
+            "technical_analysis",
+            "fundamental_analysis",
+            "macroeconomics",
+            "risk",
+            "derivatives",
+            "portfolio_management",
+            "other",
         ]
     ] = None
     related_concepts: Optional[List[str]] = None
@@ -66,8 +66,8 @@ class FinancialConcept(Entity):
 
 class GlobalEntity(Entity):
     """A global entity."""
+
     name: str
-    description: Optional[str] = None
     related_to: list["GlobalEntity"]
 
 
@@ -78,14 +78,17 @@ class Sector(GlobalEntity):
 class GlobalEvent(GlobalEntity):
     """A significant global event."""
 
+
 class MacroTrend(GlobalEntity):
     """A macroeconomic trend."""
+
 
 class GlobalInfluence(DataPoint):
     """
     Extracts named influence relationships between global entities.
     Examples: POSITIVE_AFFECT, NEGATIVE_AFFECT, INCREASES_RISK.
     """
+
     source_id: str
     target_id: str
     relationship_name: str
@@ -100,19 +103,15 @@ class InvestmentThesis(DataPoint):
     An individual's or agent's structured investment thesis.
     Links to targeted Entities (Companies/Sectors), and supporting/threatening events.
     """
+
     thesis_id: str
     summary: str
     status: Literal["Active", "Dormant", "Archived"]
-    created_at: datetime
     metadata: dict = {"index_fields": ["summary"]}
 
     # Relationship fields (using SkipValidation[Any] to avoid forward reference issues)
     # targets: Connects to Company or Sector nodes.
     targets: list["Company"]
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -142,23 +141,18 @@ class FinancialKnowledgeGraph(BaseModel):
 
     entities: List[
         Union[
-            Company, 
-            FinancialConcept, 
-            Sector, 
-            GlobalEvent, 
-            MacroTrend, 
+            Company,
+            FinancialConcept,
+            Sector,
+            GlobalEvent,
+            MacroTrend,
             InvestmentThesis,
-            # GlobalInfluence,
-            Entity,
+            GlobalInfluence,
         ]
     ] = Field(
         default_factory=list,
-        description=(
-            "All extracted financial entities."
-        ),
+        description=("All extracted financial entities."),
     )
-
-
 
 
 FinancialKnowledgeGraph.model_rebuild()

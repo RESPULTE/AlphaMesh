@@ -22,12 +22,11 @@ from __future__ import annotations
 import hashlib
 import logging
 from asyncio import Lock
-from typing import List
 from uuid import NAMESPACE_OID, uuid5
 
+from cognee.modules.engine.operations.setup import setup
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.tasks.storage.add_data_points import add_data_points as cognee_add_dp
-from cognee.modules.engine.operations.setup import setup
 
 from core.memory.exceptions import (
     NodeSetCreationError,
@@ -37,7 +36,7 @@ from core.memory.exceptions import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constantss
 # ---------------------------------------------------------------------------
 
 DATASET_NAME = "alphamese_financial"
@@ -183,7 +182,9 @@ async def get_or_create_nodeset(name: str) -> NodeSet:
             nodeset = NodeSet(id=stable_id, name=canonical_name)
             await cognee_add_dp(data_points=[nodeset])
             _nodeset_cache[canonical_name] = nodeset
-            logger.info("NodeSet '%s' persisted/verified (id=%s).", canonical_name, stable_id)
+            logger.info(
+                "NodeSet '%s' persisted/verified (id=%s).", canonical_name, stable_id
+            )
             return nodeset
         except Exception as exc:
             raise NodeSetCreationError(canonical_name, str(exc)) from exc
@@ -213,7 +214,7 @@ async def get_or_create_user_nodeset(user_email: str) -> tuple[str, NodeSet]:
     return nodeset_name, nodeset
 
 
-def get_user_nodeset_names(user_email: str) -> List[str]:
+def get_user_nodeset_names(user_email: str) -> list[str]:
     """
     Return the two NodeSet NAMES a user is authorized to access.
 

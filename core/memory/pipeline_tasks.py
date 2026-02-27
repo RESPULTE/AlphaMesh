@@ -69,12 +69,12 @@ async def process_global_influences(
     Extracts GlobalInfluence models, turns them into edges, and removes them from the parsed entities list
     so they don't get saved as standard node entities. Returns the modified chunks and a list of custom edges.
     """
-    
+
     all_custom_edges = []
-    
+
     for chunk in data_chunks:
         entities = getattr(chunk, "contains", None)
-        
+
         # Unpack FinancialKnowledgeGraph if necessary
         if isinstance(entities, FinancialKnowledgeGraph):
             entities = getattr(entities, "entities", [])
@@ -82,14 +82,15 @@ async def process_global_influences(
 
         if not entities or not isinstance(entities, list):
             continue
-            
-        influences = [e for e in entities if isinstance(e, GlobalInfluence)]
-        logger.info("Found %d global influences in chunk %s.", len(influences), chunk.id)
 
+        influences = [e for e in entities if isinstance(e, GlobalInfluence)]
+        logger.info(
+            "Found %d global influences in chunk %s.", len(influences), chunk.id
+        )
 
         # Keep only non-influences
         chunk.contains = [e for e in entities if not isinstance(e, GlobalInfluence)]
-        
+
         if influences:
             for inf in influences:
                 props = {}
@@ -98,28 +99,51 @@ async def process_global_influences(
                         props["weight"] = float(inf.weight)
                     except (ValueError, TypeError):
                         pass
-                
-                if inf.evidence is not None:
-                    props["evidence"] = str(inf.evidence) if not isinstance(inf.evidence, str) else inf.evidence
 
-                logger.info("Processing global influence: %s -> %s", inf.source_id, inf.target_id)
+                if inf.evidence is not None:
+                    props["evidence"] = (
+                        str(inf.evidence)
+                        if not isinstance(inf.evidence, str)
+                        else inf.evidence
+                    )
+
+                logger.info(
+                    "Processing global influence: %s -> %s",
+                    inf.source_id,
+                    inf.target_id,
+                )
                 all_custom_edges.append(
                     (
-                        next((e.id for e in entities if getattr(e, "name", None) == inf.source_id), str(inf.source_id)),
-                        next((e.id for e in entities if getattr(e, "name", None) == inf.target_id), str(inf.target_id)),
+                        next(
+                            (
+                                e.id
+                                for e in entities
+                                if getattr(e, "name", None) == inf.source_id
+                            ),
+                            str(inf.source_id),
+                        ),
+                        next(
+                            (
+                                e.id
+                                for e in entities
+                                if getattr(e, "name", None) == inf.target_id
+                            ),
+                            str(inf.target_id),
+                        ),
                         str(inf.relationship_name),
                         props,
                     )
                 )
 
     logger.info("Extracted %d global influence custom edges.", len(all_custom_edges))
-            
+
     return (data_chunks, all_custom_edges)
 
 
 # ---------------------------------------------------------------------------
 # Post-processing task: assign_nodeset_from_target
 # ---------------------------------------------------------------------------
+
 
 def get_canonical_id(name: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, name.upper()))
@@ -168,10 +192,17 @@ async def assign_nodesets(
         # The document was placed in a node_set via update_node_set() during classify_documents
         document_nodesets = getattr(chunk.is_part_of, "belongs_to_set", []) or []
         user_nodeset_candidates = [
-            ns for ns in document_nodesets if isinstance(ns, NodeSet) and ns.name != GLOBAL_NODESET_NAME
+            ns
+            for ns in document_nodesets
+            if isinstance(ns, NodeSet) and ns.name != GLOBAL_NODESET_NAME
         ]
-        doc_user_nodeset: Optional[NodeSet] = user_nodeset_candidates[0] if user_nodeset_candidates else None
-        doc_is_global = any(isinstance(ns, NodeSet) and ns.name == GLOBAL_NODESET_NAME for ns in document_nodesets)
+        doc_user_nodeset: Optional[NodeSet] = (
+            user_nodeset_candidates[0] if user_nodeset_candidates else None
+        )
+        doc_is_global = any(
+            isinstance(ns, NodeSet) and ns.name == GLOBAL_NODESET_NAME
+            for ns in document_nodesets
+        )
 
         entities = getattr(chunk, "contains", None)
         if not entities:
@@ -190,7 +221,6 @@ async def assign_nodesets(
             chunk.contains = entities
 
         for entity in entities:
-    
 
             entity_type = type(entity).__name__
             total_entities += 1
@@ -209,7 +239,8 @@ async def assign_nodesets(
                 elif doc_is_global:
                     logger.warning(
                         "Entity %s is USER specific, but document is GLOBAL. "
-                        "Overriding to GLOBAL NodeSet.", entity_type
+                        "Overriding to GLOBAL NodeSet.",
+                        entity_type,
                     )
                     resolved = global_nodeset
                     global_count += 1
@@ -218,27 +249,30 @@ async def assign_nodesets(
                         f"Cannot resolve USER NodeSet for entity {entity_type} in chunk {chunk.id}: "
                         "parent document has no user NodeSet assigned."
                     )
-            
+
             if resolved is None:
-                raise NodeSetResolutionError(f"Failed to resolve NodeSet for {entity_type}")
+                raise NodeSetResolutionError(
+                    f"Failed to resolve NodeSet for {entity_type}"
+                )
 
             # Assign belongs_to_set
             entity.belongs_to_set = [resolved]
             logger.debug(
                 "Entity %s (id=%s) → belongs_to_set='%s'.",
-                entity_type, entity.id, resolved.name,
+                entity_type,
+                entity.id,
+                resolved.name,
             )
 
-
-            if hasattr(entity, "ticker"):
-                entity.id = get_canonical_id(entity.ticker)
-
-            elif hasattr(entity, "name"):
+            if hasattr(entity, "name"):
                 entity.id = get_canonical_id(entity.name)
 
     logger.info(
         "assign_nodesets: %d entities (%d GLOBAL, %d USER) across %d chunks.",
-        total_entities, global_count, user_count, len(data_chunks),
+        total_entities,
+        global_count,
+        user_count,
+        len(data_chunks),
     )
     return data_chunks
 
@@ -251,14 +285,19 @@ async def assign_nodesets(
 async def add_data_points_with_custom_edges(
     payload: tuple[List[DocumentChunk], list],
     embed_triplets: bool = False,
-) -> List[DocumentChunk]:
+):
     """
     Wrapper task for `add_data_points` that unpacks the combined payload (data_chunks, custom_edges)
     from previous tasks and passes `custom_edges` correctly.
     """
-    
-    # data_chunks, custom_edges = payload
-    return await add_data_points(payload, embed_triplets=embed_triplets)
+
+    data_chunks, custom_edges = payload
+    return await add_data_points(
+        data_points=data_chunks,
+        custom_edges=custom_edges,
+        embed_triplets=embed_triplets,
+    )
+
 
 async def build_financial_pipeline(
     chunks_per_batch: int = 100,
@@ -302,6 +341,7 @@ async def build_financial_pipeline(
         Task(
             extract_graph_from_data,
             graph_model=FinancialKnowledgeGraph,
+            custom_prompt=FINANCIAL_COGNIFY_SYSTEM_PROMPT,
             task_config={"batch_size": chunks_per_batch},
         ),
         # Process global influences and remove them from entities
@@ -310,9 +350,9 @@ async def build_financial_pipeline(
             assign_nodesets,
             global_nodeset=global_nodeset,
         ),
-        # Task(
-        #     process_global_influences,
-        # ),
+        Task(
+            process_global_influences,
+        ),
         # Task(
         #     summarize_text,
         #     task_config={"batch_size": chunks_per_batch},

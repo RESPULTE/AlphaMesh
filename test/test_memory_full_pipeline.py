@@ -63,7 +63,7 @@ async def run_ingestion(memory, user_a, user_b, sep):
             },
             {
                 "role": "assistant",
-                "content": "NeuroCure ($NCT) is focused on Alzheimer's treatments. They have a Phase 3 trial reading out in Q4. This company might also negatively affect the real estate companies, like VNO",
+                "content": "NeuroCure ($NCT) is focused on Alzheimer's treatments. They have a Phase 3 trial reading out in Q4. This company might also negatively affect the real estate companies, like Vornado Realty Trust",
             },
             {
                 "role": "user",
