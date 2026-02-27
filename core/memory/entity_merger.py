@@ -147,7 +147,13 @@ async def run_entity_merging_neo4j(
             })
             YIELD node
             SET node.id = $canonical_id
-            RETURN id(node) as merged_neo4j_id, node.id as cognee_id, node.name as name
+            WITH node
+            OPTIONAL MATCH (node)-[r]-()
+            FOREACH (_ IN CASE WHEN r IS NOT NULL THEN [1] ELSE [] END |
+                SET r.source_node_id = startNode(r).id,
+                    r.target_node_id = endNode(r).id
+            )
+            RETURN DISTINCT id(node) as merged_neo4j_id, node.id as cognee_id, node.name as name
             """
 
             try:
