@@ -6,11 +6,10 @@ Operates directly on the Neo4j graph using apoc.refactor.mergeNodes.
 """
 
 import logging
-from typing import Any, List, Dict\
-import asyncio
+from typing import Any, List, Dict
 from cognee.modules.engine.utils.generate_node_id import generate_node_id
 from cognee.infrastructure.databases.relational import get_relational_engine
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 
 logger = logging.getLogger(__name__)
 
@@ -118,19 +117,19 @@ async def run_entity_merging_neo4j(
                         await conn.execute(
                             text(
                                 "UPDATE edges SET source_node_id = :canonical_id WHERE source_node_id IN :old_ids"
-                            ),
+                            ).bindparams(bindparam("old_ids", expanding=True)),
                             {
                                 "canonical_id": canonical_cognee_id,
-                                "old_ids": old_cognee_ids,
+                                "old_ids": list(old_cognee_ids),
                             },
                         )
                         await conn.execute(
                             text(
                                 "UPDATE edges SET destination_node_id = :canonical_id WHERE destination_node_id IN :old_ids"
-                            ),
+                            ).bindparams(bindparam("old_ids", expanding=True)),
                             {
                                 "canonical_id": canonical_cognee_id,
-                                "old_ids": old_cognee_ids,
+                                "old_ids": list(old_cognee_ids),
                             },
                         )
             except Exception as e:
