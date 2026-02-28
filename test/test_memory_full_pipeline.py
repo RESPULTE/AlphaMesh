@@ -118,11 +118,11 @@ async def run_smoke_test() -> None:
         hash_user_email,
     )
 
-    # # Remove all data files
-    # await cognee.prune.prune_data()
+    # Remove all data files
+    await cognee.prune.prune_data()
 
-    # # Remove everything (graph, vector, metadata, cache)
-    # await cognee.prune.prune_system(metadata=True)
+    # Remove everything (graph, vector, metadata, cache)
+    await cognee.prune.prune_system(metadata=True)
 
     USER_A = "alice@alphamese.ai"
     USER_B = "bob@alphamese.ai"

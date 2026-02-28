@@ -363,7 +363,6 @@ async def build_financial_pipeline(
             task_config={"batch_size": chunks_per_batch},
         ),
     ]
-
     logger.info(
         "Built global financial pipeline with %d tasks.",
         len(tasks),

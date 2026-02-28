@@ -21,9 +21,7 @@ from typing import Any, List, Optional
 import cognee
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.modules.pipelines import run_pipeline
-from cognee.modules.pipelines.layers.pipeline_execution_mode import (
-    get_pipeline_executor,
-)
+from cognee.modules.run_custom_pipeline import run_custom_pipeline
 from cognee.modules.search.types import SearchType
 from core.memory.exceptions import IngestionError, MemorySystemError, QueryError
 from core.memory.nodeset_manager import (
@@ -429,14 +427,11 @@ class FinancialMemorySystem:
         )
 
         try:
-            pipeline_executor_func = get_pipeline_executor(
-                run_in_background=run_in_background
-            )
-            result = await pipeline_executor_func(
-                pipeline=run_pipeline,
+            result = await run_custom_pipeline(
                 tasks=tasks,
-                datasets=DATASET_NAME,
+                dataset=DATASET_NAME,
                 pipeline_name="financial_cognify_pipeline",
+                incremental_loading=True,
             )
             logger.info("Global cognify completed. Running Neo4j entity deduplication.")
             await run_entity_merging_neo4j(self.graph_client)

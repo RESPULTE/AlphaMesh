@@ -17,6 +17,9 @@ from sqlalchemy import text, bindparam
 from cognee.api.v1.search import search
 from cognee.modules.search.types import SearchType
 from cognee.tasks.storage import index_data_points, index_graph_edges
+from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
+from cognee.infrastructure.databases.vector import get_vector_engine
+from ast import literal_eval
 
 logger = logging.getLogger(__name__)
 
@@ -215,12 +218,15 @@ async def run_entity_merging_neo4j(
 
         # Execute APOC merge for each group; update relational DB only on success
         success_count = 0
+        affected_node_ids = set()
         for nodes in merge_groups:
             canonical_cognee_id = nodes[0]["cognee_id"]
             canonical_name = nodes[0]["name"]
 
             old_cognee_ids = [n["cognee_id"] for n in nodes[1:]]
             node_ids = [n["neo4j_id"] for n in nodes]
+
+            affected_node_ids.update([canonical_cognee_id] + old_cognee_ids)
 
             logger.debug(
                 f"Merging {len(node_ids)} nodes into canonical uuid {canonical_cognee_id} ('{canonical_name}')"
@@ -286,21 +292,48 @@ async def run_entity_merging_neo4j(
         #    This keeps ChunksRetriever / JaccardChunksRetriever aligned with Neo4j.
         try:
             logger.info("Reindexing vector store after entity merges...")
-            graph_engine = await get_graph_engine()
-            nodes_data, edges_data = await graph_engine.get_graph_data()
+            graph_engine: Neo4jAdapter = await get_graph_engine()
+            vector_engine = get_vector_engine()
+
+            nodes_data, edges_data = await graph_engine.get_id_filtered_graph_data(
+                list(affected_node_ids)
+            )
+
+            collections_to_clean = [
+                "Entity_name",
+                "EntityType_name",
+                "DocumentChunk_text",
+                "EdgeType_relationship_name",
+                "TextDocument_name",
+                "TextSummary_text",
+            ]
+            for coll in collections_to_clean:
+                if await vector_engine.has_collection(coll):
+                    logger.info(f"Deleting data points from collection {coll}")
+                    await vector_engine.delete_data_points(
+                        coll, list(affected_node_ids)
+                    )
 
             # index_data_points expects DataPoint instances; nodes from get_graph_data
             # are (node_id, properties_dict) tuples — build a lightweight wrapper list
             # that only passes actual DataPoint objects through (graph backends may
             # return either raw dicts or DataPoint subclasses).
-            indexable_nodes = typing_cast(
-                list[DataPoint],
-                [props for _, props in nodes_data if isinstance(props, DataPoint)],
-            )
+            indexable_nodes = []
+            for _, props in nodes_data:
+                props = {
+                    k: literal_eval(v) if k == "metadata" else v
+                    for k, v in props.items()
+                }
+                if "metadata" in props and isinstance(props["metadata"], dict):
+                    props["metadata"].setdefault("type", props.get("type"))
+                indexable_nodes.append(DataPoint(**props))
+            logger.info(f"Reindexing {len(indexable_nodes)} nodes.")
             if indexable_nodes:
-                await index_data_points(indexable_nodes)  # type: ignore[arg-type]
+                await index_data_points(indexable_nodes)
 
+            logger.info(f"Reindexing {len(edges_data)} edges.")
             await index_graph_edges(edges_data)
+
             logger.info("Vector store reindex complete.")
         except Exception as e:
             logger.error(f"Vector store reindex failed after entity merges: {e}")
