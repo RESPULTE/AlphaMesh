@@ -118,11 +118,11 @@ async def run_smoke_test() -> None:
         hash_user_email,
     )
 
-    # Remove all data files
-    await cognee.prune.prune_data()
+    # # Remove all data files
+    # await cognee.prune.prune_data()
 
-    # Remove everything (graph, vector, metadata, cache)
-    await cognee.prune.prune_system(metadata=True)
+    # # Remove everything (graph, vector, metadata, cache)
+    # await cognee.prune.prune_system(metadata=True)
 
     USER_A = "alice@alphamese.ai"
     USER_B = "bob@alphamese.ai"
@@ -157,7 +157,8 @@ async def run_smoke_test() -> None:
                 user_email=user,
                 query_text=prompt,
                 search_type=SearchType.GRAPH_COMPLETION,
-                top_k=3,
+                top_k=20,
+                # only_context=True,
             )
             print(f"      Ans : {len(results)} chunks found.")
             for i, r in enumerate(results):
@@ -191,6 +192,8 @@ async def run_smoke_test() -> None:
     print(f"{SEP}")
     print("  Smoke test fully verified.")
     print(f"{SEP}\n")
+
+    await execute_query(USER_B, "what does VNO gets affected by any other stock?")
 
 
 if __name__ == "__main__":

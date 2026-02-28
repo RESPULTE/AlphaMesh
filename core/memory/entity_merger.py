@@ -6,27 +6,34 @@ Operates directly on the Neo4j graph using apoc.refactor.mergeNodes.
 """
 
 import logging
+import difflib
+import networkx as nx
 from typing import Any, List, Dict
 from cognee.modules.engine.utils.generate_node_id import generate_node_id
 from cognee.infrastructure.databases.relational import get_relational_engine
 from sqlalchemy import text, bindparam
+from cognee.api.v1.search import search
+from cognee.modules.search.types import SearchType
+from cognee.tasks.storage import index_data_points, index_graph_edges
 
 logger = logging.getLogger(__name__)
 
+# Configurable similarity thresholds
+AUTO_MERGE_THRESHOLD = 0.85
+SEMANTIC_CHECK_THRESHOLD = 0.50
+
 
 async def run_entity_merging_neo4j(
-    graph_client: Any, similarity_threshold: float = 0.85
+    graph_client: Any, similarity_threshold: float = AUTO_MERGE_THRESHOLD
 ) -> None:
     """
     Executes a standalone graph-maintenance query to merge similar global entities.
 
     1. Fetches candidate GlobalEntity nodes (Company, Sector, GlobalEvent, MacroTrend, FinancialConcept).
-    2. Groups them by normalized name ID (via generate_node_id).
-    3. Executes apoc.refactor.mergeNodes for each group of duplicates.
-
-    Args:
-        graph_client: The initialized Neo4j graph client (e.g., from get_graph_engine()).
-        similarity_threshold: Future-proofing for semantic matching (currently maps exact IDs).
+    2. Groups them by labels and evaluates pairs using difflib fuzzy matching.
+    3. Auto-merges nodes with similarity >= AUTO_MERGE_THRESHOLD.
+    4. Semantically checks nodes with similarity >= SEMANTIC_CHECK_THRESHOLD or subsets using SearchType.CHUNKS.
+    5. Resolves connected components and merges each cluster using apoc.refactor.mergeNodes.
     """
     if not graph_client:
         logger.warning(
@@ -37,37 +44,36 @@ async def run_entity_merging_neo4j(
     logger.info("Starting Neo4j entity merging routine...")
 
     try:
-        # Step 1: Fetch canditate entities.
-        # We target labels that inherit from GlobalEntity or are standalone globals.
-        # Neo4j adapter forces `__Node__` on all nodes, and dynamically adds `name` etc.
-        # We look for nodes that have a 'name' property and are NOT InvestmentThesis.
-
         fetch_query = """
         MATCH (n:`__Node__`)
         WHERE (n:Company OR n:Sector OR n:GlobalEvent OR n:MacroTrend OR n:FinancialConcept)
           AND n.name IS NOT NULL
         RETURN id(n) AS neo4j_id, n.id AS cognee_id, n.name AS name, labels(n) AS labels
         """
-        # Await execution. Typically neo4j execute() returns a list of Neo4j Records.
         results = await graph_client.query(fetch_query)
 
         if not results:
             logger.info("No mergeable global entities found.")
             return
 
-        # Step 2: Group by normalized ID
-        grouped_nodes: Dict[str, List[Dict[str, Any]]] = {}
+        # Group nodes by their primary global label
+        label_groups: Dict[str, List[Dict[str, Any]]] = {}
+        target_labels = {
+            "Company",
+            "Sector",
+            "GlobalEvent",
+            "MacroTrend",
+            "FinancialConcept",
+        }
+
         for record in results:
-            # Safely extract from Neo4j records, dicts, or tuples
             data_dict = {}
             if hasattr(record, "data"):
-                # Neo4j python driver Record object
                 data_dict = record.data()
             elif isinstance(record, dict):
                 data_dict = record
             else:
                 try:
-                    # Fallback for tuples if mapped as dict-like
                     data_dict = dict(record)
                 except Exception:
                     pass
@@ -75,20 +81,107 @@ async def run_entity_merging_neo4j(
             neo4j_id = data_dict.get("neo4j_id")
             cognee_id = data_dict.get("cognee_id")
             name = data_dict.get("name")
+            labels = data_dict.get("labels", [])
 
             if neo4j_id is None or name is None or cognee_id is None:
                 continue
 
-            norm_id = str(generate_node_id(str(name).strip()))
+            # Find the primary label to group by
+            primary_label = None
+            for lbl in labels:
+                if lbl in target_labels:
+                    primary_label = lbl
+                    break
 
-            if norm_id not in grouped_nodes:
-                grouped_nodes[norm_id] = []
-            grouped_nodes[norm_id].append(
-                {"neo4j_id": int(neo4j_id), "cognee_id": cognee_id}
+            if not primary_label:
+                continue
+
+            if primary_label not in label_groups:
+                label_groups[primary_label] = []
+
+            label_groups[primary_label].append(
+                {
+                    "neo4j_id": int(neo4j_id),
+                    "cognee_id": cognee_id,
+                    "name": str(name).strip(),
+                }
             )
 
-        # Filter down to only groups that have more than 1 node (duplicates exist)
-        merge_groups = {k: v for k, v in grouped_nodes.items() if len(v) > 1}
+        # Build a graph of equivalences
+        G = nx.Graph()
+
+        # Exact ID matches (the original logic)
+        for label, nodes in label_groups.items():
+            for node in nodes:
+                G.add_node(node["neo4j_id"], **node)
+
+            # Compare all pairs within the same label group
+            for i in range(len(nodes)):
+                for j in range(i + 1, len(nodes)):
+                    node_a = nodes[i]
+                    node_b = nodes[j]
+
+                    name_a = node_a["name"].lower()
+                    name_b = node_b["name"].lower()
+
+                    # 1. Exact canonical ID match (original logic)
+                    if generate_node_id(name_a) == generate_node_id(name_b):
+                        G.add_edge(node_a["neo4j_id"], node_b["neo4j_id"])
+                        continue
+
+                    # 2. Fuzzy Matching
+                    ratio = difflib.SequenceMatcher(None, name_a, name_b).ratio()
+
+                    # Condition 1: Auto-merge
+                    if ratio >= AUTO_MERGE_THRESHOLD:
+                        logger.debug(
+                            f"Auto-merging '{name_a}' and '{name_b}' (ratio: {ratio:.2f})"
+                        )
+                        G.add_edge(node_a["neo4j_id"], node_b["neo4j_id"])
+                        continue
+
+                    # Condition 2: Semantic check via Vector search chunks
+                    is_subset = (name_a in name_b) or (name_b in name_a)
+                    if ratio >= SEMANTIC_CHECK_THRESHOLD or is_subset:
+                        try:
+                            # Use CHUNKS to see if they align semantically without LLM overhead
+                            search_results = await search(
+                                query_text=name_a,
+                                query_type=SearchType.CHUNKS,
+                                top_k=10,
+                            )
+
+                            # check if the other name appears in the top retrieved chunks
+                            found_semantic_match = False
+                            for res in search_results:
+                                chunk_text = getattr(res, "text", "")
+                                if isinstance(res, dict):
+                                    chunk_text = res.get("text", "")
+
+                                if chunk_text and name_b in chunk_text.lower():
+                                    found_semantic_match = True
+                                    break
+
+                            if found_semantic_match:
+                                logger.debug(
+                                    f"Semantic match found for '{name_a}' and '{name_b}'"
+                                )
+                                G.add_edge(node_a["neo4j_id"], node_b["neo4j_id"])
+                        except Exception as e:
+                            logger.warning(
+                                f"Semantic check failed for {name_a} and {name_b}: {e}"
+                            )
+
+        # Extract connected components (clusters of duplicates)
+        merge_groups = []
+        for component in nx.connected_components(G):
+            if len(component) > 1:
+                # Get the actual node dicts
+                cluster_nodes = [G.nodes[n_id] for n_id in component]
+
+                # Sort to ensure deterministic canonical selection (shortest name, then lowest ID)
+                cluster_nodes.sort(key=lambda x: (len(x["name"]), x["neo4j_id"]))
+                merge_groups.append(cluster_nodes)
 
         if not merge_groups:
             logger.info("No duplicate entities found to merge.")
@@ -100,14 +193,15 @@ async def run_entity_merging_neo4j(
 
         # Step 3: Execute APOC merge for each group
         success_count = 0
-        for norm_id, nodes in merge_groups.items():
-
+        for nodes in merge_groups:
             canonical_cognee_id = nodes[0]["cognee_id"]
+            canonical_name = nodes[0]["name"]
+
             old_cognee_ids = tuple(n["cognee_id"] for n in nodes[1:])
             node_ids = [n["neo4j_id"] for n in nodes]
 
             logger.debug(
-                f"Merging group {norm_id} into canonical uuid {canonical_cognee_id}"
+                f"Merging {len(node_ids)} nodes into canonical uuid {canonical_cognee_id} ('{canonical_name}')"
             )
 
             try:
@@ -133,7 +227,9 @@ async def run_entity_merging_neo4j(
                             },
                         )
             except Exception as e:
-                logger.error(f"Failed to rewire Cognee edge UUIDs for {norm_id}: {e}")
+                logger.error(
+                    f"Failed to rewire Cognee edge UUIDs for '{canonical_name}': {e}"
+                )
                 continue
 
             merge_query = """
@@ -164,10 +260,10 @@ async def run_entity_merging_neo4j(
                 )
                 success_count += 1
                 logger.info(
-                    f"Successfully merged group {norm_id} with neo4j IDs {node_ids}."
+                    f"Successfully merged group '{canonical_name}' with neo4j IDs {node_ids}."
                 )
             except Exception as e:
-                logger.error(f"Failed to merge group {norm_id}: {e}")
+                logger.error(f"Failed to merge group '{canonical_name}': {e}")
 
         logger.info(
             f"Successfully merged {success_count} out of {len(merge_groups)} entity groups."
@@ -175,3 +271,7 @@ async def run_entity_merging_neo4j(
 
     except Exception as e:
         logger.error(f"Error during entity merging: {e}")
+
+
+def cleanup():
+    
