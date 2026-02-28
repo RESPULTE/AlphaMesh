@@ -8,9 +8,11 @@ Operates directly on the Neo4j graph using apoc.refactor.mergeNodes.
 import logging
 import difflib
 import networkx as nx
-from typing import Any, List, Dict
+from typing import Any, List, Dict, cast as typing_cast
 from cognee.modules.engine.utils.generate_node_id import generate_node_id
+from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.infrastructure.databases.relational import get_relational_engine
+from cognee.infrastructure.engine import DataPoint
 from sqlalchemy import text, bindparam
 from cognee.api.v1.search import search
 from cognee.modules.search.types import SearchType
@@ -191,69 +193,41 @@ async def run_entity_merging_neo4j(
 
         relational_engine = get_relational_engine()
 
-        # Step 3: Execute APOC merge for each group
+        merge_query = """
+        MATCH (n:`__Node__`)
+        WHERE id(n) IN $node_ids
+        WITH collect(n) as neo4j_nodes
+        CALL apoc.refactor.mergeNodes(neo4j_nodes, {
+            properties: "overwrite",
+            mergeRels: true,
+            preserveExistingSelfRels: false
+        })
+        YIELD node
+        SET node.id = $canonical_id
+        WITH node
+        OPTIONAL MATCH (node)-[r]-()
+        FOREACH (_ IN CASE WHEN r IS NOT NULL THEN [1] ELSE [] END |
+            SET r.source_node_id = startNode(r).id,
+                r.target_node_id = endNode(r).id
+        )
+        RETURN DISTINCT id(node) as merged_neo4j_id, node.id as cognee_id, node.name as name
+        """
+
+        # Execute APOC merge for each group; update relational DB only on success
         success_count = 0
         for nodes in merge_groups:
             canonical_cognee_id = nodes[0]["cognee_id"]
             canonical_name = nodes[0]["name"]
 
-            old_cognee_ids = tuple(n["cognee_id"] for n in nodes[1:])
+            old_cognee_ids = [n["cognee_id"] for n in nodes[1:]]
             node_ids = [n["neo4j_id"] for n in nodes]
 
             logger.debug(
                 f"Merging {len(node_ids)} nodes into canonical uuid {canonical_cognee_id} ('{canonical_name}')"
             )
 
+            # 1. Execute the APOC merge in Neo4j first
             try:
-                # Update orphaned edge references in Cognee's internal relational DB
-                if hasattr(relational_engine, "engine"):
-                    async with relational_engine.engine.begin() as conn:
-                        await conn.execute(
-                            text(
-                                "UPDATE edges SET source_node_id = :canonical_id WHERE source_node_id IN :old_ids"
-                            ).bindparams(bindparam("old_ids", expanding=True)),
-                            {
-                                "canonical_id": canonical_cognee_id,
-                                "old_ids": list(old_cognee_ids),
-                            },
-                        )
-                        await conn.execute(
-                            text(
-                                "UPDATE edges SET destination_node_id = :canonical_id WHERE destination_node_id IN :old_ids"
-                            ).bindparams(bindparam("old_ids", expanding=True)),
-                            {
-                                "canonical_id": canonical_cognee_id,
-                                "old_ids": list(old_cognee_ids),
-                            },
-                        )
-            except Exception as e:
-                logger.error(
-                    f"Failed to rewire Cognee edge UUIDs for '{canonical_name}': {e}"
-                )
-                continue
-
-            merge_query = """
-            MATCH (n:`__Node__`)
-            WHERE id(n) IN $node_ids
-            WITH collect(n) as neo4j_nodes
-            CALL apoc.refactor.mergeNodes(neo4j_nodes, {
-                properties: "overwrite",
-                mergeRels: true,
-                preserveExistingSelfRels: false
-            })
-            YIELD node
-            SET node.id = $canonical_id
-            WITH node
-            OPTIONAL MATCH (node)-[r]-()
-            FOREACH (_ IN CASE WHEN r IS NOT NULL THEN [1] ELSE [] END |
-                SET r.source_node_id = startNode(r).id,
-                    r.target_node_id = endNode(r).id
-            )
-            RETURN DISTINCT id(node) as merged_neo4j_id, node.id as cognee_id, node.name as name
-            """
-
-            try:
-                # Must cast to ensure native types (list of ints usually ok)
                 await graph_client.query(
                     merge_query,
                     {"node_ids": node_ids, "canonical_id": canonical_cognee_id},
@@ -264,14 +238,76 @@ async def run_entity_merging_neo4j(
                 )
             except Exception as e:
                 logger.error(f"Failed to merge group '{canonical_name}': {e}")
+                continue  # Skip relational update if Neo4j merge failed
+
+            # 2. Only after a confirmed Neo4j merge: rewire stale UUIDs in Cognee's
+            #    relational `edges` table (source_node_id / destination_node_id).
+            #    There is no cognee built-in for this — index_data_points / index_graph_edges
+            #    only touch the vector index, not the relational DB.
+            if not old_cognee_ids:
+                continue
+            try:
+                if hasattr(relational_engine, "engine"):
+                    async with relational_engine.engine.begin() as conn:
+                        await conn.execute(
+                            text(
+                                "UPDATE edges SET source_node_id = :canonical_id"
+                                " WHERE source_node_id IN :old_ids"
+                            ).bindparams(bindparam("old_ids", expanding=True)),
+                            {
+                                "canonical_id": canonical_cognee_id,
+                                "old_ids": old_cognee_ids,
+                            },
+                        )
+                        await conn.execute(
+                            text(
+                                "UPDATE edges SET destination_node_id = :canonical_id"
+                                " WHERE destination_node_id IN :old_ids"
+                            ).bindparams(bindparam("old_ids", expanding=True)),
+                            {
+                                "canonical_id": canonical_cognee_id,
+                                "old_ids": old_cognee_ids,
+                            },
+                        )
+            except Exception as e:
+                logger.error(
+                    f"Failed to rewire Cognee edge UUIDs for '{canonical_name}': {e}"
+                )
 
         logger.info(
             f"Successfully merged {success_count} out of {len(merge_groups)} entity groups."
         )
+
+        if success_count == 0:
+            return
+
+        # 3. Reindex the vector store from the current graph state so that stale
+        #    entries left by deleted nodes are replaced with live data.
+        #    This keeps ChunksRetriever / JaccardChunksRetriever aligned with Neo4j.
+        try:
+            logger.info("Reindexing vector store after entity merges...")
+            graph_engine = await get_graph_engine()
+            nodes_data, edges_data = await graph_engine.get_graph_data()
+
+            # index_data_points expects DataPoint instances; nodes from get_graph_data
+            # are (node_id, properties_dict) tuples — build a lightweight wrapper list
+            # that only passes actual DataPoint objects through (graph backends may
+            # return either raw dicts or DataPoint subclasses).
+            indexable_nodes = typing_cast(
+                list[DataPoint],
+                [props for _, props in nodes_data if isinstance(props, DataPoint)],
+            )
+            if indexable_nodes:
+                await index_data_points(indexable_nodes)  # type: ignore[arg-type]
+
+            await index_graph_edges(edges_data)
+            logger.info("Vector store reindex complete.")
+        except Exception as e:
+            logger.error(f"Vector store reindex failed after entity merges: {e}")
 
     except Exception as e:
         logger.error(f"Error during entity merging: {e}")
 
 
 def cleanup():
-    
+    pass
