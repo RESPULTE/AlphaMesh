@@ -23,7 +23,7 @@ import hashlib
 import logging
 from asyncio import Lock
 from uuid import NAMESPACE_OID, uuid5
-from typing import Optional
+from typing import Optional, Type
 
 from cognee.modules.engine.operations.setup import setup
 from cognee.modules.engine.models.node_set import NodeSet
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DATASET_NAME = "alphamese_financial"
-GLOBAL_NODESET_NAME = "GLOBAL"
+GLOBAL_NODESET_NAME = "Market"
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +152,9 @@ async def initialize_cognee() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def get_or_create_nodeset(name: str, **kwargs) -> NodeSet:
+async def get_or_create_nodeset(
+    name: str, nodeset_type: Type[NodeSet] = NodeSet, **kwargs
+) -> NodeSet:
     """
     Idempotently retrieve or create a NodeSet by canonical name.
 
@@ -198,12 +200,12 @@ async def get_or_create_nodeset(name: str, **kwargs) -> NodeSet:
                     canonical_name,
                     stable_id,
                 )
-                nodeset = NodeSet(id=stable_id, name=canonical_name)
+                nodeset = nodeset_type(id=stable_id, name=canonical_name, **kwargs)
                 _nodeset_cache[canonical_name] = nodeset
                 return nodeset
 
-            # NodeSet does not exist, create it
-            nodeset = NodeSet(id=stable_id, name=canonical_name, **kwargs)
+            # nodeset_type does not exist, create it
+            nodeset = nodeset_type(id=stable_id, name=canonical_name, **kwargs)
             await cognee_add_dp(data_points=[nodeset])
             _nodeset_cache[canonical_name] = nodeset
             logger.info(
@@ -216,7 +218,9 @@ async def get_or_create_nodeset(name: str, **kwargs) -> NodeSet:
 
 async def get_or_create_global_nodeset() -> NodeSet:
     """Return the GLOBAL NodeSet, creating it if necessary."""
-    return await get_or_create_nodeset(GLOBAL_NODESET_NAME)
+    return await get_or_create_nodeset(
+        GLOBAL_NODESET_NAME, Sector, description=ALL_SECTORS[GLOBAL_NODESET_NAME]
+    )
 
 
 async def get_or_create_user_nodeset(user_email: str) -> tuple[str, NodeSet]:
@@ -234,7 +238,7 @@ async def get_or_create_user_nodeset(user_email: str) -> tuple[str, NodeSet]:
         ValueError: If email is invalid.
     """
     nodeset_name = get_user_nodeset_name(user_email)
-    nodeset = await get_or_create_nodeset(nodeset_name)
+    nodeset = await get_or_create_nodeset(nodeset_name, NodeSet)
     return nodeset_name, nodeset
 
 
@@ -269,7 +273,6 @@ async def get_or_create_all_sector_nodesets() -> None:
     Raises:
         NodeSetCreationError: On any failure.
     """
-    global_nodeset = await get_or_create_global_nodeset()
 
     # Identify which sectors are missing from the cache
     missing_from_cache = {}
@@ -295,6 +298,7 @@ async def get_or_create_all_sector_nodesets() -> None:
     # Prepare IDs for the missing ones
     ids_to_check = {name: str(_cognee_nodeset_id(name)) for name in missing_from_cache}
 
+    global_nodeset = await get_or_create_global_nodeset()
     try:
         # Query the graph to see which of these NodeSets already exist
         graph_engine = await get_graph_engine()
@@ -331,20 +335,12 @@ async def get_or_create_all_sector_nodesets() -> None:
 
         # Create the ones that were not in the DB
         to_create = []
-
-        market_nodeset = Sector(
-            id=ids_to_check["Market"], name="Market", description=ALL_SECTORS["Market"]
-        )
-        market_nodeset.belongs_to_set = [global_nodeset]
-        to_create.append(market_nodeset)
-        _nodeset_cache["Market"] = market_nodeset
-        missing_from_cache.pop("Market")
-
         for name, desc in missing_from_cache.items():
-            if name not in existing_in_db:
+            if name not in existing_in_db and name != GLOBAL_NODESET_NAME:
                 stable_id = ids_to_check[name]
                 nodeset = Sector(id=stable_id, name=name, description=desc)
-                nodeset.belongs_to_set = [market_nodeset]
+                nodeset.belongs_to_set = [global_nodeset]
+
                 to_create.append(nodeset)
                 _nodeset_cache[name] = nodeset
 

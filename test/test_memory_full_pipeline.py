@@ -116,6 +116,7 @@ async def execute_query(memory, user: str, prompt: str) -> None:
             query_text=prompt,
             search_type=SearchType.GRAPH_COMPLETION,
             top_k=10,
+            only_context=True,
         )
         print(f"      Ans : {len(results)} chunks found.")
         for i, r in enumerate(results):
@@ -165,7 +166,6 @@ async def run_smoke_test() -> None:
     )
 
     # Remove all data files
-    await clear_all()
 
     USER_A = "alice@alphamese.ai"
     USER_B = "bob@alphamese.ai"
@@ -186,6 +186,7 @@ async def run_smoke_test() -> None:
     # ------------------------------------------------------------------
     # 1. Initialize
     # ------------------------------------------------------------------
+    await clear_all()
     print("[1/5] Initializing FinancialMemorySystem …")
     await memory.initialize()
     print("      > Initialized.\n")

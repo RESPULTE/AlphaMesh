@@ -59,7 +59,7 @@ class FinancialConcept(DataPoint):
     """A financial concept, term, or educational definition. Always GLOBAL."""
 
     name: str = Field(description="Name of the financial concept or metric.")
-    definition: str = Field(description="Clear definition of the concept.")
+    description: str = Field(description="Clear description of the concept.")
     category: Literal[
         "valuation",
         "technical_analysis",
@@ -75,7 +75,7 @@ class FinancialConcept(DataPoint):
         default=None, description="Other conceptually related financial terms."
     )
 
-    metadata: dict = {"index_fields": ["name", "definition"]}
+    metadata: dict = {"index_fields": ["name", "description"]}
 
 
 class FinancialEvent(DataPoint):
