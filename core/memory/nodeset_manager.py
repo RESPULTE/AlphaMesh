@@ -270,6 +270,7 @@ SECTORS = {
     "Communication Services": "Telecommunications providers, media, entertainment, and interactive service companies.",
     "Utilities": "Providers of basic services including electricity, gas, and water.",
     "Real Estate": "Companies engaged in real estate development, management, and REITs.",
+    "Market": "The overall market, representing the aggregate of all companies and sectors.",
 }
 
 
@@ -347,11 +348,19 @@ async def get_or_create_all_sector_nodesets() -> None:
         # Create the ones that were not in the DB
         to_create = []
 
+        market_nodeset = Sector(
+            id=ids_to_check["Market"], name="Market", description=SECTORS["Market"]
+        )
+        market_nodeset.belongs_to_set = [global_nodeset]
+        to_create.append(market_nodeset)
+        _nodeset_cache["Market"] = market_nodeset
+        missing_from_cache.pop("Market")
+
         for name, desc in missing_from_cache.items():
             if name not in existing_in_db:
                 stable_id = ids_to_check[name]
                 nodeset = Sector(id=stable_id, name=name, description=desc)
-                nodeset.belongs_to_set = [global_nodeset]
+                nodeset.belongs_to_set = [global_nodeset, market_nodeset]
                 to_create.append(nodeset)
                 _nodeset_cache[name] = nodeset
 

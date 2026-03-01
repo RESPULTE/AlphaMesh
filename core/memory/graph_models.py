@@ -45,6 +45,7 @@ class Sector(NodeSet):
 
     name: str = Field(description="Name of the economic sector.")
     description: str = Field(description="Explanation of the sector's main activities.")
+    metadata: dict = {"index_fields": ["name", "description"]}
 
 
 class Company(FinancialEntity):
@@ -140,6 +141,14 @@ Sector.model_rebuild()
 InvestmentInterest.model_rebuild()
 FinancialEvent.model_rebuild()
 FinancialEntity.model_rebuild()
+
+ALL_ENTITIES = {
+    "Company",
+    "Sector",
+    "FinancialConcept",
+    "FinancialEvent",
+    "InvestmentInterest",
+}
 
 
 # ---------------------------------------------------------------------------

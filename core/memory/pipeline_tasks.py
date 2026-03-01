@@ -35,7 +35,7 @@ from cognee.tasks.documents import classify_documents, extract_chunks_from_docum
 from cognee.tasks.graph import extract_graph_from_data
 from cognee.tasks.summarization import summarize_text
 from cognee.tasks.storage import add_data_points
-from core.memory.entity_merger import find_and_merge_candidates, MERGEABLE_LABELS
+from core.memory.entity_merger import find_and_merge_candidates
 from cognee.modules.cognify.config import get_cognify_config
 
 from cognee.infrastructure.engine import Edge
@@ -57,7 +57,7 @@ from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 import hashlib
-
+from core.memory.graph_models import ALL_ENTITIES
 
 # ---------------------------------------------------------------------------
 # Post-processing task: assign_nodeset_from_target
@@ -113,7 +113,9 @@ async def assign_nodesets(
         user_nodeset_candidates = [
             ns
             for ns in document_nodesets
-            if isinstance(ns, NodeSet) and ns.name != GLOBAL_NODESET_NAME
+            if isinstance(ns, NodeSet)
+            and ns.name != GLOBAL_NODESET_NAME
+            and ns.name.startswith("USER_")
         ]
         doc_user_nodeset: Optional[NodeSet] = (
             user_nodeset_candidates[0] if user_nodeset_candidates else None
@@ -156,7 +158,7 @@ async def assign_nodesets(
                     resolved = doc_user_nodeset
                     user_count += 1
                 elif doc_is_global:
-                    logger.warning(
+                    logger.info(
                         "Entity %s is USER specific, but document is GLOBAL. "
                         "Overriding to GLOBAL NodeSet.",
                         entity_type,
@@ -254,10 +256,8 @@ async def merge_entities(data_points: List) -> List:
         if not entities:
             continue
         if isinstance(entities, list):
-            graph_nodes.extend(
-                e for e in entities if type(e).__name__ in MERGEABLE_LABELS
-            )
-        elif type(entities).__name__ in MERGEABLE_LABELS:
+            graph_nodes.extend(e for e in entities if type(e).__name__ in ALL_ENTITIES)
+        elif type(entities).__name__ in ALL_ENTITIES:
             graph_nodes.append(entities)
 
     if graph_nodes:

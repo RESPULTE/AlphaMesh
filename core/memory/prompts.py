@@ -21,7 +21,7 @@ Your primary goal is to identify financial entities, categorize them precisely, 
 Categorize every identified concept into one of the following specific entity types:
 
 1. **Sector**: Broad economic sectors or industries.
-   - **Allowed Sectors:** You MUST map any sector concept to one of these exact names: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate.
+   - **Allowed Sectors:** You MUST map any sector concept to one of these exact names: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate, Market.
 
 2. **Company**: Explicitly named, publicly traded companies or investment entities (e.g., "Microsoft", "Tesla").
    - **Rule:** Every company MUST have its `sector` field populated with one of the exact Allowed Sectors listed above.
@@ -33,7 +33,7 @@ Categorize every identified concept into one of the following specific entity ty
 
 4. **FinancialEvent**: Significant financial market events, economic events, or news events.
    - **Rule:** Financial events often impact companies or sectors. Populate `positively_impacted` and `negatively_impacted` with the specific `Company` or `Sector` entities affected by the event.
-   - If an event broadly affects the overall market without a specific sector or company, do not force a link to specific companies.
+   - If an event broadly affects the overall market without a specific sector or company, link it to the `Market` entity.
 
 5. **InvestmentThesis**: An individual's structured intent or opinion on investing.
    - **CRITICAL TRIGGER:** If the user implies intent to buy, sell, hold, or short a stock, asset, or sector, you MUST create an `InvestmentThesis`.
@@ -47,7 +47,7 @@ Categorize every identified concept into one of the following specific entity ty
 2. **Be Exhaustive:** Ensure all fields and relationship lists inside each entity are populated properly. Rely on the Pydantic schema provided to you for the definition of each field.
 
 ---
-### EXAMPLE
+### EXAMPLE 1
 
 **User Input:** 
 "I just bought MSFT. Tech companies are looking good right now because inflation is dropping, which means the Fed might cut interest rates, giving a huge boost to the tech sector."
@@ -62,6 +62,16 @@ Categorize every identified concept into one of the following specific entity ty
    - status: "Bought"
    - targets: [Company("Microsoft")]
    - supporting_events: [FinancialEvent("Dropping Inflation"), FinancialEvent("Potential Fed Rate Cut")]
+
+### EXAMPLE 2
+
+**User Input:**
+"The latest GDP report shows a 3% growth, which is a strong positive signal for the entire market."
+
+**Expected Extraction Logic:**
+- **FinancialEvent**: "3% GDP Growth"
+   - GDP growth event `positively_impacted` list includes: [Sector("Market")]
+- **Sector**: Market (extracted from "entire market")
 
 Generate the output structured strictly according to the `FinancialKnowledgeGraph` schema.
 """

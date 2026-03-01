@@ -26,6 +26,8 @@ from cognee.infrastructure.databases.vector import get_vector_engine
 from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage import index_data_points, index_graph_edges
 
+from core.memory.graph_models import ALL_ENTITIES
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -38,26 +40,9 @@ FUZZY_CANDIDATE_THRESHOLD = 0.50
 # Vector engine gate — expensive embedding comparison; final merge decision
 SEMANTIC_MERGE_THRESHOLD = 0.85
 
-# Global entity labels eligible for merging
-MERGEABLE_LABELS = {
-    "Company",
-    "Sector",
-    "FinancialEvent",
-    "MacroTrend",
-    "FinancialConcept",
-}
-
 # Map entity type name → vector collection name used by index_data_points
 # Collection naming follows the pattern: {ClassName}_{first_index_field}
-_COLLECTION_MAP: Dict[str, str] = {
-    "Company": "Company_name",
-    "Sector": "Sector_name",
-    "FinancialEvent": "FinancialEvent_name",
-    "MacroTrend": "MacroTrend_name",
-    "FinancialConcept": "FinancialConcept_name",
-    # Fallback for Entity base class
-    "Entity": "Entity_name",
-}
+_COLLECTION_MAP: Dict[str, str] = {k: f"{k}_name" for k in ALL_ENTITIES}
 
 _REINDEX_COLLECTIONS = [
     "Entity_name",
@@ -120,7 +105,7 @@ async def find_and_merge_candidates(
     candidates: List[DataPoint] = [
         dp
         for dp in graph_nodes
-        if type(dp).__name__ in MERGEABLE_LABELS and getattr(dp, "name", None)
+        if type(dp).__name__ in ALL_ENTITIES and getattr(dp, "name", None)
     ]
 
     if not candidates:
@@ -271,7 +256,7 @@ async def find_and_merge_candidates(
             # Check if the candidate node appears in the top results above threshold
             # Cognee's normalisation for the score is opposite, lower = closer in similarity fkc
             for sr in scored_results:
-                if str(sr.id) == match_cognee_id and sr.score >= (
+                if str(sr.id) == match_cognee_id and sr.score <= (
                     1 - SEMANTIC_MERGE_THRESHOLD
                 ):
                     logger.info(
