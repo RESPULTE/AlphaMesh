@@ -185,7 +185,6 @@ class FinancialKnowledgeGraph(BaseModel):
             FinancialConcept,
             InvestmentInterest,
             FinancialEvent,
-            FinancialEntity,
         ]
     ] = Field(
         default_factory=list,

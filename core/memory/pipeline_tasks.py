@@ -204,9 +204,6 @@ async def assign_nodesets(
             elif entity_type == "FinancialEvent" and (
                 entity.positively_impacted or entity.negatively_impacted
             ):
-                logger.info(
-                    f"Resolving sector nodesets for FinancialEvent {entity.name}"
-                )
                 to_check = {
                     "positive": entity.positively_impacted,
                     "negative": entity.negatively_impacted,
@@ -223,8 +220,10 @@ async def assign_nodesets(
                                 sector_nodeset = await get_or_create_nodeset(sector)
                                 if impact_type == "positive":
                                     positive_imp_sectors.append(sector_nodeset)
+                                    entity.positively_impacted.remove(impacted_entity)
                                 elif impact_type == "negative":
                                     negative_imp_sectors.append(sector_nodeset)
+                                    entity.negatively_impacted.remove(impacted_entity)
                                 logger.info(
                                     f"Resolved sector nodeset {sector} for FinancialEvent {entity.name}"
                                 )
