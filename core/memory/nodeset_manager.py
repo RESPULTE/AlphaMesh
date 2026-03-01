@@ -180,10 +180,12 @@ async def get_or_create_nodeset(name: str, **kwargs) -> NodeSet:
             return _nodeset_cache[canonical_name]
 
         stable_id = _cognee_nodeset_id(canonical_name)
-        global_nodeset = await get_or_create_global_nodeset()
         try:
             # Query the graph to see if this NodeSet already exists
             graph_engine = await get_graph_engine()
+            logger.info(
+                "Querying graph for NodeSet '%s' (id=%s).", canonical_name, stable_id
+            )
 
             # Need to lookup exact node syntax depending on DB, assume typical neo4j:
             query = "MATCH (n:NodeSet {id: $id}) RETURN n"
@@ -202,7 +204,6 @@ async def get_or_create_nodeset(name: str, **kwargs) -> NodeSet:
 
             # NodeSet does not exist, create it
             nodeset = NodeSet(id=stable_id, name=canonical_name, **kwargs)
-            nodeset.belongs_to_set = [global_nodeset]
             await cognee_add_dp(data_points=[nodeset])
             _nodeset_cache[canonical_name] = nodeset
             logger.info(
@@ -293,7 +294,7 @@ async def get_or_create_all_sector_nodesets() -> None:
             missing_from_cache[canonical_name] = desc
 
     if not missing_from_cache:
-        return ""
+        return
 
     # Lock prevents duplicate writes in concurrent ingestion startup paths.
     # Re-check cache inside lock

@@ -28,8 +28,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Suppress overly verbose cognee logs so the test output is readable
-logging.getLogger("cognee").setLevel(logging.ERROR)
-logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 import cognee
 from cognee.modules.search.types import SearchType

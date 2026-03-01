@@ -106,7 +106,6 @@ class FinancialMemorySystem:
         self._initialized = False
         self._global_nodeset: Optional[NodeSet] = None
         self._user_context_cache: dict[str, UserMemoryContext] = {}
-        self.graph_client: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Initialization
@@ -137,8 +136,6 @@ class FinancialMemorySystem:
         # Ensure GLOBAL NodeSet exists in the graph
         self._global_nodeset = await get_or_create_global_nodeset()
 
-        # Initialize the graph client to attach on self
-        self.graph_client = await get_graph_engine()
         await get_or_create_all_sector_nodesets()
 
         self._initialized = True
