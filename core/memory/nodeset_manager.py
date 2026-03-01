@@ -173,7 +173,7 @@ async def get_or_create_nodeset(name: str, **kwargs) -> NodeSet:
 
     if canonical_name in _nodeset_cache:
         return _nodeset_cache[canonical_name]
-
+    logger.info("NodeSet '%s' not found in cache, checking DB...", canonical_name)
     # Lock prevents duplicate writes in concurrent ingestion startup paths.
     async with _nodeset_lock:
         if canonical_name in _nodeset_cache:

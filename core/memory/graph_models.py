@@ -32,14 +32,6 @@ USER_SPECIFIC_ENTITIES = ["InvestmentInterest"]
 # ---------------------------------------------------------------------------
 
 
-class FinancialEntity(DataPoint):
-    """A global entity."""
-
-    name: str = Field(description="Name of the entity.")
-    description: str = Field(description="A brief description of this specific entity.")
-    metadata: dict = {"index_fields": ["name", "description"]}
-
-
 class Sector(NodeSet):
     """A specific economic sector."""
 
@@ -48,19 +40,22 @@ class Sector(NodeSet):
     metadata: dict = {"index_fields": ["name", "description"]}
 
 
-class Company(FinancialEntity):
+class Company(DataPoint):
     """A publicly traded company or investment entity."""
 
     ticker: str = Field(description="Stock ticker symbol (e.g., AAPL).")
-    name: str = Field(description="Full corporate name of the company.")
+    company_name: str = Field(description="Full corporate name of the company.")
     sector: str = Field(
         description="The specific economic sector this company belongs to. Must match one of the predefined standard sectors: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate."
     )
+    description: str = Field(
+        description="A brief description of this specific company."
+    )
 
-    metadata: dict = {"index_fields": ["name", "ticker", "description"]}
+    metadata: dict = {"index_fields": ["company_name", "ticker", "description"]}
 
 
-class FinancialConcept(FinancialEntity):
+class FinancialConcept(DataPoint):
     """A financial concept, term, or educational definition. Always GLOBAL."""
 
     name: str = Field(description="Name of the financial concept or metric.")
@@ -83,9 +78,11 @@ class FinancialConcept(FinancialEntity):
     metadata: dict = {"index_fields": ["name", "definition"]}
 
 
-class FinancialEvent(FinancialEntity):
+class FinancialEvent(DataPoint):
     """A significant financial event."""
 
+    name: str = Field(description="Name of the financial event.")
+    description: str = Field(description="Description of the financial event.")
     from_date: Optional[datetime] = Field(
         default=None, description="Start date of the event, if applicable."
     )
@@ -142,7 +139,6 @@ FinancialConcept.model_rebuild()
 Sector.model_rebuild()
 InvestmentInterest.model_rebuild()
 FinancialEvent.model_rebuild()
-FinancialEntity.model_rebuild()
 
 ALL_ENTITIES = {
     "Company",

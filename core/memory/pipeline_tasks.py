@@ -23,7 +23,7 @@ import uuid
 
 import logging
 from typing import List, Optional
-from core.memory.graph_models import ALL_SECTORS, FinancialEntity
+from core.memory.graph_models import ALL_SECTORS
 
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.modules.pipelines.tasks.task import Task
@@ -214,7 +214,7 @@ async def assign_nodesets(
                     if impacted_entities is None:
                         continue
                     for impacted_entity in impacted_entities:
-                        if impacted_entity.name in ALL_SECTORS:
+                        if impacted_entity.name in ALL_SECTORS.keys():
                             sector = impacted_entity.name
                             try:
                                 sector_nodeset = await get_or_create_nodeset(sector)
