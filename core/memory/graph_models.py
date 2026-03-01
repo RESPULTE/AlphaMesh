@@ -18,7 +18,6 @@ from datetime import datetime
 from typing import List, Literal, Optional, Union
 
 from cognee.infrastructure.engine import DataPoint
-from cognee.modules.engine.models import Entity
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -32,7 +31,22 @@ USER_SPECIFIC_ENTITIES = ["InvestmentThesis"]
 # ---------------------------------------------------------------------------
 
 
-class Company(Entity):
+class FinancialEntity(DataPoint):
+    """A global entity."""
+
+    name: str
+    description: str
+    metadata: dict = {"index_fields": ["name", "description"]}
+
+
+class Sector(FinancialEntity):
+    """A specific economic sector."""
+
+    name: str
+    description: str
+
+
+class Company(FinancialEntity):
     """A publicly traded company or investment entity."""
 
     ticker: str
@@ -41,38 +55,25 @@ class Company(Entity):
     metadata: dict = {"index_fields": ["name", "ticker", "description"]}
 
 
-class FinancialConcept(Entity):
+class FinancialConcept(FinancialEntity):
     """A financial concept, term, or educational definition. Always GLOBAL."""
 
     name: str
     definition: str
-    category: Optional[
-        Literal[
-            "valuation",
-            "technical_analysis",
-            "fundamental_analysis",
-            "macroeconomics",
-            "risk",
-            "derivatives",
-            "portfolio_management",
-            "other",
-        ]
-    ] = None
+    category: Literal[
+        "valuation",
+        "technical_analysis",
+        "fundamental_analysis",
+        "macroeconomics",
+        "risk",
+        "derivatives",
+        "portfolio_management",
+        "other",
+    ]
+
     related_concepts: Optional[List[str]] = None
-    examples: Optional[List[str]] = None
 
     metadata: dict = {"index_fields": ["name", "definition"]}
-
-
-class FinancialEntity(Entity):
-    """A global entity."""
-
-    name: str
-    related_to: list["FinancialEntity"]
-
-
-class Sector(FinancialEntity):
-    """A specific economic sector."""
 
 
 class FinancialEvent(FinancialEntity):
@@ -81,20 +82,8 @@ class FinancialEvent(FinancialEntity):
     from_date: Optional[datetime] = None
     to_date: Optional[datetime] = None
 
-
-class GlobalInfluence(DataPoint):
-    """
-    Extracts named influence relationships between global entities.
-    Examples: POSITIVE_AFFECT, NEGATIVE_AFFECT, INCREASES_RISK.
-    """
-
-    source_id: str
-    target_id: str
-    relationship_name: str
-    weight: Optional[float] = None
-    evidence: Optional[str] = None
-
-    metadata: dict = {"index_fields": ["source_id", "target_id", "relationship_name"]}
+    positively_impacted: Optional[List[Union[Company, Sector]]] = None
+    negatively_impacted: Optional[List[Union[Company, Sector]]] = None
 
 
 class InvestmentThesis(DataPoint):
@@ -103,25 +92,25 @@ class InvestmentThesis(DataPoint):
     Links to targeted Entities (Companies/Sectors), and supporting/threatening events.
     """
 
-    summary: str
-    status: Literal["Active", "Dormant", "Archived"]
-    metadata: dict = {"index_fields": ["summary"]}
+    status: Literal["Bought", "Interested", "Sold", "Avoids"]
 
     # Relationship fields (using SkipValidation[Any] to avoid forward reference issues)
     # targets: Connects to Company or Sector nodes.
-    targets: list["Company"]
+    targets: list[Union[Company, Sector]]
+    supporting_events: Optional[list[FinancialEvent]] = None
+    threatening_events: Optional[list[FinancialEvent]] = None
 
 
 # ---------------------------------------------------------------------------
 # Rebuild all models (required for forward references)
 # ---------------------------------------------------------------------------
 
-Entity.model_rebuild()
 Company.model_rebuild()
 FinancialConcept.model_rebuild()
 Sector.model_rebuild()
 InvestmentThesis.model_rebuild()
 FinancialEvent.model_rebuild()
+FinancialEntity.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +128,9 @@ class FinancialKnowledgeGraph(BaseModel):
         Union[
             Company,
             FinancialConcept,
-            Sector,
             InvestmentThesis,
             FinancialEvent,
+            FinancialEntity,
         ]
     ] = Field(
         default_factory=list,

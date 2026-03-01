@@ -161,6 +161,8 @@ class FinancialMemorySystem:
             s_node.belongs_to_set = [self._global_nodeset]
             sector_nodes.append(s_node)
 
+        await cognee_add_dp(sector_nodes)
+
         logger.info(
             "FinancialMemorySystem ready. Dataset='%s', GLOBAL NodeSet id=%s.",
             DATASET_NAME,
