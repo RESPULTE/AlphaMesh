@@ -101,6 +101,7 @@ class FinancialEvent(FinancialEntity):
         default=None,
         description="Companies or Sectors that are negatively impacted by this event.",
     )
+    metadata: dict = {"index_fields": ["name", "description"]}
 
 
 class InvestmentInterest(DataPoint):
@@ -129,6 +130,7 @@ class InvestmentInterest(DataPoint):
         default=None,
         description="Financial events that threaten or pose risks to this thesis.",
     )
+    metadata: dict = {"index_fields": ["reason"]}
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +150,21 @@ ALL_ENTITIES = {
     "FinancialConcept",
     "FinancialEvent",
     "InvestmentInterest",
+}
+
+ALL_SECTORS = {
+    "Energy": "Companies involved in the exploration, production, and distribution of oil, gas, and renewable energy.",
+    "Materials": "Includes chemical, construction material, glass, paper, forest product, and mining companies.",
+    "Industrials": "Manufacturers and distributors of capital goods, including aerospace, defense, and machinery.",
+    "Consumer Discretionary": "Businesses that sell non-essential goods and services, such as automotive, apparel, and leisure.",
+    "Consumer Staples": "Essential product providers, including food, beverage, personal products, and household goods.",
+    "Health Care": "Pharmaceuticals, biotechnology, medical devices, and healthcare service providers.",
+    "Financials": "Banks, investment firms, insurance companies, and real estate finance entities.",
+    "Information Technology": "Software, hardware, semiconductors, and IT service providers.",
+    "Communication Services": "Telecommunications providers, media, entertainment, and interactive service companies.",
+    "Utilities": "Providers of basic services including electricity, gas, and water.",
+    "Real Estate": "Companies engaged in real estate development, management, and REITs.",
+    "Market": "The overall market, representing the aggregate of all companies and sectors.",
 }
 
 

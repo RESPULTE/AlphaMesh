@@ -34,7 +34,7 @@ from core.memory.exceptions import (
     NodeSetCreationError,
     DatasetInitError,
 )
-from core.memory.graph_models import Sector
+from core.memory.graph_models import ALL_SECTORS, Sector
 
 logger = logging.getLogger(__name__)
 
@@ -258,22 +258,6 @@ def get_user_nodeset_names(user_email: str) -> list[str]:
     return [GLOBAL_NODESET_NAME, get_user_nodeset_name(user_email)]
 
 
-SECTORS = {
-    "Energy": "Companies involved in the exploration, production, and distribution of oil, gas, and renewable energy.",
-    "Materials": "Includes chemical, construction material, glass, paper, forest product, and mining companies.",
-    "Industrials": "Manufacturers and distributors of capital goods, including aerospace, defense, and machinery.",
-    "Consumer Discretionary": "Businesses that sell non-essential goods and services, such as automotive, apparel, and leisure.",
-    "Consumer Staples": "Essential product providers, including food, beverage, personal products, and household goods.",
-    "Health Care": "Pharmaceuticals, biotechnology, medical devices, and healthcare service providers.",
-    "Financials": "Banks, investment firms, insurance companies, and real estate finance entities.",
-    "Information Technology": "Software, hardware, semiconductors, and IT service providers.",
-    "Communication Services": "Telecommunications providers, media, entertainment, and interactive service companies.",
-    "Utilities": "Providers of basic services including electricity, gas, and water.",
-    "Real Estate": "Companies engaged in real estate development, management, and REITs.",
-    "Market": "The overall market, representing the aggregate of all companies and sectors.",
-}
-
-
 async def get_or_create_all_sector_nodesets() -> None:
     """
     Ensure all predefined Sector NodeSets exist in the graph and cache.
@@ -289,7 +273,7 @@ async def get_or_create_all_sector_nodesets() -> None:
 
     # Identify which sectors are missing from the cache
     missing_from_cache = {}
-    for name, desc in SECTORS.items():
+    for name, desc in ALL_SECTORS.items():
         canonical_name = _normalize_nodeset_name(name)
         if canonical_name not in _nodeset_cache:
             missing_from_cache[canonical_name] = desc
@@ -300,7 +284,7 @@ async def get_or_create_all_sector_nodesets() -> None:
     # Lock prevents duplicate writes in concurrent ingestion startup paths.
     # Re-check cache inside lock
     missing_from_cache = {}
-    for name, desc in SECTORS.items():
+    for name, desc in ALL_SECTORS.items():
         canonical_name = _normalize_nodeset_name(name)
         if canonical_name not in _nodeset_cache:
             missing_from_cache[canonical_name] = desc
@@ -349,7 +333,7 @@ async def get_or_create_all_sector_nodesets() -> None:
         to_create = []
 
         market_nodeset = Sector(
-            id=ids_to_check["Market"], name="Market", description=SECTORS["Market"]
+            id=ids_to_check["Market"], name="Market", description=ALL_SECTORS["Market"]
         )
         market_nodeset.belongs_to_set = [global_nodeset]
         to_create.append(market_nodeset)

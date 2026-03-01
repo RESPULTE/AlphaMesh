@@ -23,7 +23,7 @@ import uuid
 
 import logging
 from typing import List, Optional
-from core.memory.graph_models import FinancialEntity
+from core.memory.graph_models import ALL_SECTORS, FinancialEntity
 
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.modules.pipelines.tasks.task import Task
@@ -187,32 +187,59 @@ async def assign_nodesets(
                 entity.belongs_to_set.append(resolved)
 
             # Special business logic for specific global entities
-            if (
-                entity_type == "Company" and hasattr(entity, "sector") and entity.sector
-            ) or (
-                entity_type == "FinancialEvent"
-                and (entity.positively_impacted or entity.negatively_impacted)
-            ):
+            if entity_type == "Company" and hasattr(entity, "sector") and entity.sector:
                 # Add company to its respective sector NodeSet
                 try:
                     sector_nodeset = await get_or_create_nodeset(entity.sector)
                     if sector_nodeset not in entity.belongs_to_set:
                         entity.belongs_to_set.append(sector_nodeset)
+                    logger.info(
+                        f"Resolved sector nodeset {entity.sector} for Company {entity.name}"
+                    )
                 except Exception as e:
-                    logger.warning(
+                    logger.info(
                         f"Failed to resolve sector nodeset {entity.sector} for Company {entity.name}: {e}"
                     )
-            elif entity_type == "FinancialEvent":
-                # Ensure the event itself is linked to the global nodeset
-                if global_nodeset not in entity.belongs_to_set:
-                    entity.belongs_to_set.append(global_nodeset)
 
-            logger.debug(
-                "Entity %s (id=%s) → belongs_to_set='%s'.",
-                entity_type,
-                entity.id,
-                ", ".join([ns.name for ns in entity.belongs_to_set]),
-            )
+            elif entity_type == "FinancialEvent" and (
+                entity.positively_impacted or entity.negatively_impacted
+            ):
+                logger.info(
+                    f"Resolving sector nodesets for FinancialEvent {entity.name}"
+                )
+                to_check = {
+                    "positive": entity.positively_impacted,
+                    "negative": entity.negatively_impacted,
+                }
+                positive_impacted = []
+                negative_impacted = []
+                for impact_type, impacted_entities in to_check.items():
+                    if impacted_entities is None:
+                        continue
+                    for impacted_entity in impacted_entities:
+                        if impacted_entity.name in ALL_SECTORS:
+                            sector = impacted_entity.name
+                            try:
+                                sector_nodeset = await get_or_create_nodeset(sector)
+                                if impact_type == "positive":
+                                    positive_impacted.append(sector_nodeset)
+                                elif impact_type == "negative":
+                                    negative_impacted.append(sector_nodeset)
+                                logger.info(
+                                    f"Resolved sector nodeset {sector} for FinancialEvent {entity.name}"
+                                )
+                            except Exception as e:
+                                logger.info(
+                                    f"Failed to resolve sector nodeset {sector} for FinancialEvent {entity.name}: {e}"
+                                )
+                entity.positively_impacted = positive_impacted
+                entity.negatively_impacted = negative_impacted
+                # logger.debug(
+                #     "Entity %s (id=%s) → belongs_to_set='%s'.",
+                #     entity_type,
+                #     entity.id,
+                #     ", ".join([ns.name for ns in entity.belongs_to_set]),
+                # )
 
             if hasattr(entity, "name"):
                 entity.id = get_canonical_id(entity.name)
