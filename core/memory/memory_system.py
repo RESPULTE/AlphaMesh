@@ -35,6 +35,8 @@ from core.memory.nodeset_manager import (
     initialize_cognee,
 )
 
+from core.memory.graph_models import DATASET_NAME, GLOBAL_NODESET_NAME
+
 # Initialize predefined Sector entities
 from core.memory.graph_models import Sector
 from cognee.tasks.storage.add_data_points import (

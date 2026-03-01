@@ -34,16 +34,18 @@ from core.memory.exceptions import (
     NodeSetCreationError,
     DatasetInitError,
 )
-from core.memory.graph_models import ALL_SECTORS, Sector
+from core.memory.graph_models import (
+    ALL_SECTORS,
+    Sector,
+    DATASET_NAME,
+    GLOBAL_NODESET_NAME,
+)
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constantss
 # ---------------------------------------------------------------------------
-
-DATASET_NAME = "alphamese_financial"
-GLOBAL_NODESET_NAME = "Market"
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 USER_SPECIFIC_ENTITIES = ["InvestmentInterest"]
+DATASET_NAME = "alphamese_financial"
+GLOBAL_NODESET_NAME = "Market"
 
 # ---------------------------------------------------------------------------
 # Domain DataPoint models

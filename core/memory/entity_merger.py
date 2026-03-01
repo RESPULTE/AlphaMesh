@@ -25,8 +25,9 @@ from cognee.infrastructure.databases.relational import get_relational_engine
 from cognee.infrastructure.databases.vector import get_vector_engine
 from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage import index_data_points, index_graph_edges
-
+from cognee.api.v1.datasets.datasets import datasets
 from core.memory.graph_models import ALL_ENTITIES
+from core.memory.graph_models import DATASET_NAME, GLOBAL_NODESET_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +349,7 @@ async def find_and_merge_candidates(
 
     relational_engine = get_relational_engine()
     affected_node_ids: Set[str] = set()
+    node_ids_to_keep = []
     success_count = 0
 
     for group in merge_groups:
@@ -368,7 +370,8 @@ async def find_and_merge_candidates(
             )
             continue
 
-        affected_node_ids.update([canonical_cid] + old_cids)
+        affected_node_ids.update(old_cids)
+        node_ids_to_keep.append(canonical_cid)
 
         try:
             await graph_client.query(
@@ -388,29 +391,29 @@ async def find_and_merge_candidates(
         # Rewire stale UUIDs in relational edges table
         if not old_cids:
             continue
-        try:
-            if hasattr(relational_engine, "engine"):
-                async with relational_engine.engine.begin() as conn:
-                    await conn.execute(
-                        text(
-                            "UPDATE edges SET source_node_id = :canonical_id"
-                            " WHERE source_node_id IN :old_ids"
-                        ).bindparams(bindparam("old_ids", expanding=True)),
-                        {"canonical_id": canonical_cid, "old_ids": old_cids},
-                    )
-                    await conn.execute(
-                        text(
-                            "UPDATE edges SET destination_node_id = :canonical_id"
-                            " WHERE destination_node_id IN :old_ids"
-                        ).bindparams(bindparam("old_ids", expanding=True)),
-                        {"canonical_id": canonical_cid, "old_ids": old_cids},
-                    )
-        except Exception as exc:
-            logger.error(
-                "merge_entities: relational rewire failed for '%s': %s",
-                canonical_name,
-                exc,
-            )
+        # try:
+        #     if hasattr(relational_engine, "engine"):
+        #         async with relational_engine.engine.begin() as conn:
+        #             await conn.execute(
+        #                 text(
+        #                     "UPDATE edges SET source_node_id = :canonical_id"
+        #                     " WHERE source_node_id IN :old_ids"
+        #                 ).bindparams(bindparam("old_ids", expanding=True)),
+        #                 {"canonical_id": canonical_cid, "old_ids": old_cids},
+        #             )
+        #             await conn.execute(
+        #                 text(
+        #                     "UPDATE edges SET destination_node_id = :canonical_id"
+        #                     " WHERE destination_node_id IN :old_ids"
+        #                 ).bindparams(bindparam("old_ids", expanding=True)),
+        #                 {"canonical_id": canonical_cid, "old_ids": old_cids},
+        #             )
+        # except Exception as exc:
+        #     logger.error(
+        #         "merge_entities: relational rewire failed for '%s': %s",
+        #         canonical_name,
+        #         exc,
+        #     )
 
     logger.info(
         "merge_entities: %d/%d group(s) merged successfully.",
@@ -424,39 +427,70 @@ async def find_and_merge_candidates(
     # -----------------------------------------------------------------------
     # Reindex vector store for affected nodes
     # -----------------------------------------------------------------------
-    try:
-        graph_engine = await get_graph_engine()
-        # get_id_filtered_graph_data is a Neo4j-specific method
-        neo4j_engine = typing_cast(Neo4jAdapter, graph_engine)
-        vector_engine = get_vector_engine()
+    from cognee.modules.data.methods import get_dataset_ids
+    from cognee.modules.users.methods import get_default_user
+    import uuid
 
-        nodes_data, edges_data = await neo4j_engine.get_id_filtered_graph_data(
-            list(affected_node_ids)
-        )
+    dataset_ids = await get_dataset_ids([DATASET_NAME], await get_default_user())
+    dataset_id = dataset_ids[0]
 
-        for coll in _REINDEX_COLLECTIONS:
-            if await vector_engine.has_collection(coll):
-                await vector_engine.delete_data_points(coll, list(affected_node_ids))
+    for id_to_del in affected_node_ids:
+        logger.info("Deleting node with id: %s", id_to_del)
+        await datasets.delete_data(dataset_id=dataset_id, data_id=uuid.UUID(id_to_del))
 
-        indexable_nodes = []
-        for _, props in nodes_data:
-            props = {
-                k: literal_eval(v) if k == "metadata" else v for k, v in props.items()
-            }
-            if "metadata" in props and isinstance(props["metadata"], dict):
-                props["metadata"].setdefault("type", props.get("type"))
-            indexable_nodes.append(DataPoint(**props))
+    graph_engine = await get_graph_engine()
+    # get_id_filtered_graph_data is a Neo4j-specific method
+    neo4j_engine = typing_cast(Neo4jAdapter, graph_engine)
+    nodes_data, edges_data = await neo4j_engine.get_id_filtered_graph_data(
+        node_ids_to_keep
+    )
 
-        if indexable_nodes:
-            await index_data_points(indexable_nodes)
+    indexable_nodes = []
+    for _, props in nodes_data:
+        logger.info("Keeping node with id: %s", _)
+        props = {k: literal_eval(v) if k == "metadata" else v for k, v in props.items()}
+        if "metadata" in props and isinstance(props["metadata"], dict):
+            props["metadata"].setdefault("type", props.get("type"))
+        indexable_nodes.append(DataPoint(**props))
 
-        if edges_data:
-            await index_graph_edges(edges_data)
+    if indexable_nodes:
+        await index_data_points(indexable_nodes)
 
-        logger.info(
-            "merge_entities: reindexed %d nodes, %d edges.",
-            len(indexable_nodes),
-            len(edges_data),
-        )
-    except Exception as exc:
-        logger.error("merge_entities: vector reindex failed: %s", exc)
+    if edges_data:
+        await index_graph_edges(edges_data)
+    # try:
+    #     graph_engine = await get_graph_engine()
+    #     # get_id_filtered_graph_data is a Neo4j-specific method
+    #     neo4j_engine = typing_cast(Neo4jAdapter, graph_engine)
+    #     vector_engine = get_vector_engine()
+
+    #     nodes_data, edges_data = await neo4j_engine.get_id_filtered_graph_data(
+    #         list(affected_node_ids)
+    #     )
+
+    #     for coll in _REINDEX_COLLECTIONS:
+    #         if await vector_engine.has_collection(coll):
+    #             await vector_engine.delete_data_points(coll, list(affected_node_ids))
+
+    #     indexable_nodes = []
+    #     for _, props in nodes_data:
+    #         props = {
+    #             k: literal_eval(v) if k == "metadata" else v for k, v in props.items()
+    #         }
+    #         if "metadata" in props and isinstance(props["metadata"], dict):
+    #             props["metadata"].setdefault("type", props.get("type"))
+    #         indexable_nodes.append(DataPoint(**props))
+
+    #     if indexable_nodes:
+    #         await index_data_points(indexable_nodes)
+
+    #     if edges_data:
+    #         await index_graph_edges(edges_data)
+
+    #     logger.info(
+    #         "merge_entities: reindexed %d nodes, %d edges.",
+    #         len(indexable_nodes),
+    #         len(edges_data),
+    #     )
+    # except Exception as exc:
+    #     logger.error("merge_entities: vector reindex failed: %s", exc)
