@@ -211,8 +211,8 @@ async def assign_nodesets(
                     "positive": entity.positively_impacted,
                     "negative": entity.negatively_impacted,
                 }
-                positive_impacted = []
-                negative_impacted = []
+                positive_imp_sectors = []
+                negative_imp_sectors = []
                 for impact_type, impacted_entities in to_check.items():
                     if impacted_entities is None:
                         continue
@@ -222,9 +222,9 @@ async def assign_nodesets(
                             try:
                                 sector_nodeset = await get_or_create_nodeset(sector)
                                 if impact_type == "positive":
-                                    positive_impacted.append(sector_nodeset)
+                                    positive_imp_sectors.append(sector_nodeset)
                                 elif impact_type == "negative":
-                                    negative_impacted.append(sector_nodeset)
+                                    negative_imp_sectors.append(sector_nodeset)
                                 logger.info(
                                     f"Resolved sector nodeset {sector} for FinancialEvent {entity.name}"
                                 )
@@ -232,8 +232,8 @@ async def assign_nodesets(
                                 logger.info(
                                     f"Failed to resolve sector nodeset {sector} for FinancialEvent {entity.name}: {e}"
                                 )
-                entity.positively_impacted = positive_impacted
-                entity.negatively_impacted = negative_impacted
+                entity.positively_impacted.extend(positive_imp_sectors)
+                entity.negatively_impacted.extend(negative_imp_sectors)
                 # logger.debug(
                 #     "Entity %s (id=%s) → belongs_to_set='%s'.",
                 #     entity_type,
