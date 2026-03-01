@@ -116,6 +116,7 @@ async def execute_query(memory, user: str, prompt: str) -> None:
             query_text=prompt,
             search_type=SearchType.GRAPH_COMPLETION,
             top_k=10,
+            only_context=True,
         )
         print(f"      Ans : {len(results)} chunks found.")
         for i, r in enumerate(results):
@@ -194,7 +195,9 @@ async def run_smoke_test() -> None:
     # await query_test(memory, USER_A, USER_B)
 
     await execute_query(
-        memory, USER_A, "what are the current threat / upside to my investment thesis?"
+        memory,
+        USER_A,
+        "what are the current threat / upside to my investment thesis? take into acount macroeconomic as well",
     )
 
     print(f"{SEP}")

@@ -344,7 +344,7 @@ async def get_or_create_all_sector_nodesets() -> None:
             if name not in existing_in_db:
                 stable_id = ids_to_check[name]
                 nodeset = Sector(id=stable_id, name=name, description=desc)
-                nodeset.belongs_to_set = [global_nodeset, market_nodeset]
+                nodeset.belongs_to_set = [market_nodeset]
                 to_create.append(nodeset)
                 _nodeset_cache[name] = nodeset
 
