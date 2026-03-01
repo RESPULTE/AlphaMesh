@@ -345,6 +345,10 @@ async def find_and_merge_candidates(
     )
     RETURN DISTINCT id(node) AS merged_neo4j_id, node.id AS cognee_id, node.name AS name
     """
+    affected_nodes_data, affected_edges_data = [], []
+    graph_engine = await get_graph_engine()
+    # get_id_filtered_graph_data is a Neo4j-specific method
+    neo4j_engine = typing_cast(Neo4jAdapter, graph_engine)
 
     relational_engine = get_relational_engine()
     affected_node_ids: Set[str] = set()
@@ -369,6 +373,9 @@ async def find_and_merge_candidates(
             continue
 
         affected_node_ids.update([canonical_cid] + old_cids)
+        n, e = await neo4j_engine.get_id_filtered_graph_data(list(affected_node_ids))
+        affected_nodes_data.extend(n)
+        affected_edges_data.extend(e)
 
         try:
             await graph_client.query(
@@ -425,21 +432,15 @@ async def find_and_merge_candidates(
     # Reindex vector store for affected nodes
     # -----------------------------------------------------------------------
     try:
-        graph_engine = await get_graph_engine()
-        # get_id_filtered_graph_data is a Neo4j-specific method
-        neo4j_engine = typing_cast(Neo4jAdapter, graph_engine)
-        vector_engine = get_vector_engine()
 
-        nodes_data, edges_data = await neo4j_engine.get_id_filtered_graph_data(
-            list(affected_node_ids)
-        )
+        vector_engine = get_vector_engine()
 
         for coll in _REINDEX_COLLECTIONS:
             if await vector_engine.has_collection(coll):
                 await vector_engine.delete_data_points(coll, list(affected_node_ids))
 
         indexable_nodes = []
-        for _, props in nodes_data:
+        for _, props in affected_nodes_data:
             props = {
                 k: literal_eval(v) if k == "metadata" else v for k, v in props.items()
             }
@@ -449,12 +450,12 @@ async def find_and_merge_candidates(
 
         if indexable_nodes:
             await index_data_points(indexable_nodes)
-        await index_graph_edges(edges_data)
+        await index_graph_edges(affected_edges_data)
 
         logger.info(
             "merge_entities: reindexed %d nodes, %d edges.",
             len(indexable_nodes),
-            len(edges_data),
+            len(affected_edges_data),
         )
     except Exception as exc:
         logger.error("merge_entities: vector reindex failed: %s", exc)
