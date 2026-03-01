@@ -49,7 +49,7 @@ from core.memory.graph_models import (
 )
 from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
-    get_or_create_sector_nodeset,
+    get_or_create_nodeset,
     GLOBAL_NODESET_NAME,
 )
 from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
@@ -183,7 +183,7 @@ async def assign_nodesets(
             if entity_type == "Company" and hasattr(entity, "sector") and entity.sector:
                 # Add company to its respective sector NodeSet
                 try:
-                    sector_nodeset = await get_or_create_sector_nodeset(entity.sector)
+                    sector_nodeset = await get_or_create_nodeset(entity.sector)
                     if sector_nodeset not in entity.belongs_to_set:
                         entity.belongs_to_set.append(sector_nodeset)
                 except Exception as e:

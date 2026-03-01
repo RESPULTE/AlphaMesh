@@ -34,6 +34,7 @@ from core.memory.exceptions import (
     NodeSetCreationError,
     DatasetInitError,
 )
+from core.memory.graph_models import Sector
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ async def initialize_cognee() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def get_or_create_sector_nodeset(name: str, **kwargs) -> NodeSet:
+async def get_or_create_nodeset(name: str, **kwargs) -> NodeSet:
     """
     Idempotently retrieve or create a NodeSet by canonical name.
 
@@ -214,7 +215,7 @@ async def get_or_create_sector_nodeset(name: str, **kwargs) -> NodeSet:
 
 async def get_or_create_global_nodeset() -> NodeSet:
     """Return the GLOBAL NodeSet, creating it if necessary."""
-    return await get_or_create_sector_nodeset(GLOBAL_NODESET_NAME)
+    return await get_or_create_nodeset(GLOBAL_NODESET_NAME)
 
 
 async def get_or_create_user_nodeset(user_email: str) -> tuple[str, NodeSet]:
@@ -232,7 +233,7 @@ async def get_or_create_user_nodeset(user_email: str) -> tuple[str, NodeSet]:
         ValueError: If email is invalid.
     """
     nodeset_name = get_user_nodeset_name(user_email)
-    nodeset = await get_or_create_sector_nodeset(nodeset_name)
+    nodeset = await get_or_create_nodeset(nodeset_name)
     return nodeset_name, nodeset
 
 
@@ -254,3 +255,111 @@ def get_user_nodeset_names(user_email: str) -> list[str]:
         ["GLOBAL", "USER_<hash>"]
     """
     return [GLOBAL_NODESET_NAME, get_user_nodeset_name(user_email)]
+
+
+SECTORS = {
+    "Energy": "Companies involved in the exploration, production, and distribution of oil, gas, and renewable energy.",
+    "Materials": "Includes chemical, construction material, glass, paper, forest product, and mining companies.",
+    "Industrials": "Manufacturers and distributors of capital goods, including aerospace, defense, and machinery.",
+    "Consumer Discretionary": "Businesses that sell non-essential goods and services, such as automotive, apparel, and leisure.",
+    "Consumer Staples": "Essential product providers, including food, beverage, personal products, and household goods.",
+    "Health Care": "Pharmaceuticals, biotechnology, medical devices, and healthcare service providers.",
+    "Financials": "Banks, investment firms, insurance companies, and real estate finance entities.",
+    "Information Technology": "Software, hardware, semiconductors, and IT service providers.",
+    "Communication Services": "Telecommunications providers, media, entertainment, and interactive service companies.",
+    "Utilities": "Providers of basic services including electricity, gas, and water.",
+    "Real Estate": "Companies engaged in real estate development, management, and REITs.",
+}
+
+
+async def get_or_create_all_sector_nodesets() -> None:
+    """
+    Ensure all predefined Sector NodeSets exist in the graph and cache.
+    Queries the graph once to find missing sectors, creates them, and adds them in a single batch.
+
+    Returns:
+        List of NodeSet DataPoints for all sectors.
+
+    Raises:
+        NodeSetCreationError: On any failure.
+    """
+    global_nodeset = await get_or_create_global_nodeset()
+
+    # Identify which sectors are missing from the cache
+    missing_from_cache = {}
+    for name, desc in SECTORS.items():
+        canonical_name = _normalize_nodeset_name(name)
+        if canonical_name not in _nodeset_cache:
+            missing_from_cache[canonical_name] = desc
+
+    if not missing_from_cache:
+        return ""
+
+    # Lock prevents duplicate writes in concurrent ingestion startup paths.
+    # Re-check cache inside lock
+    missing_from_cache = {}
+    for name, desc in SECTORS.items():
+        canonical_name = _normalize_nodeset_name(name)
+        if canonical_name not in _nodeset_cache:
+            missing_from_cache[canonical_name] = desc
+
+    if not missing_from_cache:
+        return
+
+    # Prepare IDs for the missing ones
+    ids_to_check = {name: str(_cognee_nodeset_id(name)) for name in missing_from_cache}
+
+    try:
+        # Query the graph to see which of these NodeSets already exist
+        graph_engine = await get_graph_engine()
+
+        query = "MATCH (n:NodeSet) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name"
+        params = {"ids": list(ids_to_check.values())}
+        results = await graph_engine.query(query, params)
+
+        existing_in_db = set()
+        if results:
+            for row in results:
+                data = (
+                    row.data()
+                    if hasattr(row, "data")
+                    else (dict(row) if isinstance(row, dict) else {})
+                )
+                db_id = data.get("id")
+                db_name = data.get("name")
+                if db_id and db_name:
+                    existing_in_db.add(db_name)
+                    logger.info(
+                        "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
+                        db_name,
+                        db_id,
+                    )
+                    # Add to cache using Sector so 'description' is a valid parameter
+                    nodeset = Sector(
+                        id=str(db_id),
+                        name=db_name,
+                        description=missing_from_cache.get(db_name, ""),
+                    )
+                    nodeset.belongs_to_set = [global_nodeset]
+                    _nodeset_cache[db_name] = nodeset
+
+        # Create the ones that were not in the DB
+        to_create = []
+
+        for name, desc in missing_from_cache.items():
+            if name not in existing_in_db:
+                stable_id = ids_to_check[name]
+                nodeset = Sector(id=stable_id, name=name, description=desc)
+                nodeset.belongs_to_set = [global_nodeset]
+                to_create.append(nodeset)
+                _nodeset_cache[name] = nodeset
+
+        if to_create:
+            await cognee_add_dp(data_points=to_create)
+            logger.info(
+                "NodeSets %s created and persisted in batch.",
+                [n.name for n in to_create],
+            )
+
+    except Exception as exc:
+        raise NodeSetCreationError("Batch Sector NodeSets", str(exc)) from exc
