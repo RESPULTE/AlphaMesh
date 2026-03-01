@@ -51,7 +51,7 @@ from core.memory.nodeset_manager import (
     get_user_nodeset_name,
     hash_user_email,
     get_user_nodeset_names,
-    get_or_create_nodeset,
+    get_or_create_sector_nodeset,
 )
 
 from core.memory.pipeline_tasks import decide_assign_nodeset
@@ -187,7 +187,7 @@ class TestHashUserEmail:
             side_effect=fake_add_data_points,
         ):
 
-            ns = await get_or_create_nodeset("  global  ")
+            ns = await get_or_create_sector_nodeset("  global  ")
 
         assert ns.name == GLOBAL_NODESET_NAME
 

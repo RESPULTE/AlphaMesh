@@ -23,10 +23,12 @@ import hashlib
 import logging
 from asyncio import Lock
 from uuid import NAMESPACE_OID, uuid5
+from typing import Optional
 
 from cognee.modules.engine.operations.setup import setup
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.tasks.storage.add_data_points import add_data_points as cognee_add_dp
+from cognee.infrastructure.databases.graph import get_graph_engine
 
 from core.memory.exceptions import (
     NodeSetCreationError,
@@ -149,7 +151,7 @@ async def initialize_cognee() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def get_or_create_nodeset(name: str) -> NodeSet:
+async def get_or_create_sector_nodeset(name: str, **kwargs) -> NodeSet:
     """
     Idempotently retrieve or create a NodeSet by canonical name.
 
@@ -177,13 +179,33 @@ async def get_or_create_nodeset(name: str) -> NodeSet:
             return _nodeset_cache[canonical_name]
 
         stable_id = _cognee_nodeset_id(canonical_name)
-
+        global_nodeset = await get_or_create_global_nodeset()
         try:
-            nodeset = NodeSet(id=stable_id, name=canonical_name)
+            # Query the graph to see if this NodeSet already exists
+            graph_engine = await get_graph_engine()
+
+            # Need to lookup exact node syntax depending on DB, assume typical neo4j:
+            query = "MATCH (n:NodeSet {id: $id}) RETURN n"
+            params = {"id": str(stable_id)}
+            results = await graph_engine.query(query, params)
+            if results and len(results) > 0:
+                # NodeSet already exists in the graph, hydrate it into the cache
+                logger.info(
+                    "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
+                    canonical_name,
+                    stable_id,
+                )
+                nodeset = NodeSet(id=stable_id, name=canonical_name)
+                _nodeset_cache[canonical_name] = nodeset
+                return nodeset
+
+            # NodeSet does not exist, create it
+            nodeset = NodeSet(id=stable_id, name=canonical_name, **kwargs)
+            nodeset.belongs_to_set = [global_nodeset]
             await cognee_add_dp(data_points=[nodeset])
             _nodeset_cache[canonical_name] = nodeset
             logger.info(
-                "NodeSet '%s' persisted/verified (id=%s).", canonical_name, stable_id
+                "NodeSet '%s' created and persisted (id=%s).", canonical_name, stable_id
             )
             return nodeset
         except Exception as exc:
@@ -192,7 +214,7 @@ async def get_or_create_nodeset(name: str) -> NodeSet:
 
 async def get_or_create_global_nodeset() -> NodeSet:
     """Return the GLOBAL NodeSet, creating it if necessary."""
-    return await get_or_create_nodeset(GLOBAL_NODESET_NAME)
+    return await get_or_create_sector_nodeset(GLOBAL_NODESET_NAME)
 
 
 async def get_or_create_user_nodeset(user_email: str) -> tuple[str, NodeSet]:
@@ -210,7 +232,7 @@ async def get_or_create_user_nodeset(user_email: str) -> tuple[str, NodeSet]:
         ValueError: If email is invalid.
     """
     nodeset_name = get_user_nodeset_name(user_email)
-    nodeset = await get_or_create_nodeset(nodeset_name)
+    nodeset = await get_or_create_sector_nodeset(nodeset_name)
     return nodeset_name, nodeset
 
 

@@ -45,11 +45,11 @@ from core.memory.exceptions import (
 )
 from core.memory.graph_models import (
     FinancialKnowledgeGraph,
-    GlobalInfluence,
     USER_SPECIFIC_ENTITIES,
 )
 from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
+    get_or_create_sector_nodeset,
     GLOBAL_NODESET_NAME,
 )
 from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
@@ -57,88 +57,6 @@ from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 import hashlib
-
-# ---------------------------------------------------------------------------
-# Post-processing task: process_global_influences
-# ---------------------------------------------------------------------------
-
-
-async def process_global_influences(
-    data_chunks: List[DocumentChunk],
-) -> tuple[List[DocumentChunk], list]:
-    """
-    Extracts GlobalInfluence models, turns them into edges, and removes them from the parsed entities list
-    so they don't get saved as standard node entities. Returns the modified chunks and a list of custom edges.
-    """
-
-    all_custom_edges = []
-
-    for chunk in data_chunks:
-        entities = getattr(chunk, "contains", None)
-
-        # Unpack FinancialKnowledgeGraph if necessary
-        if isinstance(entities, FinancialKnowledgeGraph):
-            entities = getattr(entities, "entities", [])
-            chunk.contains = entities
-
-        if not entities or not isinstance(entities, list):
-            continue
-
-        influences = [e for e in entities if isinstance(e, GlobalInfluence)]
-        logger.info(
-            "Found %d global influences in chunk %s.", len(influences), chunk.id
-        )
-
-        # Keep only non-influences
-        chunk.contains = [e for e in entities if not isinstance(e, GlobalInfluence)]
-
-        if influences:
-            for inf in influences:
-                props = {}
-                if inf.weight is not None:
-                    try:
-                        props["weight"] = float(inf.weight)
-                    except (ValueError, TypeError):
-                        pass
-
-                if inf.evidence is not None:
-                    props["evidence"] = (
-                        str(inf.evidence)
-                        if not isinstance(inf.evidence, str)
-                        else inf.evidence
-                    )
-
-                logger.info(
-                    "Processing global influence: %s -> %s",
-                    inf.source_id,
-                    inf.target_id,
-                )
-                all_custom_edges.append(
-                    (
-                        next(
-                            (
-                                e.id
-                                for e in entities
-                                if getattr(e, "name", None) == inf.source_id
-                            ),
-                            str(inf.source_id),
-                        ),
-                        next(
-                            (
-                                e.id
-                                for e in entities
-                                if getattr(e, "name", None) == inf.target_id
-                            ),
-                            str(inf.target_id),
-                        ),
-                        str(inf.relationship_name),
-                        props,
-                    )
-                )
-
-    logger.info("Extracted %d global influence custom edges.", len(all_custom_edges))
-
-    return (data_chunks, all_custom_edges)
 
 
 # ---------------------------------------------------------------------------
@@ -257,12 +175,31 @@ async def assign_nodesets(
                 )
 
             # Assign belongs_to_set
-            entity.belongs_to_set = [resolved]
+            entity.belongs_to_set = getattr(entity, "belongs_to_set", []) or []
+            if resolved not in entity.belongs_to_set:
+                entity.belongs_to_set.append(resolved)
+
+            # Special business logic for specific global entities
+            if entity_type == "Company" and hasattr(entity, "sector") and entity.sector:
+                # Add company to its respective sector NodeSet
+                try:
+                    sector_nodeset = await get_or_create_sector_nodeset(entity.sector)
+                    if sector_nodeset not in entity.belongs_to_set:
+                        entity.belongs_to_set.append(sector_nodeset)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to resolve sector nodeset {entity.sector} for Company {entity.name}: {e}"
+                    )
+            elif entity_type == "FinancialEvent":
+                # Ensure the event itself is linked to the global nodeset
+                if global_nodeset not in entity.belongs_to_set:
+                    entity.belongs_to_set.append(global_nodeset)
+
             logger.debug(
                 "Entity %s (id=%s) → belongs_to_set='%s'.",
                 entity_type,
                 entity.id,
-                resolved.name,
+                ", ".join([ns.name for ns in entity.belongs_to_set]),
             )
 
             if hasattr(entity, "name"):
@@ -284,7 +221,7 @@ async def assign_nodesets(
 
 
 async def add_data_points_with_custom_edges(
-    payload: tuple[List[DocumentChunk], list],
+    data_chunks: List[DocumentChunk],
     embed_triplets: bool = False,
 ):
     """
@@ -292,10 +229,8 @@ async def add_data_points_with_custom_edges(
     from previous tasks and passes `custom_edges` correctly.
     """
 
-    data_chunks, custom_edges = payload
     return await add_data_points(
         data_points=data_chunks,
-        custom_edges=custom_edges,
         embed_triplets=embed_triplets,
     )
 
@@ -384,9 +319,6 @@ async def build_financial_pipeline(
         Task(
             assign_nodesets,
             global_nodeset=global_nodeset,
-        ),
-        Task(
-            process_global_influences,
         ),
         # Task(
         #     summarize_text,

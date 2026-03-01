@@ -31,6 +31,7 @@ from core.memory.nodeset_manager import (
     get_or_create_user_nodeset,
     get_user_nodeset_name,
     get_user_nodeset_names,
+    get_or_create_sector_nodeset,
     initialize_cognee,
 )
 
@@ -39,9 +40,9 @@ from core.memory.graph_models import Sector
 from cognee.tasks.storage.add_data_points import (
     add_data_points as cognee_add_dp,
 )
-from core.memory.pipeline_tasks import get_canonical_id
 from core.memory.pipeline_tasks import build_financial_pipeline
 from cognee.infrastructure.databases.graph import get_graph_engine
+
 
 logger = logging.getLogger(__name__)
 
@@ -154,14 +155,8 @@ class FinancialMemorySystem:
         self.graph_client = await get_graph_engine()
         self._initialized = True
 
-        sector_nodes = []
         for name, description in SECTORS.items():
-            s_node = Sector(name=name, description=description, related_to=[])
-            s_node.id = get_canonical_id(name)
-            s_node.belongs_to_set = [self._global_nodeset]
-            sector_nodes.append(s_node)
-
-        await cognee_add_dp(sector_nodes)
+            s_node = await get_or_create_sector_nodeset(name, description=description)
 
         logger.info(
             "FinancialMemorySystem ready. Dataset='%s', GLOBAL NodeSet id=%s.",
@@ -540,114 +535,114 @@ class FinancialMemorySystem:
         except Exception as exc:
             raise QueryError(str(exc)) from exc
 
-    # ------------------------------------------------------------------
-    # Graph Edge Property and State Triggers
-    # ------------------------------------------------------------------
+    # # ------------------------------------------------------------------
+    # # Graph Edge Property and State Triggers
+    # # ------------------------------------------------------------------
 
-    async def adjust_edge_property(
-        self,
-        source_id: str,
-        target_id: str,
-        edge_label: str,
-        property_name: str,
-        delta: float,
-        min_val: float = 0.0,
-        max_val: float = 1.0,
-    ) -> float:
-        """
-        Gracefully increments or decrements a property of a graph edge.
-        Clamps the updated value strictly between min_val and max_val.
+    # async def adjust_edge_property(
+    #     self,
+    #     source_id: str,
+    #     target_id: str,
+    #     edge_label: str,
+    #     property_name: str,
+    #     delta: float,
+    #     min_val: float = 0.0,
+    #     max_val: float = 1.0,
+    # ) -> float:
+    #     """
+    #     Gracefully increments or decrements a property of a graph edge.
+    #     Clamps the updated value strictly between min_val and max_val.
 
-        Designed for Multi-Agent systems: agents provide continuous feedback (e.g., +0.05 or -0.1)
-        on relationship strength, and this handles the boundary controls deterministically.
+    #     Designed for Multi-Agent systems: agents provide continuous feedback (e.g., +0.05 or -0.1)
+    #     on relationship strength, and this handles the boundary controls deterministically.
 
-        Args:
-            graph_client: The Cognee graph engine adapter client.
-            source_id: Node ID of the relationship source.
-            target_id: Node ID of the relationship target.
-            edge_label: The relationship type (e.g., 'HoldsThesis', 'SupportedBy').
-            property_name: The edge property to adjust (e.g., 'conviction_level').
-            delta: Float value to add to the existing property value (can be negative).
-            min_val: Hard lower bound for the property.
-            max_val: Hard upper bound for the property.
+    #     Args:
+    #         graph_client: The Cognee graph engine adapter client.
+    #         source_id: Node ID of the relationship source.
+    #         target_id: Node ID of the relationship target.
+    #         edge_label: The relationship type (e.g., 'HoldsThesis', 'SupportedBy').
+    #         property_name: The edge property to adjust (e.g., 'conviction_level').
+    #         delta: Float value to add to the existing property value (can be negative).
+    #         min_val: Hard lower bound for the property.
+    #         max_val: Hard upper bound for the property.
 
-        Returns:
-            The newly calculated and clamped property value as a float.
-            Returns 0.0 if the edge was not found or execution failed but didn't crash.
-        """
-        self._require_initialized()
-        graph_client = self.graph_client
+    #     Returns:
+    #         The newly calculated and clamped property value as a float.
+    #         Returns 0.0 if the edge was not found or execution failed but didn't crash.
+    #     """
+    #     self._require_initialized()
+    #     graph_client = self.graph_client
 
-        logger.info(
-            "Adjusting '%s' for edge '%s' between '%s' and '%s' by delta %.2f.",
-            property_name,
-            edge_label,
-            source_id,
-            target_id,
-            delta,
-        )
+    #     logger.info(
+    #         "Adjusting '%s' for edge '%s' between '%s' and '%s' by delta %.2f.",
+    #         property_name,
+    #         edge_label,
+    #         source_id,
+    #         target_id,
+    #         delta,
+    #     )
 
-        # Cypher implementation applying boundary controls
-        # Uses type(e) to check edge label safely.
-        query = f"""
-        MATCH (s {{id: $source_id}})-[e]->(t {{id: $target_id}})
-        WHERE type(e) = $edge_label
-        WITH e, coalesce(e.{property_name}, 0.0) AS current_val
-        WITH e, current_val, current_val + $delta AS raw_new_val
-        WITH e,
-             CASE
-                WHEN raw_new_val < $min_val THEN $min_val
-                WHEN raw_new_val > $max_val THEN $max_val
-                ELSE raw_new_val
-             END AS final_val
-        SET e.{property_name} = final_val
-        RETURN final_val AS new_val
-        """
-        params = {
-            "source_id": source_id,
-            "target_id": target_id,
-            "edge_label": edge_label,
-            "delta": float(delta),
-            "min_val": float(min_val),
-            "max_val": float(max_val),
-        }
+    #     # Cypher implementation applying boundary controls
+    #     # Uses type(e) to check edge label safely.
+    #     query = f"""
+    #     MATCH (s {{id: $source_id}})-[e]->(t {{id: $target_id}})
+    #     WHERE type(e) = $edge_label
+    #     WITH e, coalesce(e.{property_name}, 0.0) AS current_val
+    #     WITH e, current_val, current_val + $delta AS raw_new_val
+    #     WITH e,
+    #          CASE
+    #             WHEN raw_new_val < $min_val THEN $min_val
+    #             WHEN raw_new_val > $max_val THEN $max_val
+    #             ELSE raw_new_val
+    #          END AS final_val
+    #     SET e.{property_name} = final_val
+    #     RETURN final_val AS new_val
+    #     """
+    #     params = {
+    #         "source_id": source_id,
+    #         "target_id": target_id,
+    #         "edge_label": edge_label,
+    #         "delta": float(delta),
+    #         "min_val": float(min_val),
+    #         "max_val": float(max_val),
+    #     }
 
-        try:
-            # Resolving the execution method defensively based on typical Cognee adapter shapes
-            execute_fn = None
-            if hasattr(graph_client, "query"):
-                execute_fn = graph_client.query
-            elif hasattr(graph_client, "execute"):
-                execute_fn = graph_client.execute
-            elif hasattr(graph_client, "graph") and hasattr(
-                graph_client.graph, "execute"
-            ):
-                execute_fn = graph_client.graph.execute
+    #     try:
+    #         # Resolving the execution method defensively based on typical Cognee adapter shapes
+    #         execute_fn = None
+    #         if hasattr(graph_client, "query"):
+    #             execute_fn = graph_client.query
+    #         elif hasattr(graph_client, "execute"):
+    #             execute_fn = graph_client.execute
+    #         elif hasattr(graph_client, "graph") and hasattr(
+    #             graph_client.graph, "execute"
+    #         ):
+    #             execute_fn = graph_client.graph.execute
 
-            if not execute_fn:
-                logger.warning(
-                    "Provided graph_client lacks a query() or execute() method for Cypher queries."
-                )
-                return 0.0
+    #         if not execute_fn:
+    #             logger.warning(
+    #                 "Provided graph_client lacks a query() or execute() method for Cypher queries."
+    #             )
+    #             return 0.0
 
-            results = await execute_fn(query, params)
+    #         results = await execute_fn(query, params)
 
-            # Simple parse to return the updated value safely
-            if results and isinstance(results, list) and len(results) > 0:
-                first_record = results[0]
-                if isinstance(first_record, dict) and "new_val" in first_record:
-                    return float(first_record["new_val"])
-                # Fallback for adapters returning simple tuples or scalars
-                return float(first_record) if first_record is not None else 0.0
+    #         # Simple parse to return the updated value safely
+    #         if results and isinstance(results, list) and len(results) > 0:
+    #             first_record = results[0]
+    #             if isinstance(first_record, dict) and "new_val" in first_record:
+    #                 return float(first_record["new_val"])
+    #             # Fallback for adapters returning simple tuples or scalars
+    #             return float(first_record) if first_record is not None else 0.0
 
-            logger.warning(
-                "Edge '%s' not found between '%s' and '%s' for property update.",
-                edge_label,
-                source_id,
-                target_id,
-            )
-            return 0.0
+    #         logger.warning(
+    #             "Edge '%s' not found between '%s' and '%s' for property update.",
+    #             edge_label,
+    #             source_id,
+    #             target_id,
+    #         )
+    #         return 0.0
 
-        except Exception as exc:
-            logger.error("Failed to adjust edge property %s: %s", property_name, exc)
-            raise MemorySystemError(f"Edge property adjustment failed: {exc}") from exc
+    #     except Exception as exc:
+    #         logger.error("Failed to adjust edge property %s: %s", property_name, exc)
+    #         raise MemorySystemError(f"Edge property adjustment failed: {exc}") from exc

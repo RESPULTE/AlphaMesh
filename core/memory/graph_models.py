@@ -18,13 +18,14 @@ from datetime import datetime
 from typing import List, Literal, Optional, Union
 
 from cognee.infrastructure.engine import DataPoint
+from cognee.modules.engine.models.node_set import NodeSet
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Base for all financial domain entities
 # ---------------------------------------------------------------------------
 
-USER_SPECIFIC_ENTITIES = ["InvestmentThesis"]
+USER_SPECIFIC_ENTITIES = ["InvestmentInterest"]
 
 # ---------------------------------------------------------------------------
 # Domain DataPoint models
@@ -34,23 +35,26 @@ USER_SPECIFIC_ENTITIES = ["InvestmentThesis"]
 class FinancialEntity(DataPoint):
     """A global entity."""
 
-    name: str
-    description: str
+    name: str = Field(description="Name of the entity.")
+    description: str = Field(description="A brief description of this specific entity.")
     metadata: dict = {"index_fields": ["name", "description"]}
 
 
-class Sector(FinancialEntity):
+class Sector(NodeSet):
     """A specific economic sector."""
 
-    name: str
-    description: str
+    name: str = Field(description="Name of the economic sector.")
+    description: str = Field(description="Explanation of the sector's main activities.")
 
 
 class Company(FinancialEntity):
     """A publicly traded company or investment entity."""
 
-    ticker: str
-    name: str
+    ticker: str = Field(description="Stock ticker symbol (e.g., AAPL).")
+    name: str = Field(description="Full corporate name of the company.")
+    sector: str = Field(
+        description="The specific economic sector this company belongs to. Must match one of the predefined standard sectors: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate."
+    )
 
     metadata: dict = {"index_fields": ["name", "ticker", "description"]}
 
@@ -58,8 +62,8 @@ class Company(FinancialEntity):
 class FinancialConcept(FinancialEntity):
     """A financial concept, term, or educational definition. Always GLOBAL."""
 
-    name: str
-    definition: str
+    name: str = Field(description="Name of the financial concept or metric.")
+    definition: str = Field(description="Clear definition of the concept.")
     category: Literal[
         "valuation",
         "technical_analysis",
@@ -69,9 +73,11 @@ class FinancialConcept(FinancialEntity):
         "derivatives",
         "portfolio_management",
         "other",
-    ]
+    ] = Field(description="Category of the concept.")
 
-    related_concepts: Optional[List[str]] = None
+    related_concepts: Optional[List["FinancialConcept"]] = Field(
+        default=None, description="Other conceptually related financial terms."
+    )
 
     metadata: dict = {"index_fields": ["name", "definition"]}
 
@@ -79,26 +85,49 @@ class FinancialConcept(FinancialEntity):
 class FinancialEvent(FinancialEntity):
     """A significant financial event."""
 
-    from_date: Optional[datetime] = None
-    to_date: Optional[datetime] = None
+    from_date: Optional[datetime] = Field(
+        default=None, description="Start date of the event, if applicable."
+    )
+    to_date: Optional[datetime] = Field(
+        default=None, description="End date of the event, if applicable."
+    )
 
-    positively_impacted: Optional[List[Union[Company, Sector]]] = None
-    negatively_impacted: Optional[List[Union[Company, Sector]]] = None
+    positively_impacted: Optional[List[Union[Company, Sector]]] = Field(
+        default=None,
+        description="Companies or Sectors that are positively impacted by this event.",
+    )
+    negatively_impacted: Optional[List[Union[Company, Sector]]] = Field(
+        default=None,
+        description="Companies or Sectors that are negatively impacted by this event.",
+    )
 
 
-class InvestmentThesis(DataPoint):
+class InvestmentInterest(DataPoint):
     """
     An individual's or agent's structured investment thesis.
     Links to targeted Entities (Companies/Sectors), and supporting/threatening events.
     """
 
-    status: Literal["Bought", "Interested", "Sold", "Avoids"]
+    status: Literal["Bought", "Interested", "Sold", "Avoids"] = Field(
+        description="The current status of this investment thesis."
+    )
+
+    reason: str = Field(
+        description="The reason for this investment thesis as stated by the user."
+    )
 
     # Relationship fields (using SkipValidation[Any] to avoid forward reference issues)
     # targets: Connects to Company or Sector nodes.
-    targets: list[Union[Company, Sector]]
-    supporting_events: Optional[list[FinancialEvent]] = None
-    threatening_events: Optional[list[FinancialEvent]] = None
+    targets: list[Union[Company, Sector]] = Field(
+        description="The specific Company or Sector nodes this thesis targets."
+    )
+    supporting_events: Optional[list[FinancialEvent]] = Field(
+        default=None, description="Financial events that support this thesis."
+    )
+    threatening_events: Optional[list[FinancialEvent]] = Field(
+        default=None,
+        description="Financial events that threaten or pose risks to this thesis.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +137,7 @@ class InvestmentThesis(DataPoint):
 Company.model_rebuild()
 FinancialConcept.model_rebuild()
 Sector.model_rebuild()
-InvestmentThesis.model_rebuild()
+InvestmentInterest.model_rebuild()
 FinancialEvent.model_rebuild()
 FinancialEntity.model_rebuild()
 
@@ -128,7 +157,7 @@ class FinancialKnowledgeGraph(BaseModel):
         Union[
             Company,
             FinancialConcept,
-            InvestmentThesis,
+            InvestmentInterest,
             FinancialEvent,
             FinancialEntity,
         ]

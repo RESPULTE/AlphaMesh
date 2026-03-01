@@ -215,6 +215,20 @@ async def find_and_merge_candidates(
                     match_name,
                     fuzzy_score,
                 )
+                candidate_label = (
+                    str(G.nodes[match_cognee_id].get("label", ""))
+                    if match_cognee_id in G
+                    else label
+                )
+                if candidate_label != label:
+                    logger.debug(
+                        "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
+                        name,
+                        label,
+                        match_name,
+                        candidate_label,
+                    )
+                    continue
                 G.add_node(
                     match_cognee_id,
                     cognee_id=match_cognee_id,
@@ -263,6 +277,20 @@ async def find_and_merge_candidates(
                 if str(sr.id) == match_cognee_id and sr.score >= (
                     1 - SEMANTIC_MERGE_THRESHOLD
                 ):
+                    candidate_label = (
+                        str(G.nodes[match_cognee_id].get("label", ""))
+                        if match_cognee_id in G
+                        else label
+                    )
+                    if candidate_label != label:
+                        logger.debug(
+                            "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
+                            name,
+                            label,
+                            match_name,
+                            candidate_label,
+                        )
+                        break
                     logger.info(
                         "merge_entities: confirmed match '%s' ↔ '%s' "
                         "(dice=%.3f, vector=%.3f)",
