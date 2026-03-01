@@ -41,7 +41,6 @@ from cognee.tasks.storage.add_data_points import (
 )
 from core.memory.pipeline_tasks import get_canonical_id
 from core.memory.pipeline_tasks import build_financial_pipeline
-from core.memory.entity_merger import run_entity_merging_neo4j
 from cognee.infrastructure.databases.graph import get_graph_engine
 
 logger = logging.getLogger(__name__)
@@ -462,8 +461,9 @@ class FinancialMemorySystem:
                 pipeline_name="financial_cognify_pipeline",
                 incremental_loading=True,
             )
-            logger.info("Global cognify completed. Running Neo4j entity deduplication.")
-            await run_entity_merging_neo4j(self.graph_client)
+            logger.info(
+                "Global cognify completed. Entity merging ran as pipeline step 7."
+            )
             return result
         except Exception as exc:
             raise MemorySystemError(f"Cognify failed: {exc}") from exc

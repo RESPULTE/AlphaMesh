@@ -35,6 +35,7 @@ from cognee.tasks.documents import classify_documents, extract_chunks_from_docum
 from cognee.tasks.graph import extract_graph_from_data
 from cognee.tasks.summarization import summarize_text
 from cognee.tasks.storage import add_data_points
+from core.memory.entity_merger import find_and_merge_candidates, MERGEABLE_LABELS
 from cognee.modules.cognify.config import get_cognify_config
 
 from cognee.infrastructure.engine import Edge
@@ -299,6 +300,42 @@ async def add_data_points_with_custom_edges(
     )
 
 
+async def merge_entities(data_points: List) -> List:
+    """
+    Pipeline task: runs after add_data_points_with_custom_edges.
+
+    Receives the List[DataPoint] returned by add_data_points (DocumentChunks).
+    Extracts the graph-node level entities from each chunk's `.contains` list,
+    filters to global mergeable types, and calls find_and_merge_candidates to
+    selectively detect and merge near-duplicate nodes using APOC fuzzy search
+    + vector engine semantic validation.
+
+    Returns the original data_points unchanged (pass-through).
+    """
+    # Flatten graph-level entity nodes from all chunk.contains lists
+    graph_nodes = []
+    for item in data_points:
+        entities = getattr(item, "contains", None)
+        if not entities:
+            continue
+        if isinstance(entities, list):
+            graph_nodes.extend(
+                e for e in entities if type(e).__name__ in MERGEABLE_LABELS
+            )
+        elif type(entities).__name__ in MERGEABLE_LABELS:
+            graph_nodes.append(entities)
+
+    if graph_nodes:
+        graph_engine = await get_graph_engine()
+        await find_and_merge_candidates(graph_engine, graph_nodes)
+    else:
+        logger.debug(
+            "merge_entities: no global entity nodes found in batch — skipping."
+        )
+
+    return data_points
+
+
 async def build_financial_pipeline(
     chunks_per_batch: int = 100,
     chunk_size: Optional[int] = None,
@@ -306,16 +343,14 @@ async def build_financial_pipeline(
     """
     Build the custom cognify task list for the financial memory system.
 
-    Inserts `assign_nodeset_from_target` between extract_graph_from_data and
-    summarize_text.
-
     Task order:
         1. classify_documents
         2. extract_chunks_from_documents
         3. extract_graph_from_data  (FinancialKnowledgeGraph + custom_prompt)
-        4. assign_nodesets  ← OUR STEP
-        5. summarize_text
-        6. add_data_points
+        4. assign_nodesets
+        5. process_global_influences
+        6. add_data_points_with_custom_edges
+        7. merge_entities             ← selective APOC fuzzy + vector dedup
 
     Args:
         chunks_per_batch: Batch size for tasks that support batching.
@@ -362,6 +397,7 @@ async def build_financial_pipeline(
             embed_triplets=embed_triplets,
             task_config={"batch_size": chunks_per_batch},
         ),
+        Task(merge_entities),
     ]
     logger.info(
         "Built global financial pipeline with %d tasks.",

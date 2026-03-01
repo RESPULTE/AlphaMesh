@@ -122,7 +122,6 @@ FinancialConcept.model_rebuild()
 Sector.model_rebuild()
 InvestmentThesis.model_rebuild()
 FinancialEvent.model_rebuild()
-FinancialEntity.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +142,6 @@ class FinancialKnowledgeGraph(BaseModel):
             Sector,
             InvestmentThesis,
             FinancialEvent,
-            FinancialEntity,
         ]
     ] = Field(
         default_factory=list,
