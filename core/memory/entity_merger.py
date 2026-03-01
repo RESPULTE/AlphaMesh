@@ -20,12 +20,35 @@ from cognee.tasks.storage import index_data_points, index_graph_edges
 from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
 from cognee.infrastructure.databases.vector import get_vector_engine
 from ast import literal_eval
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 # Configurable similarity thresholds
 AUTO_MERGE_THRESHOLD = 0.85
 SEMANTIC_CHECK_THRESHOLD = 0.50
+
+
+async def get_embedding_similarity(name_a: str, name_b: str) -> float:
+    """
+    Returns cosine similarity between two entity names using the vector engine.
+    """
+
+    vector_engine = get_vector_engine()
+
+    embedding_a = await vector_engine.embed_data(name_a)
+    embedding_b = await vector_engine.embed_data(name_b)
+
+    # Convert to numpy and flatten
+    vec_a = np.array(embedding_a).flatten()
+    vec_b = np.array(embedding_b).flatten()
+
+    # Normalize
+    vec_a = vec_a / np.linalg.norm(vec_a)
+    vec_b = vec_b / np.linalg.norm(vec_b)
+
+    similarity = float(np.dot(vec_a, vec_b))
+    return similarity
 
 
 async def run_entity_merging_neo4j(
@@ -148,34 +171,14 @@ async def run_entity_merging_neo4j(
                     # Condition 2: Semantic check via Vector search chunks
                     is_subset = (name_a in name_b) or (name_b in name_a)
                     if ratio >= SEMANTIC_CHECK_THRESHOLD or is_subset:
-                        try:
-                            # Use CHUNKS to see if they align semantically without LLM overhead
-                            search_results = await search(
-                                query_text=name_a,
-                                query_type=SearchType.CHUNKS,
-                                top_k=10,
+                        if (
+                            await get_embedding_similarity(name_a, name_b)
+                            >= AUTO_MERGE_THRESHOLD
+                        ):
+                            logger.debug(
+                                f"Semantic match found for '{name_a}' and '{name_b}'"
                             )
-
-                            # check if the other name appears in the top retrieved chunks
-                            found_semantic_match = False
-                            for res in search_results:
-                                chunk_text = getattr(res, "text", "")
-                                if isinstance(res, dict):
-                                    chunk_text = res.get("text", "")
-
-                                if chunk_text and name_b in chunk_text.lower():
-                                    found_semantic_match = True
-                                    break
-
-                            if found_semantic_match:
-                                logger.debug(
-                                    f"Semantic match found for '{name_a}' and '{name_b}'"
-                                )
-                                G.add_edge(node_a["neo4j_id"], node_b["neo4j_id"])
-                        except Exception as e:
-                            logger.warning(
-                                f"Semantic check failed for {name_a} and {name_b}: {e}"
-                            )
+                            G.add_edge(node_a["neo4j_id"], node_b["neo4j_id"])
 
         # Extract connected components (clusters of duplicates)
         merge_groups = []

@@ -32,6 +32,7 @@ logging.getLogger("cognee").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 import cognee
+from cognee.modules.search.types import SearchType
 
 
 async def run_ingestion(memory, user_a, user_b, sep):
@@ -108,6 +109,48 @@ async def run_ingestion(memory, user_a, user_b, sep):
     print(f"{sep}\n")
 
 
+async def execute_query(memory, user: str, prompt: str) -> None:
+    print(f"  [Q] User: {user}")
+    print(f"      Ask : '{prompt}'")
+    try:
+        results = await memory.query(
+            user_email=user,
+            query_text=prompt,
+            search_type=SearchType.GRAPH_COMPLETION,
+            top_k=10,
+        )
+        print(f"      Ans : {len(results)} chunks found.")
+        for i, r in enumerate(results):
+            text_snippet = str(r).replace("\\n", " ").strip()
+            print(f"            [{i+1}] {text_snippet}")
+    except Exception as exc:
+        print(f"      ERR : {type(exc).__name__}: {exc}")
+    print("")
+
+
+async def query_test(memory, USER_A, USER_B):
+    # Test 1: Both users can see GLOBAL data
+    print("--- Test 1: Global Data Access ---")
+    await execute_query(memory, USER_A, "What did the Federal Reserve do?")
+    await execute_query(memory, USER_B, "What did the Federal Reserve do?")
+
+    # Test 2: User A accessing User A's data (Should succeed)
+    print("--- Test 2: User A asking about their own data ---")
+    await execute_query(memory, USER_A, "What is my target price for NeuroCure ($NCT)?")
+
+    # Test 3: User B trying to access User A's data (Should return nothing or only global/hallucinations, NO $NCT data)
+    print("--- Test 3: ISOLATION CHECK — User B asking about User A's data ---")
+    await execute_query(memory, USER_B, "What is my target price for NeuroCure ($NCT)?")
+
+    # Test 4: User B accessing User B's data (Should succeed)
+    print("--- Test 4: User B asking about their own data ---")
+    await execute_query(memory, USER_B, "Why am I holding VNO?")
+
+    # Test 5: User A trying to access User B's data (Should return nothing, NO VNO data)
+    print("--- Test 5: ISOLATION CHECK — User A asking about User B's data ---")
+    await execute_query(memory, USER_A, "Why am I holding VNO?")
+
+
 async def run_smoke_test() -> None:
     from cognee.modules.search.types import SearchType
 
@@ -148,52 +191,13 @@ async def run_smoke_test() -> None:
     print("      > Initialized.\n")
 
     await run_ingestion(memory, USER_A, USER_B, SEP)
-
-    async def execute_query(user: str, prompt: str) -> None:
-        print(f"  [Q] User: {user}")
-        print(f"      Ask : '{prompt}'")
-        try:
-            results = await memory.query(
-                user_email=user,
-                query_text=prompt,
-                search_type=SearchType.GRAPH_COMPLETION,
-                top_k=20,
-                # only_context=True,
-            )
-            print(f"      Ans : {len(results)} chunks found.")
-            for i, r in enumerate(results):
-                text_snippet = str(r).replace("\\n", " ").strip()
-                print(f"            [{i+1}] {text_snippet}")
-        except Exception as exc:
-            print(f"      ERR : {type(exc).__name__}: {exc}")
-        print("")
-
-    # Test 1: Both users can see GLOBAL data
-    print("--- Test 1: Global Data Access ---")
-    await execute_query(USER_A, "What did the Federal Reserve do?")
-    await execute_query(USER_B, "What did the Federal Reserve do?")
-
-    # Test 2: User A accessing User A's data (Should succeed)
-    print("--- Test 2: User A asking about their own data ---")
-    await execute_query(USER_A, "What is my target price for NeuroCure ($NCT)?")
-
-    # Test 3: User B trying to access User A's data (Should return nothing or only global/hallucinations, NO $NCT data)
-    print("--- Test 3: ISOLATION CHECK — User B asking about User A's data ---")
-    await execute_query(USER_B, "What is my target price for NeuroCure ($NCT)?")
-
-    # Test 4: User B accessing User B's data (Should succeed)
-    print("--- Test 4: User B asking about their own data ---")
-    await execute_query(USER_B, "Why am I holding VNO?")
-
-    # Test 5: User A trying to access User B's data (Should return nothing, NO VNO data)
-    print("--- Test 5: ISOLATION CHECK — User A asking about User B's data ---")
-    await execute_query(USER_A, "Why am I holding VNO?")
+    await query_test(memory, USER_A, USER_B)
 
     print(f"{SEP}")
     print("  Smoke test fully verified.")
     print(f"{SEP}\n")
 
-    await execute_query(USER_B, "what does VNO gets affected by any other stock?")
+    # await execute_query(USER_A, "what does VNO gets affected by any other stock?")
 
 
 if __name__ == "__main__":

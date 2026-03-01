@@ -64,23 +64,22 @@ class FinancialConcept(Entity):
     metadata: dict = {"index_fields": ["name", "definition"]}
 
 
-class GlobalEntity(Entity):
+class FinancialEntity(Entity):
     """A global entity."""
 
     name: str
-    related_to: list["GlobalEntity"]
+    related_to: list["FinancialEntity"]
 
 
-class Sector(GlobalEntity):
+class Sector(FinancialEntity):
     """A specific economic sector."""
 
 
-class GlobalEvent(GlobalEntity):
-    """A significant global event."""
+class FinancialEvent(FinancialEntity):
+    """A significant financial event."""
 
-
-class MacroTrend(GlobalEntity):
-    """A macroeconomic trend."""
+    from_date: Optional[datetime] = None
+    to_date: Optional[datetime] = None
 
 
 class GlobalInfluence(DataPoint):
@@ -104,7 +103,6 @@ class InvestmentThesis(DataPoint):
     Links to targeted Entities (Companies/Sectors), and supporting/threatening events.
     """
 
-    thesis_id: str
     summary: str
     status: Literal["Active", "Dormant", "Archived"]
     metadata: dict = {"index_fields": ["summary"]}
@@ -122,10 +120,9 @@ Entity.model_rebuild()
 Company.model_rebuild()
 FinancialConcept.model_rebuild()
 Sector.model_rebuild()
-GlobalEvent.model_rebuild()
-MacroTrend.model_rebuild()
 InvestmentThesis.model_rebuild()
-GlobalInfluence.model_rebuild()
+FinancialEvent.model_rebuild()
+FinancialEntity.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
@@ -144,10 +141,9 @@ class FinancialKnowledgeGraph(BaseModel):
             Company,
             FinancialConcept,
             Sector,
-            GlobalEvent,
-            MacroTrend,
             InvestmentThesis,
-            GlobalInfluence,
+            FinancialEvent,
+            FinancialEntity,
         ]
     ] = Field(
         default_factory=list,

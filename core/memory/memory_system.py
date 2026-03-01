@@ -33,6 +33,13 @@ from core.memory.nodeset_manager import (
     get_user_nodeset_names,
     initialize_cognee,
 )
+
+# Initialize predefined Sector entities
+from core.memory.graph_models import Sector
+from cognee.tasks.storage.add_data_points import (
+    add_data_points as cognee_add_dp,
+)
+from core.memory.pipeline_tasks import get_canonical_id
 from core.memory.pipeline_tasks import build_financial_pipeline
 from core.memory.entity_merger import run_entity_merging_neo4j
 from cognee.infrastructure.databases.graph import get_graph_engine
@@ -43,6 +50,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Lightweight context object for per-user state
 # ---------------------------------------------------------------------------
+
+SECTORS = {
+    "Energy": "Companies involved in the exploration, production, and distribution of oil, gas, and renewable energy.",
+    "Materials": "Includes chemical, construction material, glass, paper, forest product, and mining companies.",
+    "Industrials": "Manufacturers and distributors of capital goods, including aerospace, defense, and machinery.",
+    "Consumer Discretionary": "Businesses that sell non-essential goods and services, such as automotive, apparel, and leisure.",
+    "Consumer Staples": "Essential product providers, including food, beverage, personal products, and household goods.",
+    "Health Care": "Pharmaceuticals, biotechnology, medical devices, and healthcare service providers.",
+    "Financials": "Banks, investment firms, insurance companies, and real estate finance entities.",
+    "Information Technology": "Software, hardware, semiconductors, and IT service providers.",
+    "Communication Services": "Telecommunications providers, media, entertainment, and interactive service companies.",
+    "Utilities": "Providers of basic services including electricity, gas, and water.",
+    "Real Estate": "Companies engaged in real estate development, management, and REITs.",
+}
 
 
 @dataclass
@@ -133,6 +154,14 @@ class FinancialMemorySystem:
         # Initialize the graph client to attach on self
         self.graph_client = await get_graph_engine()
         self._initialized = True
+
+        sector_nodes = []
+        for name, description in SECTORS.items():
+            s_node = Sector(name=name, description=description, related_to=[])
+            s_node.id = get_canonical_id(name)
+            s_node.belongs_to_set = [self._global_nodeset]
+            sector_nodes.append(s_node)
+
         logger.info(
             "FinancialMemorySystem ready. Dataset='%s', GLOBAL NodeSet id=%s.",
             DATASET_NAME,

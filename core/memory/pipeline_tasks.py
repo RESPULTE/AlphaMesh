@@ -23,7 +23,7 @@ import uuid
 
 import logging
 from typing import List, Optional
-from core.memory.graph_models import GlobalEntity
+from core.memory.graph_models import FinancialEntity
 
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.modules.pipelines.tasks.task import Task
@@ -145,8 +145,8 @@ async def process_global_influences(
 # ---------------------------------------------------------------------------
 
 
-def get_canonical_id(name: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, name.upper()))
+def get_canonical_id(name: str) -> uuid.UUID:
+    return uuid.uuid5(uuid.NAMESPACE_DNS, name.upper())
 
 
 async def assign_nodesets(
