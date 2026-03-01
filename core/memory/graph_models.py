@@ -44,7 +44,7 @@ class Company(DataPoint):
     """A publicly traded company or investment entity."""
 
     ticker: str = Field(description="Stock ticker symbol (e.g., AAPL).")
-    company_name: str = Field(description="Full corporate name of the company.")
+    name: str = Field(description="Full corporate name of the company.")
     sector: str = Field(
         description="The specific economic sector this company belongs to. Must match one of the predefined standard sectors: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate."
     )
