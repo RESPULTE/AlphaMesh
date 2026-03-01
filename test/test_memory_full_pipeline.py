@@ -116,7 +116,6 @@ async def execute_query(memory, user: str, prompt: str) -> None:
             query_text=prompt,
             search_type=SearchType.GRAPH_COMPLETION,
             top_k=10,
-            only_context=True,
         )
         print(f"      Ans : {len(results)} chunks found.")
         for i, r in enumerate(results):
@@ -192,7 +191,7 @@ async def run_smoke_test() -> None:
     print("      > Initialized.\n")
 
     await run_ingestion(memory, USER_A, USER_B, SEP)
-    # await query_test(memory, USER_A, USER_B)
+    await query_test(memory, USER_A, USER_B)
 
     await execute_query(
         memory,

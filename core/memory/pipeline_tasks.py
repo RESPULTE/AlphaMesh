@@ -231,8 +231,10 @@ async def assign_nodesets(
                                 logger.info(
                                     f"Failed to resolve sector nodeset {sector} for FinancialEvent {entity.name}: {e}"
                                 )
-                entity.positively_impacted.extend(positive_imp_sectors)
-                entity.negatively_impacted.extend(negative_imp_sectors)
+                if positive_imp_sectors and entity.positively_impacted:
+                    entity.positively_impacted.extend(positive_imp_sectors)
+                if negative_imp_sectors and entity.negatively_impacted:
+                    entity.negatively_impacted.extend(negative_imp_sectors)
                 # logger.debug(
                 #     "Entity %s (id=%s) → belongs_to_set='%s'.",
                 #     entity_type,
