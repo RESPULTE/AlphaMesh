@@ -33,7 +33,7 @@ Categorize every identified concept into one of the following specific entity ty
 
 4. **FinancialEvent**: Significant financial market events, economic events, or news events.
    - **Rule:** Financial events often impact companies or sectors. Populate `positively_impacted` and `negatively_impacted` with the specific `Company` or `Sector` entities affected by the event.
-   - If an event broadly affects the overall market without a specific sector or company, link it to the `Market` entity.
+   - If an event broadly affects the overall market without a specific sector or company, you MUST link it to the `Market` entity.
 
 5. **InvestmentThesis**: An individual's structured intent or opinion on investing.
    - **CRITICAL TRIGGER:** If the user implies intent to buy, sell, hold, or short a stock, asset, or sector, you MUST create an `InvestmentThesis`.

@@ -112,10 +112,6 @@ async def find_and_merge_candidates(
         logger.info("merge_entities: no mergeable global entities in batch.")
         return
 
-    logger.info(
-        "merge_entities: %d mergeable global entities from this batch.", len(candidates)
-    )
-
     vector_engine = get_vector_engine()
 
     # Build an equivalence graph — nodes are cognee UUIDs (str)
@@ -128,6 +124,7 @@ async def find_and_merge_candidates(
         canonical_id = str(dp.id)
         label = type(dp).__name__
         name = str(getattr(dp, "name", "") or "").strip()
+
         if not name:
             continue
 

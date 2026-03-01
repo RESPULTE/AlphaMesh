@@ -102,6 +102,11 @@ async def assign_nodesets(
             f"assign_nodeset_from_target: expected list[DocumentChunk], got {type(data_chunks)}"
         )
 
+    if not isinstance(global_nodeset, NodeSet):
+        raise TypeError(
+            f"assign_nodeset_from_target: expected NodeSet, got {type(global_nodeset)}"
+        )
+
     total_entities = 0
     global_count = 0
     user_count = 0
@@ -182,7 +187,12 @@ async def assign_nodesets(
                 entity.belongs_to_set.append(resolved)
 
             # Special business logic for specific global entities
-            if entity_type == "Company" and hasattr(entity, "sector") and entity.sector:
+            if (
+                entity_type == "Company" and hasattr(entity, "sector") and entity.sector
+            ) or (
+                entity_type == "FinancialEvent"
+                and (entity.positively_impacted or entity.negatively_impacted)
+            ):
                 # Add company to its respective sector NodeSet
                 try:
                     sector_nodeset = await get_or_create_nodeset(entity.sector)
