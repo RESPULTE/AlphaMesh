@@ -159,10 +159,10 @@ async def find_and_merge_candidates(
                 toLower(n.name), toLower($name)
              ) AS sim
         WHERE sim >= $threshold
-        WITH n, id(n) AS neo4j_id, sim
+        WITH n, id(n) AS neo4j_id, sim, n.type AS type
         ORDER BY sim DESC
         LIMIT 10
-        RETURN neo4j_id, n.id AS cognee_id, n.name AS name, sim
+        RETURN neo4j_id, n.id AS cognee_id, n.name AS name, sim, type
         """
         try:
             rows = await graph_client.query(
@@ -198,6 +198,17 @@ async def find_and_merge_candidates(
             if not match_cognee_id or match_cognee_id == canonical_id:
                 continue
 
+            candidate_label = str(data.get("type", ""))
+            if candidate_label != label:
+                logger.info(
+                    "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
+                    name,
+                    label,
+                    match_name,
+                    candidate_label,
+                )
+                continue
+
             if match_neo4j_id is not None:
                 neo4j_id_map[match_cognee_id] = int(match_neo4j_id)
 
@@ -215,20 +226,6 @@ async def find_and_merge_candidates(
                     match_name,
                     fuzzy_score,
                 )
-                candidate_label = (
-                    str(G.nodes[match_cognee_id].get("label", ""))
-                    if match_cognee_id in G
-                    else label
-                )
-                if candidate_label != label:
-                    logger.debug(
-                        "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
-                        name,
-                        label,
-                        match_name,
-                        candidate_label,
-                    )
-                    continue
                 G.add_node(
                     match_cognee_id,
                     cognee_id=match_cognee_id,
@@ -277,20 +274,6 @@ async def find_and_merge_candidates(
                 if str(sr.id) == match_cognee_id and sr.score >= (
                     1 - SEMANTIC_MERGE_THRESHOLD
                 ):
-                    candidate_label = (
-                        str(G.nodes[match_cognee_id].get("label", ""))
-                        if match_cognee_id in G
-                        else label
-                    )
-                    if candidate_label != label:
-                        logger.debug(
-                            "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
-                            name,
-                            label,
-                            match_name,
-                            candidate_label,
-                        )
-                        break
                     logger.info(
                         "merge_entities: confirmed match '%s' ↔ '%s' "
                         "(dice=%.3f, vector=%.3f)",

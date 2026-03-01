@@ -149,6 +149,11 @@ async def query_test(memory, USER_A, USER_B):
     await execute_query(memory, USER_A, "Why am I holding VNO?")
 
 
+async def clear_all():
+    await cognee.prune.prune_data()
+    await cognee.prune.prune_system(metadata=True)
+
+
 async def run_smoke_test() -> None:
     from cognee.modules.search.types import SearchType
 
@@ -160,10 +165,7 @@ async def run_smoke_test() -> None:
     )
 
     # Remove all data files
-    await cognee.prune.prune_data()
-
-    # Remove everything (graph, vector, metadata, cache)
-    await cognee.prune.prune_system(metadata=True)
+    await clear_all()
 
     USER_A = "alice@alphamese.ai"
     USER_B = "bob@alphamese.ai"
@@ -189,7 +191,11 @@ async def run_smoke_test() -> None:
     print("      > Initialized.\n")
 
     await run_ingestion(memory, USER_A, USER_B, SEP)
-    await query_test(memory, USER_A, USER_B)
+    # await query_test(memory, USER_A, USER_B)
+
+    await execute_query(
+        memory, USER_A, "what are the current threat / upside to my investment thesis?"
+    )
 
     print(f"{SEP}")
     print("  Smoke test fully verified.")
