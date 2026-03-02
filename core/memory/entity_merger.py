@@ -435,7 +435,7 @@ async def find_and_merge_candidates(
     dataset_id = dataset_ids[0]
 
     for id_to_del in affected_node_ids:
-        logger.info("Deleting node with id: %s", id_to_del)
+        # logger.info("Deleting node with id: %s", id_to_del)
         await datasets.delete_data(dataset_id=dataset_id, data_id=uuid.UUID(id_to_del))
 
     graph_engine = await get_graph_engine()
@@ -447,7 +447,7 @@ async def find_and_merge_candidates(
 
     indexable_nodes = []
     for _, props in nodes_data:
-        logger.info("Keeping node with id: %s", _)
+        # logger.info("Keeping node with id: %s", _)
         props = {k: literal_eval(v) if k == "metadata" else v for k, v in props.items()}
         if "metadata" in props and isinstance(props["metadata"], dict):
             props["metadata"].setdefault("type", props.get("type"))
