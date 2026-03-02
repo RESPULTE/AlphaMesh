@@ -24,6 +24,8 @@ import logging
 import os
 import sys
 
+from core.memory.financial_retriever import QueryScope
+
 # Ensure project root on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -114,9 +116,9 @@ async def execute_query(memory, user: str, prompt: str) -> None:
         results = await memory.query(
             user_email=user,
             query_text=prompt,
-            search_type=SearchType.GRAPH_COMPLETION,
+            query_scope=QueryScope.COMPANY,
+            entity_name="Vornado Realty Trust (VNO)",
             top_k=10,
-            only_context=True,
         )
         print(f"      Ans : {len(results)} chunks found.")
         for i, r in enumerate(results):

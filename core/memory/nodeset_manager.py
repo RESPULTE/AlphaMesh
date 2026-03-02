@@ -305,7 +305,7 @@ async def get_or_create_all_sector_nodesets() -> None:
         # Query the graph to see which of these NodeSets already exist
         graph_engine = await get_graph_engine()
 
-        query = "MATCH (n:NodeSet) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name"
+        query = "MATCH (n:Sector) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name"
         params = {"ids": list(ids_to_check.values())}
         results = await graph_engine.query(query, params)
 
@@ -321,11 +321,11 @@ async def get_or_create_all_sector_nodesets() -> None:
                 db_name = data.get("name")
                 if db_id and db_name:
                     existing_in_db.add(db_name)
-                    logger.info(
-                        "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
-                        db_name,
-                        db_id,
-                    )
+                    # logger.info(
+                    #     "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
+                    #     db_name,
+                    #     db_id,
+                    # )
                     # Add to cache using Sector so 'description' is a valid parameter
                     nodeset = Sector(
                         id=str(db_id),

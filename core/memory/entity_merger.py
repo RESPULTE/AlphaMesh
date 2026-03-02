@@ -182,7 +182,7 @@ async def find_and_merge_candidates(
                 continue
 
             candidate_label = str(data.get("type", ""))
-            if candidate_label != label:
+            if candidate_label != label and candidate_label.lower() != "sector":
                 logger.info(
                     "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
                     name,
@@ -208,6 +208,9 @@ async def find_and_merge_candidates(
                     name,
                     match_name,
                     fuzzy_score,
+                )
+                label = (
+                    candidate_label if candidate_label.lower() == "sector" else label
                 )
                 G.add_node(
                     match_cognee_id,
@@ -264,6 +267,11 @@ async def find_and_merge_candidates(
                         match_name,
                         fuzzy_score,
                         sr.score,
+                    )
+                    label = (
+                        candidate_label
+                        if candidate_label.lower() == "sector"
+                        else label
                     )
                     G.add_node(
                         match_cognee_id,
