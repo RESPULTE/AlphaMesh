@@ -435,7 +435,7 @@ async def find_and_merge_candidates(
     dataset_id = dataset_ids[0]
 
     for id_to_del in affected_node_ids:
-        # logger.info("Deleting node with id: %s", id_to_del)
+        logger.info("Deleting node with id: %s", id_to_del)
         await datasets.delete_data(dataset_id=dataset_id, data_id=uuid.UUID(id_to_del))
 
     graph_engine = await get_graph_engine()

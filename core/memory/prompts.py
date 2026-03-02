@@ -75,3 +75,62 @@ Categorize every identified concept into one of the following specific entity ty
 
 Generate the output structured strictly according to the `FinancialKnowledgeGraph` schema.
 """
+
+# ---------------------------------------------------------------------------
+# Search / query system prompt
+# ---------------------------------------------------------------------------
+# This prompt governs how AlphaMesh answers user queries from the knowledge graph.
+# It is intentionally separate from the cognify prompt above so that answer tone
+# and behaviour can be tuned at runtime without affecting graph extraction.
+#
+# Usage:
+#   - Default:           get_search_system_prompt()
+#   - Runtime override:  get_search_system_prompt(override="Your custom prompt here.")
+#
+# The override mechanism is designed to be populated by a future orchestration
+# agent that resolves user preferences (e.g. verbosity, risk appetite framing)
+# before the query reaches the retriever.
+
+from typing import (
+    Optional as _Optional,
+)  # local import to avoid polluting module namespace
+
+FINANCIAL_SEARCH_SYSTEM_PROMPT = """\
+You are AlphaMesh, an expert financial research assistant with deep knowledge of \
+equity markets, macroeconomics, and sector dynamics.
+
+Your role is to synthesise insights from the financial knowledge graph and answer \
+the user's question clearly, accurately, and concisely.
+
+### ANSWER GUIDELINES
+1. **Accuracy first** — only state facts that are directly supported by the retrieved context.
+2. **Be specific** — cite companies, sectors, or events by name where relevant.
+3. **Quantify when possible** — include metrics, percentages, or time ranges if present in the context.
+4. **Surface uncertainty** — if the context is incomplete or ambiguous, say so explicitly.
+5. **Structured response** — use short paragraphs or bullet points to maximise readability.
+6. **Source transparency** — refer to the provided source citations when grounding a claim.
+
+Do not speculate beyond the provided context. If the knowledge graph does not contain \
+sufficient information, acknowledge the gap and suggest what data would be needed.
+"""
+
+
+def get_search_system_prompt(override: _Optional[str] = None) -> str:
+    """
+    Return the system prompt used when answering user queries.
+
+    The default prompt is `FINANCIAL_SEARCH_SYSTEM_PROMPT`.  Pass an
+    ``override`` string to replace it entirely at runtime — for example,
+    when a future orchestration agent resolves user preferences (verbosity,
+    risk framing, language) before the query reaches the retriever.
+
+    Args:
+        override: Optional string to replace the default prompt.  If ``None``
+                  or empty the default is returned unchanged.
+
+    Returns:
+        The effective system prompt string.
+    """
+    if override and override.strip():
+        return override.strip()
+    return FINANCIAL_SEARCH_SYSTEM_PROMPT

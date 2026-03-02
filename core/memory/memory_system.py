@@ -22,7 +22,6 @@ import cognee
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.modules.pipelines import run_pipeline
 from cognee.modules.run_custom_pipeline import run_custom_pipeline
-from cognee.modules.search.types import SearchType
 from core.memory.exceptions import IngestionError, MemorySystemError, QueryError
 from core.memory.nodeset_manager import (
     DATASET_NAME,
@@ -44,6 +43,8 @@ from cognee.tasks.storage.add_data_points import (
 )
 from core.memory.pipeline_tasks import build_financial_pipeline
 from cognee.infrastructure.databases.graph import get_graph_engine
+from core.memory.financial_retriever import FinancialGraphRetriever, QueryScope
+from core.memory.prompts import get_search_system_prompt
 
 
 logger = logging.getLogger(__name__)
@@ -456,60 +457,102 @@ class FinancialMemorySystem:
         self,
         user_email: str,
         query_text: str,
-        search_type: SearchType = SearchType.GRAPH_COMPLETION,
+        query_scope: QueryScope = QueryScope.MARKET,
+        entity_name: Optional[str] = None,
         top_k: int = 10,
-        only_context: bool = False,
+        system_prompt_override: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> List[Any]:
         """
         Query the knowledge graph with strict NodeSet isolation.
 
-        Uses Cognee's node_type + node_name filtering to restrict results to
-        ONLY the GLOBAL NodeSet and the user's own USER_<hash> NodeSet.
+        Internally delegates to `FinancialGraphRetriever` which fans out to up
+        to 3 parallel sub-searches depending on `query_scope`, then reranks
+        results by recency and attaches source citations to every answer.
 
         Under no circumstances will this query include another user's NodeSet.
 
-        Args:
-            user_email:  Authenticated user's email.
-            query_text:  Natural language query string.
-            search_type: Cognee search type (default GRAPH_COMPLETION).
-            top_k:       Max results to return.
+        Parameters
+        ----------
+        user_email:
+            Authenticated user's email address.
+        query_text:
+            Natural language query string.
+        query_scope:
+            `QueryScope` enum that determines the search fan-out strategy.
+            Controlled entirely by the caller — typically the orchestration
+            layer or a future agent preprocessor:
 
-        Returns:
-            List of search results.
+            * ``QueryScope.COMPANY``
+                Fire 3 parallel searches: company anchor + its sector + market.
+                Set ``entity_name`` to the ticker or company name.
+            * ``QueryScope.SECTOR``
+                Fire 2 parallel searches: the named sector + market.
+                Set ``entity_name`` to the sector name.
+            * ``QueryScope.MARKET``
+                Single market-wide search.  ``entity_name`` is ignored.
 
-        Raises:
-            QueryError: If query fails.
-            ValueError: If query_text is empty.
+        entity_name:
+            For COMPANY scope: ticker symbol or full company name.
+            For SECTOR  scope: sector name (must match a NodeSet in the graph).
+            Ignored for MARKET scope.  Leave ``None`` when not applicable.
+        top_k:
+            Maximum number of reranked edges to return to the LLM.
+        system_prompt_override:
+            Optional runtime system prompt string.  When supplied it fully
+            replaces ``FINANCIAL_SEARCH_SYSTEM_PROMPT``.  Intended for future
+            orchestration agents that resolve user preferences (tone, verbosity)
+            before the query reaches this layer.
+        session_id:
+            Optional identifier for session-based conversation caching.
+
+        Returns
+        -------
+        List of result dicts, each with shape::
+
+            {
+                "answer":    <str>,
+                "citations": [
+                    {"source_url": ..., "chunk_text": ..., "node_id": ...},
+                    ...
+                ]
+            }
+
+        Raises
+        ------
+        QueryError: If retrieval or completion fails.
+        ValueError: If query_text is empty.
         """
         self._require_initialized()
 
         if not query_text or not query_text.strip():
             raise ValueError("query_text must not be empty.")
 
-        # Deterministically derive the two authorized nodeset names — no DB call needed
+        # Deterministically derive the two authorised nodeset names — no DB call needed
         nodeset_names = get_user_nodeset_names(user_email)
 
+        system_prompt = get_search_system_prompt(system_prompt_override)
+
         logger.info(
-            "Query for '%s': type=%s, nodesets=%s, text='%.100s'",
+            "Query for '%s': scope=%s, entity=%s, nodesets=%s, text='%.100s'",
             user_email,
-            search_type.value if hasattr(search_type, "value") else search_type,
+            query_scope.value,
+            entity_name,
             nodeset_names,
             query_text,
         )
 
         try:
-            # Cognee search filters by node_type=NodeSet and node_name=[names]
-            # This ensures the graph traversal starts ONLY from the allowed NodeSet nodes
-            results = await cognee.search(
-                query_text=query_text,
-                query_type=search_type,
-                datasets=DATASET_NAME,
-                node_type=NodeSet,
-                node_name=nodeset_names,  # EXACTLY ["GLOBAL", "USER_<hash>"]
+            retriever = FinancialGraphRetriever(
+                user_nodeset_names=nodeset_names,
+                query_scope=query_scope,
+                entity_name=entity_name,
+                system_prompt=system_prompt,
                 top_k=top_k,
-                only_context=only_context,
+                session_id=session_id,
             )
-            result_list = results or []
+            result_list = await retriever.get_completion(query_text)
+            result_list = result_list or []
             logger.info(
                 "Query returned %d results for '%s'.", len(result_list), user_email
             )
