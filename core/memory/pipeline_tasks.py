@@ -42,11 +42,14 @@ from core.memory.exceptions import (
 from core.memory.graph_models import (
     ALL_ENTITIES,
     ALL_MAIN_SECTORS,
+    GLOBAL_FINANCIAL_EVENT_NODESET,
+    GLOBAL_FINANCIAL_WISDOM_NODESET,
     USER_SPECIFIC_ENTITIES,
     FinancialKnowledgeGraph,
 )
 from core.memory.nodeset_manager import (
     GLOBAL_NODESET_NAME,
+    get_or_create_all_global_entity_nodesets,
     get_or_create_global_nodeset,
     get_or_create_nodeset,
 )
@@ -67,6 +70,8 @@ def get_canonical_id(name: str) -> uuid.UUID:
 async def assign_nodesets(
     data_chunks: List[DocumentChunk],
     global_nodeset: NodeSet,
+    financial_wisdom_nodeset: NodeSet,
+    financial_event_nodeset: NodeSet,
 ) -> List[DocumentChunk]:
     """
     Post-processing pipeline task.
@@ -76,14 +81,17 @@ async def assign_nodesets(
     For every entity in each chunk's `contains` list:
       1. Check if the entity type belongs to USER_SPECIFIC_ENTITIES.
       2. Resolve to actual NodeSet DataPoint:
-          - If GLOBAL: use the provided global_nodeset
-          - If USER: use the document-level User NodeSet that was stored on the
-                     chunk's document during ingestion.
+          - FinancialConcept  → financial_wisdom_nodeset ("Global Financial Wisdom")
+          - FinancialEvent    → financial_event_nodeset  ("Global Financial Event")
+          - Other GLOBAL      → global_nodeset ("Market")
+          - USER              → the document-level user NodeSet
       3. Assign belongs_to_set = [resolved_nodeset]
 
     Args:
-        data_chunks: List of DocumentChunk objects.
-        global_nodeset: The shared GLOBAL NodeSet.
+        data_chunks:               List of DocumentChunk objects.
+        global_nodeset:            The shared GLOBAL (Market) NodeSet.
+        financial_wisdom_nodeset:  NodeSet for FinancialConcept entities.
+        financial_event_nodeset:   NodeSet for FinancialEvent entities.
 
     Returns:
         List[DocumentChunk]: The same data_chunks list with `belongs_to_set` populated on all entities.
@@ -165,7 +173,13 @@ async def assign_nodesets(
 
             # Resolve to actual NodeSet object
             if not is_user_entity:
-                resolved: NodeSet = global_nodeset
+                # Route specific global entity types to their dedicated nodesets
+                if entity_type == "FinancialConcept":
+                    resolved: NodeSet = financial_wisdom_nodeset
+                elif entity_type == "FinancialEvent":
+                    resolved = financial_event_nodeset
+                else:
+                    resolved = global_nodeset
                 global_count += 1
             else:
                 if doc_user_nodeset is not None:
@@ -192,7 +206,7 @@ async def assign_nodesets(
 
             # Assign belongs_to_set
             entity.belongs_to_set = getattr(entity, "belongs_to_set", []) or []
-            if resolved not in entity.belongs_to_set:
+            if resolved not in entity.belongs_to_set and entity_type != "Company":
                 entity.belongs_to_set.append(resolved)
 
             # Special business logic for specific global entities
@@ -333,8 +347,15 @@ async def build_financial_pipeline(
     Returns:
         List of Task objects in execution order.
     """
-    # Pre-fetch global nodeset to ensure it's in cache
+    # Pre-fetch global nodeset and dedicated entity nodesets to ensure they're in cache
     global_nodeset = await get_or_create_global_nodeset()
+    await get_or_create_all_global_entity_nodesets()
+    financial_wisdom_nodeset = await get_or_create_nodeset(
+        GLOBAL_FINANCIAL_WISDOM_NODESET
+    )
+    financial_event_nodeset = await get_or_create_nodeset(
+        GLOBAL_FINANCIAL_EVENT_NODESET
+    )
 
     # Cognee config for embed_triplets
     cognify_config = get_cognify_config()
@@ -358,6 +379,8 @@ async def build_financial_pipeline(
         Task(
             assign_nodesets,
             global_nodeset=global_nodeset,
+            financial_wisdom_nodeset=financial_wisdom_nodeset,
+            financial_event_nodeset=financial_event_nodeset,
         ),
         # Task(
         #     summarize_text,

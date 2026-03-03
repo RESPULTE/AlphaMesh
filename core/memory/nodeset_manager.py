@@ -34,6 +34,7 @@ from core.memory.exceptions import (
 )
 from core.memory.graph_models import (
     ALL_MAIN_SECTORS,
+    GLOBAL_ENTITY_NODESETS,
     GLOBAL_NODESET_NAME,
     Sector,
 )
@@ -203,7 +204,9 @@ async def get_or_create_nodeset(
 async def get_or_create_global_nodeset() -> NodeSet:
     """Return the GLOBAL NodeSet, creating it if necessary."""
     return await get_or_create_nodeset(
-        GLOBAL_NODESET_NAME, Sector, description=ALL_MAIN_SECTORS[GLOBAL_NODESET_NAME]
+        GLOBAL_NODESET_NAME,
+        Sector,
+        description=GLOBAL_ENTITY_NODESETS[GLOBAL_NODESET_NAME],
     )
 
 
@@ -249,92 +252,124 @@ def get_user_nodeset_names(user_email: str) -> list[str]:
 async def get_or_create_all_sector_nodesets() -> None:
     """
     Ensure all predefined Sector NodeSets exist in the graph and cache.
-    Queries the graph once to find missing sectors, creates them, and adds them in a single batch.
-
-    Returns:
-        List of NodeSet DataPoints for all sectors.
+    Queries the graph once to find missing sectors, creates them in a single batch.
 
     Raises:
         NodeSetCreationError: On any failure.
     """
-
-    # Identify which sectors are missing from the cache
-    missing_from_cache = {}
-    for name, desc in ALL_MAIN_SECTORS.items():
-        canonical_name = _normalize_nodeset_name(name)
-        if canonical_name not in _nodeset_cache:
-            missing_from_cache[canonical_name] = desc
-
-    if not missing_from_cache:
-        return
-
-    # Lock prevents duplicate writes in concurrent ingestion startup paths.
-    # Re-check cache inside lock
-    missing_from_cache = {}
-    for name, desc in ALL_MAIN_SECTORS.items():
-        canonical_name = _normalize_nodeset_name(name)
-        if canonical_name not in _nodeset_cache:
-            missing_from_cache[canonical_name] = desc
-
-    if not missing_from_cache:
-        return
-
-    # Prepare IDs for the missing ones
-    ids_to_check = {name: str(_cognee_nodeset_id(name)) for name in missing_from_cache}
-
     global_nodeset = await get_or_create_global_nodeset()
-    try:
-        # Query the graph to see which of these NodeSets already exist
-        graph_engine = await get_graph_engine()
+    await _create_predefined_nodesets(ALL_MAIN_SECTORS, Sector, global_nodeset)
 
-        query = "MATCH (n:Sector) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name"
-        params = {"ids": list(ids_to_check.values())}
-        results = await graph_engine.query(query, params)
 
-        existing_in_db = set()
-        if results:
-            for row in results:
-                data = (
-                    row.data()
-                    if hasattr(row, "data")
-                    else (dict(row) if isinstance(row, dict) else {})
+async def get_or_create_all_global_entity_nodesets() -> None:
+    """
+    Ensure the dedicated global entity NodeSets exist in the graph and cache.
+
+    Bootstraps:
+      - "Global Financial Wisdom"  — home for all FinancialConcept entities
+      - "Global Financial Event"   — home for all FinancialEvent entities
+
+    Raises:
+        NodeSetCreationError: On any failure.
+    """
+    await _create_predefined_nodesets(GLOBAL_ENTITY_NODESETS, NodeSet, None)
+
+
+async def _create_predefined_nodesets(
+    registry: dict[str, str],
+    nodeset_type: Type[NodeSet],
+    parent_nodeset: NodeSet,
+) -> None:
+    """
+    Generic batch bootstrap for any predefined {name: description} registry.
+
+    Checks the in-memory cache, queries the graph for what already exists,
+    then creates all missing entries in a single write batch.
+
+    Args:
+        registry:       Mapping of nodeset name -> description.
+        nodeset_type:   NodeSet subclass to instantiate (e.g. Sector, NodeSet).
+        parent_nodeset: The parent NodeSet to link new nodes to via belongs_to_set.
+
+    Raises:
+        NodeSetCreationError: On any graph or persistence failure.
+    """
+    # Build the set of names missing from cache (fast path before locking)
+    missing_from_cache = {
+        _normalize_nodeset_name(name): desc
+        for name, desc in registry.items()
+        if _normalize_nodeset_name(name) not in _nodeset_cache
+    }
+    if not missing_from_cache:
+        return
+
+    async with _nodeset_lock:
+        # Re-check inside the lock
+        missing_from_cache = {
+            _normalize_nodeset_name(name): desc
+            for name, desc in registry.items()
+            if _normalize_nodeset_name(name) not in _nodeset_cache
+        }
+        if not missing_from_cache:
+            return
+
+        ids_to_check = {
+            name: str(_cognee_nodeset_id(name)) for name in missing_from_cache
+        }
+
+        try:
+            graph_engine = await get_graph_engine()
+            label = nodeset_type.__name__
+
+            query = f"MATCH (n:{label}) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name"
+            params = {"ids": list(ids_to_check.values())}
+            results = await graph_engine.query(query, params)
+
+            existing_in_db: set[str] = set()
+            if results:
+                for row in results:
+                    data = (
+                        row.data()
+                        if hasattr(row, "data")
+                        else (dict(row) if isinstance(row, dict) else {})
+                    )
+                    db_id = data.get("id")
+                    db_name = data.get("name")
+                    if db_id and db_name:
+                        existing_in_db.add(db_name)
+                        logger.debug(
+                            "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
+                            db_name,
+                            db_id,
+                        )
+                        nodeset = nodeset_type(
+                            id=str(db_id),
+                            name=db_name,
+                            description=missing_from_cache.get(db_name, ""),
+                        )
+                        if parent_nodeset:
+                            nodeset.belongs_to_set = [parent_nodeset]
+                        _nodeset_cache[db_name] = nodeset
+
+            to_create = []
+            for name, desc in missing_from_cache.items():
+                if (
+                    name not in existing_in_db
+                    and name not in GLOBAL_ENTITY_NODESETS.keys()
+                ):
+                    stable_id = ids_to_check[name]
+                    nodeset = nodeset_type(id=stable_id, name=name, description=desc)
+                    if parent_nodeset:
+                        nodeset.belongs_to_set = [parent_nodeset]
+                    to_create.append(nodeset)
+                    _nodeset_cache[name] = nodeset
+
+            if to_create:
+                await cognee_add_dp(data_points=to_create)
+                logger.info(
+                    "NodeSets %s created and persisted in batch.",
+                    [n.name for n in to_create],
                 )
-                db_id = data.get("id")
-                db_name = data.get("name")
-                if db_id and db_name:
-                    existing_in_db.add(db_name)
-                    logger.debug(
-                        "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
-                        db_name,
-                        db_id,
-                    )
-                    # Add to cache using Sector so 'description' is a valid parameter
-                    nodeset = Sector(
-                        id=str(db_id),
-                        name=db_name,
-                        description=missing_from_cache.get(db_name, ""),
-                    )
-                    nodeset.belongs_to_set = [global_nodeset]
-                    _nodeset_cache[db_name] = nodeset
 
-        # Create the ones that were not in the DB
-        to_create = []
-        for name, desc in missing_from_cache.items():
-            if name not in existing_in_db and name != GLOBAL_NODESET_NAME:
-                stable_id = ids_to_check[name]
-                nodeset = Sector(id=stable_id, name=name, description=desc)
-                if name != "Market":
-                    nodeset.belongs_to_set = [global_nodeset]
-
-                to_create.append(nodeset)
-                _nodeset_cache[name] = nodeset
-
-        if to_create:
-            await cognee_add_dp(data_points=to_create)
-            logger.info(
-                "NodeSets %s created and persisted in batch.",
-                [n.name for n in to_create],
-            )
-
-    except Exception as exc:
-        raise NodeSetCreationError("Batch Sector NodeSets", str(exc)) from exc
+        except Exception as exc:
+            raise NodeSetCreationError(f"Batch {label} NodeSets", str(exc)) from exc

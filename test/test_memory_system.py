@@ -24,42 +24,24 @@ No live LLM or DB required — external I/O is mocked.
 
 from __future__ import annotations
 
-
-from typing import List
-
-from unittest.mock import AsyncMock, MagicMock, patch
-
+from unittest.mock import MagicMock, patch
 from uuid import NAMESPACE_OID, uuid4, uuid5
 
 import pytest
-
-
-from core.memory.exceptions import (
-    NodeSetResolutionError,
-    QueryError,
-)
-
-from core.memory.graph_models import (
-    ListedStock,
-    FinancialConcept,
-    FinancialKnowledgeGraph,
-    InvestmentThesis,
-)
-
-from core.memory.nodeset_manager import (
-    GLOBAL_NODESET_NAME,
-    get_user_nodeset_name,
-    hash_user_email,
-    get_user_nodeset_names,
-    get_or_create_nodeset,
-)
-
-from core.memory.pipeline_tasks import decide_assign_nodeset
-
-from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
-
 from cognee.modules.engine.models.node_set import NodeSet
 
+from core.memory.graph_models import (
+    InvestmentThesis,
+    ListedStock,
+)
+from core.memory.nodeset_manager import (
+    GLOBAL_NODESET_NAME,
+    get_or_create_nodeset,
+    get_user_nodeset_name,
+    get_user_nodeset_names,
+    hash_user_email,
+)
+from core.memory.pipeline_tasks import decide_assign_nodeset
 
 # ---------------------------------------------------------------------------
 
@@ -451,9 +433,8 @@ class TestQueryIsolation:
     @pytest.mark.asyncio
     async def test_query_before_init_raises(self):
 
-        from core.memory.memory_system import FinancialMemorySystem
-
         from core.memory.exceptions import MemorySystemError
+        from core.memory.memory_system import FinancialMemorySystem
 
         system = FinancialMemorySystem()
 

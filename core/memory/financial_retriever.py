@@ -39,8 +39,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type, Union
 
-from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 from cognee.modules.engine.models.node_set import NodeSet
+from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
 from cognee.modules.retrieval.utils.brute_force_triplet_search import (
     brute_force_triplet_search,

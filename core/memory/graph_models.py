@@ -28,7 +28,26 @@ from pydantic import BaseModel, Field
 
 USER_SPECIFIC_ENTITIES = ["UserInvestmentInterest", "UserLearningInterest"]
 DATASET_NAME = "alphamese_financial"
+
+# Dedicated global nodesets for non-sector shared entities
 GLOBAL_NODESET_NAME = "Market"
+GLOBAL_FINANCIAL_WISDOM_NODESET = "Global Financial Wisdom"
+GLOBAL_FINANCIAL_EVENT_NODESET = "Global Financial Event"
+
+# Registry consumed by nodeset_manager to bootstrap these nodes at startup
+GLOBAL_ENTITY_NODESETS: dict[str, str] = {
+    GLOBAL_FINANCIAL_WISDOM_NODESET: (
+        "A shared knowledge base of financial concepts, metrics, and educational definitions "
+        "(e.g. Interest Rates, P/E Ratio, Inflation). Entities here are always globally accessible."
+    ),
+    GLOBAL_FINANCIAL_EVENT_NODESET: (
+        "A shared repository of significant financial market and economic events "
+        "(e.g. Fed rate cuts, GDP reports, earnings surprises). Entities here are always globally accessible."
+    ),
+    GLOBAL_NODESET_NAME: (
+        "The overall market, representing the aggregate of all companies and sectors."
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # Domain DataPoint models
@@ -227,7 +246,6 @@ ALL_MAIN_SECTORS = {
     "Communication Services": "Telecommunications providers, media, entertainment, and interactive service companies.",
     "Utilities": "Providers of basic services including electricity, gas, and water.",
     "Real Estate": "Companies engaged in real estate development, management, and REITs.",
-    "Market": "The overall market, representing the aggregate of all companies and sectors.",
 }
 
 
