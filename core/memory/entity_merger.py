@@ -14,20 +14,20 @@ Algorithm:
 
 import logging
 from ast import literal_eval
-from typing import Any, Dict, List, Set, Tuple, cast as typing_cast
+from typing import Any, Dict, List, Set, Tuple
+from typing import cast as typing_cast
 
 import networkx as nx
-from sqlalchemy import bindparam, text
-
+from cognee.api.v1.datasets.datasets import datasets
 from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.infrastructure.databases.graph.neo4j_driver.adapter import Neo4jAdapter
 from cognee.infrastructure.databases.relational import get_relational_engine
 from cognee.infrastructure.databases.vector import get_vector_engine
 from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage import index_data_points, index_graph_edges
-from cognee.api.v1.datasets.datasets import datasets
-from core.memory.graph_models import ALL_ENTITIES
-from core.memory.graph_models import DATASET_NAME, GLOBAL_NODESET_NAME
+from sqlalchemy import bindparam, text
+
+from core.memory.graph_models import ALL_ENTITIES, DATASET_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +44,6 @@ SEMANTIC_MERGE_THRESHOLD = 0.85
 # Map entity type name → vector collection name used by index_data_points
 # Collection naming follows the pattern: {ClassName}_{first_index_field}
 _COLLECTION_MAP: Dict[str, str] = {k: f"{k}_name" for k in ALL_ENTITIES}
-
-# _REINDEX_COLLECTIONS = [
-#     "Entity_name",
-#     "EntityType_name",
-#     "DocumentChunk_text",
-#     "EdgeType_relationship_name",
-#     "TextDocument_name",
-#     "TextSummary_text",
-# ]
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +95,7 @@ async def find_and_merge_candidates(
 
     candidates = _filter_mergeable_candidates(graph_nodes)
     if not candidates:
-        logger.info("merge_entities: no mergeable global entities in batch.")
+        logger.debug("merge_entities: no mergeable global entities in batch.")
         return
 
     vector_engine = get_vector_engine()
@@ -117,10 +108,10 @@ async def find_and_merge_candidates(
     # 2. Resolve connected components → merge groups
     merge_groups = _resolve_merge_groups(G)
     if not merge_groups:
-        logger.info("merge_entities: no duplicate entities detected.")
+        logger.debug("merge_entities: no duplicate entities detected.")
         return
 
-    logger.info("merge_entities: %d merge group(s) identified.", len(merge_groups))
+    logger.debug("merge_entities: %d merge group(s) identified.", len(merge_groups))
 
     # 3. Fetch missing neo4j internal IDs for nodes discovered only via APOC
     await _fetch_missing_neo4j_ids(graph_client, merge_groups, neo4j_id_map)
@@ -134,7 +125,9 @@ async def find_and_merge_candidates(
         return
 
     # 5. Reindex vector store for affected nodes
-    await _reindex_vector_store(node_ids_to_keep, affected_node_ids)
+    await _reindex_vector_store(node_ids_to_keep)
+
+    await _delete_merged_orphaned_nodes(affected_node_ids)
 
 
 def _filter_mergeable_candidates(graph_nodes: List[DataPoint]) -> List[DataPoint]:
@@ -192,8 +185,8 @@ async def _find_and_add_fuzzy_matches(
     name: str,
 ) -> None:
     """Find fuzzy candidates on Neo4j and confirm them via the vector engine."""
-    fuzzy_query = f"""
-    MATCH (n:`__Node__`:`{label}`)
+    fuzzy_query = """
+    MATCH (n:`__Node__`)
     WHERE n.name IS NOT NULL AND n.id <> $cognee_id
     WITH n, apoc.text.sorensenDiceSimilarity(
             toLower(n.name), toLower($name)
@@ -240,7 +233,7 @@ async def _find_and_add_fuzzy_matches(
         candidate_label = str(data.get("type", ""))
         # entities must be superseded by the sector
         if candidate_label != label and candidate_label.lower() != "sector":
-            logger.info(
+            logger.debug(
                 "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
                 name,
                 label,
@@ -252,7 +245,7 @@ async def _find_and_add_fuzzy_matches(
         if match_neo4j_id is not None:
             neo4j_id_map[match_cognee_id] = int(match_neo4j_id)
 
-        logger.info(
+        logger.debug(
             "merge_entities: fuzzy candidate '%s' ↔ '%s' (dice=%.3f)",
             name,
             match_name,
@@ -261,7 +254,7 @@ async def _find_and_add_fuzzy_matches(
 
         match_confirmed = False
         if fuzzy_score >= SEMANTIC_MERGE_THRESHOLD:
-            logger.info(
+            logger.debug(
                 "merge_entities: confirmed match '%s' ↔ '%s' (dice=%.3f)",
                 name,
                 match_name,
@@ -304,7 +297,7 @@ async def _confirm_semantic_match(
 
     collection = _get_collection_for(dp)
     if not collection:
-        logger.info(
+        logger.debug(
             "merge_entities: no collection for type %s, skipping semantic gate.",
             label,
         )
@@ -316,7 +309,7 @@ async def _confirm_semantic_match(
             query_text=embeddable,
             limit=10,
         )
-        logger.info(
+        logger.debug(
             "merge_entities: vector search results for '%s': %s",
             name,
             scored_results,
@@ -329,7 +322,7 @@ async def _confirm_semantic_match(
     # Cognee's normalisation for the score is opposite, lower = closer in similarity fkc
     for sr in scored_results:
         if str(sr.id) == match_cognee_id and sr.score <= (1 - SEMANTIC_MERGE_THRESHOLD):
-            logger.info(
+            logger.debug(
                 "merge_entities: confirmed match '%s' ↔ '%s' "
                 "(dice=%.3f, vector=%.3f)",
                 name,
@@ -398,6 +391,33 @@ async def _execute_apoc_merges(
     neo4j_id_map: Dict[str, int],
 ) -> Tuple[Set[str], List[str], int]:
     """Execute APOC merges and update relational edges table."""
+
+    async def _update_relational_database(canonical_cid: str, old_cids: List[str]):
+        try:
+            relational_engine = get_relational_engine()
+            if hasattr(relational_engine, "engine"):
+                async with relational_engine.engine.begin() as conn:
+                    await conn.execute(
+                        text(
+                            "UPDATE edges SET source_node_id = :canonical_id"
+                            " WHERE source_node_id IN :old_ids"
+                        ).bindparams(bindparam("old_ids", expanding=True)),
+                        {"canonical_id": canonical_cid, "old_ids": old_cids},
+                    )
+                    await conn.execute(
+                        text(
+                            "UPDATE edges SET destination_node_id = :canonical_id"
+                            " WHERE destination_node_id IN :old_ids"
+                        ).bindparams(bindparam("old_ids", expanding=True)),
+                        {"canonical_id": canonical_cid, "old_ids": old_cids},
+                    )
+        except Exception as exc:
+            logger.error(
+                "merge_entities: relational rewire failed for '%s': %s",
+                canonical_name,
+                exc,
+            )
+
     merge_query = """
     MATCH (n:`__Node__`)
     WHERE id(n) IN $node_ids
@@ -418,7 +438,6 @@ async def _execute_apoc_merges(
     RETURN DISTINCT id(node) AS merged_neo4j_id, node.id AS cognee_id, node.name AS name
     """
 
-    # relational_engine = get_relational_engine()
     affected_node_ids: Set[str] = set()
     node_ids_to_keep = []
     success_count = 0
@@ -450,7 +469,7 @@ async def _execute_apoc_merges(
                 {"node_ids": node_ids, "canonical_id": canonical_cid},
             )
             success_count += 1
-            logger.info(
+            logger.debug(
                 "merge_entities: merged %d nodes → '%s'.", len(node_ids), canonical_name
             )
         except Exception as exc:
@@ -462,31 +481,10 @@ async def _execute_apoc_merges(
         # Rewire stale UUIDs in relational edges table
         if not old_cids:
             continue
-        # try:
-        #     if hasattr(relational_engine, "engine"):
-        #         async with relational_engine.engine.begin() as conn:
-        #             await conn.execute(
-        #                 text(
-        #                     "UPDATE edges SET source_node_id = :canonical_id"
-        #                     " WHERE source_node_id IN :old_ids"
-        #                 ).bindparams(bindparam("old_ids", expanding=True)),
-        #                 {"canonical_id": canonical_cid, "old_ids": old_cids},
-        #             )
-        #             await conn.execute(
-        #                 text(
-        #                     "UPDATE edges SET destination_node_id = :canonical_id"
-        #                     " WHERE destination_node_id IN :old_ids"
-        #                 ).bindparams(bindparam("old_ids", expanding=True)),
-        #                 {"canonical_id": canonical_cid, "old_ids": old_cids},
-        #             )
-        # except Exception as exc:
-        #     logger.error(
-        #         "merge_entities: relational rewire failed for '%s': %s",
-        #         canonical_name,
-        #         exc,
-        #     )
 
-    logger.info(
+        await _update_relational_database(canonical_cid, old_cids)
+
+    logger.debug(
         "merge_entities: %d/%d group(s) merged successfully.",
         success_count,
         len(merge_groups),
@@ -495,19 +493,8 @@ async def _execute_apoc_merges(
     return affected_node_ids, node_ids_to_keep, success_count
 
 
-async def _reindex_vector_store(
-    node_ids_to_keep: List[str], affected_node_ids: Set[str]
-) -> None:
+async def _reindex_vector_store(node_ids_to_keep: List[str]) -> None:
     """Reindex vector store for affected nodes."""
-    from cognee.modules.data.methods import get_unique_dataset_id
-    from cognee.modules.users.methods import get_default_user
-    import uuid
-
-    dataset_id = await get_unique_dataset_id(DATASET_NAME, await get_default_user())
-
-    for id_to_del in affected_node_ids:
-        logger.info("Deleting node with id: %s", id_to_del)
-        await datasets.delete_data(dataset_id=dataset_id, data_id=uuid.UUID(id_to_del))
 
     graph_engine = await get_graph_engine()
     # get_id_filtered_graph_data is a Neo4j-specific method
@@ -518,7 +505,7 @@ async def _reindex_vector_store(
 
     indexable_nodes = []
     for _, props in nodes_data:
-        # logger.info("Keeping node with id: %s", _)
+        # logger.debug("Keeping node with id: %s", _)
         props = {k: literal_eval(v) if k == "metadata" else v for k, v in props.items()}
         if "metadata" in props and isinstance(props["metadata"], dict):
             props["metadata"].setdefault("type", props.get("type"))
@@ -529,39 +516,15 @@ async def _reindex_vector_store(
 
     if edges_data:
         await index_graph_edges(edges_data)
-    # try:
-    #     graph_engine = await get_graph_engine()
-    #     # get_id_filtered_graph_data is a Neo4j-specific method
-    #     neo4j_engine = typing_cast(Neo4jAdapter, graph_engine)
-    #     vector_engine = get_vector_engine()
-    #
-    #     nodes_data, edges_data = await neo4j_engine.get_id_filtered_graph_data(
-    #         list(affected_node_ids)
-    #     )
-    #
-    #     for coll in _REINDEX_COLLECTIONS:
-    #         if await vector_engine.has_collection(coll):
-    #             await vector_engine.delete_data_points(coll, list(affected_node_ids))
-    #
-    #     indexable_nodes = []
-    #     for _, props in nodes_data:
-    #         props = {
-    #             k: literal_eval(v) if k == "metadata" else v for k, v in props.items()
-    #         }
-    #         if "metadata" in props and isinstance(props["metadata"], dict):
-    #             props["metadata"].setdefault("type", props.get("type"))
-    #         indexable_nodes.append(DataPoint(**props))
-    #
-    #     if indexable_nodes:
-    #         await index_data_points(indexable_nodes)
-    #
-    #     if edges_data:
-    #         await index_graph_edges(edges_data)
-    #
-    #     logger.info(
-    #         "merge_entities: reindexed %d nodes, %d edges.",
-    #         len(indexable_nodes),
-    #         len(edges_data),
-    #     )
-    # except Exception as exc:
-    #     logger.error("merge_entities: vector reindex failed: %s", exc)
+
+
+async def _delete_merged_orphaned_nodes(affected_node_ids: Set[str]):
+    import uuid
+
+    from cognee.modules.data.methods import get_unique_dataset_id
+    from cognee.modules.users.methods import get_default_user
+
+    dataset_id = await get_unique_dataset_id(DATASET_NAME, await get_default_user())
+    for id_to_del in affected_node_ids:
+        logger.debug("Deleting node with id: %s", id_to_del)
+        await datasets.delete_data(dataset_id=dataset_id, data_id=uuid.UUID(id_to_del))

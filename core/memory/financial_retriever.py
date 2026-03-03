@@ -37,7 +37,7 @@ import asyncio
 import logging
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type, Union
 
 from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 from cognee.modules.engine.models.node_set import NodeSet
@@ -583,8 +583,8 @@ class FinancialGraphRetriever(GraphCompletionRetriever):
     async def get_completion(
         self,
         query: Optional[str] = None,
-        query_batch: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        only_context: bool = False,
+    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Full pipeline: retrieve → build context + citations → LLM completion.
 
@@ -594,6 +594,11 @@ class FinancialGraphRetriever(GraphCompletionRetriever):
         context = await self.get_context_from_objects(
             query=query, retrieved_objects=retrieved_objects
         )
+        if only_context:
+            return {
+                "context_text": context.context_text,
+                "citations": [c._asdict() for c in context.citations],
+            }
         return await self.get_completion_from_context(
             query=query,
             retrieved_objects=retrieved_objects,

@@ -24,6 +24,8 @@ import logging
 import os
 import sys
 
+import cognee
+
 from core.memory.financial_retriever import QueryScope
 
 # Ensure project root on path
@@ -31,8 +33,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Suppress overly verbose cognee logs so the test output is readable
 logging.basicConfig(level=logging.DEBUG, format="%(message)s")
-import cognee
-from cognee.modules.search.types import SearchType
 
 
 async def run_ingestion(memory, user_a, user_b, sep):
@@ -43,9 +43,13 @@ async def run_ingestion(memory, user_a, user_b, sep):
     await memory.ingest_news(
         articles=[
             {
-                "headline": "Federal Reserve maintains interest rates at 5.25%",
-                "summary": "The Fed held rates steady, signaling lower inflation risks.",
-            }
+                "headline": "Federal Reserve maintains interest rates at 5.25% amid easing inflation data",
+                "summary": "The Federal Reserve held its benchmark interest rate steady at the 5.25%-5.50% range, signaling that while inflation risks have diminished considerably over the last two quarters, policymakers are awaiting further conclusive economic data before committing to consecutive rate cuts in the latter half of the year. The broader market reacted positively to the dovish tone.",
+            },
+            {
+                "headline": "Biotech funding sees a resurgence in Q3 led by neurodegenerative breakthroughs",
+                "summary": "Venture capital funding for clinical-stage biotechnology firms surged by 22% quarter-over-over. The influx of capital is largely attributed to promising preliminary data from several phase 2 and phase 3 trials focusing on Alzheimer's and Parkinson's disease therapeutics.",
+            },
         ],
         is_global=True,
     )
@@ -60,15 +64,15 @@ async def run_ingestion(memory, user_a, user_b, sep):
         messages=[
             {
                 "role": "user",
-                "content": "I just invested heavily in NeuroCure Therapeutics ($NCT).",
+                "content": "I just invested heavily in NeuroCure Therapeutics ($NCT). I believe their pipeline is undervalued given the recent biotech market trends.",
             },
             {
                 "role": "assistant",
-                "content": "NeuroCure ($NCT) is focused on Alzheimer's treatments. They have a Phase 3 trial reading out in Q4. This company might also negatively affect the real estate companies, like Vornado Realty Trust",
+                "content": "NeuroCure Therapeutics ($NCT) is significantly focused on next-generation Alzheimer's treatments. Their flagship asset, NC-842, is currently in a pivotal Phase 3 trial reading out in Q4, which targets amyloid plaques utilizing a novel transport mechanism. If successful, it could capture a large share of a multi-billion dollar Total Addressable Market (TAM). \n\nHowever, it's worth noting the broader interconnected market effects: substantial breakthroughs extending lifespans and requiring specialized assisted living infrastructure could indirectly impact the demand for specific real estate assets. While somewhat tangential, shifts in healthcare outcomes might eventually influence the portfolios of major commercial real estate companies, like Vornado Realty Trust ($VNO), if they expand into life sciences or specialized medical real estate to capture the shifting demographic needs.",
             },
             {
                 "role": "user",
-                "content": "My target price for $NCT is $150 if the trial succeeds.",
+                "content": "That is an interesting macro perspective. Regardless, my target price for $NCT is $150 if the trial succeeds, based on comparable acquisition multiples of recent clinical-stage neuro-focused peers.",
             },
         ],
     )
@@ -83,15 +87,15 @@ async def run_ingestion(memory, user_a, user_b, sep):
         messages=[
             {
                 "role": "user",
-                "content": "I am looking at buying commercial real estate via the VNO REIT.",
+                "content": "I am looking at buying commercial real estate equities to hedge against inflation, specifically considering the VNO REIT.",
             },
             {
                 "role": "assistant",
-                "content": "Vornado Realty Trust (VNO) has significant exposure to NYC office space.",
+                "content": "Vornado Realty Trust (VNO) is one of the largest real estate investment trusts in the United States, with significant exposure to premium NYC office space and street retail properties. The company's portfolio is heavily concentrated in Manhattan, driving its core revenue.\n\nWhile VNO offers an attractive dividend yield, the current macroeconomic environment—specifically the Federal Reserve's stance on holding interest rates steady at 5.25%—means borrowing costs remain elevated for property developers. Furthermore, the persistent shift towards hybrid work models continues to pose a medium-term headwind to office occupancy rates. To counteract this, some commercial REITs are looking to diversify their tenant base by converting traditional office spaces into specialized medical facilities or life sciences labs, though VNO's core strength remains in prime traditional office and retail spaces.",
             },
             {
                 "role": "user",
-                "content": "Yes, I plan to hold VNO for the 7% dividend yield.",
+                "content": "Yes, I understand the risks with NYC office exposure. But I plan to hold VNO primarily for the robust 7% dividend yield, and I believe the premium properties will hold their valuation over the next decade.",
             },
         ],
     )
@@ -109,47 +113,121 @@ async def run_ingestion(memory, user_a, user_b, sep):
     print(f"{sep}\n")
 
 
-async def execute_query(memory, user: str, prompt: str) -> None:
+async def execute_query(
+    memory, user: str, prompt: str, entity_name: str, scope: QueryScope
+) -> None:
     print(f"  [Q] User: {user}")
     print(f"      Ask : '{prompt}'")
+    only_context = False
     try:
         results = await memory.query(
             user_email=user,
             query_text=prompt,
-            query_scope=QueryScope.COMPANY,
-            entity_name="Vornado Realty Trust (VNO)",
+            query_scope=scope,
+            entity_name=entity_name,
             top_k=10,
+            only_context=only_context,
         )
-        print(f"      Ans : {len(results)} chunks found.")
-        for i, r in enumerate(results):
-            text_snippet = str(r).replace("\\n", " ").strip()
-            print(f"            [{i+1}] {text_snippet}")
+        if not only_context:
+            print(f"      Ans : {len(results)} chunks found.")
+            for i, r in enumerate(results):
+                text_snippet = str(r).replace("\\n", " ").strip()
+                print(f"            [{i+1}] {text_snippet}")
+        else:
+            print(f"      Ans : {len(results)} chunks found.")
+            print(results["context_text"])
+            for i, r in enumerate(results["citations"]):
+                text_snippet = str(r).replace("\\n", " ").strip()
+                print(f"            [{i+1}] {text_snippet}")
     except Exception as exc:
         print(f"      ERR : {type(exc).__name__}: {exc}")
     print("")
 
 
 async def query_test(memory, USER_A, USER_B):
-    # Test 1: Both users can see GLOBAL data
-    print("--- Test 1: Global Data Access ---")
-    await execute_query(memory, USER_A, "What did the Federal Reserve do?")
-    await execute_query(memory, USER_B, "What did the Federal Reserve do?")
+    # Test 1: Both users can see GLOBAL data (Federal Reserve)
+    print("--- Test 1a: Global Data Access — Federal Reserve ---")
+    await execute_query(
+        memory,
+        USER_A,
+        "What is the Federal Reserve's current stance on interest rates?",
+        "Federal Reserve",
+        QueryScope.MARKET,
+    )
+    await execute_query(
+        memory,
+        USER_B,
+        "What is the Federal Reserve's current stance on interest rates?",
+        "Federal Reserve",
+        QueryScope.MARKET,
+    )
+
+    # Test 1b: Both users can see GLOBAL data (Biotech funding)
+    print("--- Test 1b: Global Data Access — Biotech Funding ---")
+    await execute_query(
+        memory,
+        USER_A,
+        "How is biotech venture capital funding trending this quarter?",
+        "Biotech",
+        QueryScope.MARKET,
+    )
+    await execute_query(
+        memory,
+        USER_B,
+        "How is biotech venture capital funding trending this quarter?",
+        "Biotech",
+        QueryScope.MARKET,
+    )
 
     # Test 2: User A accessing User A's data (Should succeed)
     print("--- Test 2: User A asking about their own data ---")
-    await execute_query(memory, USER_A, "What is my target price for NeuroCure ($NCT)?")
+    await execute_query(
+        memory,
+        USER_A,
+        "What is my target price for NeuroCure Therapeutics ($NCT) and what is the NC-842 Phase 3 trial status?",
+        "NeuroCure Therapeutics",
+        QueryScope.COMPANY,
+    )
 
-    # Test 3: User B trying to access User A's data (Should return nothing or only global/hallucinations, NO $NCT data)
+    # Test 3: User B trying to access User A's data (Should return nothing or only global, NO $NCT data)
     print("--- Test 3: ISOLATION CHECK — User B asking about User A's data ---")
-    await execute_query(memory, USER_B, "What is my target price for NeuroCure ($NCT)?")
+    await execute_query(
+        memory,
+        USER_B,
+        "What is the target price for NeuroCure Therapeutics ($NCT) and what is the NC-842 Phase 3 trial status?",
+        "NeuroCure Therapeutics",
+        QueryScope.COMPANY,
+    )
 
     # Test 4: User B accessing User B's data (Should succeed)
     print("--- Test 4: User B asking about their own data ---")
-    await execute_query(memory, USER_B, "Why am I holding VNO?")
+    await execute_query(
+        memory,
+        USER_B,
+        "Why am I holding VNO and what dividend yield am I expecting from it?",
+        "Vornado Realty Trust",
+        QueryScope.COMPANY,
+    )
 
     # Test 5: User A trying to access User B's data (Should return nothing, NO VNO data)
     print("--- Test 5: ISOLATION CHECK — User A asking about User B's data ---")
-    await execute_query(memory, USER_A, "Why am I holding VNO?")
+    await execute_query(
+        memory,
+        USER_A,
+        "Why am I holding VNO and what dividend yield am I expecting from it?",
+        "Vornado Realty Trust",
+        QueryScope.COMPANY,
+    )
+
+    # Test 6: Cross-scope query — User A asking about macro threats to their thesis
+    print("--- Test 6: User A — Cross-scope investment thesis analysis ---")
+    await execute_query(
+        memory,
+        USER_A,
+        "What are the current macro threats and upsides to my investment thesis in NeuroCure ($NCT), taking into account interest rate and biotech market conditions?",
+        "NeuroCure Therapeutics",
+        QueryScope.COMPANY,
+    )
 
 
 async def clear_all():
@@ -158,13 +236,11 @@ async def clear_all():
 
 
 async def run_smoke_test() -> None:
-    from cognee.modules.search.types import SearchType
 
     from core.memory import (
         GLOBAL_NODESET_NAME,
         FinancialMemorySystem,
         get_user_nodeset_name,
-        hash_user_email,
     )
 
     # Remove all data files
@@ -194,13 +270,7 @@ async def run_smoke_test() -> None:
     print("      > Initialized.\n")
 
     await run_ingestion(memory, USER_A, USER_B, SEP)
-    await query_test(memory, USER_A, USER_B)
-
-    await execute_query(
-        memory,
-        USER_A,
-        "what are the current threat / upside to my investment thesis? take into acount macroeconomic as well",
-    )
+    # await query_test(memory, USER_A, USER_B)
 
     print(f"{SEP}")
     print("  Smoke test fully verified.")

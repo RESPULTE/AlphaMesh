@@ -19,44 +19,41 @@ Pipeline insertion order:
 """
 
 from __future__ import annotations
-import uuid
 
 import logging
-from typing import List, Optional
-from core.memory.graph_models import ALL_MAIN_SECTORS
+import uuid
+from typing import Any, List, Optional
 
-from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
-from cognee.modules.pipelines.tasks.task import Task
-from cognee.modules.chunking.TextChunker import TextChunker
+from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.infrastructure.llm import get_max_chunk_tokens
+from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
+from cognee.modules.chunking.TextChunker import TextChunker
+from cognee.modules.cognify.config import get_cognify_config
 from cognee.modules.engine.models.node_set import NodeSet
-
+from cognee.modules.pipelines.tasks.task import Task
 from cognee.tasks.documents import classify_documents, extract_chunks_from_documents
 from cognee.tasks.graph import extract_graph_from_data
 from cognee.tasks.storage import add_data_points
-from core.memory.entity_merger import find_and_merge_candidates
-from cognee.modules.cognify.config import get_cognify_config
 
-from cognee.infrastructure.engine import Edge
-from cognee.infrastructure.databases.graph import get_graph_engine
+from core.memory.entity_merger import find_and_merge_candidates
 from core.memory.exceptions import (
     NodeSetResolutionError,
 )
 from core.memory.graph_models import (
-    FinancialKnowledgeGraph,
+    ALL_ENTITIES,
+    ALL_MAIN_SECTORS,
     USER_SPECIFIC_ENTITIES,
+    FinancialKnowledgeGraph,
 )
 from core.memory.nodeset_manager import (
+    GLOBAL_NODESET_NAME,
     get_or_create_global_nodeset,
     get_or_create_nodeset,
-    GLOBAL_NODESET_NAME,
 )
 from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-import hashlib
-from core.memory.graph_models import ALL_ENTITIES
 
 # ---------------------------------------------------------------------------
 # Post-processing task: assign_nodeset_from_target
@@ -95,6 +92,19 @@ async def assign_nodesets(
         NodeSetResolutionError: Safety net if NodeSet object is None or not found on document.
         TypeError: If data_chunks is not a list.
     """
+
+    async def _classify_company(company: Any, sector_or_industry: str):
+        try:
+            sector_nodeset = await get_or_create_nodeset(sector_or_industry)
+            if sector_nodeset not in company.belongs_to_set:
+                company.belongs_to_set.append(sector_nodeset)
+            logger.info(
+                f"Resolved sector/industry nodeset {sector_or_industry} for Company {company.name}"
+            )
+        except Exception as e:
+            logger.info(
+                f"Failed to resolve sector/industry nodeset {sector_or_industry} for Company {company.name}: {e}"
+            )
 
     if not isinstance(data_chunks, list):
         raise TypeError(
@@ -186,19 +196,11 @@ async def assign_nodesets(
                 entity.belongs_to_set.append(resolved)
 
             # Special business logic for specific global entities
-            if entity_type == "Company" and hasattr(entity, "sector") and entity.sector:
-                # Add company to its respective sector NodeSet
-                try:
-                    sector_nodeset = await get_or_create_nodeset(entity.sector)
-                    if sector_nodeset not in entity.belongs_to_set:
-                        entity.belongs_to_set.append(sector_nodeset)
-                    logger.info(
-                        f"Resolved sector nodeset {entity.sector} for Company {entity.name}"
-                    )
-                except Exception as e:
-                    logger.info(
-                        f"Failed to resolve sector nodeset {entity.sector} for Company {entity.name}: {e}"
-                    )
+            if entity_type == "Company":
+                if hasattr(entity, "sector") and entity.sector:
+                    await _classify_company(entity, entity.sector)
+                elif hasattr(entity, "industry") and entity.industry:
+                    await _classify_company(entity, entity.industry)
 
             elif entity_type == "FinancialEvent" and (
                 entity.positively_impacted or entity.negatively_impacted

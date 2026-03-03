@@ -22,20 +22,20 @@ from __future__ import annotations
 import hashlib
 import logging
 from asyncio import Lock
+from typing import Type
 from uuid import NAMESPACE_OID, uuid5
-from typing import Optional, Type
 
+from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.tasks.storage.add_data_points import add_data_points as cognee_add_dp
-from cognee.infrastructure.databases.graph import get_graph_engine
 
 from core.memory.exceptions import (
     NodeSetCreationError,
 )
 from core.memory.graph_models import (
     ALL_MAIN_SECTORS,
-    Sector,
     GLOBAL_NODESET_NAME,
+    Sector,
 )
 
 logger = logging.getLogger(__name__)
@@ -323,7 +323,8 @@ async def get_or_create_all_sector_nodesets() -> None:
             if name not in existing_in_db and name != GLOBAL_NODESET_NAME:
                 stable_id = ids_to_check[name]
                 nodeset = Sector(id=stable_id, name=name, description=desc)
-                nodeset.belongs_to_set = [global_nodeset]
+                if name != "Market":
+                    nodeset.belongs_to_set = [global_nodeset]
 
                 to_create.append(nodeset)
                 _nodeset_cache[name] = nodeset

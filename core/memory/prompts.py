@@ -20,27 +20,37 @@ Your primary goal is to identify financial entities, categorize them precisely, 
 ### ENTITY CATEGORIES & RULES
 Categorize every identified concept into one of the following specific entity types:
 
-1. **Sector**: Broad economic sectors or industries.
+1. **Sector**: Broad economic sectors.
    - **Allowed Sectors:** You MUST map any sector concept to one of these exact names: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate, Market.
 
-2. **Company**: Explicitly named, publicly traded companies or investment entities (e.g., "Microsoft", "Tesla").
-   - **Rule:** Every company MUST have its `sector` field populated with one of the exact Allowed Sectors listed above.
-   - If the text mentions a group of companies vaguely, extract a `Sector` instead.
+2. **Industry**: A specific industrial niche or specialized business category within a primary economic Sector.
+    - Used for granular classification (e.g., 'Cloud Infrastructure' as an Industry of 'Information Technology').
 
-3. **FinancialConcept**: Financial terms, metrics, and educational definitions (e.g., "Interest Rates", "Inflation", "P/E Ratio").
+3. **Company**: Explicitly named, publicly traded companies or investment entities (e.g., "Microsoft", "Tesla").
+   - **Rule:** Every company MUST have its `sector` field populated with one of the exact Allowed Sectors listed above.
+   - **Rule:** You may optionally populate the `industry` field with a more granular specific niche.
+   - If the text mentions a group of companies vaguely, extract an `Industry` or `Sector` instead.
+
+4. **FinancialConcept**: Financial terms, metrics, and educational definitions (e.g., "Interest Rates", "Inflation", "P/E Ratio").
    - Classify the concept accurately into its `category` (e.g., macroeconomics, valuation).
    - Use `related_concepts` to link to other extracted FinancialConcepts.
 
-4. **FinancialEvent**: Significant financial market events, economic events, or news events.
+5. **FinancialEvent**: Significant financial market events, economic events, or news events.
    - **Rule:** Financial events often impact companies or sectors. Populate `positively_impacted` and `negatively_impacted` with the specific `Company` or `Sector` entities affected by the event.
    - If an event broadly affects the overall market without a specific sector or company, you MUST link it to the `Market` entity.
 
-5. **InvestmentThesis**: An individual's structured intent or opinion on investing.
-   - **CRITICAL TRIGGER:** If the user implies intent to buy, sell, hold, or short a stock, asset, or sector, you MUST create an `InvestmentThesis`.
-   - Provide the rationale in the `description` or `metadata`.
-   - Set the `status` carefully based on context (Bought, Interested, Sold, Avoids).
+6. **UserInvestmentInterest**: An individual's structured intent or opinion on investing.
+   - **CRITICAL TRIGGER:** If the user implies intent to buy, sell, hold, short, or express interest in a stock, asset, or sector, you MUST create a `UserInvestmentInterest`.
+   - Provide the rationale in the `reason` field.
+   - Set the `status` carefully via the nested status object, picking from (Bought, Interested, Sold, Avoids).
    - Link the relevant `Company` or `Sector` entities in the `targets` list.
-   - Optional: link supporting or threatening `FinancialEvent`s to the thesis using `supporting_events` and `threatening_events`.
+   - Optional: link supporting or threatening `FinancialEvent`s to the interest using `supporting_events` and `threatening_events`.
+
+7. **UserLearningInterest**: A topic, concept, or event that the user wants to learn more about or understand better.
+   - **CRITICAL TRIGGER:** If the user asks for clarification, expresses confusion, or explicitly states they want to learn about a concept or event, you MUST create a `UserLearningInterest`.
+   - Provide the specific question or confusion in the `reason` field.
+   - Set the `status` via the nested status object, picking from (Interested, Understood, Confused, Not Interested).
+   - Link the relevant `FinancialConcept` or `FinancialEvent` entities in the `targets` list.
 
 ### EXTRACTION DIRECTIVES
 1. **Extract Implied Entities:** Do not limit yourself strictly to the exact words in the text. If a financial-related entity is strongly implied and necessary to capture the full financial context, extract it. 
@@ -53,25 +63,31 @@ Categorize every identified concept into one of the following specific entity ty
 "I just bought MSFT. Tech companies are looking good right now because inflation is dropping, which means the Fed might cut interest rates, giving a huge boost to the tech sector."
 
 **Expected Extraction Logic:**
-- **Company**: Microsoft (ticker: MSFT, sector: "Information Technology")
+- **Company**: Microsoft (ticker: MSFT, sector: "Information Technology", industry: "Software")
 - **Sector**: Information Technology (extracted from "Tech companies")
 - **FinancialConcept**: Inflation (category: macroeconomics), Interest Rates (category: macroeconomics)
 - **FinancialEvent**: "Dropping Inflation", "Potential Fed Rate Cut"
    - Rate Cut event `positively_impacted` list includes: [Sector("Information Technology")]
-- **InvestmentThesis**: 
-   - status: "Bought"
+- **UserInvestmentInterest**: 
+   - status: {"status": "Bought"}
+   - reason: "Tech companies are looking good right now because inflation is dropping, which means the Fed might cut interest rates."
    - targets: [Company("Microsoft")]
    - supporting_events: [FinancialEvent("Dropping Inflation"), FinancialEvent("Potential Fed Rate Cut")]
 
 ### EXAMPLE 2
 
 **User Input:**
-"The latest GDP report shows a 3% growth, which is a strong positive signal for the entire market."
+"The latest GDP report shows a 3% growth, which is a strong positive signal for the entire market. I don't really understand how GDP affects my portfolio though, can you explain?"
 
 **Expected Extraction Logic:**
 - **FinancialEvent**: "3% GDP Growth"
    - GDP growth event `positively_impacted` list includes: [Sector("Market")]
 - **Sector**: Market (extracted from "entire market")
+- **FinancialConcept**: GDP (category: macroeconomics)
+- **UserLearningInterest**:
+   - status: {"status": "Confused"}
+   - reason: "I don't really understand how GDP affects my portfolio though, can you explain?"
+   - targets: [FinancialConcept("GDP")]
 
 Generate the output structured strictly according to the `FinancialKnowledgeGraph` schema.
 """

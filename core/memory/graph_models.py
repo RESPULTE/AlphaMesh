@@ -22,6 +22,7 @@ from cognee.modules.engine.models.node_set import NodeSet
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
+
 # Base for all financial domain entities
 # ---------------------------------------------------------------------------
 
@@ -42,10 +43,10 @@ class Sector(NodeSet):
     metadata: dict = {"index_fields": ["name", "description"]}
 
 
-class Subsector(Sector):
+class Industry(NodeSet):
     """
     A specific industrial niche or specialized business category within a primary economic Sector.
-    Used for granular classification (e.g., 'Cloud Infrastructure' as a Subsector of 'Information Technology').
+    Used for granular classification (e.g., 'Cloud Infrastructure' as a Industry of 'Information Technology').
     """
 
     name: str = Field(
@@ -62,14 +63,17 @@ class Company(DataPoint):
 
     ticker: str = Field(description="Stock ticker symbol (e.g., AAPL).")
     name: str = Field(description="Full corporate name of the company.")
-    sector: str = Field(
-        description="The specific economic sector this company belongs to. Must match one of the predefined standard sectors: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate."
-    )
     description: str = Field(
         description="A brief description of this specific company."
     )
+    sector: str = Field(
+        description="The specific economic sector this company belongs to. Must match one of the predefined standard sectors: Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples, Health Care, Financials, Information Technology, Communication Services, Utilities, Real Estate."
+    )
+    industry: Optional[str] = Field(
+        description="The specific industrial niche or specialized business category within a primary economic Sector. Used for granular classification (e.g., 'Cloud Infrastructure' as a Industry of 'Information Technology')."
+    )
 
-    metadata: dict = {"index_fields": ["company_name", "ticker", "description"]}
+    metadata: dict = {"index_fields": ["name", "ticker", "description"]}
 
 
 class FinancialConcept(DataPoint):
@@ -101,7 +105,8 @@ class FinancialEvent(DataPoint):
     name: str = Field(description="Name of the financial event.")
     description: str = Field(description="Description of the financial event.")
     date: datetime = Field(
-        description="Date of the event. Use the current date if none is found"
+        description="Date of the event. Use the current date if none is found",
+        default_factory=datetime.now,
     )
 
     positively_impacted: Optional[List[Union[Company, Sector]]] = Field(
@@ -198,7 +203,7 @@ Sector.model_rebuild()
 UserInvestmentInterest.model_rebuild()
 UserLearningInterest.model_rebuild()
 FinancialEvent.model_rebuild()
-Subsector.model_rebuild()
+Industry.model_rebuild()
 
 ALL_ENTITIES = {
     "Company",
@@ -207,7 +212,7 @@ ALL_ENTITIES = {
     "FinancialEvent",
     "UserInvestmentInterest",
     "UserLearningInterest",
-    "Subsector",
+    "Industry",
 }
 
 ALL_MAIN_SECTORS = {
@@ -244,7 +249,7 @@ class FinancialKnowledgeGraph(BaseModel):
             UserInvestmentInterest,
             UserLearningInterest,
             FinancialEvent,
-            Subsector,
+            Industry,
         ]
     ] = Field(
         default_factory=list,

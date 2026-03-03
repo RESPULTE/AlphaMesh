@@ -16,38 +16,33 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import cognee
 from cognee.modules.engine.models.node_set import NodeSet
-from cognee.modules.pipelines import run_pipeline
+from cognee.modules.engine.operations.setup import setup
 from cognee.modules.run_custom_pipeline import run_custom_pipeline
-from core.memory.exceptions import IngestionError, MemorySystemError, QueryError
+
+from core.memory.exceptions import (
+    DatasetInitError,
+    IngestionError,
+    MemorySystemError,
+    QueryError,
+)
+from core.memory.financial_retriever import FinancialGraphRetriever, QueryScope
+from core.memory.graph_models import DATASET_NAME, GLOBAL_NODESET_NAME
 from core.memory.nodeset_manager import (
     GLOBAL_NODESET_NAME,
+    get_or_create_all_sector_nodesets,
     get_or_create_global_nodeset,
     get_or_create_user_nodeset,
     get_user_nodeset_name,
     get_user_nodeset_names,
-    get_or_create_all_sector_nodesets,
 )
-
-from core.memory.graph_models import DATASET_NAME, GLOBAL_NODESET_NAME
 
 # Initialize predefined Sector entities
-from core.memory.graph_models import Sector
-from cognee.tasks.storage.add_data_points import (
-    add_data_points as cognee_add_dp,
-)
 from core.memory.pipeline_tasks import build_financial_pipeline
-from cognee.infrastructure.databases.graph import get_graph_engine
-from core.memory.financial_retriever import FinancialGraphRetriever, QueryScope
 from core.memory.prompts import get_search_system_prompt
-from cognee.modules.engine.operations.setup import setup
-
-from core.memory.exceptions import (
-    DatasetInitError,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -479,7 +474,8 @@ class FinancialMemorySystem:
         top_k: int = 10,
         system_prompt_override: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> List[Any]:
+        only_context: bool = False,
+    ) -> Dict[str, Any]:
         """
         Query the knowledge graph with strict NodeSet isolation.
 
@@ -568,7 +564,9 @@ class FinancialMemorySystem:
                 top_k=top_k,
                 session_id=session_id,
             )
-            result_list = await retriever.get_completion(query_text)
+            result_list = await retriever.get_completion(
+                query_text, only_context=only_context
+            )
             result_list = result_list or []
             logger.info(
                 "Query returned %d results for '%s'.", len(result_list), user_email
