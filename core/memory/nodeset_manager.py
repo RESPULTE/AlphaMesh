@@ -35,7 +35,7 @@ from core.memory.exceptions import (
     DatasetInitError,
 )
 from core.memory.graph_models import (
-    ALL_SECTORS,
+    ALL_MAIN_SECTORS,
     Sector,
     DATASET_NAME,
     GLOBAL_NODESET_NAME,
@@ -134,21 +134,6 @@ def _cognee_nodeset_id(name: str):
 # ---------------------------------------------------------------------------
 
 
-async def initialize_cognee() -> None:
-    """
-    Initialize Cognee's relational and vector databases.
-    Must be called before any other operations. Idempotent.
-
-    Raises:
-        DatasetInitError: If setup fails.
-    """
-    try:
-        await setup()
-        logger.info("Cognee database setup complete.")
-    except Exception as exc:
-        raise DatasetInitError(str(exc)) from exc
-
-
 # ---------------------------------------------------------------------------
 # NodeSet management
 # ---------------------------------------------------------------------------
@@ -221,7 +206,7 @@ async def get_or_create_nodeset(
 async def get_or_create_global_nodeset() -> NodeSet:
     """Return the GLOBAL NodeSet, creating it if necessary."""
     return await get_or_create_nodeset(
-        GLOBAL_NODESET_NAME, Sector, description=ALL_SECTORS[GLOBAL_NODESET_NAME]
+        GLOBAL_NODESET_NAME, Sector, description=ALL_MAIN_SECTORS[GLOBAL_NODESET_NAME]
     )
 
 
@@ -278,7 +263,7 @@ async def get_or_create_all_sector_nodesets() -> None:
 
     # Identify which sectors are missing from the cache
     missing_from_cache = {}
-    for name, desc in ALL_SECTORS.items():
+    for name, desc in ALL_MAIN_SECTORS.items():
         canonical_name = _normalize_nodeset_name(name)
         if canonical_name not in _nodeset_cache:
             missing_from_cache[canonical_name] = desc
@@ -289,7 +274,7 @@ async def get_or_create_all_sector_nodesets() -> None:
     # Lock prevents duplicate writes in concurrent ingestion startup paths.
     # Re-check cache inside lock
     missing_from_cache = {}
-    for name, desc in ALL_SECTORS.items():
+    for name, desc in ALL_MAIN_SECTORS.items():
         canonical_name = _normalize_nodeset_name(name)
         if canonical_name not in _nodeset_cache:
             missing_from_cache[canonical_name] = desc

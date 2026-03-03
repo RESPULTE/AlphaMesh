@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 # Base for all financial domain entities
 # ---------------------------------------------------------------------------
 
-USER_SPECIFIC_ENTITIES = ["InvestmentInterest"]
+USER_SPECIFIC_ENTITIES = ["UserInvestmentInterest", "UserLearningInterest"]
 DATASET_NAME = "alphamese_financial"
 GLOBAL_NODESET_NAME = "Market"
 
@@ -37,8 +37,23 @@ GLOBAL_NODESET_NAME = "Market"
 class Sector(NodeSet):
     """A specific economic sector."""
 
-    name: str = Field(description="Name of the economic sector.")
+    name: str = Field(description="Name of the main economic sector.")
     description: str = Field(description="Explanation of the sector's main activities.")
+    metadata: dict = {"index_fields": ["name", "description"]}
+
+
+class Subsector(Sector):
+    """
+    A specific industrial niche or specialized business category within a primary economic Sector.
+    Used for granular classification (e.g., 'Cloud Infrastructure' as a Subsector of 'Information Technology').
+    """
+
+    name: str = Field(
+        description="The precise name of the industrial niche or sub-category."
+    )
+    description: str = Field(
+        description="A focused explanation of the niche segment's core business activities and scope."
+    )
     metadata: dict = {"index_fields": ["name", "description"]}
 
 
@@ -85,11 +100,8 @@ class FinancialEvent(DataPoint):
 
     name: str = Field(description="Name of the financial event.")
     description: str = Field(description="Description of the financial event.")
-    from_date: Optional[datetime] = Field(
-        default=None, description="Start date of the event, if applicable."
-    )
-    to_date: Optional[datetime] = Field(
-        default=None, description="End date of the event, if applicable."
+    date: datetime = Field(
+        description="Date of the event. Use the current date if none is found"
     )
 
     positively_impacted: Optional[List[Union[Company, Sector]]] = Field(
@@ -103,33 +115,77 @@ class FinancialEvent(DataPoint):
     metadata: dict = {"index_fields": ["name", "description"]}
 
 
-class InvestmentInterest(DataPoint):
+class UserInvestmentInterestStatus(DataPoint):
     """
-    An individual's or agent's structured investment thesis.
-    Links to targeted Entities (Companies/Sectors), and supporting/threatening events.
+    Represents the current actionable status of a user's investment thesis.
     """
 
     status: Literal["Bought", "Interested", "Sold", "Avoids"] = Field(
+        description="The definitive state of the user's investment perspective regarding the associated targets. E.g., 'Bought' if they own it, 'Avoids' if they explicitly decide against it."
+    )
+    metadata: dict = {"index_fields": ["status"]}
+
+
+class UserInvestmentInterest(DataPoint):
+    """
+    Represents a structured investment thesis or perspective articulated by the user.
+    It captures what the user thinks about specific financial entities and why.
+    """
+
+    status: UserInvestmentInterestStatus = Field(
         description="The current status of this investment thesis."
     )
 
     reason: str = Field(
-        description="The reason for this investment thesis as stated by the user."
+        description="A detailed explanation or rationale for the user's investment thesis or interest."
     )
 
     # Relationship fields (using SkipValidation[Any] to avoid forward reference issues)
     # targets: Connects to Company or Sector nodes.
     targets: list[Union[Company, Sector]] = Field(
-        description="The specific Company or Sector nodes this thesis targets."
+        description="The specific Company or Sector nodes that this investment thesis targets. These are the focal points of the user's interest."
     )
     supporting_events: Optional[list[FinancialEvent]] = Field(
-        default=None, description="Financial events that support this thesis."
+        default=None,
+        description="Financial events that bolster or justify this thesis.",
     )
     threatening_events: Optional[list[FinancialEvent]] = Field(
         default=None,
-        description="Financial events that threaten or pose risks to this thesis.",
+        description="Financial events that challenge, threaten, or pose direct risks to this thesis.",
     )
-    metadata: dict = {"index_fields": ["reason"]}
+    metadata: dict = {"index_fields": ["reason", "status"]}
+
+
+class UserLearningInterestStatus(DataPoint):
+    """
+    Represents the current state of a user's educational or learning journey regarding a specific topic.
+    """
+
+    status: Literal["Interested", "Understood", "Confused", "Not Interested"] = Field(
+        description="The current state of the user's comprehension or curiosity about the topic. E.g., 'Confused' if they ask for clarification, 'Understood' if they indicate comprehension."
+    )
+    metadata: dict = {"index_fields": ["status"]}
+
+
+class UserLearningInterest(DataPoint):
+    """
+    Represents a topic, concept, or event that the user wants to learn more about or understand better.
+    This tracks the user's educational progress and curiosity.
+    """
+
+    reason: str = Field(
+        description="The specific questions, confusion, or curiosity the user expressed, explaining why they are interested in learning about these targets."
+    )
+
+    status: UserLearningInterestStatus = Field(
+        description="The current comprehension status of this learning interest."
+    )
+
+    targets: list[Union[FinancialConcept, FinancialEvent]] = Field(
+        description="The specific predefined FinancialConcept or FinancialEvent nodes that the user is trying to understand."
+    )
+
+    metadata: dict = {"index_fields": ["reason", "status"]}
 
 
 # ---------------------------------------------------------------------------
@@ -139,18 +195,22 @@ class InvestmentInterest(DataPoint):
 Company.model_rebuild()
 FinancialConcept.model_rebuild()
 Sector.model_rebuild()
-InvestmentInterest.model_rebuild()
+UserInvestmentInterest.model_rebuild()
+UserLearningInterest.model_rebuild()
 FinancialEvent.model_rebuild()
+Subsector.model_rebuild()
 
 ALL_ENTITIES = {
     "Company",
     "Sector",
     "FinancialConcept",
     "FinancialEvent",
-    "InvestmentInterest",
+    "UserInvestmentInterest",
+    "UserLearningInterest",
+    "Subsector",
 }
 
-ALL_SECTORS = {
+ALL_MAIN_SECTORS = {
     "Energy": "Companies involved in the exploration, production, and distribution of oil, gas, and renewable energy.",
     "Materials": "Includes chemical, construction material, glass, paper, forest product, and mining companies.",
     "Industrials": "Manufacturers and distributors of capital goods, including aerospace, defense, and machinery.",
@@ -181,8 +241,10 @@ class FinancialKnowledgeGraph(BaseModel):
         Union[
             Company,
             FinancialConcept,
-            InvestmentInterest,
+            UserInvestmentInterest,
+            UserLearningInterest,
             FinancialEvent,
+            Subsector,
         ]
     ] = Field(
         default_factory=list,

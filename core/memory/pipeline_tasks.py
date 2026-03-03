@@ -23,7 +23,7 @@ import uuid
 
 import logging
 from typing import List, Optional
-from core.memory.graph_models import ALL_SECTORS
+from core.memory.graph_models import ALL_MAIN_SECTORS
 
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.modules.pipelines.tasks.task import Task
@@ -33,7 +33,6 @@ from cognee.modules.engine.models.node_set import NodeSet
 
 from cognee.tasks.documents import classify_documents, extract_chunks_from_documents
 from cognee.tasks.graph import extract_graph_from_data
-from cognee.tasks.summarization import summarize_text
 from cognee.tasks.storage import add_data_points
 from core.memory.entity_merger import find_and_merge_candidates
 from cognee.modules.cognify.config import get_cognify_config
@@ -214,7 +213,7 @@ async def assign_nodesets(
                     if impacted_entities is None:
                         continue
                     for impacted_entity in impacted_entities:
-                        if impacted_entity.name in ALL_SECTORS.keys():
+                        if impacted_entity.name in ALL_MAIN_SECTORS.keys():
                             sector = impacted_entity.name
                             try:
                                 sector_nodeset = await get_or_create_nodeset(sector)

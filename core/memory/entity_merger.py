@@ -14,7 +14,7 @@ Algorithm:
 
 import logging
 from ast import literal_eval
-from typing import Any, Dict, List, Set, cast as typing_cast
+from typing import Any, Dict, List, Set, Tuple, cast as typing_cast
 
 import networkx as nx
 from sqlalchemy import bindparam, text
@@ -102,24 +102,57 @@ async def find_and_merge_candidates(
     if not graph_client or not graph_nodes:
         return
 
-    # Filter to mergeable global entity types with a name attribute
-    candidates: List[DataPoint] = [
-        dp
-        for dp in graph_nodes
-        if type(dp).__name__ in ALL_ENTITIES and getattr(dp, "name", None)
-    ]
-
+    candidates = _filter_mergeable_candidates(graph_nodes)
     if not candidates:
         logger.info("merge_entities: no mergeable global entities in batch.")
         return
 
     vector_engine = get_vector_engine()
 
-    # Build an equivalence graph — nodes are cognee UUIDs (str)
+    # 1. Build an equivalence graph
+    G, neo4j_id_map, name_map = await _build_equivalence_graph(
+        graph_client, vector_engine, candidates
+    )
+
+    # 2. Resolve connected components → merge groups
+    merge_groups = _resolve_merge_groups(G)
+    if not merge_groups:
+        logger.info("merge_entities: no duplicate entities detected.")
+        return
+
+    logger.info("merge_entities: %d merge group(s) identified.", len(merge_groups))
+
+    # 3. Fetch missing neo4j internal IDs for nodes discovered only via APOC
+    await _fetch_missing_neo4j_ids(graph_client, merge_groups, neo4j_id_map)
+
+    # 4. Execute APOC merges + relational rewires
+    affected_node_ids, node_ids_to_keep, success_count = await _execute_apoc_merges(
+        graph_client, merge_groups, neo4j_id_map
+    )
+
+    if success_count == 0 or not affected_node_ids:
+        return
+
+    # 5. Reindex vector store for affected nodes
+    await _reindex_vector_store(node_ids_to_keep, affected_node_ids)
+
+
+def _filter_mergeable_candidates(graph_nodes: List[DataPoint]) -> List[DataPoint]:
+    """Filter to mergeable global entity types with a name attribute."""
+    return [
+        dp
+        for dp in graph_nodes
+        if type(dp).__name__ in ALL_ENTITIES and getattr(dp, "name", None)
+    ]
+
+
+async def _build_equivalence_graph(
+    graph_client: Any, vector_engine: Any, candidates: List[DataPoint]
+) -> Tuple[nx.Graph, Dict[str, int], Dict[str, str]]:
+    """Build an equivalence graph of fuzzy name-duplicates."""
     G: nx.Graph = nx.Graph()
-    # Track neo4j internal IDs for APOC merge
-    neo4j_id_map: Dict[str, int] = {}  # cognee_id → neo4j internal id
-    name_map: Dict[str, str] = {}  # cognee_id → name
+    neo4j_id_map: Dict[str, int] = {}
+    name_map: Dict[str, str] = {}
 
     for dp in candidates:
         canonical_id = str(dp.id)
@@ -132,160 +165,185 @@ async def find_and_merge_candidates(
         G.add_node(canonical_id, cognee_id=canonical_id, label=label, name=name)
         name_map[canonical_id] = name
 
-        # ----------------------------------------------------------------
-        # APOC fuzzy search on Neo4j for similar nodes of the same label
-        # ----------------------------------------------------------------
-        fuzzy_query = f"""
-        MATCH (n:`__Node__`:`{label}`)
-        WHERE n.name IS NOT NULL AND n.id <> $cognee_id
-        WITH n, apoc.text.sorensenDiceSimilarity(
-                toLower(n.name), toLower($name)
-             ) AS sim
-        WHERE sim >= $threshold
-        WITH n, id(n) AS neo4j_id, sim, n.type AS type
-        ORDER BY sim DESC
-        LIMIT 10
-        RETURN neo4j_id, n.id AS cognee_id, n.name AS name, sim, type
-        """
-        try:
-            rows = await graph_client.query(
-                fuzzy_query,
-                {
-                    "cognee_id": canonical_id,
-                    "name": name,
-                    "threshold": FUZZY_CANDIDATE_THRESHOLD,
-                },
-            )
-        except Exception as exc:
-            logger.warning(
-                "merge_entities: APOC fuzzy query failed for '%s': %s", name, exc
-            )
+        await _find_and_add_fuzzy_matches(
+            graph_client,
+            vector_engine,
+            dp,
+            G,
+            neo4j_id_map,
+            name_map,
+            canonical_id,
+            label,
+            name,
+        )
+
+    return G, neo4j_id_map, name_map
+
+
+async def _find_and_add_fuzzy_matches(
+    graph_client: Any,
+    vector_engine: Any,
+    dp: DataPoint,
+    G: nx.Graph,
+    neo4j_id_map: Dict[str, int],
+    name_map: Dict[str, str],
+    canonical_id: str,
+    label: str,
+    name: str,
+) -> None:
+    """Find fuzzy candidates on Neo4j and confirm them via the vector engine."""
+    fuzzy_query = f"""
+    MATCH (n:`__Node__`:`{label}`)
+    WHERE n.name IS NOT NULL AND n.id <> $cognee_id
+    WITH n, apoc.text.sorensenDiceSimilarity(
+            toLower(n.name), toLower($name)
+         ) AS sim
+    WHERE sim >= $threshold
+    WITH n, id(n) AS neo4j_id, sim, n.type AS type
+    ORDER BY sim DESC
+    LIMIT 10
+    RETURN neo4j_id, n.id AS cognee_id, n.name AS name, sim, type
+    """
+
+    try:
+        rows = await graph_client.query(
+            fuzzy_query,
+            {
+                "cognee_id": canonical_id,
+                "name": name,
+                "threshold": FUZZY_CANDIDATE_THRESHOLD,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "merge_entities: APOC fuzzy query failed for '%s': %s", name, exc
+        )
+        return
+
+    if not rows:
+        return
+
+    for row in rows:
+        data = (
+            row.data()
+            if hasattr(row, "data")
+            else (dict(row) if isinstance(row, dict) else {})
+        )
+        match_cognee_id = str(data.get("cognee_id", ""))
+        match_name = str(data.get("name", "")).strip()
+        match_neo4j_id = data.get("neo4j_id")
+        fuzzy_score = float(data.get("sim", 0.0))
+
+        if not match_cognee_id or match_cognee_id == canonical_id:
             continue
 
-        if not rows:
-            continue
-
-        # Store the new node's neo4j internal ID from the first result's graph context
-        # (we'll also query it explicitly if necessary)
-        for row in rows:
-            data = (
-                row.data()
-                if hasattr(row, "data")
-                else (dict(row) if isinstance(row, dict) else {})
-            )
-            match_cognee_id = str(data.get("cognee_id", ""))
-            match_name = str(data.get("name", "")).strip()
-            match_neo4j_id = data.get("neo4j_id")
-            fuzzy_score = float(data.get("sim", 0.0))
-
-            if not match_cognee_id or match_cognee_id == canonical_id:
-                continue
-
-            candidate_label = str(data.get("type", ""))
-            if candidate_label != label and candidate_label.lower() != "sector":
-                logger.info(
-                    "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
-                    name,
-                    label,
-                    match_name,
-                    candidate_label,
-                )
-                continue
-
-            if match_neo4j_id is not None:
-                neo4j_id_map[match_cognee_id] = int(match_neo4j_id)
-
+        candidate_label = str(data.get("type", ""))
+        # entities must be superseded by the sector
+        if candidate_label != label and candidate_label.lower() != "sector":
             logger.info(
-                "merge_entities: fuzzy candidate '%s' ↔ '%s' (dice=%.3f)",
+                "merge_entities: skipping cross-type merge '%s' (%s) ↔ '%s' (%s)",
+                name,
+                label,
+                match_name,
+                candidate_label,
+            )
+            continue
+
+        if match_neo4j_id is not None:
+            neo4j_id_map[match_cognee_id] = int(match_neo4j_id)
+
+        logger.info(
+            "merge_entities: fuzzy candidate '%s' ↔ '%s' (dice=%.3f)",
+            name,
+            match_name,
+            fuzzy_score,
+        )
+
+        match_confirmed = False
+        if fuzzy_score >= SEMANTIC_MERGE_THRESHOLD:
+            logger.info(
+                "merge_entities: confirmed match '%s' ↔ '%s' (dice=%.3f)",
                 name,
                 match_name,
                 fuzzy_score,
             )
+            match_confirmed = True
+        else:
+            match_confirmed = await _confirm_semantic_match(
+                vector_engine, dp, name, label, match_cognee_id, match_name, fuzzy_score
+            )
 
-            if fuzzy_score >= SEMANTIC_MERGE_THRESHOLD:
-                logger.info(
-                    "merge_entities: confirmed match '%s' ↔ '%s' " "(dice=%.3f)",
-                    name,
-                    match_name,
-                    fuzzy_score,
-                )
-                label = (
-                    candidate_label if candidate_label.lower() == "sector" else label
-                )
-                G.add_node(
-                    match_cognee_id,
-                    cognee_id=match_cognee_id,
-                    label=label,
-                    name=match_name,
-                )
-                G.add_edge(canonical_id, match_cognee_id)
-                name_map[match_cognee_id] = match_name
-                continue
+        if match_confirmed:
+            # entities must be superseded by the sector
+            final_label = (
+                candidate_label if candidate_label.lower() == "sector" else label
+            )
+            G.add_node(
+                match_cognee_id,
+                cognee_id=match_cognee_id,
+                label=final_label,
+                name=match_name,
+            )
+            G.add_edge(canonical_id, match_cognee_id)
+            name_map[match_cognee_id] = match_name
 
-            # ----------------------------------------------------------------
-            # Vector engine semantic gate
-            # ----------------------------------------------------------------
-            embeddable = _embeddable_text(dp)
-            if not embeddable:
-                embeddable = name
 
-            collection = _get_collection_for(dp)
-            if not collection:
-                logger.info(
-                    "merge_entities: no collection for type %s, skipping semantic gate.",
-                    label,
-                )
-                continue
+async def _confirm_semantic_match(
+    vector_engine: Any,
+    dp: DataPoint,
+    name: str,
+    label: str,
+    match_cognee_id: str,
+    match_name: str,
+    fuzzy_score: float,
+) -> bool:
+    """Confirm a fuzzy match using the vector engine."""
+    embeddable = _embeddable_text(dp)
+    if not embeddable:
+        embeddable = name
 
-            try:
-                scored_results = await vector_engine.search(
-                    collection_name=collection,
-                    query_text=embeddable,
-                    limit=10,
-                )
-                logger.info(
-                    "merge_entities: vector search results for '%s': %s",
-                    name,
-                    scored_results,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "merge_entities: vector search failed for '%s': %s", name, exc
-                )
-                continue
+    collection = _get_collection_for(dp)
+    if not collection:
+        logger.info(
+            "merge_entities: no collection for type %s, skipping semantic gate.",
+            label,
+        )
+        return False
 
-            # Check if the candidate node appears in the top results above threshold
-            # Cognee's normalisation for the score is opposite, lower = closer in similarity fkc
-            for sr in scored_results:
-                if str(sr.id) == match_cognee_id and sr.score <= (
-                    1 - SEMANTIC_MERGE_THRESHOLD
-                ):
-                    logger.info(
-                        "merge_entities: confirmed match '%s' ↔ '%s' "
-                        "(dice=%.3f, vector=%.3f)",
-                        name,
-                        match_name,
-                        fuzzy_score,
-                        sr.score,
-                    )
-                    label = (
-                        candidate_label
-                        if candidate_label.lower() == "sector"
-                        else label
-                    )
-                    G.add_node(
-                        match_cognee_id,
-                        cognee_id=match_cognee_id,
-                        label=label,
-                        name=match_name,
-                    )
-                    G.add_edge(canonical_id, match_cognee_id)
-                    name_map[match_cognee_id] = match_name
-                    break
+    try:
+        scored_results = await vector_engine.search(
+            collection_name=collection,
+            query_text=embeddable,
+            limit=10,
+        )
+        logger.info(
+            "merge_entities: vector search results for '%s': %s",
+            name,
+            scored_results,
+        )
+    except Exception as exc:
+        logger.warning("merge_entities: vector search failed for '%s': %s", name, exc)
+        return False
 
-    # -----------------------------------------------------------------------
-    # Resolve connected components → merge groups
-    # -----------------------------------------------------------------------
+    # Check if the candidate node appears in the top results above threshold
+    # Cognee's normalisation for the score is opposite, lower = closer in similarity fkc
+    for sr in scored_results:
+        if str(sr.id) == match_cognee_id and sr.score <= (1 - SEMANTIC_MERGE_THRESHOLD):
+            logger.info(
+                "merge_entities: confirmed match '%s' ↔ '%s' "
+                "(dice=%.3f, vector=%.3f)",
+                name,
+                match_name,
+                fuzzy_score,
+                sr.score,
+            )
+            return True
+
+    return False
+
+
+def _resolve_merge_groups(G: nx.Graph) -> List[List[Dict[str, Any]]]:
+    """Resolve connected components into a list of merge groups."""
     merge_groups: List[List[Dict[str, Any]]] = []
     for component in nx.connected_components(G):
         if len(component) < 2:
@@ -294,16 +352,15 @@ async def find_and_merge_candidates(
         # Canonical = shortest name, then lexicographic — deterministic
         cluster.sort(key=lambda x: (len(x["name"]), x["name"]))
         merge_groups.append(cluster)
+    return merge_groups
 
-    if not merge_groups:
-        logger.info("merge_entities: no duplicate entities detected.")
-        return
 
-    logger.info("merge_entities: %d merge group(s) identified.", len(merge_groups))
-
-    # -----------------------------------------------------------------------
-    # Fetch missing neo4j internal IDs for nodes discovered only via APOC
-    # -----------------------------------------------------------------------
+async def _fetch_missing_neo4j_ids(
+    graph_client: Any,
+    merge_groups: List[List[Dict[str, Any]]],
+    neo4j_id_map: Dict[str, int],
+) -> None:
+    """Fetch missing neo4j internal IDs for nodes discovered only via APOC."""
     all_cognee_ids_needed: Set[str] = set()
     for group in merge_groups:
         for node in group:
@@ -311,30 +368,36 @@ async def find_and_merge_candidates(
             if cid not in neo4j_id_map:
                 all_cognee_ids_needed.add(cid)
 
-    if all_cognee_ids_needed:
-        id_fetch_query = """
-        MATCH (n:`__Node__`)
-        WHERE n.id IN $ids
-        RETURN n.id AS cognee_id, id(n) AS neo4j_id
-        """
-        try:
-            id_rows = await graph_client.query(
-                id_fetch_query, {"ids": list(all_cognee_ids_needed)}
-            )
-            for row in id_rows:
-                data = (
-                    row.data()
-                    if hasattr(row, "data")
-                    else (dict(row) if isinstance(row, dict) else {})
-                )
-                if data.get("cognee_id") and data.get("neo4j_id") is not None:
-                    neo4j_id_map[str(data["cognee_id"])] = int(data["neo4j_id"])
-        except Exception as exc:
-            logger.warning("merge_entities: failed to fetch neo4j IDs: %s", exc)
+    if not all_cognee_ids_needed:
+        return
 
-    # -----------------------------------------------------------------------
-    # Execute APOC merges + relational + vector reindex
-    # -----------------------------------------------------------------------
+    id_fetch_query = """
+    MATCH (n:`__Node__`)
+    WHERE n.id IN $ids
+    RETURN n.id AS cognee_id, id(n) AS neo4j_id
+    """
+    try:
+        id_rows = await graph_client.query(
+            id_fetch_query, {"ids": list(all_cognee_ids_needed)}
+        )
+        for row in id_rows:
+            data = (
+                row.data()
+                if hasattr(row, "data")
+                else (dict(row) if isinstance(row, dict) else {})
+            )
+            if data.get("cognee_id") and data.get("neo4j_id") is not None:
+                neo4j_id_map[str(data["cognee_id"])] = int(data["neo4j_id"])
+    except Exception as exc:
+        logger.warning("merge_entities: failed to fetch neo4j IDs: %s", exc)
+
+
+async def _execute_apoc_merges(
+    graph_client: Any,
+    merge_groups: List[List[Dict[str, Any]]],
+    neo4j_id_map: Dict[str, int],
+) -> Tuple[Set[str], List[str], int]:
+    """Execute APOC merges and update relational edges table."""
     merge_query = """
     MATCH (n:`__Node__`)
     WHERE id(n) IN $node_ids
@@ -355,7 +418,7 @@ async def find_and_merge_candidates(
     RETURN DISTINCT id(node) AS merged_neo4j_id, node.id AS cognee_id, node.name AS name
     """
 
-    relational_engine = get_relational_engine()
+    # relational_engine = get_relational_engine()
     affected_node_ids: Set[str] = set()
     node_ids_to_keep = []
     success_count = 0
@@ -429,18 +492,18 @@ async def find_and_merge_candidates(
         len(merge_groups),
     )
 
-    if success_count == 0 or not affected_node_ids:
-        return
+    return affected_node_ids, node_ids_to_keep, success_count
 
-    # -----------------------------------------------------------------------
-    # Reindex vector store for affected nodes
-    # -----------------------------------------------------------------------
-    from cognee.modules.data.methods import get_dataset_ids
+
+async def _reindex_vector_store(
+    node_ids_to_keep: List[str], affected_node_ids: Set[str]
+) -> None:
+    """Reindex vector store for affected nodes."""
+    from cognee.modules.data.methods import get_unique_dataset_id
     from cognee.modules.users.methods import get_default_user
     import uuid
 
-    dataset_ids = await get_dataset_ids([DATASET_NAME], await get_default_user())
-    dataset_id = dataset_ids[0]
+    dataset_id = await get_unique_dataset_id(DATASET_NAME, await get_default_user())
 
     for id_to_del in affected_node_ids:
         logger.info("Deleting node with id: %s", id_to_del)
@@ -471,15 +534,15 @@ async def find_and_merge_candidates(
     #     # get_id_filtered_graph_data is a Neo4j-specific method
     #     neo4j_engine = typing_cast(Neo4jAdapter, graph_engine)
     #     vector_engine = get_vector_engine()
-
+    #
     #     nodes_data, edges_data = await neo4j_engine.get_id_filtered_graph_data(
     #         list(affected_node_ids)
     #     )
-
+    #
     #     for coll in _REINDEX_COLLECTIONS:
     #         if await vector_engine.has_collection(coll):
     #             await vector_engine.delete_data_points(coll, list(affected_node_ids))
-
+    #
     #     indexable_nodes = []
     #     for _, props in nodes_data:
     #         props = {
@@ -488,13 +551,13 @@ async def find_and_merge_candidates(
     #         if "metadata" in props and isinstance(props["metadata"], dict):
     #             props["metadata"].setdefault("type", props.get("type"))
     #         indexable_nodes.append(DataPoint(**props))
-
+    #
     #     if indexable_nodes:
     #         await index_data_points(indexable_nodes)
-
+    #
     #     if edges_data:
     #         await index_graph_edges(edges_data)
-
+    #
     #     logger.info(
     #         "merge_entities: reindexed %d nodes, %d edges.",
     #         len(indexable_nodes),

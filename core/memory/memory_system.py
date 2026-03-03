@@ -45,7 +45,12 @@ from core.memory.pipeline_tasks import build_financial_pipeline
 from cognee.infrastructure.databases.graph import get_graph_engine
 from core.memory.financial_retriever import FinancialGraphRetriever, QueryScope
 from core.memory.prompts import get_search_system_prompt
+from cognee.modules.engine.operations.setup import setup
 
+from core.memory.exceptions import (
+    NodeSetCreationError,
+    DatasetInitError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +99,21 @@ class IngestionItem:
 # ---------------------------------------------------------------------------
 # Main memory system class
 # ---------------------------------------------------------------------------
+
+
+async def initialize_cognee() -> None:
+    """
+    Initialize Cognee's relational and vector databases.
+    Must be called before any other operations. Idempotent.
+
+    Raises:
+        DatasetInitError: If setup fails.
+    """
+    try:
+        await setup()
+        logger.info("Cognee database setup complete.")
+    except Exception as exc:
+        raise DatasetInitError(str(exc)) from exc
 
 
 class FinancialMemorySystem:
