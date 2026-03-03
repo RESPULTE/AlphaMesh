@@ -25,19 +25,16 @@ from asyncio import Lock
 from uuid import NAMESPACE_OID, uuid5
 from typing import Optional, Type
 
-from cognee.modules.engine.operations.setup import setup
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.tasks.storage.add_data_points import add_data_points as cognee_add_dp
 from cognee.infrastructure.databases.graph import get_graph_engine
 
 from core.memory.exceptions import (
     NodeSetCreationError,
-    DatasetInitError,
 )
 from core.memory.graph_models import (
     ALL_MAIN_SECTORS,
     Sector,
-    DATASET_NAME,
     GLOBAL_NODESET_NAME,
 )
 
@@ -306,11 +303,11 @@ async def get_or_create_all_sector_nodesets() -> None:
                 db_name = data.get("name")
                 if db_id and db_name:
                     existing_in_db.add(db_name)
-                    # logger.info(
-                    #     "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
-                    #     db_name,
-                    #     db_id,
-                    # )
+                    logger.debug(
+                        "NodeSet '%s' (id=%s) found in graph DB, loading to cache.",
+                        db_name,
+                        db_id,
+                    )
                     # Add to cache using Sector so 'description' is a valid parameter
                     nodeset = Sector(
                         id=str(db_id),

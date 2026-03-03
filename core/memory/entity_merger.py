@@ -45,14 +45,14 @@ SEMANTIC_MERGE_THRESHOLD = 0.85
 # Collection naming follows the pattern: {ClassName}_{first_index_field}
 _COLLECTION_MAP: Dict[str, str] = {k: f"{k}_name" for k in ALL_ENTITIES}
 
-_REINDEX_COLLECTIONS = [
-    "Entity_name",
-    "EntityType_name",
-    "DocumentChunk_text",
-    "EdgeType_relationship_name",
-    "TextDocument_name",
-    "TextSummary_text",
-]
+# _REINDEX_COLLECTIONS = [
+#     "Entity_name",
+#     "EntityType_name",
+#     "DocumentChunk_text",
+#     "EdgeType_relationship_name",
+#     "TextDocument_name",
+#     "TextSummary_text",
+# ]
 
 
 # ---------------------------------------------------------------------------

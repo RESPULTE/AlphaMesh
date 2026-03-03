@@ -4,7 +4,11 @@ core/memory/__init__.py
 Public API for the AlphaMesh multi-tenant financial memory system (Cognee-based).
 """
 
-from core.memory.memory_system import FinancialMemorySystem, UserMemoryContext, IngestionItem
+from core.memory.memory_system import (
+    FinancialMemorySystem,
+    UserMemoryContext,
+    IngestionItem,
+)
 
 from core.memory.nodeset_manager import (
     hash_user_email,
@@ -12,8 +16,6 @@ from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
     get_or_create_user_nodeset,
     get_user_nodeset_names,
-    initialize_cognee,
-    DATASET_NAME,
     GLOBAL_NODESET_NAME,
 )
 
@@ -49,13 +51,10 @@ __all__ = [
     "get_or_create_global_nodeset",
     "get_or_create_user_nodeset",
     "get_user_nodeset_names",
-    "initialize_cognee",
-    "DATASET_NAME",
     "GLOBAL_NODESET_NAME",
     # Cognee built-in NodeSet
     "NodeSet",
     # Graph models
-    "FinancialBaseDataPoint",
     "Company",
     "FinancialConcept",
     "FinancialKnowledgeGraph",
