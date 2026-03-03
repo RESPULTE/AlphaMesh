@@ -229,7 +229,10 @@ async def assign_nodesets(
                     if impacted_entities is None:
                         continue
                     for impacted_entity in impacted_entities:
-                        if impacted_entity.name in ALL_MAIN_SECTORS.keys():
+                        if (
+                            impacted_entity.name in ALL_MAIN_SECTORS.keys()
+                            or impacted_entity.name == GLOBAL_NODESET_NAME
+                        ):
                             sector = impacted_entity.name
                             try:
                                 sector_nodeset = await get_or_create_nodeset(sector)
