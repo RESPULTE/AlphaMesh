@@ -14,6 +14,7 @@ Pipeline insertion order:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, List, Optional
@@ -39,6 +40,7 @@ from core.memory.graph_models import (
     GLOBAL_FINANCIAL_WISDOM_NODESET,
     USER_SPECIFIC_ENTITIES,
     FinancialKnowledgeGraph,
+    Sector,
 )
 from core.memory.nodeset_manager import (
     GLOBAL_NODESET_NAME,
@@ -156,7 +158,7 @@ async def assign_nodesets(
             try:
 
                 entity.belongs_to_set = getattr(entity, "belongs_to_set", []) or []
-                entity_type = type(entity).__name__.lower()
+                entity_type = type(entity).__name__
 
                 total_entities += 1
 
@@ -165,15 +167,11 @@ async def assign_nodesets(
                     user_count += 1
 
                 # Special business logic for specific global entities
-                elif entity_type == "financialconcept":
+                elif entity_type == "FinancialConcept":
                     entity.belongs_to_set.append(financial_wisdom_nodeset)
                     global_count += 1
 
-                elif entity_type == "industry":
-                    import asyncio
-
-                    from core.memory.graph_models import Sector
-
+                elif entity_type == "Industry":
                     resolved_nodesets = await asyncio.gather(
                         *[
                             get_or_create_nodeset(ns.name, Sector)
@@ -184,13 +182,13 @@ async def assign_nodesets(
                         if ns not in entity.belongs_to_set:
                             assert isinstance(ns, Sector)
                             entity.belongs_to_set.append(ns)
-                elif entity_type == "company":
+                elif entity_type == "Company":
                     if hasattr(entity, "sector") and entity.sector:
                         await _classify_company(entity, entity.sector)
                     elif hasattr(entity, "industry") and entity.industry:
                         await _classify_company(entity, entity.industry)
 
-                elif entity_type == "financialevent":
+                elif entity_type == "FinancialEvent":
                     entity.belongs_to_set.append(financial_event_nodeset)
                     if entity.positively_impacted or entity.negatively_impacted:
                         to_check = {
