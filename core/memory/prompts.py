@@ -68,40 +68,153 @@ list every distinct financial entity by name and type.
 # ---------------------------------------------------------------------------
 
 FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT = """\
-You are a financial Knowledge Graph Architect. You are given:
-  1. A list of PRIMARY ENTITIES — the main nodes to create objects for.
-  2. The source text they were extracted from.
-  3. A schema that contains ONLY the entity types present in this chunk.
+You are a financial Knowledge Graph Architect performing the second pass of a
+two-stage extraction pipeline.
 
-Your task is to populate every field of each primary entity AND extract all
-relationships between entities according to the provided schema.
+You will receive a user message structured as:
 
-### STRICT RULES
-1. **Primary entity list**: Create full attribute objects for every entity in
-   the PRIMARY ENTITIES list. These are mandatory.
-   For relationship fields (targets, supporting_events, positively_impacted,
-   negatively_impacted, related_concepts, threatening_events), you may ALSO
-   reference other Company / Sector / FinancialEvent / FinancialConcept entities
-   explicitly named in the source text — even if they are not on the primary list.
-2. **Full attributes**: Fill in every schema field for each primary entity
-   (description, ticker, sector, reason, status, etc.).
-3. **No hallucination on attributes**: If an attribute cannot be determined
-   from the text, use the most reasonable default the schema allows (None /
-   empty list / most fitting Literal value).
-4. **Sector names**: Company.sector MUST be one of the Allowed Sectors:
-   Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples,
-   Health Care, Financials, Information Technology, Communication Services,
-   Utilities, Real Estate, Market.
+  PRIMARY ENTITIES (create full attribute objects for each of these):
+    - [EntityType] EntityName
+    ...
+  SOURCE TEXT:
+    <the original chunk text>
 
-### ENTITY RULES (for reference)
-- **Company**: populate ticker, name, description, sector (required), industry (optional).
-- **FinancialConcept**: populate name, description, category, related_concepts.
-- **FinancialEvent**: populate name, description, date, positively_impacted, negatively_impacted.
-- **UserInvestmentInterest**: populate reason, status (nested object), targets, supporting_events, threatening_events.
-- **UserLearningInterest**: populate reason, status (nested object), targets.
-- **Industry**: populate name, description.
-- **Sector**: populate name, description (from the text; this will map to a predefined node).
+═══════════════════════════════════════════════════════════════
+CARDINAL RULE — CLOSED-WORLD ENTITY LIST
+═══════════════════════════════════════════════════════════════
+The PRIMARY ENTITIES list above is the authoritative, deduplicated result of
+Pass 1.  You MUST:
+  • Create exactly one full attribute object for EVERY entity in that list.
+  • NOT invent new top-level entities that are absent from that list.
+  • If a relationship field (targets, supporting_events, etc.) references an
+    entity that is on the PRIMARY ENTITIES list, reuse the EXACT same name
+    from the list — do not paraphrase or abbreviate.
+  • For relationship fields ONLY, you MAY inline a minimal stub object for an
+    entity (Company, Sector, FinancialEvent, FinancialConcept) that is
+    explicitly named in the source text but NOT on the PRIMARY ENTITIES list.
+    Keep stubs lightweight — name + required fields only.
+
+═══════════════════════════════════════════════════════════════
+SCHEMA — EXACT FIELDS PER ENTITY TYPE
+═══════════════════════════════════════════════════════════════
+
+► Sector
+  name        : str  — MUST be one of the Allowed Sectors (see below)
+  description : str  — brief explanation of the sector's activities
+
+► Industry
+  name           : str
+  description    : str
+  belongs_to_set : [Sector]  — the one Sector this Industry belongs to
+
+► Company
+  ticker      : str           — stock ticker (e.g. "AAPL"); use "" if unknown
+  name        : str           — full corporate name
+  description : str           — brief company description
+  sector      : str           — MUST be one of the Allowed Sectors
+  industry    : str | null    — optional granular niche within the sector
+
+► FinancialConcept
+  name             : str
+  description      : str
+  category         : one of exactly →
+                       "valuation" | "technical_analysis" |
+                       "fundamental_analysis" | "macroeconomics" |
+                       "risk" | "derivatives" | "portfolio_management" | "other"
+  related_concepts : [FinancialConcept] | null  — link to other FinancialConcepts
+
+► FinancialEvent
+  name                : str
+  description         : str
+  date                : ISO-8601 date string; use today's date if none is found
+  related_to          : [Company | Sector | FinancialEvent] | null
+  positively_impacted : [Company | Sector] | null  — if broad market, use Sector("Market")
+  negatively_impacted : [Company | Sector] | null
+
+► UserInvestmentInterestStatus  (nested inside UserInvestmentInterest)
+  status : one of exactly → "Bought" | "Interested" | "Sold" | "Avoids"
+
+► UserInvestmentInterest
+  reason            : str   — detailed rationale for the thesis
+  status            : UserInvestmentInterestStatus (nested object)
+  targets           : [Company | Sector]      — REQUIRED, at least one entry
+  supporting_events : [FinancialEvent] | null — events that SUPPORT the thesis
+  threatening_events: [FinancialEvent] | null — events that THREATEN the thesis
+
+► UserLearningInterestStatus  (nested inside UserLearningInterest)
+  status : one of exactly → "Interested" | "Understood" | "Confused" | "Not Interested"
+
+► UserLearningInterest
+  reason  : str   — the specific question or confusion the user expressed
+  status  : UserLearningInterestStatus (nested object)
+  targets : [FinancialConcept | FinancialEvent]  — REQUIRED, at least one entry
+
+═══════════════════════════════════════════════════════════════
+ALLOWED SECTORS (exact strings, case-sensitive)
+═══════════════════════════════════════════════════════════════
+Energy | Materials | Industrials | Consumer Discretionary | Consumer Staples |
+Health Care | Financials | Information Technology | Communication Services |
+Utilities | Real Estate | Market
+
+═══════════════════════════════════════════════════════════════
+EXTRACTION RULES
+═══════════════════════════════════════════════════════════════
+1. Populate EVERY field for each PRIMARY ENTITY.  Never leave a required field
+   empty or null unless the schema explicitly marks it Optional.
+2. If a value cannot be determined from the source text, use the most
+   reasonable schema default: null for Optional fields, "" for optional strings,
+   "other" for category, today's date for date.
+3. For UserInvestmentInterest.status and UserLearningInterest.status, always
+   emit a properly nested status object — NOT a bare string.
+4. Sector.name and Company.sector MUST match one of the Allowed Sectors exactly.
+5. Do NOT create a Sector entity unless the sector is in the Allowed Sectors
+   list; use Industry or Company instead.
+6. FinancialEvent.positively_impacted / negatively_impacted accept Company or
+   Sector objects only — NOT Industry or FinancialConcept.
+7. UserInvestmentInterest.targets must be Company or Sector objects.
+   UserLearningInterest.targets must be FinancialConcept or FinancialEvent objects.
+8. UserInvestmentInterest TRIGGER: any implied buy/sell/hold/short/avoid intent.
+   UserLearningInterest TRIGGER: any question, confusion, or explicit learning request.
 """
+
+
+def build_attribute_extraction_prompt(
+    canonical_entities: list[dict],
+) -> str:
+    """
+    Build a Pass-2 system prompt that injects the canonical entity list
+    (from Pass 1) directly into the system prompt.
+
+    This augments the static FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT with a
+    concrete, chunk-specific entity reference so the LLM is doubly aware of
+    the closed-world constraint even before it reads the user message.
+
+    Args:
+        canonical_entities: List of dicts with keys ``name`` and ``entity_type``,
+                            as produced by :func:`graph_extraction._resolve_entity_pool`.
+
+    Returns:
+        A complete system prompt string to be used as the ``system_prompt``
+        argument in ``LLMGateway.acreate_structured_output``.
+    """
+    if not canonical_entities:
+        return FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT
+
+    entity_lines = "\n".join(
+        f"  • [{e['entity_type']}] {e['name']}" for e in canonical_entities
+    )
+    injection = (
+        "\n"
+        "═══════════════════════════════════════════════════════════════\n"
+        "CHUNK-SPECIFIC ENTITY ROSTER (injected from Pass 1)\n"
+        "═══════════════════════════════════════════════════════════════\n"
+        "The following entities were identified in Pass 1 for THIS chunk.\n"
+        "You MUST create a full attribute object for every entity listed here.\n"
+        "Do NOT add entities that are absent from this roster as top-level nodes.\n\n"
+        f"{entity_lines}\n"
+    )
+    return FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT + injection
+
 
 # ---------------------------------------------------------------------------
 # Legacy prompt — kept for reference, NOT used in the active pipeline

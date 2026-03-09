@@ -54,8 +54,8 @@ from core.memory.graph_models import (
     UserLearningInterest,
 )
 from core.memory.prompts import (
-    FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT,
     FINANCIAL_NODE_EXTRACTION_PROMPT,
+    build_attribute_extraction_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -483,10 +483,19 @@ async def _extract_full_graph_for_chunk(
 ) -> Tuple[DocumentChunk, FinancialKnowledgeGraph]:
     """LLM Call 2: extract full attributes + relationships for canonical entities."""
     user_message = _build_section2_user_message(chunk.text, canonical_entities)
+
+    # Build a chunk-specific system prompt that injects the canonical entity
+    # roster directly, so the LLM sees the closed-world constraint in BOTH
+    # the system prompt and the user message.
+    entity_dicts = [
+        {"name": ce.name, "entity_type": ce.entity_type} for ce in canonical_entities
+    ]
+    system_prompt = build_attribute_extraction_prompt(entity_dicts)
+
     try:
         raw_result = await LLMGateway.acreate_structured_output(
             text_input=user_message,
-            system_prompt=FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT,
+            system_prompt=system_prompt,
             response_model=sliced_model,
         )
         entities = getattr(raw_result, "entities", [])

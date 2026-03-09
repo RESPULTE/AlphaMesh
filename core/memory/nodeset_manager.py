@@ -159,6 +159,7 @@ async def get_or_create_nodeset(
     canonical_name = _normalize_nodeset_name(name)
 
     if canonical_name in _nodeset_cache:
+        logger.info("NodeSet '%s' found in cache.", canonical_name)
         return _nodeset_cache[canonical_name]
     logger.info("NodeSet '%s' not found in cache, checking DB...", canonical_name)
     # Lock prevents duplicate writes in concurrent ingestion startup paths.
@@ -195,6 +196,11 @@ async def get_or_create_nodeset(
             _nodeset_cache[canonical_name] = nodeset
             logger.info(
                 "NodeSet '%s' created and persisted (id=%s).", canonical_name, stable_id
+            )
+
+            assert hasattr(nodeset, "name"), (
+                f"get_or_create_nodeset: created object of type {type(nodeset).__name__!r} "
+                f"has no .name attribute — nodeset_type={nodeset_type!r}"
             )
             return nodeset
         except Exception as exc:
@@ -273,6 +279,15 @@ async def get_or_create_all_global_entity_nodesets() -> None:
         NodeSetCreationError: On any failure.
     """
     await _create_predefined_nodesets(GLOBAL_ENTITY_NODESETS, NodeSet, None)
+
+    # Verify the cache was actually populated
+    for name in GLOBAL_ENTITY_NODESETS:
+        canonical = _normalize_nodeset_name(name)
+        if canonical not in _nodeset_cache:
+            raise NodeSetCreationError(
+                canonical,
+                "NodeSet was not added to cache after _create_predefined_nodesets",
+            )
 
 
 async def _create_predefined_nodesets(
@@ -353,10 +368,7 @@ async def _create_predefined_nodesets(
 
             to_create = []
             for name, desc in missing_from_cache.items():
-                if (
-                    name not in existing_in_db
-                    and name not in GLOBAL_ENTITY_NODESETS.keys()
-                ):
+                if name not in existing_in_db:
                     stable_id = ids_to_check[name]
                     nodeset = nodeset_type(id=stable_id, name=name, description=desc)
                     if parent_nodeset:

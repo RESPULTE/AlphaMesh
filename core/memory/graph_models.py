@@ -128,6 +128,11 @@ class FinancialEvent(DataPoint):
         default_factory=datetime.now,
     )
 
+    related_to: Optional[List[Union[Company, Sector, FinancialEvent]]] = Field(
+        default=None,
+        description="Companies, Sectors or other FinancialEvents that this event is related to.",
+    )
+
     positively_impacted: Optional[List[Union[Company, Sector]]] = Field(
         default=None,
         description="Companies or Sectors that are positively impacted by this event.",

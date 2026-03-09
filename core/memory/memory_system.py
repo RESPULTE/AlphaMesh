@@ -659,7 +659,7 @@ class FinancialMemorySystem:
         self,
         run_in_background: bool = False,
         chunks_per_batch: int = 100,
-        chunk_size: Optional[int] = 100,
+        chunk_size: Optional[int] = 500,
     ) -> Any:
         """
         Run cognify over the entire dataset with the custom financial pipeline.

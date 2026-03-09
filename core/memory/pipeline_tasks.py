@@ -134,10 +134,6 @@ async def assign_nodesets(
         doc_user_nodeset: Optional[NodeSet] = (
             user_nodeset_candidates[0] if user_nodeset_candidates else None
         )
-        doc_is_global = any(
-            isinstance(ns, NodeSet) and ns.name == GLOBAL_NODESET_NAME
-            for ns in document_nodesets
-        )
 
         entities = getattr(chunk, "contains", None)
         if not entities:
@@ -157,103 +153,97 @@ async def assign_nodesets(
 
         for entity in entities:
 
-            entity_type = type(entity).__name__
-            total_entities += 1
+            try:
 
-            # Determine Target based on entity type
-            is_user_entity = entity_type in USER_SPECIFIC_ENTITIES
+                entity.belongs_to_set = getattr(entity, "belongs_to_set", []) or []
+                entity_type = type(entity).__name__.lower()
 
-            # Resolve to actual NodeSet object
-            if not is_user_entity:
-                # Route specific global entity types to their dedicated nodesets
-                if entity_type == "FinancialConcept":
-                    resolved = financial_wisdom_nodeset
-                elif entity_type == "FinancialEvent":
-                    resolved = financial_event_nodeset
-                else:
-                    resolved = global_nodeset
-                global_count += 1
-            else:
-                if doc_user_nodeset is not None:
-                    resolved = doc_user_nodeset
+                total_entities += 1
+
+                if entity_type in USER_SPECIFIC_ENTITIES:
+                    entity.belongs_to_set.append(doc_user_nodeset)
                     user_count += 1
-                elif doc_is_global:
-                    logger.info(
-                        "Entity %s is USER specific, but document is GLOBAL. "
-                        "Overriding to GLOBAL NodeSet.",
-                        entity_type,
-                    )
-                    resolved = global_nodeset
+
+                # Special business logic for specific global entities
+                elif entity_type == "financialconcept":
+                    entity.belongs_to_set.append(financial_wisdom_nodeset)
                     global_count += 1
-                else:
-                    raise NodeSetResolutionError(
-                        f"Cannot resolve USER NodeSet for entity {entity_type} in chunk {chunk.id}: "
-                        "parent document has no user NodeSet assigned."
+
+                elif entity_type == "industry":
+                    import asyncio
+
+                    from core.memory.graph_models import Sector
+
+                    resolved_nodesets = await asyncio.gather(
+                        *[
+                            get_or_create_nodeset(ns.name, Sector)
+                            for ns in entity.belongs_to_set
+                        ]
                     )
+                    for ns in resolved_nodesets:
+                        if ns not in entity.belongs_to_set:
+                            assert isinstance(ns, Sector)
+                            entity.belongs_to_set.append(ns)
+                elif entity_type == "company":
+                    if hasattr(entity, "sector") and entity.sector:
+                        await _classify_company(entity, entity.sector)
+                    elif hasattr(entity, "industry") and entity.industry:
+                        await _classify_company(entity, entity.industry)
 
-            if resolved is None:
-                raise NodeSetResolutionError(
-                    f"Failed to resolve NodeSet for {entity_type}"
-                )
+                elif entity_type == "financialevent":
+                    entity.belongs_to_set.append(financial_event_nodeset)
+                    if entity.positively_impacted or entity.negatively_impacted:
+                        to_check = {
+                            "positive": entity.positively_impacted,
+                            "negative": entity.negatively_impacted,
+                        }
+                        positive_imp_sectors = []
+                        negative_imp_sectors = []
+                        for impact_type, impacted_entities in to_check.items():
+                            if impacted_entities is None:
+                                continue
+                            for impacted_entity in impacted_entities:
+                                if (
+                                    impacted_entity.name in ALL_MAIN_SECTORS.keys()
+                                    or impacted_entity.name == GLOBAL_NODESET_NAME
+                                ):
+                                    sector = impacted_entity.name
+                                    try:
+                                        sector_nodeset = await get_or_create_nodeset(
+                                            sector
+                                        )
+                                        if impact_type == "positive":
+                                            positive_imp_sectors.append(sector_nodeset)
+                                            entity.positively_impacted.remove(
+                                                impacted_entity
+                                            )
+                                        elif impact_type == "negative":
+                                            negative_imp_sectors.append(sector_nodeset)
+                                            entity.negatively_impacted.remove(
+                                                impacted_entity
+                                            )
+                                        logger.info(
+                                            f"Resolved sector nodeset {sector} for FinancialEvent {entity.name}"
+                                        )
+                                    except Exception as e:
+                                        logger.info(
+                                            f"Failed to resolve sector nodeset {sector} for FinancialEvent {entity.name}: {e}"
+                                        )
+                        if positive_imp_sectors and entity.positively_impacted:
+                            entity.positively_impacted.extend(positive_imp_sectors)
+                        if negative_imp_sectors and entity.negatively_impacted:
+                            entity.negatively_impacted.extend(negative_imp_sectors)
+                        # logger.debug(
+                        #     "Entity %s (id=%s) → belongs_to_set='%s'.",
+                        #     entity_type,
+                        #     entity.id,
+                        #     ", ".join([ns.name for ns in entity.belongs_to_set]),
+                        # )
 
-            # Assign belongs_to_set
-            entity.belongs_to_set = getattr(entity, "belongs_to_set", []) or []
-            if resolved not in entity.belongs_to_set and entity_type != "Company":
-                entity.belongs_to_set.append(resolved)
-
-            # Special business logic for specific global entities
-            if entity_type == "Company":
-                if hasattr(entity, "sector") and entity.sector:
-                    await _classify_company(entity, entity.sector)
-                elif hasattr(entity, "industry") and entity.industry:
-                    await _classify_company(entity, entity.industry)
-
-            elif entity_type == "FinancialEvent" and (
-                entity.positively_impacted or entity.negatively_impacted
-            ):
-                to_check = {
-                    "positive": entity.positively_impacted,
-                    "negative": entity.negatively_impacted,
-                }
-                positive_imp_sectors = []
-                negative_imp_sectors = []
-                for impact_type, impacted_entities in to_check.items():
-                    if impacted_entities is None:
-                        continue
-                    for impacted_entity in impacted_entities:
-                        if (
-                            impacted_entity.name in ALL_MAIN_SECTORS.keys()
-                            or impacted_entity.name == GLOBAL_NODESET_NAME
-                        ):
-                            sector = impacted_entity.name
-                            try:
-                                sector_nodeset = await get_or_create_nodeset(sector)
-                                if impact_type == "positive":
-                                    positive_imp_sectors.append(sector_nodeset)
-                                    entity.positively_impacted.remove(impacted_entity)
-                                elif impact_type == "negative":
-                                    negative_imp_sectors.append(sector_nodeset)
-                                    entity.negatively_impacted.remove(impacted_entity)
-                                logger.info(
-                                    f"Resolved sector nodeset {sector} for FinancialEvent {entity.name}"
-                                )
-                            except Exception as e:
-                                logger.info(
-                                    f"Failed to resolve sector nodeset {sector} for FinancialEvent {entity.name}: {e}"
-                                )
-                if positive_imp_sectors and entity.positively_impacted:
-                    entity.positively_impacted.extend(positive_imp_sectors)
-                if negative_imp_sectors and entity.negatively_impacted:
-                    entity.negatively_impacted.extend(negative_imp_sectors)
-                # logger.debug(
-                #     "Entity %s (id=%s) → belongs_to_set='%s'.",
-                #     entity_type,
-                #     entity.id,
-                #     ", ".join([ns.name for ns in entity.belongs_to_set]),
-                # )
-
-            if hasattr(entity, "name"):
-                entity.id = get_canonical_id(entity.name)
+                if hasattr(entity, "name"):
+                    entity.id = get_canonical_id(entity.name)
+            except Exception as e:
+                raise NodeSetResolutionError(f"Failed to process entity {entity}: {e}")
 
     logger.info(
         "assign_nodesets: %d entities (%d GLOBAL, %d USER) across %d chunks.",
@@ -384,7 +374,7 @@ async def build_financial_pipeline(
             embed_triplets=embed_triplets,
             task_config={"batch_size": chunks_per_batch},
         ),
-        Task(merge_entities),
+        # Task(merge_entities),
     ]
     logger.info(
         "Built global financial pipeline with %d tasks.",
