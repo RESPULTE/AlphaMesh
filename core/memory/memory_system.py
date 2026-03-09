@@ -659,7 +659,7 @@ class FinancialMemorySystem:
         self,
         run_in_background: bool = False,
         chunks_per_batch: int = 100,
-        chunk_size: Optional[int] = 50,
+        chunk_size: Optional[int] = 100,
     ) -> Any:
         """
         Run cognify over the entire dataset with the custom financial pipeline.
@@ -700,6 +700,7 @@ class FinancialMemorySystem:
             logger.info(
                 "Global cognify completed. Entity merging ran as pipeline step 7."
             )
+
             return result
         except Exception as exc:
             raise MemorySystemError(f"Cognify failed: {exc}") from exc
