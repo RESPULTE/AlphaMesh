@@ -1,18 +1,113 @@
 """
 core/memory/prompts.py
 
-Custom extraction prompts for the Cognee cognify() step.
+System prompts for the two-pass financial graph extraction pipeline.
 
-The LLM uses these prompts to correctly set `target_nodeset` on every
-extracted financial entity. This is the first line of privacy enforcement:
-the LLM is guided to classify data as GLOBAL (shared) or USER (private).
+  Pass 1 — FINANCIAL_NODE_EXTRACTION_PROMPT
+    Extracts entity names and types only (shallow pass).
+    Used in parallel across all chunks in Section 1.
 
-Post-processing validation then enforces correctness — the prompt is a
-hint, not a trust boundary.
+  Pass 2 — FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT
+    Given a fixed canonical entity list from pass 1 + the chunk text,
+    fills full attributes and relationships in one schema-sliced call.
+    Used per-chunk in Section 2.
+
+The legacy FINANCIAL_COGNIFY_SYSTEM_PROMPT is kept for reference but is
+no longer wired into the active pipeline.
 """
 
-FINANCIAL_COGNIFY_SYSTEM_PROMPT = """\
+from typing import Optional as _Optional  # avoid polluting module namespace
 
+# ---------------------------------------------------------------------------
+# Pass 1 — Shallow entity identification (name + type only)
+# ---------------------------------------------------------------------------
+
+FINANCIAL_NODE_EXTRACTION_PROMPT = """\
+You are a financial entity identifier. Your ONLY task is to scan the text and
+list every distinct financial entity by name and type.
+
+### OUTPUT RULES
+- Return a `ChunkNodeList` containing one `ExtractedEntity` per entity found.
+- Each entry has exactly two fields: `name` (string) and `entity_type` (one of the allowed types).
+- DO NOT populate any other attributes (ticker, description, reason, etc.).
+- DO NOT infer relationships. Only names and types.
+
+### ALLOWED TYPES & CONSTRAINTS
+1. **Sector** — broad economic sectors.
+   HARD RULE: `name` MUST be one of these exact strings (case-sensitive):
+   Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples,
+   Health Care, Financials, Information Technology, Communication Services,
+   Utilities, Real Estate, Market.
+   If no exact match: do NOT create a Sector. Use Industry or Company instead.
+
+2. **Industry** — a granular niche within a Sector (e.g. "Cloud Infrastructure").
+
+3. **Company** — explicitly named publicly traded company (e.g. "Apple", "Tesla").
+   If text refers to companies vaguely, use Industry or Sector instead.
+
+4. **FinancialConcept** — financial term or metric (e.g. "Inflation", "P/E Ratio").
+
+5. **FinancialEvent** — a specific financial or economic event (e.g. "Fed Rate Cut").
+
+6. **UserInvestmentInterest** — user's buy/sell/hold/short intent on an asset or sector.
+   Trigger: the user implies investment action. Name it descriptively
+   (e.g. "Alice's MSFT Investment Thesis").
+
+7. **UserLearningInterest** — user want to learn about a concept or event.
+   Trigger: user asks for clarification or expresses confusion.
+   Name it descriptively (e.g. "Alice's GDP Question").
+
+### DEDUPLICATION
+- If the same entity appears multiple times under different phrasings,
+  return only ONE entry using the most formal / canonical name.
+- Do NOT create duplicate entries for the same real-world entity.
+"""
+
+# ---------------------------------------------------------------------------
+# Pass 2 — Full attribute + relationship extraction (schema-sliced)
+# ---------------------------------------------------------------------------
+
+FINANCIAL_ATTRIBUTE_EXTRACTION_PROMPT = """\
+You are a financial Knowledge Graph Architect. You are given:
+  1. A list of PRIMARY ENTITIES — the main nodes to create objects for.
+  2. The source text they were extracted from.
+  3. A schema that contains ONLY the entity types present in this chunk.
+
+Your task is to populate every field of each primary entity AND extract all
+relationships between entities according to the provided schema.
+
+### STRICT RULES
+1. **Primary entity list**: Create full attribute objects for every entity in
+   the PRIMARY ENTITIES list. These are mandatory.
+   For relationship fields (targets, supporting_events, positively_impacted,
+   negatively_impacted, related_concepts, threatening_events), you may ALSO
+   reference other Company / Sector / FinancialEvent / FinancialConcept entities
+   explicitly named in the source text — even if they are not on the primary list.
+2. **Full attributes**: Fill in every schema field for each primary entity
+   (description, ticker, sector, reason, status, etc.).
+3. **No hallucination on attributes**: If an attribute cannot be determined
+   from the text, use the most reasonable default the schema allows (None /
+   empty list / most fitting Literal value).
+4. **Sector names**: Company.sector MUST be one of the Allowed Sectors:
+   Energy, Materials, Industrials, Consumer Discretionary, Consumer Staples,
+   Health Care, Financials, Information Technology, Communication Services,
+   Utilities, Real Estate, Market.
+
+### ENTITY RULES (for reference)
+- **Company**: populate ticker, name, description, sector (required), industry (optional).
+- **FinancialConcept**: populate name, description, category, related_concepts.
+- **FinancialEvent**: populate name, description, date, positively_impacted, negatively_impacted.
+- **UserInvestmentInterest**: populate reason, status (nested object), targets, supporting_events, threatening_events.
+- **UserLearningInterest**: populate reason, status (nested object), targets.
+- **Industry**: populate name, description.
+- **Sector**: populate name, description (from the text; this will map to a predefined node).
+"""
+
+# ---------------------------------------------------------------------------
+# Legacy prompt — kept for reference, NOT used in the active pipeline
+# ---------------------------------------------------------------------------
+
+FINANCIAL_COGNIFY_SYSTEM_PROMPT = """\
 You are an expert financial analyst and Knowledge Graph Architect. Your task is to extract a comprehensive, highly accurate `FinancialKnowledgeGraph` from the provided text. You will map the extracted information strictly to the defined schema.
 
 Your primary goal is to identify financial entities, categorize them precisely, and establish how they relate to one another according to the schema.
@@ -53,41 +148,8 @@ Categorize every identified concept into one of the following specific entity ty
    - Link the relevant `FinancialConcept` or `FinancialEvent` entities in the `targets` list.
 
 ### EXTRACTION DIRECTIVES
-1. **Extract Implied Entities:** Do not limit yourself strictly to the exact words in the text. If a financial-related entity is strongly implied and necessary to capture the full financial context, extract it. 
+1. **Extract Implied Entities:** Do not limit yourself strictly to the exact words in the text. If a financial-related entity is strongly implied and necessary to capture the full financial context, extract it.
 2. **Be Exhaustive:** Ensure all fields and relationship lists inside each entity are populated properly. Rely on the Pydantic schema provided to you for the definition of each field.
-
----
-### EXAMPLE 1
-
-**User Input:** 
-"I just bought MSFT. Tech companies are looking good right now because inflation is dropping, which means the Fed might cut interest rates, giving a huge boost to the tech sector."
-
-**Expected Extraction Logic:**
-- **Company**: Microsoft (ticker: MSFT, sector: "Information Technology", industry: "Software")
-- **Sector**: Information Technology (extracted from "Tech companies")
-- **FinancialConcept**: Inflation (category: macroeconomics), Interest Rates (category: macroeconomics)
-- **FinancialEvent**: "Dropping Inflation", "Potential Fed Rate Cut"
-   - Rate Cut event `positively_impacted` list includes: [Sector("Information Technology")]
-- **UserInvestmentInterest**: 
-   - status: {"status": "Bought"}
-   - reason: "Tech companies are looking good right now because inflation is dropping, which means the Fed might cut interest rates."
-   - targets: [Company("Microsoft")]
-   - supporting_events: [FinancialEvent("Dropping Inflation"), FinancialEvent("Potential Fed Rate Cut")]
-
-### EXAMPLE 2
-
-**User Input:**
-"The latest GDP report shows a 3% growth, which is a strong positive signal for the entire market. I don't really understand how GDP affects my portfolio though, can you explain?"
-
-**Expected Extraction Logic:**
-- **FinancialEvent**: "3% GDP Growth"
-   - GDP growth event `positively_impacted` list includes: [Sector("Market")]
-- **Sector**: Market (extracted from "entire market")
-- **FinancialConcept**: GDP (category: macroeconomics)
-- **UserLearningInterest**:
-   - status: {"status": "Confused"}
-   - reason: "I don't really understand how GDP affects my portfolio though, can you explain?"
-   - targets: [FinancialConcept("GDP")]
 
 Generate the output structured strictly according to the `FinancialKnowledgeGraph` schema.
 """
@@ -107,9 +169,6 @@ Generate the output structured strictly according to the `FinancialKnowledgeGrap
 # agent that resolves user preferences (e.g. verbosity, risk appetite framing)
 # before the query reaches the retriever.
 
-from typing import (
-    Optional as _Optional,
-)  # local import to avoid polluting module namespace
 
 FINANCIAL_SEARCH_SYSTEM_PROMPT = """\
 You are AlphaMesh, an expert financial research assistant with deep knowledge of \

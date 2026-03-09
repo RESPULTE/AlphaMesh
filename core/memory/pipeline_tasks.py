@@ -6,16 +6,10 @@ Custom Cognee pipeline task and pipeline builder for the financial memory system
 Pipeline insertion order:
     1. classify_documents
     2. extract_chunks_from_documents
-    3. extract_graph_from_data
-    4. assign_nodesets              ← OUR TASK: validates & resolves belongs_to_set
-    5. summarize_text
-    6. add_data_points
-
-`assign_nodesets` is the enforcement layer that:
-  - Automatically identifies USER vs GLOBAL entities via USER_SPECIFIC_ENTITIES
-  - Resolves to the actual Cognee NodeSet DataPoint
-  - Assigns belongs_to_set = [resolved_nodeset_datapoint]
-  - Never silently passes invalid data downstream
+    3. extract_financial_graph       ← CUSTOM: 2-LLM-call, 3-section extraction
+    4. assign_nodesets               ← OUR TASK: validates & resolves belongs_to_set
+    5. add_data_points
+    6. merge_entities                ← safety-net dedup (APOC + vector)
 """
 
 from __future__ import annotations
@@ -25,20 +19,19 @@ import uuid
 from typing import Any, List, Optional
 
 from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.infrastructure.llm import get_max_chunk_tokens
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.modules.chunking.TextChunker import TextChunker
 from cognee.modules.cognify.config import get_cognify_config
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.modules.pipelines.tasks.task import Task
 from cognee.tasks.documents import classify_documents, extract_chunks_from_documents
-from cognee.tasks.graph import extract_graph_from_data
 from cognee.tasks.storage import add_data_points
 
 from core.memory.entity_merger import find_and_merge_candidates
 from core.memory.exceptions import (
     NodeSetResolutionError,
 )
+from core.memory.graph_extraction import extract_financial_graph
 from core.memory.graph_models import (
     ALL_ENTITIES,
     ALL_MAIN_SECTORS,
@@ -53,7 +46,6 @@ from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
     get_or_create_nodeset,
 )
-from core.memory.prompts import FINANCIAL_COGNIFY_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -368,13 +360,11 @@ async def build_financial_pipeline(
         Task(classify_documents),
         Task(
             extract_chunks_from_documents,
-            max_chunk_size=chunk_size or get_max_chunk_tokens(),
+            max_chunk_size=chunk_size,
             chunker=TextChunker,
         ),
         Task(
-            extract_graph_from_data,
-            graph_model=FinancialKnowledgeGraph,
-            custom_prompt=FINANCIAL_COGNIFY_SYSTEM_PROMPT,
+            extract_financial_graph,
             task_config={"batch_size": chunks_per_batch},
         ),
         # Process global influences and remove them from entities
