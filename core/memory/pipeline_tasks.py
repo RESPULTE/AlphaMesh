@@ -175,7 +175,7 @@ async def assign_nodesets(
             if not is_user_entity:
                 # Route specific global entity types to their dedicated nodesets
                 if entity_type == "FinancialConcept":
-                    resolved: NodeSet = financial_wisdom_nodeset
+                    resolved = financial_wisdom_nodeset
                 elif entity_type == "FinancialEvent":
                     resolved = financial_event_nodeset
                 else:

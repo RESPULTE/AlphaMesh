@@ -16,9 +16,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import cognee
+from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.modules.engine.models.node_set import NodeSet
 from cognee.modules.engine.operations.setup import setup
 from cognee.modules.run_custom_pipeline import run_custom_pipeline
@@ -30,7 +32,7 @@ from core.memory.exceptions import (
     QueryError,
 )
 from core.memory.financial_retriever import FinancialGraphRetriever, QueryScope
-from core.memory.graph_models import DATASET_NAME, GLOBAL_NODESET_NAME
+from core.memory.graph_models import DATASET_NAME
 from core.memory.nodeset_manager import (
     GLOBAL_NODESET_NAME,
     get_or_create_all_sector_nodesets,
@@ -64,6 +66,75 @@ class UserMemoryContext:
 
     def __post_init__(self) -> None:
         self.allowed_nodeset_names = [self.global_nodeset.name, self.user_nodeset.name]
+
+
+class UserContextRecord(NamedTuple):
+    """
+    One user-specific interest node returned by
+    :meth:`FinancialMemorySystem.get_user_knowledge_context`.
+
+    Fields
+    ------
+    node_id:
+        The graph node's UUID string.
+    node_type:
+        ``"UserInvestmentInterest"`` or ``"UserLearningInterest"``.
+    status:
+        Status string from the linked grouping node, e.g. ``"Bought"``
+        or ``"Understood"``.
+    reason:
+        Textual rationale / question stored on the interest node.
+    updated_at:
+        Timestamp parsed from the node's ``updated_at`` property, or
+        ``None`` when the property is absent.
+    raw_properties:
+        Full property dict returned from the graph (diagnostic use).
+    """
+
+    node_id: str
+    node_type: str
+    status: str
+    reason: str
+    updated_at: Optional[datetime]
+    raw_properties: Dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# User context retrieval — module-level constants (shared, not instance state)
+# ---------------------------------------------------------------------------
+
+# Cache keys for the nested _user_context_cache
+USER_NODESET_CONTEXT = "nodeset_context"
+USER_KNOWLEDGE_CONTEXT = "knowledge_context"
+
+# Priority order for ranking interest nodes by status (lower = higher ranked).
+_STATUS_RANK: Dict[str, int] = {
+    "Bought": 0,
+    "Interested": 1,
+    "Understood": 2,
+    "Confused": 3,
+    "Sold": 4,
+    "Avoids": 5,
+    "Not Interested": 6,
+}
+
+# Traverses from the user's NodeSet to all linked UserInvestmentInterest /
+# UserLearningInterest nodes (bidirectional edge match), then optionally
+# expands to their status grouping nodes.
+_USER_CONTEXT_CYPHER = """
+MATCH (ns:NodeSet {name: $nodeset_name})
+MATCH (ns)-[:belongs_to_set|BELONGS_TO_SET]-(n)
+WHERE n:UserInvestmentInterest OR n:UserLearningInterest
+OPTIONAL MATCH (n)-[:status|STATUS]->(s)
+RETURN
+    n.id          AS node_id,
+    n.type        AS node_type,
+    n.reason      AS reason,
+    n.updated_at  AS updated_at,
+    s.status      AS status,
+    properties(n) AS props
+LIMIT 500
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +191,8 @@ class FinancialMemorySystem:
     def __init__(self) -> None:
         self._initialized = False
         self._global_nodeset: Optional[NodeSet] = None
-        self._user_context_cache: dict[str, UserMemoryContext] = {}
+        # Nested cache: { user_email: { "nodeset_context": UserMemoryContext, "knowledge_context": List[UserContextRecord] } }
+        self._user_context_cache: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Initialization
@@ -186,8 +258,9 @@ class FinancialMemorySystem:
         self._require_initialized()
         normalized = user_email.strip().lower()
 
-        if normalized in self._user_context_cache:
-            return self._user_context_cache[normalized]
+        user_cache = self._user_context_cache.get(normalized)
+        if user_cache and USER_NODESET_CONTEXT in user_cache:
+            return user_cache[USER_NODESET_CONTEXT]
 
         nodeset_name, user_nodeset = await get_or_create_user_nodeset(normalized)
         global_nodeset = self._global_nodeset or await get_or_create_global_nodeset()
@@ -198,11 +271,135 @@ class FinancialMemorySystem:
             user_nodeset=user_nodeset,
             global_nodeset=global_nodeset,
         )
-        self._user_context_cache[normalized] = ctx
+
+        if normalized not in self._user_context_cache:
+            self._user_context_cache[normalized] = {}
+        self._user_context_cache[normalized][USER_NODESET_CONTEXT] = ctx
+
         logger.info(
             "User context resolved for '%s' → NodeSet '%s'.", normalized, nodeset_name
         )
         return ctx
+
+    async def get_user_knowledge_context(
+        self,
+        user_email: str,
+        top_k: int = 25,
+    ) -> List[UserContextRecord]:
+        """
+        Retrieve all user-specific interest nodes for a given user, ranked
+        by status priority then recency.
+
+        Internally reuses :meth:`get_user_context` so the nodeset lookup is
+        served from the in-process cache — no redundant DB calls.
+
+        The graph store is queried directly with a parameterized Cypher query
+        so that the nodeset name filter is safe and driver-optimised.
+
+        Ranking
+        -------
+        Primary key — status priority (ascending):
+            ``Bought`` → ``Interested`` → ``Understood`` → ``Confused``
+            → ``Sold`` → ``Avoids`` → ``Not Interested`` → unknown
+        Secondary key — ``updated_at`` timestamp (descending, most recent first).
+        Nodes without a timestamp rank last within their status tier.
+
+        Parameters
+        ----------
+        user_email:
+            The authenticated user's email address (the user ID used
+            throughout the AlphaMesh codebase).
+        top_k:
+            Maximum number of records to return.  Defaults to 25.
+
+        Returns
+        -------
+        List of :class:`UserContextRecord` ordered by status priority then recency.
+
+        Raises
+        ------
+        QueryError: If the graph query fails.
+        """
+        ctx = await self.get_user_context(user_email)
+        normalized = ctx.user_email
+
+        # Check if the knowledge context is already cached
+        user_cache = self._user_context_cache.get(normalized, {})
+        if USER_KNOWLEDGE_CONTEXT in user_cache:
+            cached_records = user_cache[USER_KNOWLEDGE_CONTEXT]
+            logger.info(
+                "get_user_knowledge_context: Cache hit for '%s' → %d records.",
+                normalized,
+                len(cached_records),
+            )
+            return cached_records[:top_k]
+
+        nodeset_name = ctx.nodeset_name
+        graph_engine = await get_graph_engine()
+
+        try:
+            rows: List[Dict[str, Any]] = await graph_engine.query(
+                _USER_CONTEXT_CYPHER,
+                {"nodeset_name": nodeset_name},
+            )
+        except Exception as exc:
+            logger.error(
+                "get_user_knowledge_context: graph query failed for '%s' (nodeset '%s'): %s",
+                user_email,
+                nodeset_name,
+                exc,
+            )
+            raise QueryError(str(exc)) from exc
+
+        records: List[UserContextRecord] = []
+        for row in rows:
+            raw_ts = row.get("updated_at")
+            parsed_ts: Optional[datetime] = None
+            if isinstance(raw_ts, datetime):
+                parsed_ts = raw_ts
+            elif isinstance(raw_ts, (int, float)):
+                try:
+                    parsed_ts = datetime.utcfromtimestamp(raw_ts / 1000)
+                except Exception:
+                    parsed_ts = None
+            elif isinstance(raw_ts, str):
+                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        parsed_ts = datetime.strptime(raw_ts, fmt)
+                        break
+                    except ValueError:
+                        continue
+
+            records.append(
+                UserContextRecord(
+                    node_id=str(row.get("node_id") or ""),
+                    node_type=str(row.get("node_type") or ""),
+                    status=str(row.get("status") or ""),
+                    reason=str(row.get("reason") or ""),
+                    updated_at=parsed_ts,
+                    raw_properties=row.get("props") or {},
+                )
+            )
+
+        records.sort(
+            key=lambda r: (
+                _STATUS_RANK.get(r.status, 99),
+                -(r.updated_at.timestamp() if r.updated_at else 0),
+            )
+        )
+
+        # Cache the full list of records
+        if normalized not in self._user_context_cache:
+            self._user_context_cache[normalized] = {}
+        self._user_context_cache[normalized][USER_KNOWLEDGE_CONTEXT] = records
+
+        logger.info(
+            "get_user_knowledge_context: %d records for '%s' → top-%d returned (cached).",
+            len(records),
+            normalized,
+            top_k,
+        )
+        return records[:top_k]
 
     # ------------------------------------------------------------------
     # Ingestion helpers — cognee.add() handles dataset creation internally
@@ -575,115 +772,3 @@ class FinancialMemorySystem:
 
         except Exception as exc:
             raise QueryError(str(exc)) from exc
-
-    # # ------------------------------------------------------------------
-    # # Graph Edge Property and State Triggers
-    # # ------------------------------------------------------------------
-
-    # async def adjust_edge_property(
-    #     self,
-    #     source_id: str,
-    #     target_id: str,
-    #     edge_label: str,
-    #     property_name: str,
-    #     delta: float,
-    #     min_val: float = 0.0,
-    #     max_val: float = 1.0,
-    # ) -> float:
-    #     """
-    #     Gracefully increments or decrements a property of a graph edge.
-    #     Clamps the updated value strictly between min_val and max_val.
-
-    #     Designed for Multi-Agent systems: agents provide continuous feedback (e.g., +0.05 or -0.1)
-    #     on relationship strength, and this handles the boundary controls deterministically.
-
-    #     Args:
-    #         graph_client: The Cognee graph engine adapter client.
-    #         source_id: Node ID of the relationship source.
-    #         target_id: Node ID of the relationship target.
-    #         edge_label: The relationship type (e.g., 'HoldsThesis', 'SupportedBy').
-    #         property_name: The edge property to adjust (e.g., 'conviction_level').
-    #         delta: Float value to add to the existing property value (can be negative).
-    #         min_val: Hard lower bound for the property.
-    #         max_val: Hard upper bound for the property.
-
-    #     Returns:
-    #         The newly calculated and clamped property value as a float.
-    #         Returns 0.0 if the edge was not found or execution failed but didn't crash.
-    #     """
-    #     self._require_initialized()
-    #     graph_client = self.graph_client
-
-    #     logger.info(
-    #         "Adjusting '%s' for edge '%s' between '%s' and '%s' by delta %.2f.",
-    #         property_name,
-    #         edge_label,
-    #         source_id,
-    #         target_id,
-    #         delta,
-    #     )
-
-    #     # Cypher implementation applying boundary controls
-    #     # Uses type(e) to check edge label safely.
-    #     query = f"""
-    #     MATCH (s {{id: $source_id}})-[e]->(t {{id: $target_id}})
-    #     WHERE type(e) = $edge_label
-    #     WITH e, coalesce(e.{property_name}, 0.0) AS current_val
-    #     WITH e, current_val, current_val + $delta AS raw_new_val
-    #     WITH e,
-    #          CASE
-    #             WHEN raw_new_val < $min_val THEN $min_val
-    #             WHEN raw_new_val > $max_val THEN $max_val
-    #             ELSE raw_new_val
-    #          END AS final_val
-    #     SET e.{property_name} = final_val
-    #     RETURN final_val AS new_val
-    #     """
-    #     params = {
-    #         "source_id": source_id,
-    #         "target_id": target_id,
-    #         "edge_label": edge_label,
-    #         "delta": float(delta),
-    #         "min_val": float(min_val),
-    #         "max_val": float(max_val),
-    #     }
-
-    #     try:
-    #         # Resolving the execution method defensively based on typical Cognee adapter shapes
-    #         execute_fn = None
-    #         if hasattr(graph_client, "query"):
-    #             execute_fn = graph_client.query
-    #         elif hasattr(graph_client, "execute"):
-    #             execute_fn = graph_client.execute
-    #         elif hasattr(graph_client, "graph") and hasattr(
-    #             graph_client.graph, "execute"
-    #         ):
-    #             execute_fn = graph_client.graph.execute
-
-    #         if not execute_fn:
-    #             logger.warning(
-    #                 "Provided graph_client lacks a query() or execute() method for Cypher queries."
-    #             )
-    #             return 0.0
-
-    #         results = await execute_fn(query, params)
-
-    #         # Simple parse to return the updated value safely
-    #         if results and isinstance(results, list) and len(results) > 0:
-    #             first_record = results[0]
-    #             if isinstance(first_record, dict) and "new_val" in first_record:
-    #                 return float(first_record["new_val"])
-    #             # Fallback for adapters returning simple tuples or scalars
-    #             return float(first_record) if first_record is not None else 0.0
-
-    #         logger.warning(
-    #             "Edge '%s' not found between '%s' and '%s' for property update.",
-    #             edge_label,
-    #             source_id,
-    #             target_id,
-    #         )
-    #         return 0.0
-
-    #     except Exception as exc:
-    #         logger.error("Failed to adjust edge property %s: %s", property_name, exc)
-    #         raise MemorySystemError(f"Edge property adjustment failed: {exc}") from exc

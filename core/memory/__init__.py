@@ -24,6 +24,7 @@ from core.memory.graph_models import (
 from core.memory.memory_system import (
     FinancialMemorySystem,
     IngestionItem,
+    UserContextRecord,
     UserMemoryContext,
 )
 from core.memory.nodeset_manager import (
@@ -42,6 +43,8 @@ __all__ = [
     "FinancialMemorySystem",
     "UserMemoryContext",
     "IngestionItem",
+    # User context retrieval (output type; method lives on FinancialMemorySystem)
+    "UserContextRecord",
     # NodeSet management
     "hash_user_email",
     "get_user_nodeset_name",
