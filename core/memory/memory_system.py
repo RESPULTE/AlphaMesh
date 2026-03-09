@@ -96,6 +96,9 @@ class UserContextRecord(NamedTuple):
     status: str
     reason: str
     updated_at: Optional[datetime]
+    targets: List[Dict[str, Any]]
+    supporting_events: List[Dict[str, Any]]
+    threatening_events: List[Dict[str, Any]]
     raw_properties: Dict[str, Any]
 
 
@@ -118,13 +121,11 @@ _STATUS_RANK: Dict[str, int] = {
     "Not Interested": 6,
 }
 
-# Traverses from the user's NodeSet to all linked UserInvestmentInterest /
-# UserLearningInterest nodes (bidirectional edge match), then optionally
-# expands to their status grouping nodes.
-_USER_CONTEXT_CYPHER = """
+# Specialized queries for user interest types
+_USER_INVESTMENT_CONTEXT_CYPHER = """
 MATCH (ns:NodeSet {name: $nodeset_name})
 MATCH (ns)-[:belongs_to_set|BELONGS_TO_SET]-(n)
-WHERE n:UserInvestmentInterest OR n:UserLearningInterest
+WHERE n.type = 'UserInvestmentInterest'
 OPTIONAL MATCH (n)-[:status|STATUS]->(s)
 RETURN
     n.id          AS node_id,
@@ -132,7 +133,26 @@ RETURN
     n.reason      AS reason,
     n.updated_at  AS updated_at,
     s.status      AS status,
-    properties(n) AS props
+    properties(n) AS props,
+    [(n)-[:targets|TARGETS]->(t) | {id: t.id, name: t.name, type: t.type}] AS targets,
+    [(n)-[:supporting_events|SUPPORTING_EVENTS]->(se) | {id: se.id, name: se.name, type: se.type}] AS supporting_events,
+    [(n)-[:threatening_events|THREATENING_EVENTS]->(te) | {id: te.id, name: te.name, type: te.type}] AS threatening_events
+LIMIT 500
+"""
+
+_USER_LEARNING_CONTEXT_CYPHER = """
+MATCH (ns:NodeSet {name: $nodeset_name})
+MATCH (ns)-[:belongs_to_set|BELONGS_TO_SET]-(n)
+WHERE n.type = 'UserLearningInterest'
+OPTIONAL MATCH (n)-[:status|STATUS]->(s)
+RETURN
+    n.id          AS node_id,
+    n.type        AS node_type,
+    n.reason      AS reason,
+    n.updated_at  AS updated_at,
+    s.status      AS status,
+    properties(n) AS props,
+    [(n)-[:targets|TARGETS]->(t) | {id: t.id, name: t.name, type: t.type}] AS targets
 LIMIT 500
 """
 
@@ -338,13 +358,22 @@ class FinancialMemorySystem:
         graph_engine = await get_graph_engine()
 
         try:
-            rows: List[Dict[str, Any]] = await graph_engine.query(
-                _USER_CONTEXT_CYPHER,
+            # Run both queries in parallel
+            investment_task = graph_engine.query(
+                _USER_INVESTMENT_CONTEXT_CYPHER,
                 {"nodeset_name": nodeset_name},
+            )
+            learning_task = graph_engine.query(
+                _USER_LEARNING_CONTEXT_CYPHER,
+                {"nodeset_name": nodeset_name},
+            )
+
+            investment_rows, learning_rows = await asyncio.gather(
+                investment_task, learning_task
             )
         except Exception as exc:
             logger.error(
-                "get_user_knowledge_context: graph query failed for '%s' (nodeset '%s'): %s",
+                "get_user_knowledge_context: parallel graph queries failed for '%s' (nodeset '%s'): %s",
                 user_email,
                 nodeset_name,
                 exc,
@@ -352,34 +381,14 @@ class FinancialMemorySystem:
             raise QueryError(str(exc)) from exc
 
         records: List[UserContextRecord] = []
-        for row in rows:
-            raw_ts = row.get("updated_at")
-            parsed_ts: Optional[datetime] = None
-            if isinstance(raw_ts, datetime):
-                parsed_ts = raw_ts
-            elif isinstance(raw_ts, (int, float)):
-                try:
-                    parsed_ts = datetime.utcfromtimestamp(raw_ts / 1000)
-                except Exception:
-                    parsed_ts = None
-            elif isinstance(raw_ts, str):
-                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                    try:
-                        parsed_ts = datetime.strptime(raw_ts, fmt)
-                        break
-                    except ValueError:
-                        continue
 
-            records.append(
-                UserContextRecord(
-                    node_id=str(row.get("node_id") or ""),
-                    node_type=str(row.get("node_type") or ""),
-                    status=str(row.get("status") or ""),
-                    reason=str(row.get("reason") or ""),
-                    updated_at=parsed_ts,
-                    raw_properties=row.get("props") or {},
-                )
-            )
+        # Parse investment rows (includes targets, supporting_events, threatening_events)
+        for row in investment_rows:
+            records.append(self._parse_user_context_row(row))
+
+        # Parse learning rows (includes targets only)
+        for row in learning_rows:
+            records.append(self._parse_user_context_row(row))
 
         records.sort(
             key=lambda r: (
@@ -400,6 +409,43 @@ class FinancialMemorySystem:
             top_k,
         )
         return records[:top_k]
+
+    def _parse_user_context_row(self, row: Dict[str, Any]) -> UserContextRecord:
+        """Helper to parse a single Cypher row into a UserContextRecord."""
+        raw_ts = row.get("updated_at")
+        parsed_ts: Optional[datetime] = None
+        if isinstance(raw_ts, datetime):
+            parsed_ts = raw_ts
+        elif isinstance(raw_ts, (int, float)):
+            try:
+                # Cognee timestamps are often in milliseconds
+                parsed_ts = datetime.utcfromtimestamp(raw_ts / 1000)
+            except Exception:
+                parsed_ts = None
+        elif isinstance(raw_ts, str):
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    parsed_ts = datetime.strptime(raw_ts, fmt)
+                    break
+                except ValueError:
+                    continue
+
+        def clean_list(lst):
+            if not lst:
+                return []
+            return [i for i in lst if i and i.get("id") is not None]
+
+        return UserContextRecord(
+            node_id=str(row.get("node_id") or ""),
+            node_type=str(row.get("node_type") or ""),
+            status=str(row.get("status") or ""),
+            reason=str(row.get("reason") or ""),
+            updated_at=parsed_ts,
+            targets=clean_list(row.get("targets")),
+            supporting_events=clean_list(row.get("supporting_events")),
+            threatening_events=clean_list(row.get("threatening_events")),
+            raw_properties=row.get("props") or {},
+        )
 
     # ------------------------------------------------------------------
     # Ingestion helpers — cognee.add() handles dataset creation internally

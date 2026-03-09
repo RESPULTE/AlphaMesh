@@ -106,6 +106,9 @@ async def run_test():
             print(f"    STATUS: {rec.status}")
             print(f"    REASON: {rec.reason}")
             print(f"    UPDATED: {rec.updated_at}")
+            print(f"    TARGETS: {rec.targets}")
+            print(f"    SUPPORTING: {rec.supporting_events}")
+            print(f"    THREATENING: {rec.threatening_events}")
             print("-" * 40)
 
     # Simple validations
