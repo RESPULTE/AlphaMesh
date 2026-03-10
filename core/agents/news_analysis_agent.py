@@ -1,13 +1,9 @@
 import asyncio
 import json
-import logging
 import operator
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Optional, Type
 
-from core.agents.base_agent import AbstractAgent
-from core.agents.models import BaseAgentInput, BaseAgentOutput
-from core.services import service_manager
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
@@ -19,8 +15,14 @@ from langgraph.graph import END, START, StateGraph
 from newspaper import Article, ArticleException
 from pydantic import BaseModel, Field
 
+from core.agents.base_agent import AbstractAgent
+from core.agents.models import BaseAgentInput, BaseAgentOutput
+
 # --- Logging Setup ---
 from core.logger import get_logger
+from core.memory.graph_models import Company
+from core.memory.pipeline_tasks import get_canonical_id
+from core.services import service_manager
 
 logger = get_logger(__name__)
 
@@ -536,7 +538,11 @@ class NewsAnalysisAgent(AbstractAgent):
             retval = await service_manager.get_agent().ainvoke(messages)
 
             return NewsAnalysisOutput(
-                analysis=retval.content, sources=state.news_context
+                analysis=retval.content,
+                sources=state.news_context,
+                entities_enriched=_build_entities_from_news(
+                    state.ticker, state.news_context, retval.content
+                ),
             )
         except Exception as e:
             logger.error(f"❌ Error in generation: {e}")
@@ -544,7 +550,30 @@ class NewsAnalysisAgent(AbstractAgent):
             return NewsAnalysisOutput(
                 analysis="Error generating analysis due to model failure.",
                 sources=[],
+                entities_enriched=_build_entities_from_news(
+                    state.ticker, state.news_context, ""
+                ),
             )
+
+
+def _build_entities_from_news(ticker: str, sources: list, analysis_text: str) -> list:
+    """
+    Build minimal enriched DataPoints from what the news agent already retrieved.
+    Company is always emitted. No extra LLM call — events are not extracted here;
+    that is the synthesiser's job via the CoT <relationships> block.
+    """
+    entities = []
+
+    company = Company(
+        id=get_canonical_id(ticker.upper()),
+        ticker=ticker.upper(),
+        name=ticker.upper(),
+        description=f"Company in focus for news analysis: {ticker.upper()}",
+        sector="",
+        industry=None,
+    )
+    entities.append(company)
+    return entities
 
 
 if __name__ == "__main__":

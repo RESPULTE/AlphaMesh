@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -51,6 +51,14 @@ class BaseAgentOutput(BaseModel, ABC):
     )
     analysis: str = Field(
         description="The detailed analysis or primary output of the agent."
+    )
+    entities_enriched: List[Any] = Field(
+        default_factory=list,
+        description=(
+            "List of enriched DataPoint objects resolved by this agent. "
+            "Must use classes from core.memory.graph_models. "
+            "Populated by each agent's final node before returning."
+        ),
     )
 
     @abstractmethod

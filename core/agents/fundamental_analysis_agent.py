@@ -4,14 +4,17 @@ import operator
 from typing import Annotated, List, Optional, Type
 
 import pandas as pd
-from core.agents.base_agent import AbstractAgent
-from core.agents.get_financial_data import FinancialDatabase
-from core.agents.models import BaseAgentInput, BaseAgentOutput
-from core.services import service_manager
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
+
+from core.agents.base_agent import AbstractAgent
+from core.agents.financial_db import FinancialDatabase
+from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.logger import get_logger
+from core.memory.graph_models import Company
+from core.memory.pipeline_tasks import get_canonical_id
+from core.services import service_manager
 
 logger = get_logger(__name__)
 
@@ -95,6 +98,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         return FundamentalAnalysisOutput(
             financial_data=final_state.get("financial_data"),
             analysis=final_state.get("analysis"),
+            entities_enriched=final_state.get("entities_enriched", []),
         )
 
     def _build_graph(self):
@@ -129,7 +133,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         Checks which metrics are raw DB columns vs. which need to be calculated.
         """
         # REWRITTEN: Use state.attribute access
-        logger.info(f"--- [Node] Parser ---")
+        logger.info("--- [Node] Parser ---")
 
         await self.db.update_financials(
             state.ticker,
@@ -240,11 +244,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
         metrics_to_fetch = [d for d in new_dependencies if d not in calculated_vars]
         metrics_to_fetch.extend([t for t in targets if t not in calculated_vars])
 
-        logger.info(f"   -> New dependencies to fetch: ")
+        logger.info("   -> New dependencies to fetch: ")
         for m in metrics_to_fetch:
             logger.info(f"      - {m}")
 
-        logger.info(f"   -> Calculations to perform:")
+        logger.info("   -> Calculations to perform:")
         for i, calc in enumerate(result.calculations, 1):
             logger.info(
                 f"      {i}. {calc.target_metric_name} = {calc.pandas_eval_expression}"
@@ -260,7 +264,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         Retrieves the actual data values from the database.
         """
         # REWRITTEN: Use state.attribute access
-        logger.info(f"--- [Node] Fetcher ---")
+        logger.info("--- [Node] Fetcher ---")
         metrics_to_query = list(set(state.metrics_to_fetch))
 
         if not metrics_to_query:
@@ -294,7 +298,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         Executes the formulas from the decomposer using pandas eval.
         """
         # REWRITTEN: Use state.attribute access
-        logger.info(f"--- [Node] Calculator ---")
+        logger.info("--- [Node] Calculator ---")
         df = state.financial_data
         calculations = state.calculations_to_run
 
@@ -320,12 +324,14 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
                 df_eval.eval(f"{target} = {expr}", inplace=True)
             except Exception as e:
-                logger.error(f"[Calculator] Error calculating {calc.target_metric_name}: {e}")
+                logger.error(
+                    f"[Calculator] Error calculating {calc.target_metric_name}: {e}"
+                )
 
         return {"financial_data": df_eval.T}
 
     async def _generate_analysis(self, state: _AgentState) -> FundamentalAnalysisOutput:
-        logger.info(f"--- [Node] Analyst ---")
+        logger.info("--- [Node] Analyst ---")
 
         # Format dataframe for readability
         if state.financial_data is None or state.financial_data.empty:
@@ -352,8 +358,26 @@ class FundamentalAnalysisAgent(AbstractAgent):
         response = await service_manager.get_agent(temperature=0.7).ainvoke(msg)
 
         return FundamentalAnalysisOutput(
-            financial_data=state.financial_data, analysis=response.content
+            financial_data=state.financial_data,
+            analysis=response.content,
+            entities_enriched=[_build_company_entity(state.ticker, response.content)],
         )
+
+
+def _build_company_entity(ticker: str, analysis_text: str) -> Company:
+    """
+    Build a minimal enriched Company DataPoint from what the fundamental agent knows.
+    The description is seeded from the analysis — this is the enrichment.
+    """
+    first_sentence = analysis_text.split(".")[0].strip() + "." if analysis_text else ""
+    return Company(
+        id=get_canonical_id(ticker.upper()),
+        ticker=ticker.upper(),
+        name=ticker.upper(),
+        description=first_sentence,
+        sector="",
+        industry=None,
+    )
 
 
 def add_units(x):

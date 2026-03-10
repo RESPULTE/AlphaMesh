@@ -48,6 +48,7 @@ from core.memory.nodeset_manager import (
     get_or_create_global_nodeset,
     get_or_create_nodeset,
 )
+from core.memory.prompts import LEAN_SUMMARY_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +306,120 @@ async def merge_entities(data_points: List) -> List:
         )
 
     return data_points
+
+
+async def summarise_chunks_lean(
+    data_chunks: List[DocumentChunk],
+) -> List[DocumentChunk]:
+    """
+    Lean summarisation pipeline task.
+
+    Generates a terse 1-2 sentence financial summary for each chunk
+    that has been classified into a meaningful section.
+
+    DIFFERENCES from the old summarize_text cognee task:
+      - Uses LEAN_SUMMARY_SYSTEM_PROMPT (domain-specific, forces terse output)
+      - Hard cap of 80 output tokens per chunk
+      - Skips unclassified chunks (section is None or chunk < 120 chars)
+      - Stores summary text back on chunk.text_summary (not a new DataPoint)
+      - Returns the SAME chunk list — does not add extra DataPoints
+
+    This keeps the vector store summary index populated for
+    SearchType.SUMMARIES retrieval, without spinning up the full
+    LLM-based cognee summarise_text pipeline.
+    """
+    from cognee.infrastructure.llm.LLMGateway import LLMGateway
+
+    for chunk in data_chunks:
+        # Skip front matter / table of contents / trivially short chunks
+        if not chunk.text or len(chunk.text) < 120:
+            continue
+
+        try:
+            summary = await LLMGateway.acreate(
+                messages=[
+                    {"role": "system", "content": LEAN_SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": chunk.text[:2000]},  # cap input too
+                ],
+                max_tokens=80,
+                temperature=0.0,
+            )
+            summary_text = summary.choices[0].message.content.strip()
+
+            if summary_text == "NO_FINANCIAL_DATA":
+                continue
+
+            # Store on the chunk for add_data_points to index
+            chunk.text_summary = summary_text
+
+        except Exception as exc:
+            logger.warning(
+                "summarise_chunks_lean: failed for chunk %s: %s", chunk.id, exc
+            )
+            continue
+
+    return data_chunks
+
+
+async def build_lean_document_pipeline(
+    chunks_per_batch: int = 100,
+    chunk_size: Optional[int] = None,
+    include_summaries: bool = True,
+) -> list[Task]:
+    """
+    Build a token-efficient ingestion pipeline for financial documents.
+
+    DIFFERENCE from build_financial_pipeline:
+      - Removes extract_financial_graph (eliminates 2 LLM calls per chunk)
+      - Removes assign_nodesets (no entities extracted, nothing to assign)
+      - Removes merge_entities (nothing to merge)
+      - Optionally adds summarise_chunks_lean (1 LLM call per chunk, 80 tokens out)
+      - Graph construction is deferred to conversation write-back
+
+    Task order:
+      1. classify_documents
+      2. extract_chunks_from_documents
+      3. summarise_chunks_lean        ← optional; 1 LLM call/chunk, 80 tokens max
+      4. add_data_points              ← embeds chunks (and summaries if present)
+
+    Args:
+        chunks_per_batch:   Batch size for add_data_points.
+        chunk_size:         Max tokens per chunk (auto if None).
+        include_summaries:  If True, runs lean summarisation. Default True.
+                            Set False to skip all LLM calls entirely (pure embed).
+
+    Returns:
+        List of Task objects in execution order.
+    """
+    cognify_config = get_cognify_config()
+    embed_triplets = cognify_config.triplet_embedding
+
+    tasks = [
+        Task(classify_documents),
+        Task(
+            extract_chunks_from_documents,
+            max_chunk_size=chunk_size,
+            chunker=TextChunker,
+        ),
+    ]
+
+    if include_summaries:
+        tasks.append(Task(summarise_chunks_lean))
+
+    tasks.append(
+        Task(
+            add_data_points_with_custom_edges,
+            embed_triplets=embed_triplets,
+            task_config={"batch_size": chunks_per_batch},
+        )
+    )
+
+    logger.info(
+        "Built lean document pipeline with %d tasks (summaries=%s).",
+        len(tasks),
+        include_summaries,
+    )
+    return tasks
 
 
 async def build_financial_pipeline(

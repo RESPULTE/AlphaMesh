@@ -1,5 +1,6 @@
 import asyncio
-import logging
+import json
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Type
 
@@ -14,11 +15,12 @@ from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.agents.news_analysis_agent import CitedSource, NewsAnalysisAgent
+from core.logger import get_logger
+from core.memory.conversation_writeback import run_conversation_writeback
+from core.memory.prompts import SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
 
 # --- Import Core Services ---
 from core.services import service_manager
-
-from core.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -55,6 +57,10 @@ class OrchestratorState(BaseModel):
     plan: Optional[OrchestratorPlan] = None
     agent_outputs: Dict[str, BaseAgentOutput] = Field(default_factory=dict)
     final_response: Optional[FinalResponse] = None
+    # NEW: write-back payload populated by _synthesize_node
+    writeback_relationships: List[dict] = Field(default_factory=list)
+    writeback_entities: List[Any] = Field(default_factory=list)
+    conversation_id: Optional[str] = None  # passed in from caller
 
 
 class OrchestratorAgent:
@@ -94,9 +100,14 @@ class OrchestratorAgent:
         workflow.add_edge("portfolio_analyst", END)
         return workflow.compile()
 
-    async def run(self, messages: List[BaseMessage]) -> FinalResponse:
+    async def run(
+        self, messages: List[BaseMessage], conversation_id: Optional[str] = None
+    ) -> FinalResponse:
         """Entry point accepting a list of LangChain messages."""
-        initial_state = OrchestratorState(messages=messages)
+        initial_state = OrchestratorState(
+            messages=messages,
+            conversation_id=conversation_id,
+        )
         final_state = await self._graph.ainvoke(initial_state)
 
         if final_state.get("final_response"):
@@ -155,9 +166,15 @@ class OrchestratorAgent:
         return {"agent_outputs": outputs}
 
     async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """
+        MODIFIED: Emits CoT <relationships> block before the user-facing response.
+        The relationships block serves as explicit reasoning grounding the analysis.
+        Write-back is fired asynchronously after this node completes.
+        """
         context_parts = []
         fundamental_df = None
         news_sources = []
+        all_enriched_entities = []
 
         for name, output in state.agent_outputs.items():
             context_parts.append(output.get_llm_context_str())
@@ -165,30 +182,61 @@ class OrchestratorAgent:
                 fundamental_df = getattr(output, "financial_data", None)
             if name == "news_agent":
                 news_sources = getattr(output, "sources", [])
+            # Collect enriched entities from ALL agents
+            all_enriched_entities.extend(getattr(output, "entities_enriched", []))
 
-        # Using MessagesPlaceholder to inject the history into the synthesis
+        # Use the CoT synthesiser prompt instead of the old system prompt
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    "You are a Senior Financial Analyst. Write a cohesive narrative summary based on findings.\n"
-                    "**IMPORTANT**: Use numeric in-text citations like [1], [2].\n"
-                    "Findings:\n{context}",
+                    SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
+                    + "\n\nAgent Findings:\n{context}",
                 ),
                 MessagesPlaceholder(variable_name="history"),
-                ("human", "Produce the final analysis based on our conversation."),
+                ("human", "Produce the relationship reasoning and final analysis."),
             ]
         )
 
         chain = prompt | self._llm
         response = await chain.ainvoke(
-            {"history": state.messages, "context": "\n".join(context_parts)}
+            {"history": state.messages, "context": "\n\n".join(context_parts)}
         )
+        raw = response.content.strip()
+
+        # --- Parse <relationships> block (fault-tolerant) ---
+        relationships = []
+        rel_match = re.search(r"<relationships>(.*?)</relationships>", raw, re.DOTALL)
+        if rel_match:
+            try:
+                relationships = json.loads(rel_match.group(1).strip())
+                if not isinstance(relationships, list):
+                    relationships = []
+            except json.JSONDecodeError:
+                relationships = []  # malformed JSON must NOT break user response
+
+        # --- Parse <response> block ---
+        resp_match = re.search(r"<response>(.*?)</response>", raw, re.DOTALL)
+        user_response = resp_match.group(1).strip() if resp_match else raw
+
+        # --- Fire write-back asynchronously (non-blocking) ---
+        # This runs after the node returns — user never waits for it
+        if state.conversation_id:
+            asyncio.create_task(
+                run_conversation_writeback(
+                    relationships=relationships,
+                    enriched_entities=all_enriched_entities,
+                    user_email=None,  # pass from caller if multi-tenant needed
+                    conversation_id=state.conversation_id,
+                )
+            )
 
         return {
             "final_response": FinalResponse(
-                summary=response.content,
+                summary=user_response,
                 fundamental_data=fundamental_df,
                 sources=news_sources,
-            )
+            ),
+            "writeback_relationships": relationships,
+            "writeback_entities": all_enriched_entities,
         }

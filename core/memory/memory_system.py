@@ -43,7 +43,10 @@ from core.memory.nodeset_manager import (
 )
 
 # Initialize predefined Sector entities
-from core.memory.pipeline_tasks import build_financial_pipeline
+from core.memory.pipeline_tasks import (
+    build_financial_pipeline,
+    build_lean_document_pipeline,
+)
 from core.memory.prompts import get_search_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -545,47 +548,103 @@ class FinancialMemorySystem:
         node_set = [GLOBAL_NODESET_NAME] if is_global else None
         await self._add_to_cognee(text, node_set=node_set)
 
+    async def ingest_document_lean(
+        self,
+        ticker: str,
+        report_type: str,
+        content: str,
+        period: Optional[str] = None,
+        include_summaries: bool = True,
+        is_global: bool = True,
+    ) -> Any:
+        """
+        Ingest a financial document using the lean pipeline (no graph extraction).
+
+        REPLACES the pattern of: ingest_financial_report() → cognify()
+        for standard document ingestion use cases.
+
+        The lean pipeline:
+          - Chunks the document
+          - Optionally generates terse financial summaries (80 tokens/chunk)
+          - Embeds and indexes chunks for vector retrieval
+          - Does NOT extract entities or build graph edges
+
+        Graph construction happens lazily via conversation write-back as
+        users query the system and the synthesiser extracts relationships.
+
+        Args:
+            ticker:            Stock ticker (e.g. "AAPL").
+            report_type:       "10-K", "10-Q", "8-K", "annual", "quarterly".
+            content:           Full text of the report.
+            period:            Reporting period string (e.g. "Q3 2024"). Optional.
+            include_summaries: If True, runs lean per-chunk summarisation.
+            is_global:         True for public SEC filings (default).
+
+        Returns:
+            PipelineRunInfo from run_custom_pipeline.
+
+        Raises:
+            IngestionError:   If cognee.add() fails.
+            MemorySystemError: If the pipeline fails.
+        """
+        self._require_initialized()
+
+        if not ticker or not content:
+            raise ValueError("ticker and content are required.")
+
+        header = f"FINANCIAL REPORT\nTICKER: {ticker.upper()}\nTYPE: {report_type}\n"
+        if period:
+            header += f"PERIOD: {period}\n"
+        text = header + "\n" + content
+
+        node_set = [GLOBAL_NODESET_NAME] if is_global else None
+        await self._add_to_cognee(text, node_set=node_set)
+
+        logger.info(
+            "Running lean pipeline for %s %s (%d chars, summaries=%s).",
+            report_type,
+            ticker.upper(),
+            len(text),
+            include_summaries,
+        )
+
+        tasks = await build_lean_document_pipeline(include_summaries=include_summaries)
+
+        try:
+            result = await run_custom_pipeline(
+                tasks=tasks,
+                dataset=DATASET_NAME,
+                pipeline_name="lean_document_pipeline",
+                incremental_loading=True,
+            )
+            logger.info(
+                "Lean document pipeline completed for %s %s.", report_type, ticker
+            )
+            return result
+        except Exception as exc:
+            raise MemorySystemError(f"Lean document pipeline failed: {exc}") from exc
+
     async def ingest_conversation(
         self,
         user_email: str,
         messages: List[dict],
     ) -> None:
         """
-        Ingest a conversation session.
+        DEPRECATED: Conversation insights now flow into the knowledge graph via
+        OrchestratorAgent._synthesize_node → run_conversation_writeback.
 
-        The conversation is formatted as plain text and classified as USER-scoped
-        by the LLM during cognify().
+        Kept for backward compatibility. In the new architecture this method
+        is a no-op — calling it will log a warning and return immediately.
 
-        Args:
-            user_email: Owner of this conversation.
-            messages:   List of {role, content} dicts (OpenAI-style turns).
-
-        Raises:
-            IngestionError: If cognee.add() fails.
-            ValueError: If messages is empty or malformed.
+        To write conversation entities to the graph, call run_conversation_writeback()
+        from the synthesiser after each conversation turn.
         """
-        self._require_initialized()
-
-        if not messages:
-            raise ValueError("messages must be a non-empty list.")
-
-        # Ensure the user's NodeSet is pre-created before cognify runs
-        await self.get_user_context(user_email)
-
-        lines = [
-            f"[{msg.get('role', 'unknown').upper()}]: {msg.get('content', '')}"
-            for msg in messages
-        ]
-        text = "\n".join(lines)
-
-        logger.info(
-            "Ingesting conversation for '%s' (%d messages, %d chars).",
-            user_email,
-            len(messages),
-            len(text),
+        logger.warning(
+            "ingest_conversation() is deprecated. Conversation insights are now "
+            "written to the graph via run_conversation_writeback() from the synthesiser. "
+            "This call has no effect."
         )
-        nodeset_name = get_user_nodeset_name(user_email)
-        await self._add_to_cognee(text, node_set=[nodeset_name])
+        return
 
     # ------------------------------------------------------------------
     # Batch ingestion
