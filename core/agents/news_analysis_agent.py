@@ -181,13 +181,17 @@ async def ingest_stock_news_tool(
                     "publish_time": meta.get("publishedAt", ""),
                 }
 
-                success = (
-                    await service_manager.get_vector_store_manager().ingest_article(
-                        raw_text=text,
-                        source_metadata=source_meta,
-                        should_summarize=False,
+                from core.memory.memory_system import IngestionItem
+
+                item = IngestionItem(content=text, metadata=source_meta)
+                try:
+                    await service_manager.get_memory_system().ingest_document_lean(
+                        user_email=None, items=[item]  # Global context for news
                     )
-                )
+                    success = True
+                except Exception as e:
+                    logger.error(f"Error ingesting news article: {e}")
+                    success = False
 
                 if success and LOG_INGESTED_TITLES:
                     logger.info(f"      + Ingested: {title}")
@@ -313,12 +317,22 @@ class NewsAnalysisAgent(AbstractAgent):
             f"🔍 [Step: Retrieve] Checking vector store (Attempt {state.attempt_count})..."
         )
 
-        docs = await asyncio.to_thread(
-            service_manager.get_vector_store_manager().retrieve,
-            query=state.vector_query,
-            filter_dict={"ticker": state.ticker},
-            k=10,
+        import cognee
+
+        search_results = await cognee.search(
+            query_type=service_manager.get_chunk_search_type(),
+            query_text=state.vector_query,
         )
+
+        # Cognee chunk search results are typically a list of dicts with 'chunk_text' and 'metadata'
+        docs = []
+        for res in search_results:
+            docs.append(
+                {
+                    "page_content": res.get("chunk_text") or res.get("text", ""),
+                    "metadata": res.get("metadata") or {},
+                }
+            )
 
         context_pieces = []
         current_article_count = len(state.news_context)
@@ -327,12 +341,12 @@ class NewsAnalysisAgent(AbstractAgent):
 
         if docs:
             logger.info(f"   -> Found {len(docs)} existing documents.")
-            for i, doc in enumerate(docs, start=start_id):
-                meta = doc.metadata
+            for i, doc in enumerate(docs[:10], start=start_id):
+                meta = doc["metadata"]
                 title = meta.get("title", "Unknown Title")
                 url = meta.get("url", "#")
                 pub_time_str = meta.get("publish_time", "")
-                content = meta.get("summary", doc.page_content)
+                content = doc["page_content"]
 
                 if url in [c.url for c in state.news_context]:
                     logger.info(

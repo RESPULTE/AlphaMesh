@@ -112,7 +112,7 @@ async def run_integration_tests():
             n_agent._graph.ainvoke = AsyncMock(
                 return_value={
                     "analysis": "Test news analysis.",
-                    "news_context": [],
+                    "sources": [],
                     "entities_enriched": [MagicMock(ticker="MSFT")],
                 }
             )
