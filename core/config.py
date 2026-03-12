@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 64
 
+    # Extraction Configuration
+    EXTRACTION_BATCH_SIZE: int = 6
+    EXTRACTION_MAX_CONCURRENCY: int = 3
+
     # NewsAPI Configuration
     NEWSAPI_KEY: Optional[str] = None
 

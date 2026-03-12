@@ -19,12 +19,19 @@ from core.agents.models import (
     NewsAgentOutput,
     NewsAgentState,
 )
+from core.config import settings
 from core.graph.extraction_prompts import build_extraction_prompt
-from core.graph.models import ENTITY_NAMESPACE, ChunkExtractionResult, EntityNode
+from core.graph.models import (
+    ENTITY_NAMESPACE,
+    BatchExtractionResult,
+    ChunkExtractionResult,
+    EntityNode,
+)
 from core.logger import get_logger
 from core.services import service_manager
 
 logger = get_logger(__name__)
+EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 
 
 class NewsAnalysisAgent(AbstractAgent):
@@ -209,38 +216,71 @@ class NewsAnalysisAgent(AbstractAgent):
             return {"extraction_results": [], "entities_enriched": []}
 
         chunk_lookup = {c.chunk_id: c for c in state.retrieved_chunks}
-        prompt = build_extraction_prompt()
-        extraction_chain = prompt | self._llm.with_structured_output(
-            ChunkExtractionResult
-        )
-
-        async def _extract_chunk(chunk: ChunkResult) -> ChunkExtractionResult:
-
-            try:
-                result: ChunkExtractionResult = await extraction_chain.ainvoke(
-                    {"chunk_text": chunk.text}
-                )
-            except Exception as exc:
-                logger.error(
-                    "Extraction failed for chunk %s: %s", chunk.chunk_id[:10], exc
-                )
-                raise
-
-            result.chunk_id = chunk.chunk_id
-            return result
-
-        tasks = [
-            _extract_chunk(chunk_lookup[cid])
+        chunks_to_process = [
+            chunk_lookup[cid]
             for cid in state.unextracted_chunk_ids
             if cid in chunk_lookup
         ]
-        results = await asyncio.gather(*tasks)
+        if not chunks_to_process:
+            return {"extraction_results": [], "entities_enriched": []}
+
+        prompt = build_extraction_prompt()
+        extraction_chain = prompt | self._llm.with_structured_output(
+            BatchExtractionResult
+        )
+
+        async def _extract_batch(
+            chunks: List[ChunkResult],
+        ) -> BatchExtractionResult:
+            chunk_blocks = "\n\n".join(
+                [f"[CHUNK_ID: {chunk.chunk_id}]\n{chunk.text}" for chunk in chunks]
+            )
+            try:
+                async with EXTRACTION_SEMAPHORE:
+                    result: BatchExtractionResult = await extraction_chain.ainvoke(
+                        {"chunk_blocks": chunk_blocks}
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Extraction failed for batch starting %s: %s",
+                    chunks[0].chunk_id[:10],
+                    exc,
+                )
+                raise
+
+            return result
+
+        batch_size = max(settings.EXTRACTION_BATCH_SIZE, 1)
+        batches = [
+            chunks_to_process[i : i + batch_size]
+            for i in range(0, len(chunks_to_process), batch_size)
+        ]
+        batch_results = await asyncio.gather(
+            *[_extract_batch(batch) for batch in batches]
+        )
+
+        results: List[ChunkExtractionResult] = []
+        for batch in batch_results:
+            results.extend(batch.results)
+
+        validated_results: List[ChunkExtractionResult] = []
+        for result in results:
+            if not result.chunk_id:
+                logger.warning("Skipping extraction result with missing chunk_id.")
+                continue
+            if result.chunk_id not in chunk_lookup:
+                logger.warning(
+                    "Skipping extraction result for unknown chunk_id: %s",
+                    result.chunk_id,
+                )
+                continue
+            validated_results.append(result)
 
         entities_enriched: List[EntityNode] = []
         neo4j_adapter = service_manager.get_neo4j_adapter()
         chroma_adapter = service_manager.get_chroma_adapter()
 
-        for result in results:
+        for result in validated_results:
             local_id_map = {}
             for entity in result.entities:
                 canonical_id = str(
@@ -289,7 +329,10 @@ class NewsAnalysisAgent(AbstractAgent):
                     [result.chunk_id], [updated_metadata]
                 )
 
-        return {"extraction_results": results, "entities_enriched": entities_enriched}
+        return {
+            "extraction_results": validated_results,
+            "entities_enriched": entities_enriched,
+        }
 
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""

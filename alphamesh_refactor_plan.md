@@ -71,6 +71,9 @@ CHROMA_COLLECTION_NEWS: str = "news_chunks"
 
 CHUNK_SIZE: int = 512          # tokens
 CHUNK_OVERLAP: int = 64        # tokens
+
+EXTRACTION_BATCH_SIZE: int = 6
+EXTRACTION_MAX_CONCURRENCY: int = 3
 ```
 
 All values must be sourced from the `.env` file via `pydantic-settings`. No defaults for credentials.
@@ -117,6 +120,9 @@ Define Pydantic models that represent the Neo4j graph schema. These are **not** 
 
 **`ChunkExtractionResult`**
 - Fields: `chunk_id: str`, `entities: List[EntityNode]`, `relationships: List[ExtractedRelationship]`
+
+**`BatchExtractionResult`**
+- Fields: `results: List[ChunkExtractionResult]`
 
 ---
 
@@ -416,15 +422,7 @@ entities_enriched: List[EntityNode]   # for orchestrator writeback
 - Writes to state: `unextracted_chunk_ids`
 
 **`extract_entities_node`**
-- For each unextracted chunk (can be parallelised with `asyncio.gather`):
-  - Builds prompt using `build_extraction_prompt()`
-  - Calls LLM with `with_structured_output(ChunkExtractionResult)` (LangChain structured output)
-  - Resolves entity canonical IDs using UUID5 on `(name, entity_type)`
-  - Calls `neo4j_adapter.merge_entity_node(...)` for each entity
-  - Calls `neo4j_adapter.merge_relationship(...)` for each relationship
-  - Calls `neo4j_adapter.update_chunk_extraction_status(chunk_id, "EXTRACTED")`
-  - Updates ChromaDB metadata via `chroma_adapter` to set `extraction_status = "EXTRACTED"`
-- Writes to state: `extraction_results`, `entities_enriched`
+> Uses a batched extraction strategy. Unextracted chunks are grouped into batches of up to `EXTRACTION_BATCH_SIZE` chunks (default 6, configurable via `config.py`). Each batch is a single LLM call using `with_structured_output(BatchExtractionResult)`. The prompt includes all chunks in the batch with clear `[CHUNK_ID: ...]` delimiters so the LLM can echo back the correct `chunk_id` in each result. Batches are processed with `asyncio.gather` gated by a module-level `asyncio.Semaphore(EXTRACTION_MAX_CONCURRENCY)` (default 3). After each batch call, each `ChunkExtractionResult` is individually committed to Neo4j and both store statuses are updated.
 
 **`analyse_news_node`**
 - Builds context string from ALL `retrieved_chunks` (both previously extracted and newly extracted)

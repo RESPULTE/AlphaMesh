@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core import logger
 from core.agents.models import BaseAgentInput
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 
@@ -58,5 +57,3 @@ async def test_news_agent_pipeline() -> None:
     if output.sources:
         assert all(source.title for source in output.sources)
         assert all(source.url for source in output.sources)
-
-    logger.get_logger(__name__).info("NewsAnalysisAgent output: %s", output)

@@ -90,3 +90,11 @@ class ChunkExtractionResult(BaseModel):
     )
     entities: List[EntityNode] = Field(default_factory=list)
     relationships: List[ExtractedRelationship] = Field(default_factory=list)
+
+
+class BatchExtractionResult(BaseModel):
+    """Structured extraction output for a batch of chunks."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    results: List[ChunkExtractionResult] = Field(default_factory=list)
