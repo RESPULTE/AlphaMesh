@@ -1,4 +1,5 @@
 """Article chunking utilities for news ingestion."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -8,7 +9,10 @@ from uuid import uuid4
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, ConfigDict, Field
 
+from core import logger
 from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class DocumentMetadata(BaseModel):
@@ -73,7 +77,9 @@ class ArticleChunker:
         )
 
         document_id = str(uuid4())
-        full_text = "\n\n".join([part for part in [title, description, content] if part])
+        full_text = "\n\n".join(
+            [part for part in [title, description, content] if part]
+        )
         chunks = self._splitter.split_text(full_text)
 
         document_meta = DocumentMetadata(
@@ -83,6 +89,8 @@ class ArticleChunker:
             published_at=published_at,
             companies_involved=companies_involved,
         )
+
+        logger.info("Chunking article '%s' into %d chunks.", title, len(chunks))
 
         chunk_records: List[ChunkRecord] = []
         for idx, chunk_text in enumerate(chunks):

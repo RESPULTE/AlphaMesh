@@ -1,4 +1,5 @@
 """Pydantic models and constants for the Neo4j graph schema."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,7 +7,6 @@ from typing import List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
-
 
 ENTITY_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 
@@ -85,6 +85,8 @@ class ChunkExtractionResult(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    chunk_id: str
+    chunk_id: str = Field(
+        default="", description="ignored by input, used for traceability in output"
+    )
     entities: List[EntityNode] = Field(default_factory=list)
     relationships: List[ExtractedRelationship] = Field(default_factory=list)

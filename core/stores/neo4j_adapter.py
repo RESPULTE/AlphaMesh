@@ -83,7 +83,6 @@ class Neo4jAdapter:
             "MERGE (d:Document {id: $doc_id}) "
             "MERGE (c:Chunk {id: $id}) "
             "SET c += $props "
-            "MERGE (d)-[:HAS_CHUNK]->(c) "
             "MERGE (c)-[:BELONGS_TO_DOCUMENT]->(d)"
         )
         props = node.model_dump()
@@ -143,18 +142,18 @@ class Neo4jAdapter:
         props = {"id": nodeset_id, "name": name, "description": description}
         await self._execute_write(cypher, {"id": nodeset_id, "props": props})
 
-    async def anchor_document_to_global(
-        self, document_id: str, global_anchor_id: str
-    ) -> None:
-        """Anchor a document to the global anchor node."""
-        cypher = (
-            "MERGE (d:Document {id: $doc_id}) "
-            "MERGE (g:GlobalAnchor {id: $anchor_id}) "
-            "MERGE (d)-[:ANCHORED_TO]->(g)"
-        )
-        await self._execute_write(
-            cypher, {"doc_id": document_id, "anchor_id": global_anchor_id}
-        )
+    # async def anchor_document_to_global(
+    #     self, document_id: str, global_anchor_id: str
+    # ) -> None:
+    #     """Anchor a document to the global anchor node."""
+    #     cypher = (
+    #         "MERGE (d:Document {id: $doc_id}) "
+    #         "MERGE (g:GlobalAnchor {id: $anchor_id}) "
+    #         "MERGE (d)-[:ANCHORED_TO]->(g)"
+    #     )
+    #     await self._execute_write(
+    #         cypher, {"doc_id": document_id, "anchor_id": global_anchor_id}
+    #     )
 
     async def close(self) -> None:
         """Close the underlying Neo4j driver."""

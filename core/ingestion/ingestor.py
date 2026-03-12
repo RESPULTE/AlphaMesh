@@ -1,6 +1,8 @@
 """Dual-store ingestion pipeline for news articles."""
+
 from __future__ import annotations
 
+import datetime
 from datetime import datetime, timezone
 from typing import List
 
@@ -31,18 +33,38 @@ class DualStoreIngestor:
         self._chunker = chunker
         self._logger = get_logger(__name__)
 
-    async def ingest_articles(self, articles: List[dict], companies_involved: List[str]) -> List[str]:
+    async def ingest_articles(
+        self, articles: List[dict], companies_involved: List[str]
+    ) -> List[str]:
         """Ingest a batch of articles into both stores."""
         try:
-            global_anchor_id = await self._nodeset_manager.get_global_financial_events_id()
+            global_anchor_id = (
+                await self._nodeset_manager.get_global_financial_events_id()
+            )
             documents: List[DocumentMetadata] = []
             chunks: List[ChunkRecord] = []
             for article in articles:
+                source_url = (article.get("url") or "").strip()
+
+                existing_chunks = await self._chroma_adapter.get_chunks_with_source_url(
+                    source_url
+                )
+                if source_url and len(existing_chunks) > 0:
+                    self._logger.info(
+                        "Skipping article with existing source URL: %s", source_url
+                    )
+                    continue
                 doc_meta, chunk_records = self._chunker.chunk_article(
                     article, companies_involved
                 )
                 documents.append(doc_meta)
                 chunks.extend(chunk_records)
+
+            if not documents:
+                self._logger.info(
+                    "No new articles to ingest after filtering by source URL."
+                )
+                return []
 
             await self._write_document_nodes(documents, global_anchor_id)
             await self._write_chunk_nodes(chunks, global_anchor_id)
@@ -69,9 +91,6 @@ class DualStoreIngestor:
                     nodeset_ids=[global_anchor_id],
                 )
                 await self._neo4j_adapter.merge_document_node(node)
-                await self._neo4j_adapter.anchor_document_to_global(
-                    doc.document_id, global_anchor_id
-                )
                 await self._nodeset_manager.assign_to_node(
                     doc.document_id, "Document", global_anchor_id
                 )

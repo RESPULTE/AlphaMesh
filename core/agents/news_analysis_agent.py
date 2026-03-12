@@ -1,4 +1,5 @@
 """News analysis agent with dual-store ingestion and chunk-level extraction."""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,7 @@ from core.agents.models import (
     NewsAgentState,
 )
 from core.graph.extraction_prompts import build_extraction_prompt
-from core.graph.models import ChunkExtractionResult, ENTITY_NAMESPACE, EntityNode
+from core.graph.models import ENTITY_NAMESPACE, ChunkExtractionResult, EntityNode
 from core.logger import get_logger
 from core.services import service_manager
 
@@ -52,7 +53,9 @@ class NewsAnalysisAgent(AbstractAgent):
 
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
-        start_date = input_data.start_date or (datetime.now(timezone.utc) - timedelta(days=7))
+        start_date = input_data.start_date or (
+            datetime.now(timezone.utc) - timedelta(days=7)
+        )
         end_date = input_data.end_date or datetime.now(timezone.utc)
 
         initial_state = NewsAgentState(
@@ -139,7 +142,7 @@ class NewsAnalysisAgent(AbstractAgent):
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
             raise
-
+        logger.info("Ingested articles into memory. #Chunk IDs: %s", len(chunk_ids))
         return {"chunk_ids": chunk_ids}
 
     async def _retrieve_chunks_node(self, state: NewsAgentState) -> dict:
@@ -153,12 +156,10 @@ class NewsAnalysisAgent(AbstractAgent):
             logger.error("Embedding query failed: %s", exc)
             raise
 
-        where = None
-        if state.ticker:
-            where = {"companies_involved": state.ticker}
-
         try:
-            result = await chroma_adapter.query(query_embedding, n_results=20, where=where)
+            result = await chroma_adapter.query(
+                query_embedding, n_results=20, where=None
+            )
         except Exception as exc:
             logger.error("ChromaDB query failed: %s", exc)
             raise
@@ -178,7 +179,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     score=distances[idx] if idx < len(distances) else 0.0,
                 )
             )
-
+        logger.info("Retrieved %d chunks from ChromaDB.", len(retrieved))
         return {"retrieved_chunks": retrieved}
 
     async def _identify_unextracted_node(self, state: NewsAgentState) -> dict:
@@ -188,8 +189,10 @@ class NewsAnalysisAgent(AbstractAgent):
 
         chunk_ids = [chunk.chunk_id for chunk in state.retrieved_chunks]
         try:
-            status_map = await service_manager.get_neo4j_adapter().get_chunk_extraction_status(
-                chunk_ids
+            status_map = (
+                await service_manager.get_neo4j_adapter().get_chunk_extraction_status(
+                    chunk_ids
+                )
             )
         except Exception as exc:
             logger.error("Failed to fetch extraction status: %s", exc)
@@ -207,26 +210,29 @@ class NewsAnalysisAgent(AbstractAgent):
 
         chunk_lookup = {c.chunk_id: c for c in state.retrieved_chunks}
         prompt = build_extraction_prompt()
-        extraction_chain = prompt | self._llm.with_structured_output(ChunkExtractionResult)
+        extraction_chain = prompt | self._llm.with_structured_output(
+            ChunkExtractionResult
+        )
 
         async def _extract_chunk(chunk: ChunkResult) -> ChunkExtractionResult:
-            companies = chunk.metadata.get("companies_involved", [])
-            if isinstance(companies, str):
-                companies = [c.strip() for c in companies.split(",") if c.strip()]
 
             try:
                 result: ChunkExtractionResult = await extraction_chain.ainvoke(
-                    {"chunk_text": chunk.text, "companies": ", ".join(companies)}
+                    {"chunk_text": chunk.text}
                 )
             except Exception as exc:
-                logger.error("Extraction failed for chunk %s: %s", chunk.chunk_id, exc)
+                logger.error(
+                    "Extraction failed for chunk %s: %s", chunk.chunk_id[:10], exc
+                )
                 raise
 
             result.chunk_id = chunk.chunk_id
             return result
 
         tasks = [
-            _extract_chunk(chunk_lookup[cid]) for cid in state.unextracted_chunk_ids if cid in chunk_lookup
+            _extract_chunk(chunk_lookup[cid])
+            for cid in state.unextracted_chunk_ids
+            if cid in chunk_lookup
         ]
         results = await asyncio.gather(*tasks)
 
@@ -271,13 +277,17 @@ class NewsAnalysisAgent(AbstractAgent):
                     },
                 )
 
-            await neo4j_adapter.update_chunk_extraction_status(result.chunk_id, "EXTRACTED")
+            await neo4j_adapter.update_chunk_extraction_status(
+                result.chunk_id, "EXTRACTED"
+            )
 
             chunk = chunk_lookup.get(result.chunk_id)
             if chunk:
                 updated_metadata = dict(chunk.metadata)
                 updated_metadata["extraction_status"] = "EXTRACTED"
-                await chroma_adapter.update_metadata([result.chunk_id], [updated_metadata])
+                await chroma_adapter.update_metadata(
+                    [result.chunk_id], [updated_metadata]
+                )
 
         return {"extraction_results": results, "entities_enriched": entities_enriched}
 
@@ -314,7 +324,10 @@ class NewsAnalysisAgent(AbstractAgent):
 
         try:
             response = await self._llm.ainvoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ]
             )
             analysis_text = response.content
         except Exception as exc:

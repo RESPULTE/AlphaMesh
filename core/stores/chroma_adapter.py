@@ -151,3 +151,19 @@ class ChromaDBAdapter:
         except Exception:
             self._logger.exception("Failed to update ChromaDB metadata.")
             raise
+
+    async def get_chunks_with_source_url(self, source_url: str) -> dict:
+        """Check whether any chunks exist with the given source URL."""
+        if not source_url:
+            return []
+        try:
+            collection = await self.get_or_create_collection(self._collection_name)
+            result = await asyncio.to_thread(
+                collection.get, where={"source_url": source_url}, limit=1
+            )
+            if not result["ids"] or not result["documents"] or not result["metadatas"]:
+                return {}
+            return result
+        except Exception:
+            self._logger.exception("Failed to check ChromaDB for source URL.")
+            raise

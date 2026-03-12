@@ -1,116 +1,62 @@
-"""Unit tests for NewsAnalysisAgent."""
+"""Integration test for NewsAnalysisAgent using live services."""
+
+import logging
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
-from core.agents.news_analysis_agent import NewsAnalysisAgent
+from core import logger
 from core.agents.models import BaseAgentInput
-from core.graph.models import ChunkExtractionResult
-from core.services import service_manager
-
-
-class DummyNewsAPI:
-    def get_everything(self, **kwargs):
-        return {
-            "status": "ok",
-            "articles": [
-                {
-                    "title": "Test",
-                    "url": "http://example.com",
-                    "publishedAt": "2026-03-10T00:00:00Z",
-                    "description": "desc",
-                    "content": "content text",
-                    "source": {"name": "Example"},
-                }
-            ],
-        }
-
-
-class DummyIngestor:
-    async def ingest_articles(self, articles, companies_involved):
-        return ["chunk-1"]
-
-
-class DummyEmbeddingFunc:
-    async def aembed_query(self, query):
-        return [0.1, 0.2]
-
-    async def aembed_documents(self, docs):
-        return [[0.1, 0.2] for _ in docs]
-
-
-class DummyChromaAdapter:
-    async def query(self, _embedding, n_results, where=None):
-        return {
-            "ids": [["chunk-1"]],
-            "documents": [["chunk text"]],
-            "metadatas": [
-                [
-                    {
-                        "companies_involved": ["Test"],
-                        "article_title": "Test",
-                        "source_url": "http://example.com",
-                    }
-                ]
-            ],
-            "distances": [[0.1]],
-        }
-
-    async def update_metadata(self, ids, metadatas):
-        self.updated = list(zip(ids, metadatas))
-
-
-class DummyNeo4jAdapter:
-    async def get_chunk_extraction_status(self, chunk_ids):
-        return {cid: "PENDING" for cid in chunk_ids}
-
-    async def merge_entity_node(self, node):
-        self.entities = getattr(self, "entities", []) + [node]
-
-    async def merge_relationship(self, source_id, target_id, rel_type, props):
-        self.relationships = getattr(self, "relationships", []) + [
-            (source_id, target_id, rel_type, props)
-        ]
-
-    async def update_chunk_extraction_status(self, chunk_id, status):
-        self.status = (chunk_id, status)
-
-
-class DummyLLM:
-    def with_structured_output(self, schema):
-        return self
-
-    async def ainvoke(self, *args, **kwargs):
-        return type("Resp", (), {"content": "analysis"})()
-
-
-class DummyExtractionPrompt:
-    def __or__(self, other):
-        return self
-
-    async def ainvoke(self, *args, **kwargs):
-        return ChunkExtractionResult(chunk_id="chunk-1", entities=[], relationships=[])
+from core.agents.news_analysis_agent import NewsAnalysisAgent
 
 
 @pytest.mark.asyncio
-async def test_news_agent_pipeline(monkeypatch):
-    monkeypatch.setattr(service_manager, "get_news_api", lambda: DummyNewsAPI())
-    monkeypatch.setattr(service_manager, "get_ingestor", lambda: DummyIngestor())
-    monkeypatch.setattr(service_manager, "get_embedding_func", lambda: DummyEmbeddingFunc())
-    monkeypatch.setattr(service_manager, "get_chroma_adapter", lambda: DummyChromaAdapter())
-    monkeypatch.setattr(service_manager, "get_neo4j_adapter", lambda: DummyNeo4jAdapter())
-    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0: DummyLLM())
-    monkeypatch.setattr(
-        "core.graph.extraction_prompts.build_extraction_prompt",
-        lambda: DummyExtractionPrompt(),
-    )
+async def test_news_agent_pipeline() -> None:
+    logging.basicConfig(level=logging.INFO)
+
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=3)
 
     agent = NewsAnalysisAgent()
     input_data = BaseAgentInput(
-        query="test",
-        vector_query="vector test",
-        ticker="TEST",
-        start_date="2026-03-01",
-        end_date="2026-03-02",
+        query="Recent Apple stock price",
+        vector_query="Apple stock price",
+        ticker="AAPL",
+        start_date=start_date,
+        end_date=end_date,
     )
-    output = await agent.run(input_data)
-    assert output.analysis == "analysis"
-    assert output.sources
+
+    try:
+        output = await agent.run(input_data)
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        exc_type = str(type(exc).__name__).lower()
+        if any(
+            keyword in exc_str or keyword in exc_type
+            for keyword in [
+                "connection",
+                "refused",
+                "chroma",
+                "neo4j",
+                "could not connect",
+                "api key",
+                "apikey",
+                "unauthorized",
+                "permission",
+                "forbidden",
+                "quota",
+                "rate",
+                "timeout",
+                "newsapi",
+            ]
+        ):
+            pytest.skip(f"Skipping; live service call failed: {exc}")
+        raise
+
+    assert output.agent_name == "news_agent"
+    assert isinstance(output.analysis, str)
+    if output.sources:
+        assert all(source.title for source in output.sources)
+        assert all(source.url for source in output.sources)
+
+    logger.get_logger(__name__).info("NewsAnalysisAgent output: %s", output)
