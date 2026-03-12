@@ -15,6 +15,8 @@ os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
 
 from core.agents.orchestrator_agent import FinalResponse, OrchestratorAgent
+from core.config import settings
+from core.services import service_manager
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -80,6 +82,13 @@ class AlphaMeshUI:
         if "orchestrator" not in st.session_state:
 
             async def init():
+                service_manager.get_neo4j_adapter()
+                await service_manager.get_nodeset_manager().get_global_financial_events_id()
+                chroma_adapter = service_manager.get_chroma_adapter()
+                await chroma_adapter.get_or_create_collection(
+                    settings.CHROMA_COLLECTION_NEWS
+                )
+                service_manager.get_ingestor()
                 return OrchestratorAgent()
 
             st.session_state.orchestrator = AsyncLoopThread.run_coroutine(init())

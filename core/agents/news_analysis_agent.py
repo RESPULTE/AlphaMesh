@@ -1,623 +1,324 @@
-import asyncio
-import json
-import operator
-from datetime import datetime, timedelta, timezone
-from typing import Annotated, List, Optional, Type
+"""News analysis agent with dual-store ingestion and chunk-level extraction."""
+from __future__ import annotations
 
-from langchain_core.messages import (
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
-from langchain_core.tools import tool
+import asyncio
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import List, Type
+
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
-from newspaper import Article, ArticleException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from core.agents.base_agent import AbstractAgent
-from core.agents.models import BaseAgentInput, BaseAgentOutput
-
-# --- Logging Setup ---
+from core.agents.models import (
+    BaseAgentInput,
+    ChunkResult,
+    CitedSource,
+    NewsAgentOutput,
+    NewsAgentState,
+)
+from core.graph.extraction_prompts import build_extraction_prompt
+from core.graph.models import ChunkExtractionResult, ENTITY_NAMESPACE, EntityNode
 from core.logger import get_logger
-from core.memory.graph_models import Company
-from core.memory.pipeline_tasks import get_canonical_id
 from core.services import service_manager
 
 logger = get_logger(__name__)
 
-# --- Configuration & Toggles ---
-LOG_INGESTED_TITLES = True
-MAX_SEARCH_ATTEMPTS = 2
-MAX_LOOKBACK_DAYS = 29
-BATCH_SIZE = 10
-
-
-# --- Structured Outputs ---
-class SufficiencyCheck(BaseModel):
-    is_sufficient: bool = Field(description="True if context answers the question.")
-    reasoning: str = Field(description="Explanation.")
-
-
-class CitedSource(BaseModel):
-    source_id: int = Field(description="The numeric ID used in the text, e.g., 1.")
-    title: str = Field(description="The title of the article.")
-    url: str = Field(description="The URL of the article.")
-    page_content: str = Field(description="The content of the article.")
-
-
-class NewsAnalysisOutput(BaseAgentOutput):
-    """Data container for the News Analysis Agent."""
-
-    agent_name: str = "news_agent"
-    sources: List[CitedSource] = Field(
-        description="The list of raw source articles gathered by the agent."
-    )
-
-    def get_llm_context_str(self) -> str:
-        """Formats the list of sources into a numbered, citable block for the analyst LLM."""
-        if not self.sources:
-            return "### REPORT FROM news_agent\nNo relevant news articles were found."
-
-        header = "### REPORT FROM news_agent (Qualitative News Analysis)\n"
-        # Format each source with its citation ID prominently displayed
-        formatted_sources = "\n".join(
-            [
-                f"[{s.source_id}] Title: {s.title}\n"
-                f"    URL: {s.url}\n"
-                f'    Content Snippet: "{s.page_content[:300]}..."'
-                for s in self.sources
-            ]
-        )
-        return header + formatted_sources
-
-
-# --- Internal State ---
-class _AgentState(BaseAgentInput):
-    current_page: int = 1
-    last_total_results: int = 0
-    attempt_count: int = 0
-
-    latest_retrieved: Optional[datetime] = None
-    news_context: List[CitedSource] = Field(default_factory=list)
-
-    needs_more_data: bool = False
-    is_fully_resolved: bool = False
-
-    sufficiency_reasoning: str = ""
-
-    messages: Annotated[List[BaseMessage], operator.add] = Field(default_factory=list)
-
-
-# --- Tools ---
-
-
-def _download_article_sync(url: str) -> Optional[str]:
-    """Blocking helper to download and parse article text."""
-    try:
-        article = Article(url)
-        article.download()
-        article.parse()
-        if len(article.text) < 200:
-            return None
-        return article.text
-    except (Exception, ArticleException):
-        return None
-
-
-@tool
-async def ingest_stock_news_tool(
-    ticker: str, from_date: str, to_date: str, page: int
-) -> str:
-    """
-    Fetches news metadata from an API, downloads content, and ingests it directly
-    into the vector store. The vector store handles summarization and embedding.
-    Returns a JSON string with results count.
-    """
-    logger.info(
-        f"🛠️  Tool Call: Fetching '{ticker}' | Dates: {from_date} to {to_date} | Page: {page}"
-    )
-
-    try:
-        loop = asyncio.get_running_loop()
-
-        # 1. Fetch Metadata from NewsAPI
-        response = await loop.run_in_executor(
-            None,
-            lambda: service_manager.get_news_api().get_everything(
-                q=ticker,
-                from_param=from_date,
-                to=to_date,
-                language="en",
-                sort_by="relevancy",
-                page=page,
-                page_size=BATCH_SIZE,
-            ),
-        )
-
-        if response.get("status") != "ok":
-            logger.error(f"   ❌ API Error: {response.get('message')}")
-            return json.dumps(
-                {"success": False, "error": response.get("message"), "total_results": 0}
-            )
-
-        articles_meta = response.get("articles", [])
-        total_results = response.get("totalResults", 0)
-
-        if not articles_meta:
-            return json.dumps(
-                {
-                    "success": True,
-                    "count": 0,
-                    "total_results": 0,
-                    "message": "No articles found.",
-                }
-            )
-
-        # 2. Download Raw Content
-        logger.info(
-            f"   -> Downloading raw content for {len(articles_meta)} articles..."
-        )
-
-        sem = asyncio.Semaphore(10)
-
-        async def _fetch_and_ingest(meta):
-            async with sem:
-                url = meta.get("url")
-                if not url:
-                    return False
-
-                text = await loop.run_in_executor(None, _download_article_sync, url)
-                if not text:
-                    return False
-
-                title = meta.get("title", "Unknown")
-
-                source_meta = {
-                    "url": url,
-                    "title": title,
-                    "source": "NewsAPI",
-                    "ticker": ticker,
-                    "publish_time": meta.get("publishedAt", ""),
-                }
-
-                from core.memory.memory_system import IngestionItem
-
-                item = IngestionItem(content=text, metadata=source_meta)
-                try:
-                    await service_manager.get_memory_system().ingest_document_lean(
-                        user_email=None, items=[item]  # Global context for news
-                    )
-                    success = True
-                except Exception as e:
-                    logger.error(f"Error ingesting news article: {e}")
-                    success = False
-
-                if success and LOG_INGESTED_TITLES:
-                    logger.info(f"      + Ingested: {title}")
-
-                return success
-
-        results = await asyncio.gather(*[_fetch_and_ingest(a) for a in articles_meta])
-        ingest_count = sum(1 for r in results if r)
-
-        logger.info(
-            f"✅ Batch Complete. Ingested {ingest_count}/{len(articles_meta)} articles."
-        )
-
-        return json.dumps(
-            {
-                "success": True,
-                "count": ingest_count,
-                "total_results": total_results,
-                "message": f"Ingested {ingest_count} articles.",
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"❌ Critical Tool Error: {e}", exc_info=True)
-        return json.dumps({"success": False, "error": str(e), "total_results": 0})
-
-
-# --- Main Agent ---
-
 
 class NewsAnalysisAgent(AbstractAgent):
-    def __init__(self):
+    """LangGraph-based news analysis agent."""
+
+    def __init__(self) -> None:
+        """Initialize the agent and compile the graph."""
         super().__init__()
-        self.tools = [ingest_stock_news_tool]
-        self.tool_map = {t.name: t for t in self.tools}
-        self.llm_with_tools = service_manager.get_agent().bind_tools(self.tools)
+        self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
 
     @staticmethod
     def name() -> str:
+        """Return the agent name."""
         return "news_agent"
 
     @staticmethod
     def description() -> str:
-        return "Gathers raw news articles and sources based on a query. Does not perform analysis."
+        """Return the agent description."""
+        return "Ingests news into dual stores, extracts entities per chunk, and synthesizes analysis."
 
     @staticmethod
     def get_output_schema_class() -> Type[BaseModel]:
-        return NewsAnalysisOutput
+        """Return the output schema class."""
+        return NewsAgentOutput
 
-    async def run(self, input_data: BaseAgentInput) -> NewsAnalysisOutput:
-        logger.info(f"🚀 [Agent Start] Ticker: {input_data.ticker}")
+    async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
+        """Run the agent end-to-end with the provided input."""
+        start_date = input_data.start_date or (datetime.now(timezone.utc) - timedelta(days=7))
+        end_date = input_data.end_date or datetime.now(timezone.utc)
 
-        final_state = await self._graph.ainvoke(input_data.model_dump())
+        initial_state = NewsAgentState(
+            query=input_data.query,
+            ticker=input_data.ticker or "",
+            start_date=start_date,
+            end_date=end_date,
+        )
 
-        return NewsAnalysisOutput(**final_state)
+        final_state = await self._graph.ainvoke(initial_state.model_dump())
+        return NewsAgentOutput(**final_state)
 
     def _build_graph(self):
-        workflow = StateGraph(_AgentState, output_schema=NewsAnalysisOutput)
+        """Compile the linear LangGraph workflow."""
+        workflow = StateGraph(NewsAgentState, output_schema=NewsAgentOutput)
 
-        # Define Nodes
-        workflow.add_node("parse_input", self._parse_input)
-        workflow.add_node("retrieve", self._retrieve_news)
-        workflow.add_node("evaluate_sufficiency", self._evaluate_sufficiency)
-        workflow.add_node("strategize_search", self._strategize_search)
+        workflow.add_node("fetch_news", self._fetch_news_node)
+        workflow.add_node("ingest_articles", self._ingest_articles_node)
+        workflow.add_node("retrieve_chunks", self._retrieve_chunks_node)
+        workflow.add_node("identify_unextracted", self._identify_unextracted_node)
+        workflow.add_node("extract_entities", self._extract_entities_node)
+        workflow.add_node("analyse_news", self._analyse_news_node)
 
-        # NEW: The combined node
-        workflow.add_node("execute_search_action", self._execute_search_action)
-
-        workflow.add_node("generate_analysis", self._generate_analysis)
-
-        # Define Edges
-        workflow.add_edge(START, "parse_input")
-        workflow.add_edge("parse_input", "retrieve")
-        workflow.add_edge("retrieve", "evaluate_sufficiency")
-
-        # Sufficiency Logic (With the dictionary fix from the previous step)
-        workflow.add_conditional_edges(
-            "evaluate_sufficiency",
-            lambda state: (
-                "generate_analysis" if state.is_fully_resolved else "strategize_search"
-            ),
-            {
-                "generate_analysis": "generate_analysis",
-                "strategize_search": "strategize_search",
-            },
-        )
-
-        # Strategy Logic
-        # Note: We now point to 'execute_search_action' instead of 'call_tool_agent'
-        workflow.add_conditional_edges(
-            "strategize_search",
-            lambda state: (
-                "execute_search_action"
-                if state.needs_more_data
-                else "generate_analysis"
-            ),
-            {
-                "execute_search_action": "execute_search_action",
-                "generate_analysis": "generate_analysis",
-            },
-        )
-
-        # Simplified Flow
-        # execute_search_action now loops directly back to retrieve
-        workflow.add_edge("execute_search_action", "retrieve")
-
-        workflow.add_edge("generate_analysis", END)
+        workflow.add_edge(START, "fetch_news")
+        workflow.add_edge("fetch_news", "ingest_articles")
+        workflow.add_edge("ingest_articles", "retrieve_chunks")
+        workflow.add_edge("retrieve_chunks", "identify_unextracted")
+        workflow.add_edge("identify_unextracted", "extract_entities")
+        workflow.add_edge("extract_entities", "analyse_news")
+        workflow.add_edge("analyse_news", END)
 
         return workflow.compile()
 
-    # --- Node Implementations ---
+    def _extract_companies(self, articles: List[dict], ticker: str) -> List[str]:
+        """Derive a companies-involved list from article metadata."""
+        companies = set()
+        if ticker:
+            companies.add(ticker.upper())
+        for article in articles:
+            source = article.get("source") or {}
+            name = source.get("name")
+            if name:
+                companies.add(name)
+        return sorted(companies)
 
-    def _parse_input(self, state: BaseAgentInput) -> _AgentState:
-        if (datetime.now() - state.start_date) > timedelta(days=MAX_LOOKBACK_DAYS):
-            state.start_date = datetime.now() - timedelta(days=MAX_LOOKBACK_DAYS)
-
-        return state.model_dump().copy()
-
-    async def _retrieve_news(self, state: _AgentState) -> dict:
-        # REWRITTEN: Use state.attribute access
-        logger.info(
-            f"🔍 [Step: Retrieve] Checking vector store (Attempt {state.attempt_count})..."
-        )
-
-        import cognee
-
-        search_results = await cognee.search(
-            query_type=service_manager.get_chunk_search_type(),
-            query_text=state.vector_query,
-        )
-
-        # Cognee chunk search results are typically a list of dicts with 'chunk_text' and 'metadata'
-        docs = []
-        for res in search_results:
-            docs.append(
-                {
-                    "page_content": res.get("chunk_text") or res.get("text", ""),
-                    "metadata": res.get("metadata") or {},
-                }
-            )
-
-        context_pieces = []
-        current_article_count = len(state.news_context)
-        start_id = current_article_count + 1
-        latest_retrieved = state.latest_retrieved
-
-        if docs:
-            logger.info(f"   -> Found {len(docs)} existing documents.")
-            for i, doc in enumerate(docs[:10], start=start_id):
-                meta = doc["metadata"]
-                title = meta.get("title", "Unknown Title")
-                url = meta.get("url", "#")
-                pub_time_str = meta.get("publish_time", "")
-                content = doc["page_content"]
-
-                if url in [c.url for c in state.news_context]:
-                    logger.info(
-                        f"skipping article already in context: {title[:50]}...."
-                    )
-                    continue  # Skip already added articles
-
-                context_pieces.append(
-                    CitedSource(source_id=i, title=title, url=url, page_content=content)
-                )
-                if pub_time_str:
-                    try:
-                        latest_retrieved = datetime.fromisoformat(
-                            pub_time_str.replace("Z", "+00:00")
-                        )
-                    except ValueError:
-                        pass  # Ignore if date format is unexpected
-        else:
-            logger.info("   -> No documents found in store.")
-
-        return {
-            "news_context": context_pieces,
-            "latest_retrieved": latest_retrieved,
-        }
-
-    async def _evaluate_sufficiency(self, state: _AgentState) -> dict:
-        """
-        Evaluates if enough data has been gathered based on heuristics.
-        """
-        # REWRITTEN: Use state.attribute access
-        logger.info(
-            f"🤔 [Step: Evaluate Sufficiency] Attempt {state.attempt_count}/{MAX_SEARCH_ATTEMPTS}"
-        )
-
-        article_count = len(state.news_context)
-
-        if state.attempt_count >= MAX_SEARCH_ATTEMPTS:
-            logger.info("   -> Max attempts reached. Concluding search.")
-            return {"is_fully_resolved": True}
-
-        if (
-            datetime.now().replace(tzinfo=timezone.utc) - state.latest_retrieved
-        ) > timedelta(hours=12):
-            logger.info("   -> Latest retrieved article is too old. Continuing search.")
-            return {"is_fully_resolved": False}
-
-        if article_count >= 15:
-            logger.info("   -> Content saturation (15+ articles). Concluding search.")
-            return {"is_fully_resolved": True}
-
-        if state.start_date and (
-            (datetime.now() - state.start_date).days > MAX_LOOKBACK_DAYS
-        ):
-            logger.info("   -> Max lookback window reached. Concluding search.")
-            return {"is_fully_resolved": True}
-
-        logger.info("   -> Insufficient data based on heuristics. Continuing search.")
-        return {"is_fully_resolved": False}
-
-    def _strategize_search(self, state: _AgentState) -> dict:
-        # REWRITTEN: Use state.attribute access
-        logger.info("🧠 [Step: Strategize] Calculating next search parameters...")
-
-        today = datetime.now()
-        limit_date = today - timedelta(days=MAX_LOOKBACK_DAYS)
-
-        articles_fetched = state.current_page * BATCH_SIZE
-        can_paginate = state.last_total_results > articles_fetched
-
-        if can_paginate:
-            logger.info(
-                f"   -> Strategy: Pagination. Moving to page {state.current_page + 1}."
-            )
-            return {
-                "needs_more_data": True,
-                "current_page": state.current_page + 1,
-                "attempt_count": state.attempt_count + 1,
-            }
-
-        potential_from = state.start_date - timedelta(days=7)
-        if potential_from < limit_date:
-            potential_from = limit_date
-
-        logger.info(
-            f"   -> Strategy: Expanding range to {potential_from.strftime('%Y-%m-%d')}."
-        )
-        return {
-            "needs_more_data": True,
-            "current_page": 1,
-            "start_date": potential_from,
-            "attempt_count": state.attempt_count + 1,
-        }
-
-    async def _execute_search_action(self, state: _AgentState) -> _AgentState:
-        """
-        FIXED: Generic Tool Execution Node.
-        1. Calls LLM with bound tools.
-        2. Iterates over ANY tool calls returned.
-        3. Looks up the tool in self.tool_map and executes it.
-        """
-        logger.info("🤖 [Step: Execute Search Action] deciding and running tools...")
-
-        # 1. Prepare LLM Call
-        system_msg = SystemMessage(
-            content="You are a research assistant. Use the available tools to fetch data based on the user's strategy."
-        )
-        # We explicitly guide the LLM using the state calculated in the previous 'strategize' node
-        user_msg = (
-            f"Please execute the search strategy for ticker '{state.ticker}'. "
-            f"Use Date Range: {state.start_date.strftime('%Y-%m-%d')} to {state.end_date.strftime('%Y-%m-%d')}. "
-            f"Page: {state.current_page}."
-        )
-
-        response = await self.llm_with_tools.ainvoke([system_msg, user_msg])
-        output_messages = [response]
-        total_results = 0
-
-        # 2. Dynamic Tool Execution
-        if response.tool_calls:
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                logger.info(f"   -> LLM selected Tool: {tool_name}")
-
-                # Retrieve the actual tool function from the map
-                selected_tool = self.tool_map.get(tool_name)
-
-                if selected_tool:
-                    try:
-                        # Execute the tool dynamically
-                        tool_output = await selected_tool.ainvoke(tool_call["args"])
-
-                        # Create the ToolMessage (Required for chat history consistency)
-                        tool_msg = ToolMessage(
-                            content=tool_output,
-                            tool_call_id=tool_call["id"],
-                            name=tool_name,
-                        )
-                        output_messages.append(tool_msg)
-
-                        # 3. Post-Processing (Attempt to parse JSON for state updates)
-                        # This logic allows specific tools to update the state variable 'last_total_results'
-                        # while ignoring others that might return plain text.
-                        try:
-                            if isinstance(tool_output, str):
-                                data = json.loads(tool_output)
-                                # Only update if the specific key exists
-                                if "total_results" in data:
-                                    total_results = data["total_results"]
-                                    logger.info(
-                                        f"   -> Extracted total_results: {total_results}"
-                                    )
-                        except json.JSONDecodeError:
-                            # Not a JSON output, or not relevant to total_results
-                            pass
-                    except Exception as e:
-                        logger.error(f"   ❌ Error executing tool {tool_name}: {e}")
-                else:
-                    logger.warning(
-                        f"   ⚠️ Tool '{tool_name}' selected by LLM but not found in tool_map."
-                    )
-
-        return {"messages": output_messages, "last_total_results": total_results}
-
-    async def _generate_analysis(self, state: _AgentState) -> NewsAnalysisOutput:
-        logger.info("✍️  [Step: Generate Answer]")
-
-        # 1. FIX: Check if we actually have context
-        # Check if the string is not empty and contains the article separator
-        has_news = len(state.news_context) > 0
-
-        # 2. FIX: specific instructions for the "System"
-        system_instructions = (
-            "You are a professional financial analyst. Your task is to produce a rigorous, "
-            "multi-facet analysis that is grounded in the provided context.\n\n"
-            "### CITATION RULES (STRICT):\n"
-            "1. Use inline citations with bracketed IDs like [1](url_1) or [1][2](url_1, url_2).\n"
-            "2. Each ID must correspond to a 'Source ID' from the provided context.\n"
-            "4. Every factual claim must have at least one citation.\n"
-            "5. Do NOT cite nonexistent or fabricated IDs.\n\n"
-            "### OUTPUT FORMAT:\n"
-            "You must output a JSON object. The 'analysis' field must contain the full "
-            "narrative report (multiple paragraphs), not just a summary or entity name."
-        )
-
-        context = "\n".join([n.model_dump_json() for n in state.news_context])
-        user_content = (
-            f"### USER QUESTION:\n'{state.query}'\n\n"
-            f"### SEARCH METADATA:\n"
-            f'Reasoning: "{state.sufficiency_reasoning}"\n\n'
-            f"### CONTEXT:\n"
-            f"{context if has_news else 'No relevant news articles found.'}\n\n"
-            f"Please generate the detailed analysis now."
-        )
-
-        # Bind the structured output schema
-
-        # 4. FIX: Pass messages instead of a single formatted string
-        messages = [
-            SystemMessage(content=system_instructions),
-            HumanMessage(content=user_content),
-        ]
+    async def _fetch_news_node(self, state: NewsAgentState) -> dict:
+        """Fetch raw news articles from NewsAPI."""
+        loop = asyncio.get_running_loop()
         try:
-            retval = await service_manager.get_agent().ainvoke(messages)
-
-            return NewsAnalysisOutput(
-                analysis=retval.content,
-                sources=state.news_context,
-                entities_enriched=_build_entities_from_news(
-                    state.ticker, state.news_context, retval.content
+            response = await loop.run_in_executor(
+                None,
+                lambda: service_manager.get_news_api().get_everything(
+                    q=state.ticker,
+                    from_param=state.start_date.date().isoformat(),
+                    to=state.end_date.date().isoformat(),
+                    language="en",
+                    sort_by="relevancy",
+                    page=1,
+                    page_size=50,
                 ),
             )
-        except Exception as e:
-            logger.error(f"❌ Error in generation: {e}")
-            # Fallback if generation fails
-            return NewsAnalysisOutput(
-                analysis="Error generating analysis due to model failure.",
-                sources=[],
-                entities_enriched=_build_entities_from_news(
-                    state.ticker, state.news_context, ""
-                ),
+        except Exception as exc:
+            logger.error("NewsAPI request failed: %s", exc)
+            raise
+
+        if response.get("status") != "ok":
+            raise RuntimeError(response.get("message", "NewsAPI error"))
+
+        articles = [a for a in response.get("articles", []) if a.get("content")]
+        logger.info("Fetched %d articles from NewsAPI.", len(articles))
+        _ = self._extract_companies(articles, state.ticker)
+        return {"raw_articles": articles}
+
+    async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
+        """Ingest articles into Neo4j and ChromaDB."""
+        if not state.raw_articles:
+            return {"chunk_ids": []}
+
+        companies_involved = self._extract_companies(state.raw_articles, state.ticker)
+        try:
+            chunk_ids = await service_manager.get_ingestor().ingest_articles(
+                state.raw_articles, companies_involved
+            )
+        except Exception as exc:
+            logger.error("Ingestion failed: %s", exc)
+            raise
+
+        return {"chunk_ids": chunk_ids}
+
+    async def _retrieve_chunks_node(self, state: NewsAgentState) -> dict:
+        """Retrieve relevant chunks from ChromaDB."""
+        embedding_func = service_manager.get_embedding_func()
+        chroma_adapter = service_manager.get_chroma_adapter()
+
+        try:
+            query_embedding = await embedding_func.aembed_query(state.query)
+        except Exception as exc:
+            logger.error("Embedding query failed: %s", exc)
+            raise
+
+        where = None
+        if state.ticker:
+            where = {"companies_involved": state.ticker}
+
+        try:
+            result = await chroma_adapter.query(query_embedding, n_results=20, where=where)
+        except Exception as exc:
+            logger.error("ChromaDB query failed: %s", exc)
+            raise
+
+        ids = (result.get("ids") or [[]])[0]
+        documents = (result.get("documents") or [[]])[0]
+        metadatas = (result.get("metadatas") or [[]])[0]
+        distances = (result.get("distances") or [[]])[0]
+
+        retrieved: List[ChunkResult] = []
+        for idx, chunk_id in enumerate(ids):
+            retrieved.append(
+                ChunkResult(
+                    chunk_id=chunk_id,
+                    text=documents[idx] if idx < len(documents) else "",
+                    metadata=metadatas[idx] if idx < len(metadatas) else {},
+                    score=distances[idx] if idx < len(distances) else 0.0,
+                )
             )
 
+        return {"retrieved_chunks": retrieved}
 
-def _build_entities_from_news(ticker: str, sources: list, analysis_text: str) -> list:
-    """
-    Build minimal enriched DataPoints from what the news agent already retrieved.
-    Company is always emitted. No extra LLM call — events are not extracted here;
-    that is the synthesiser's job via the CoT <relationships> block.
-    """
-    entities = []
+    async def _identify_unextracted_node(self, state: NewsAgentState) -> dict:
+        """Identify chunks that still require extraction."""
+        if not state.retrieved_chunks:
+            return {"unextracted_chunk_ids": []}
 
-    company = Company(
-        id=get_canonical_id(ticker.upper()),
-        ticker=ticker.upper(),
-        name=ticker.upper(),
-        description=f"Company in focus for news analysis: {ticker.upper()}",
-        sector="",
-        industry=None,
-    )
-    entities.append(company)
-    return entities
+        chunk_ids = [chunk.chunk_id for chunk in state.retrieved_chunks]
+        try:
+            status_map = await service_manager.get_neo4j_adapter().get_chunk_extraction_status(
+                chunk_ids
+            )
+        except Exception as exc:
+            logger.error("Failed to fetch extraction status: %s", exc)
+            raise
 
+        unextracted = [
+            chunk_id for chunk_id in chunk_ids if status_map.get(chunk_id) == "PENDING"
+        ]
+        return {"unextracted_chunk_ids": unextracted}
 
-if __name__ == "__main__":
+    async def _extract_entities_node(self, state: NewsAgentState) -> dict:
+        """Extract entities and relationships for unextracted chunks."""
+        if not state.unextracted_chunk_ids:
+            return {"extraction_results": [], "entities_enriched": []}
 
-    async def main():
-        agent = NewsAnalysisAgent()
-        input_data = BaseAgentInput(
-            ticker="AAPL",
-            vector_query="reason price rise Apple",
-            query="why did apple's share price rise so much recently?",
-            start_date="2025-12-01",
-            end_date="2025-12-05",
+        chunk_lookup = {c.chunk_id: c for c in state.retrieved_chunks}
+        prompt = build_extraction_prompt()
+        extraction_chain = prompt | self._llm.with_structured_output(ChunkExtractionResult)
+
+        async def _extract_chunk(chunk: ChunkResult) -> ChunkExtractionResult:
+            companies = chunk.metadata.get("companies_involved", [])
+            if isinstance(companies, str):
+                companies = [c.strip() for c in companies.split(",") if c.strip()]
+
+            try:
+                result: ChunkExtractionResult = await extraction_chain.ainvoke(
+                    {"chunk_text": chunk.text, "companies": ", ".join(companies)}
+                )
+            except Exception as exc:
+                logger.error("Extraction failed for chunk %s: %s", chunk.chunk_id, exc)
+                raise
+
+            result.chunk_id = chunk.chunk_id
+            return result
+
+        tasks = [
+            _extract_chunk(chunk_lookup[cid]) for cid in state.unextracted_chunk_ids if cid in chunk_lookup
+        ]
+        results = await asyncio.gather(*tasks)
+
+        entities_enriched: List[EntityNode] = []
+        neo4j_adapter = service_manager.get_neo4j_adapter()
+        chroma_adapter = service_manager.get_chroma_adapter()
+
+        for result in results:
+            local_id_map = {}
+            for entity in result.entities:
+                canonical_id = str(
+                    uuid.uuid5(
+                        ENTITY_NAMESPACE,
+                        f"{entity.name.lower()}::{entity.entity_type.lower()}",
+                    )
+                )
+                local_key = entity.local_id or canonical_id
+                entity.id = canonical_id
+                local_id_map[local_key] = entity
+                entities_enriched.append(entity)
+                await neo4j_adapter.merge_entity_node(entity)
+                await neo4j_adapter.merge_relationship(
+                    result.chunk_id,
+                    entity.id,
+                    "MENTIONS_ENTITY",
+                    {"confidence": 1.0},
+                )
+
+            for rel in result.relationships:
+                source_entity = local_id_map.get(rel.source_entity_local_id)
+                target_entity = local_id_map.get(rel.target_entity_local_id)
+                if not source_entity or not target_entity:
+                    continue
+                await neo4j_adapter.merge_relationship(
+                    source_entity.id,
+                    target_entity.id,
+                    "RELATED_TO",
+                    {
+                        "relationship_type": rel.relationship_type,
+                        "source_chunk_id": result.chunk_id,
+                        "confidence": rel.confidence,
+                    },
+                )
+
+            await neo4j_adapter.update_chunk_extraction_status(result.chunk_id, "EXTRACTED")
+
+            chunk = chunk_lookup.get(result.chunk_id)
+            if chunk:
+                updated_metadata = dict(chunk.metadata)
+                updated_metadata["extraction_status"] = "EXTRACTED"
+                await chroma_adapter.update_metadata([result.chunk_id], [updated_metadata])
+
+        return {"extraction_results": results, "entities_enriched": entities_enriched}
+
+    async def _analyse_news_node(self, state: NewsAgentState) -> dict:
+        """Generate a grounded financial analysis from retrieved chunks."""
+        if not state.retrieved_chunks:
+            return {"analysis": "No relevant news articles found.", "sources": []}
+
+        sources: List[CitedSource] = []
+        for idx, chunk in enumerate(state.retrieved_chunks, start=1):
+            metadata = chunk.metadata or {}
+            sources.append(
+                CitedSource(
+                    source_id=idx,
+                    title=metadata.get("article_title", "Unknown Title"),
+                    url=metadata.get("source_url", ""),
+                    page_content=chunk.text,
+                )
+            )
+
+        context = "\n\n".join(
+            [f"[{s.source_id}] {s.title}\n{s.page_content}" for s in sources]
         )
-        res = await agent.run(input_data)
-        logger.info("\n--- RAW AGENT OUTPUT ---\n")
-        logger.info(f"Found {len(res.sources)} sources:")
-        for source in res.sources:
-            logger.info(f"- {source.title}")
 
-        logger.info(res.analysis)
+        system_prompt = (
+            "You are a professional financial analyst. "
+            "Use only the provided context to answer the question."
+        )
+        user_prompt = (
+            f"Question: {state.query}\n\n"
+            f"Context:\n{context}\n\n"
+            "Provide a concise, evidence-based analysis."
+        )
 
-        for s in res.sources:
-            logger.info(s.model_dump_json(indent=2))
+        try:
+            response = await self._llm.ainvoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            )
+            analysis_text = response.content
+        except Exception as exc:
+            logger.error("Analysis generation failed: %s", exc)
+            raise
 
-    asyncio.run(main())
-
-    # agent = NewsAnalysisAgent()
-    # png_bytes = agent._graph.get_graph().draw_mermaid_png()
-
-    # with open("new_analysis.png", "wb") as f:
-    #     f.write(png_bytes)
-
-    # logger.info("Saved graph as graph.png")
+        return {"analysis": analysis_text, "sources": sources}

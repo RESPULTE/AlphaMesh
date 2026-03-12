@@ -1,14 +1,20 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from core.graph.models import ChunkExtractionResult, EntityNode
 
 
 class BaseAgentInput(BaseModel):
     """
     The unified input schema shared by the Orchestrator and all Sub-Agents.
     """
+
+    model_config = ConfigDict(extra="ignore")
 
     query: str = Field(description="The original user query for context.")
     vector_query: str = Field(
@@ -46,6 +52,8 @@ class BaseAgentOutput(BaseModel, ABC):
     type must know how to format itself into a string for the final LLM analyst.
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     agent_name: str = Field(
         description="The name of the agent that produced this output."
     )
@@ -67,3 +75,68 @@ class BaseAgentOutput(BaseModel, ABC):
         Formats the output's data into a string suitable for an LLM context.
         """
         raise NotImplementedError
+
+
+class CitedSource(BaseModel):
+    """Citable source metadata for news analysis output."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    source_id: int = Field(description="The numeric ID used in the text, e.g., 1.")
+    title: str = Field(description="The title of the article.")
+    url: str = Field(description="The URL of the article.")
+    page_content: str = Field(description="The content of the article.")
+
+
+class ChunkResult(BaseModel):
+    """Lightweight container for retrieved chunk results."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    chunk_id: str
+    text: str
+    metadata: dict
+    score: float
+
+
+class NewsAgentState(BaseModel):
+    """State container for the refactored news analysis agent."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    query: str
+    ticker: str
+    start_date: datetime
+    end_date: datetime
+    raw_articles: List[dict] = Field(default_factory=list)
+    chunk_ids: List[str] = Field(default_factory=list)
+    retrieved_chunks: List[ChunkResult] = Field(default_factory=list)
+    unextracted_chunk_ids: List[str] = Field(default_factory=list)
+    extraction_results: List[ChunkExtractionResult] = Field(default_factory=list)
+    analysis: Optional[str] = None
+    sources: List[CitedSource] = Field(default_factory=list)
+    entities_enriched: List[EntityNode] = Field(default_factory=list)
+
+
+class NewsAgentOutput(BaseAgentOutput):
+    """Output schema for the refactored news analysis agent."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    agent_name: str = Field(default="news_agent")
+    sources: List[CitedSource] = Field(default_factory=list)
+    entities_enriched: List[EntityNode] = Field(default_factory=list)
+
+    def get_llm_context_str(self) -> str:
+        """Return analysis and sources formatted for LLM context."""
+        header = "### REPORT FROM news_agent\n"
+        if not self.sources:
+            return f"{header}{self.analysis}"
+
+        sources_block = "\n".join(
+            [
+                f"[{s.source_id}] {s.title}\n{getattr(s, 'url', '')}".strip()
+                for s in self.sources
+            ]
+        )
+        return f"{header}{self.analysis}\n\n### SOURCES\n{sources_block}"

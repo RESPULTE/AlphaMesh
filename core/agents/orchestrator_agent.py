@@ -8,13 +8,13 @@ import pandas as pd
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # --- Import Sub-Agents & Their Outputs ---
 from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
-from core.agents.models import BaseAgentInput, BaseAgentOutput
-from core.agents.news_analysis_agent import CitedSource, NewsAnalysisAgent
+from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
+from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.logger import get_logger
 from core.memory.conversation_writeback import run_conversation_writeback
 from core.memory.prompts import SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
@@ -33,15 +33,16 @@ AVAILABLE_AGENTS: List[Type[AbstractAgent]] = [
 class FinalResponse(BaseModel):
     """The structured output returned to the UI for professional rendering."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     summary: str
     fundamental_data: Optional[pd.DataFrame] = None
     sources: List[CitedSource] = Field(default_factory=list)
 
-    class Config:
-        arbitrary_types_allowed = True
-
 
 class OrchestratorPlan(BaseAgentInput):
+    model_config = ConfigDict(extra="ignore")
+
     target_agents: List[str] = Field(description="Agents to activate.")
     request_requires_agents: bool = Field(
         description="True if query needs agent tools."
@@ -52,6 +53,8 @@ class OrchestratorPlan(BaseAgentInput):
 
 
 class OrchestratorState(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     # Changed from query: str to messages: List[BaseMessage]
     messages: List[BaseMessage] = Field(default_factory=list)
     plan: Optional[OrchestratorPlan] = None
@@ -61,6 +64,7 @@ class OrchestratorState(BaseModel):
     writeback_relationships: List[dict] = Field(default_factory=list)
     writeback_entities: List[Any] = Field(default_factory=list)
     conversation_id: Optional[str] = None  # passed in from caller
+    graph_context: List[dict] = Field(default_factory=list)
 
 
 class OrchestratorAgent:
@@ -123,6 +127,10 @@ class OrchestratorAgent:
         available_agents_desc = ", ".join(
             [f"{a.name()}: {a.description()}" for a in AVAILABLE_AGENTS]
         )
+        graph_context = await self._query_user_graph_context(
+            query=state.messages[-1].content if state.messages else "",
+            conversation_id=state.conversation_id,
+        )
 
         system_prompt = (
             "You are a Financial Orchestrator. Review the chat history and decide which agents to call.\n"
@@ -145,7 +153,19 @@ class OrchestratorAgent:
         if plan.start_date is None:
             plan.start_date = plan.end_date - timedelta(days=365)
 
-        return {"plan": plan}
+        return {"plan": plan, "graph_context": graph_context}
+
+    async def _query_user_graph_context(
+        self, query: str, conversation_id: Optional[str]
+    ) -> List[dict]:
+        """
+        Future iteration: retrieve user-specific graph context ranked by recency.
+        Queries Neo4j for entities and relationships related to the user's
+        conversation history, ordered by `ingested_at` descending.
+
+        Returns: List of entity/relationship dicts (empty list until implemented)
+        """
+        return []
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
         plan = state.plan

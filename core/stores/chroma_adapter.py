@@ -1,0 +1,153 @@
+"""Async adapter for local Chroma via LangChain integration."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from langchain_chroma import Chroma
+
+from core.logger import get_logger
+
+_LIST_FIELDS = {"companies_involved", "nodeset_ids"}
+
+
+class ChromaDBAdapter:
+    """Encapsulates local Chroma operations via LangChain's Chroma wrapper."""
+
+    def __init__(
+        self,
+        persist_directory: str,
+        collection_name: str,
+        embedding_function=None,
+    ) -> None:
+        """Initialize the adapter with local persistence settings."""
+        self._persist_directory = persist_directory
+        self._collection_name = collection_name
+        self._embedding_function = embedding_function
+        self._vectorstore: Optional[Chroma] = None
+        self._collection = None
+        self._logger = get_logger(__name__)
+
+    async def _get_collection(self):
+        """Lazily initialize and return the underlying Chroma collection."""
+        if self._collection is not None:
+            return self._collection
+
+        try:
+            self._vectorstore = Chroma(
+                collection_name=self._collection_name,
+                embedding_function=self._embedding_function,
+                persist_directory=self._persist_directory,
+            )
+            self._collection = self._vectorstore._collection
+            return self._collection
+        except Exception:
+            self._logger.exception("Failed to initialize local Chroma collection.")
+            raise
+
+    def _serialize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Serialize list fields and datetimes for ChromaDB metadata."""
+        serialized: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            if key in _LIST_FIELDS and isinstance(value, list):
+                serialized[key] = ",".join(value)
+            elif isinstance(value, datetime):
+                serialized[key] = value.isoformat()
+            else:
+                serialized[key] = value
+        return serialized
+
+    def _deserialize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Deserialize list fields from ChromaDB metadata."""
+        deserialized: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            if key in _LIST_FIELDS and isinstance(value, str):
+                if value.strip() == "":
+                    deserialized[key] = []
+                else:
+                    deserialized[key] = [item.strip() for item in value.split(",")]
+            else:
+                deserialized[key] = value
+        return deserialized
+
+    async def get_or_create_collection(self, collection_name: str):
+        """Return a ChromaDB collection, creating it if needed."""
+        _ = collection_name
+        return await self._get_collection()
+
+    async def upsert_chunks(
+        self,
+        chunk_ids: List[str],
+        texts: List[str],
+        embeddings: List[List[float]],
+        metadatas: List[dict],
+    ) -> None:
+        """Batch upsert chunk vectors with metadata."""
+        try:
+            collection = await self.get_or_create_collection(self._collection_name)
+            serialized = [self._serialize_metadata(m) for m in metadatas]
+            payload = {
+                "ids": chunk_ids,
+                "documents": texts,
+                "embeddings": embeddings,
+                "metadatas": serialized,
+            }
+            await asyncio.to_thread(collection.upsert, **payload)
+        except Exception:
+            self._logger.exception("Failed to upsert chunks to ChromaDB.")
+            raise
+
+    async def query(
+        self, query_embedding: List[float], n_results: int, where: Optional[dict] = None
+    ):
+        """Query ChromaDB for nearest neighbors."""
+        try:
+            collection = await self.get_or_create_collection(self._collection_name)
+            payload = {"query_embeddings": [query_embedding], "n_results": n_results}
+            if where is not None:
+                payload["where"] = where
+            result = await asyncio.to_thread(collection.query, **payload)
+            if "metadatas" in result and result["metadatas"]:
+                result["metadatas"] = [
+                    [self._deserialize_metadata(m) for m in batch]
+                    for batch in result["metadatas"]
+                ]
+            return result
+        except Exception:
+            self._logger.exception("Failed to query ChromaDB.")
+            raise
+
+    async def get_by_ids(self, ids: List[str]):
+        """Fetch documents by their IDs."""
+        try:
+            collection = await self.get_or_create_collection(self._collection_name)
+            result = await asyncio.to_thread(collection.get, ids=ids)
+            if "metadatas" in result and result["metadatas"]:
+                result["metadatas"] = [
+                    self._deserialize_metadata(m) for m in result["metadatas"]
+                ]
+            return result
+        except Exception:
+            self._logger.exception("Failed to fetch documents from ChromaDB.")
+            raise
+
+    async def delete_by_ids(self, ids: List[str]) -> None:
+        """Delete documents by their IDs."""
+        try:
+            collection = await self.get_or_create_collection(self._collection_name)
+            await asyncio.to_thread(collection.delete, ids=ids)
+        except Exception:
+            self._logger.exception("Failed to delete documents from ChromaDB.")
+            raise
+
+    async def update_metadata(self, ids: List[str], metadatas: List[dict]) -> None:
+        """Update metadata for existing documents."""
+        try:
+            collection = await self.get_or_create_collection(self._collection_name)
+            serialized = [self._serialize_metadata(m) for m in metadatas]
+            await asyncio.to_thread(collection.update, ids=ids, metadatas=serialized)
+        except Exception:
+            self._logger.exception("Failed to update ChromaDB metadata.")
+            raise

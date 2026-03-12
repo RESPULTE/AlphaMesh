@@ -7,6 +7,7 @@ from core.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 class AgentInput(BaseModel):
     """Base schema for agent inputs."""
 
