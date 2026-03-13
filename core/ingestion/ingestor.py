@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
-import datetime
+import asyncio
+import uuid
 from datetime import datetime, timezone
 from typing import List
 
-from core.graph.models import ChunkNode, DocumentNode
+from core.config import settings
+from core.graph.extraction_prompts import build_extraction_prompt
+from core.graph.models import (
+    ENTITY_NAMESPACE,
+    BatchExtractionResult,
+    ChunkExtractionResult,
+    ChunkNode,
+    DocumentNode,
+)
 from core.graph.nodeset_manager import NodeSetManager
 from core.ingestion.chunker import ArticleChunker, ChunkRecord, DocumentMetadata
 from core.logger import get_logger
 from core.stores.chroma_adapter import ChromaDBAdapter
 from core.stores.neo4j_adapter import Neo4jAdapter
+
+EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 
 
 class DualStoreIngestor:
@@ -24,6 +35,7 @@ class DualStoreIngestor:
         nodeset_manager: NodeSetManager,
         embedding_func,
         chunker: ArticleChunker,
+        llm=None,
     ) -> None:
         """Initialize the ingestor with adapters and utilities."""
         self._neo4j_adapter = neo4j_adapter
@@ -31,6 +43,7 @@ class DualStoreIngestor:
         self._nodeset_manager = nodeset_manager
         self._embedding_func = embedding_func
         self._chunker = chunker
+        self._llm = llm
         self._logger = get_logger(__name__)
 
     async def ingest_articles(
@@ -69,7 +82,9 @@ class DualStoreIngestor:
             await self._write_document_nodes(documents, global_anchor_id)
             await self._write_chunk_nodes(chunks, global_anchor_id)
             await self._write_vector_chunks(chunks, global_anchor_id)
-            return [chunk.chunk_id for chunk in chunks]
+            chunk_ids = [chunk.chunk_id for chunk in chunks]
+            self._schedule_extraction(chunk_ids)
+            return chunk_ids
         except Exception:
             self._logger.exception("Failed to ingest articles.")
             raise
@@ -155,3 +170,139 @@ class DualStoreIngestor:
         except Exception:
             self._logger.exception("Failed to write vector chunks.")
             raise
+
+    def _schedule_extraction(self, chunk_ids: List[str]) -> None:
+        """Schedule non-blocking entity extraction for chunk IDs."""
+        if not chunk_ids or self._llm is None:
+            return
+        task = asyncio.create_task(self._extract_entities_for_chunks(chunk_ids))
+        task.add_done_callback(self._log_extraction_task_result)
+
+    def _log_extraction_task_result(self, task: asyncio.Task) -> None:
+        """Log any exception raised by the background extraction task."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            self._logger.warning("Background extraction task was cancelled.")
+        except Exception:
+            self._logger.exception("Background extraction task failed.")
+
+    async def _extract_entities_for_chunks(self, chunk_ids: List[str]) -> None:
+        """Extract entities/relationships for pending chunks in the background."""
+        if not chunk_ids:
+            return
+
+        status_map = await self._neo4j_adapter.get_chunk_extraction_status(chunk_ids)
+        pending_chunk_ids = [
+            chunk_id
+            for chunk_id in chunk_ids
+            if status_map.get(chunk_id) == "PENDING"
+        ]
+        if not pending_chunk_ids:
+            return
+
+        chunk_payload = await self._chroma_adapter.get_by_ids(pending_chunk_ids)
+        ids = chunk_payload.get("ids") or []
+        documents = chunk_payload.get("documents") or []
+        metadatas = chunk_payload.get("metadatas") or []
+
+        chunk_lookup = {}
+        for idx, chunk_id in enumerate(ids):
+            chunk_lookup[chunk_id] = {
+                "text": documents[idx] if idx < len(documents) else "",
+                "metadata": metadatas[idx] if idx < len(metadatas) else {},
+            }
+
+        chunks_to_process = [
+            {"chunk_id": chunk_id, **chunk_lookup[chunk_id]}
+            for chunk_id in pending_chunk_ids
+            if chunk_id in chunk_lookup
+        ]
+        if not chunks_to_process:
+            return
+
+        prompt = build_extraction_prompt()
+        extraction_chain = prompt | self._llm.with_structured_output(
+            BatchExtractionResult
+        )
+
+        async def _extract_batch(chunks: List[dict]) -> BatchExtractionResult:
+            chunk_blocks = "\n\n".join(
+                [f"[CHUNK_ID: {chunk['chunk_id']}]\n{chunk['text']}" for chunk in chunks]
+            )
+            async with EXTRACTION_SEMAPHORE:
+                return await extraction_chain.ainvoke({"chunk_blocks": chunk_blocks})
+
+        batch_size = max(settings.EXTRACTION_BATCH_SIZE, 1)
+        batches = [
+            chunks_to_process[i : i + batch_size]
+            for i in range(0, len(chunks_to_process), batch_size)
+        ]
+        batch_results = await asyncio.gather(
+            *[_extract_batch(batch) for batch in batches]
+        )
+
+        results: List[ChunkExtractionResult] = []
+        for batch in batch_results:
+            results.extend(batch.results)
+
+        validated_results: List[ChunkExtractionResult] = []
+        for result in results:
+            if not result.chunk_id:
+                self._logger.warning("Skipping extraction result with missing chunk_id.")
+                continue
+            if result.chunk_id not in chunk_lookup:
+                self._logger.warning(
+                    "Skipping extraction result for unknown chunk_id: %s",
+                    result.chunk_id,
+                )
+                continue
+            validated_results.append(result)
+
+        for result in validated_results:
+            local_id_map = {}
+            for entity in result.entities:
+                canonical_id = str(
+                    uuid.uuid5(
+                        ENTITY_NAMESPACE,
+                        f"{entity.name.lower()}::{entity.entity_type.lower()}",
+                    )
+                )
+                local_key = entity.local_id or canonical_id
+                entity.id = canonical_id
+                local_id_map[local_key] = entity
+                await self._neo4j_adapter.merge_entity_node(entity)
+                await self._neo4j_adapter.merge_relationship(
+                    result.chunk_id,
+                    entity.id,
+                    "MENTIONS_ENTITY",
+                    {"confidence": 1.0},
+                )
+
+            for rel in result.relationships:
+                source_entity = local_id_map.get(rel.source_entity_local_id)
+                target_entity = local_id_map.get(rel.target_entity_local_id)
+                if not source_entity or not target_entity:
+                    continue
+                await self._neo4j_adapter.merge_relationship(
+                    source_entity.id,
+                    target_entity.id,
+                    "RELATED_TO",
+                    {
+                        "relationship_type": rel.relationship_type,
+                        "source_chunk_id": result.chunk_id,
+                        "confidence": rel.confidence,
+                    },
+                )
+
+            await self._neo4j_adapter.update_chunk_extraction_status(
+                result.chunk_id, "EXTRACTED"
+            )
+
+            chunk_meta = chunk_lookup.get(result.chunk_id)
+            if chunk_meta:
+                updated_metadata = dict(chunk_meta.get("metadata") or {})
+                updated_metadata["extraction_status"] = "EXTRACTED"
+                await self._chroma_adapter.update_metadata(
+                    [result.chunk_id], [updated_metadata]
+                )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Type
 
@@ -19,19 +18,10 @@ from core.agents.models import (
     NewsAgentOutput,
     NewsAgentState,
 )
-from core.config import settings
-from core.graph.extraction_prompts import build_extraction_prompt
-from core.graph.models import (
-    ENTITY_NAMESPACE,
-    BatchExtractionResult,
-    ChunkExtractionResult,
-    EntityNode,
-)
 from core.logger import get_logger
 from core.services import service_manager
 
 logger = get_logger(__name__)
-EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 
 
 class NewsAnalysisAgent(AbstractAgent):
@@ -51,7 +41,9 @@ class NewsAnalysisAgent(AbstractAgent):
     @staticmethod
     def description() -> str:
         """Return the agent description."""
-        return "Ingests news into dual stores, extracts entities per chunk, and synthesizes analysis."
+        return (
+            "Ingests news into dual stores, schedules background extraction, and synthesizes analysis."
+        )
 
     @staticmethod
     def get_output_schema_class() -> Type[BaseModel]:
@@ -82,16 +74,12 @@ class NewsAnalysisAgent(AbstractAgent):
         workflow.add_node("fetch_news", self._fetch_news_node)
         workflow.add_node("ingest_articles", self._ingest_articles_node)
         workflow.add_node("retrieve_chunks", self._retrieve_chunks_node)
-        workflow.add_node("identify_unextracted", self._identify_unextracted_node)
-        workflow.add_node("extract_entities", self._extract_entities_node)
         workflow.add_node("analyse_news", self._analyse_news_node)
 
         workflow.add_edge(START, "fetch_news")
         workflow.add_edge("fetch_news", "ingest_articles")
         workflow.add_edge("ingest_articles", "retrieve_chunks")
-        workflow.add_edge("retrieve_chunks", "identify_unextracted")
-        workflow.add_edge("identify_unextracted", "extract_entities")
-        workflow.add_edge("extract_entities", "analyse_news")
+        workflow.add_edge("retrieve_chunks", "analyse_news")
         workflow.add_edge("analyse_news", END)
 
         return workflow.compile()
@@ -188,151 +176,6 @@ class NewsAnalysisAgent(AbstractAgent):
             )
         logger.info("Retrieved %d chunks from ChromaDB.", len(retrieved))
         return {"retrieved_chunks": retrieved}
-
-    async def _identify_unextracted_node(self, state: NewsAgentState) -> dict:
-        """Identify chunks that still require extraction."""
-        if not state.retrieved_chunks:
-            return {"unextracted_chunk_ids": []}
-
-        chunk_ids = [chunk.chunk_id for chunk in state.retrieved_chunks]
-        try:
-            status_map = (
-                await service_manager.get_neo4j_adapter().get_chunk_extraction_status(
-                    chunk_ids
-                )
-            )
-        except Exception as exc:
-            logger.error("Failed to fetch extraction status: %s", exc)
-            raise
-
-        unextracted = [
-            chunk_id for chunk_id in chunk_ids if status_map.get(chunk_id) == "PENDING"
-        ]
-        return {"unextracted_chunk_ids": unextracted}
-
-    async def _extract_entities_node(self, state: NewsAgentState) -> dict:
-        """Extract entities and relationships for unextracted chunks."""
-        if not state.unextracted_chunk_ids:
-            return {"extraction_results": [], "entities_enriched": []}
-
-        chunk_lookup = {c.chunk_id: c for c in state.retrieved_chunks}
-        chunks_to_process = [
-            chunk_lookup[cid]
-            for cid in state.unextracted_chunk_ids
-            if cid in chunk_lookup
-        ]
-        if not chunks_to_process:
-            return {"extraction_results": [], "entities_enriched": []}
-
-        prompt = build_extraction_prompt()
-        extraction_chain = prompt | self._llm.with_structured_output(
-            BatchExtractionResult
-        )
-
-        async def _extract_batch(
-            chunks: List[ChunkResult],
-        ) -> BatchExtractionResult:
-            chunk_blocks = "\n\n".join(
-                [f"[CHUNK_ID: {chunk.chunk_id}]\n{chunk.text}" for chunk in chunks]
-            )
-            try:
-                async with EXTRACTION_SEMAPHORE:
-                    result: BatchExtractionResult = await extraction_chain.ainvoke(
-                        {"chunk_blocks": chunk_blocks}
-                    )
-            except Exception as exc:
-                logger.error(
-                    "Extraction failed for batch starting %s: %s",
-                    chunks[0].chunk_id[:10],
-                    exc,
-                )
-                raise
-
-            return result
-
-        batch_size = max(settings.EXTRACTION_BATCH_SIZE, 1)
-        batches = [
-            chunks_to_process[i : i + batch_size]
-            for i in range(0, len(chunks_to_process), batch_size)
-        ]
-        batch_results = await asyncio.gather(
-            *[_extract_batch(batch) for batch in batches]
-        )
-
-        results: List[ChunkExtractionResult] = []
-        for batch in batch_results:
-            results.extend(batch.results)
-
-        validated_results: List[ChunkExtractionResult] = []
-        for result in results:
-            if not result.chunk_id:
-                logger.warning("Skipping extraction result with missing chunk_id.")
-                continue
-            if result.chunk_id not in chunk_lookup:
-                logger.warning(
-                    "Skipping extraction result for unknown chunk_id: %s",
-                    result.chunk_id,
-                )
-                continue
-            validated_results.append(result)
-
-        entities_enriched: List[EntityNode] = []
-        neo4j_adapter = service_manager.get_neo4j_adapter()
-        chroma_adapter = service_manager.get_chroma_adapter()
-
-        for result in validated_results:
-            local_id_map = {}
-            for entity in result.entities:
-                canonical_id = str(
-                    uuid.uuid5(
-                        ENTITY_NAMESPACE,
-                        f"{entity.name.lower()}::{entity.entity_type.lower()}",
-                    )
-                )
-                local_key = entity.local_id or canonical_id
-                entity.id = canonical_id
-                local_id_map[local_key] = entity
-                entities_enriched.append(entity)
-                await neo4j_adapter.merge_entity_node(entity)
-                await neo4j_adapter.merge_relationship(
-                    result.chunk_id,
-                    entity.id,
-                    "MENTIONS_ENTITY",
-                    {"confidence": 1.0},
-                )
-
-            for rel in result.relationships:
-                source_entity = local_id_map.get(rel.source_entity_local_id)
-                target_entity = local_id_map.get(rel.target_entity_local_id)
-                if not source_entity or not target_entity:
-                    continue
-                await neo4j_adapter.merge_relationship(
-                    source_entity.id,
-                    target_entity.id,
-                    "RELATED_TO",
-                    {
-                        "relationship_type": rel.relationship_type,
-                        "source_chunk_id": result.chunk_id,
-                        "confidence": rel.confidence,
-                    },
-                )
-
-            await neo4j_adapter.update_chunk_extraction_status(
-                result.chunk_id, "EXTRACTED"
-            )
-
-            chunk = chunk_lookup.get(result.chunk_id)
-            if chunk:
-                updated_metadata = dict(chunk.metadata)
-                updated_metadata["extraction_status"] = "EXTRACTED"
-                await chroma_adapter.update_metadata(
-                    [result.chunk_id], [updated_metadata]
-                )
-
-        return {
-            "extraction_results": validated_results,
-            "entities_enriched": entities_enriched,
-        }
 
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""

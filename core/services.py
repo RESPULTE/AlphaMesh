@@ -143,6 +143,7 @@ class ServiceManager:
                     nodeset_manager=self.get_nodeset_manager(),
                     embedding_func=self.get_embedding_func(),
                     chunker=chunker,
+                    llm=self.get_agent(),
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreIngestor: {e}")
