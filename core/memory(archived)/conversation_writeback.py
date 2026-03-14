@@ -27,7 +27,7 @@ from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage import add_data_points
 
 from core.memory.entity_merger import find_and_merge_candidates
-from core.memory.graph_models import (
+from core.memory.graph.models import (
     GLOBAL_FINANCIAL_EVENT_NODESET,
     GLOBAL_FINANCIAL_WISDOM_NODESET,
 )
@@ -235,7 +235,7 @@ async def run_conversation_writeback(
 
         # If user_email provided, also tag user-specific entities
         if user_email:
-            from core.memory.graph_models import (
+            from core.memory.graph.models import (
                 UserInvestmentInterest,
                 UserLearningInterest,
             )

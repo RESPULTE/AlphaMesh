@@ -8,19 +8,19 @@ from datetime import datetime, timezone
 from typing import List
 
 from core.config import settings
-from core.graph.extraction_prompts import build_extraction_prompt
-from core.graph.models import (
+from core.logger import get_logger
+from core.memory.graph.extraction_prompts import build_extraction_prompt
+from core.memory.graph.models import (
     ENTITY_NAMESPACE,
     BatchExtractionResult,
     ChunkExtractionResult,
     ChunkNode,
     DocumentNode,
 )
-from core.graph.nodeset_manager import NodeSetManager
-from core.ingestion.chunker import ArticleChunker, ChunkRecord, DocumentMetadata
-from core.logger import get_logger
-from core.stores.chroma_adapter import ChromaDBAdapter
-from core.stores.neo4j_adapter import Neo4jAdapter
+from core.memory.graph.nodeset_manager import NodeSetManager
+from core.memory.ingestion.chunker import ArticleChunker, ChunkRecord, DocumentMetadata
+from core.memory.stores.chroma_adapter import ChromaDBAdapter
+from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 

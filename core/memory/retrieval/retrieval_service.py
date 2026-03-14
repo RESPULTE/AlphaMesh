@@ -1,13 +1,19 @@
 """Memory retrieval service - fans out DualStoreRetriever calls per active domain."""
+
 from __future__ import annotations
 
 import asyncio
 from typing import List
 
 from core.logger import get_logger
-from core.memory.reranker import CompositeReranker
-from core.retrieval.dual_store_retriever import DualStoreRetriever
-from core.retrieval.models import MemoryChunk, MemoryContext, RewrittenQueries, RetrievedChunk
+from core.memory.retrieval.dual_store_retriever import DualStoreRetriever
+from core.memory.retrieval.models import (
+    MemoryChunk,
+    MemoryContext,
+    RetrievedChunk,
+    RewrittenQueries,
+)
+from core.memory.retrieval.reranker import CompositeReranker
 
 
 class MemoryRetrievalService:
@@ -31,16 +37,15 @@ class MemoryRetrievalService:
             if domain in rewritten_queries.active_domains and query is not None
         }
 
-        tasks = [
-            self._retriever.retrieve(query)
-            for query in active_queries.values()
-        ]
+        tasks = [self._retriever.retrieve(query) for query in active_queries.values()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_chunks: List[MemoryChunk] = []
         for (domain, _query), result in zip(active_queries.items(), results):
             if isinstance(result, Exception):
-                self._logger.error("Memory retrieval failed for domain %s: %s", domain, result)
+                self._logger.error(
+                    "Memory retrieval failed for domain %s: %s", domain, result
+                )
                 continue
             if not isinstance(result, list):
                 continue
@@ -52,4 +57,3 @@ class MemoryRetrievalService:
 
         ranked = self._reranker.rank(all_chunks)
         return MemoryContext(chunks=ranked, rewritten_queries=rewritten_queries)
-

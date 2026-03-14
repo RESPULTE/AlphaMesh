@@ -1,10 +1,11 @@
 """Unit tests for NodeSetManager."""
+
 import uuid
 
 import pytest
 
-from core.graph.models import ENTITY_NAMESPACE
-from core.graph.nodeset_manager import NodeSetManager
+from core.memory.graph.models import ENTITY_NAMESPACE
+from core.memory.graph.nodeset_manager import NodeSetManager
 
 
 class DummyResult:

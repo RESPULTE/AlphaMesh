@@ -1,11 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from core.agents.models import BaseAgentInput, ChunkResult
 from core.agents.news_analysis_agent import NewsAnalysisAgent
-from core.retrieval.models import MemoryChunk, MemoryContext
+from core.memory.retrieval.models import MemoryChunk, MemoryContext
 
 
 @pytest.fixture
@@ -75,8 +75,8 @@ async def test_news_agent_mocked_workflow(mock_service_manager):
         query="What is new with Apple?",
         vector_query="What is new with Apple?",
         ticker="AAPL",
-        start_date=datetime.now(timezone.utc),
-        end_date=datetime.now(timezone.utc),
+        start_date=datetime.now(),
+        end_date=datetime.now(),
         target_agents=["news_agent"],
         request_requires_agents=True,
     )
@@ -93,7 +93,7 @@ async def test_news_agent_mocked_workflow(mock_service_manager):
 async def test_news_agent_with_memory_task(mock_service_manager):
     agent = NewsAnalysisAgent()
 
-    from core.retrieval.models import RewrittenQueries
+    from core.memory.retrieval.models import RewrittenQueries
 
     # Pre-resolved memory context
     memory_chunk = MemoryChunk(
@@ -129,8 +129,8 @@ async def test_news_agent_with_memory_task(mock_service_manager):
         query="What is new with Apple?",
         vector_query="What is new with Apple?",
         ticker="AAPL",
-        start_date=datetime.now(timezone.utc),
-        end_date=datetime.now(timezone.utc),
+        start_date=datetime.now(),
+        end_date=datetime.now(),
         target_agents=["news_agent"],
         request_requires_agents=True,
         memory_task=memory_task,

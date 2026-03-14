@@ -1,11 +1,12 @@
 """Pytest fixtures and stubs for AlphaMesh unit tests."""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
 import pytest
 
-from core.stores.chroma_adapter import ChromaDBAdapter
+from core.memory.stores.chroma_adapter import ChromaDBAdapter
 
 
 class DummyCollection:
@@ -28,7 +29,9 @@ class DummyCollection:
         return {
             "ids": ids,
             "documents": ["dummy"] * len(ids),
-            "metadatas": [{"companies_involved": "A,B", "nodeset_ids": "n1"} for _ in ids],
+            "metadatas": [
+                {"companies_involved": "A,B", "nodeset_ids": "n1"} for _ in ids
+            ],
         }
 
     def delete(self, ids: List[str]) -> None:
@@ -39,9 +42,13 @@ class DummyCollection:
 
 
 @pytest.fixture
-def chroma_adapter_stub(monkeypatch: pytest.MonkeyPatch) -> Tuple[ChromaDBAdapter, DummyCollection]:
+def chroma_adapter_stub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Tuple[ChromaDBAdapter, DummyCollection]:
     """Provide a ChromaDBAdapter backed by a dummy collection."""
-    adapter = ChromaDBAdapter(collection_name="news_chunks", persist_directory=".chroma_test")
+    adapter = ChromaDBAdapter(
+        collection_name="news_chunks", persist_directory=".chroma_test"
+    )
     collection = DummyCollection()
 
     async def fake_get_collection() -> DummyCollection:

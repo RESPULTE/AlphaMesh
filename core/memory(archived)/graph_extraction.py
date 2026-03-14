@@ -43,7 +43,7 @@ from cognee.infrastructure.llm.LLMGateway import LLMGateway
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from pydantic import BaseModel, Field, create_model
 
-from core.memory.graph_models import (
+from core.memory.graph.models import (
     ALL_MAIN_SECTORS,
     Company,
     FinancialConcept,

@@ -7,8 +7,8 @@ from typing import Dict, List, Optional
 from neo4j import AsyncDriver, AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
-from core.graph.models import ChunkNode, DocumentNode, EntityNode
 from core.logger import get_logger
+from core.memory.graph.models import ChunkNode, DocumentNode, EntityNode
 
 _ALLOWED_ENTITY_TYPES = {
     "Company",

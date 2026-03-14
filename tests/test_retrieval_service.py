@@ -2,8 +2,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.memory.retrieval_service import MemoryRetrievalService
-from core.retrieval.models import RetrievedChunk, RewrittenQueries
+from core.memory.retrieval.models import RetrievedChunk, RewrittenQueries
+from core.memory.retrieval.retrieval_service import MemoryRetrievalService
 
 
 @pytest.fixture

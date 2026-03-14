@@ -32,7 +32,7 @@ from core.memory.exceptions import (
     QueryError,
 )
 from core.memory.financial_retriever import FinancialGraphRetriever, QueryScope
-from core.memory.graph_models import DATASET_NAME
+from core.memory.graph.models import DATASET_NAME
 from core.memory.nodeset_manager import (
     GLOBAL_NODESET_NAME,
     get_or_create_all_sector_nodesets,

@@ -5,9 +5,9 @@ from __future__ import annotations
 import uuid
 from typing import Dict, Optional
 
-from core.graph.models import ENTITY_NAMESPACE
 from core.logger import get_logger
-from core.stores.neo4j_adapter import Neo4jAdapter
+from core.memory.graph.models import ENTITY_NAMESPACE
+from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 
 class NodeSetManager:
@@ -28,6 +28,8 @@ class NodeSetManager:
         cypher = "MATCH (n:NodeSet) RETURN n.id AS id, n.name AS name"
         try:
             records = await self._neo4j_adapter._execute_read(cypher, {})
+            if hasattr(records, "data"):
+                records = await records.data()
             for record in records:
                 if record.get("name") and record.get("id"):
                     self._registry[record["name"]] = record["id"]

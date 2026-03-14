@@ -19,7 +19,7 @@ from core.agents.models import (
     NewsAgentState,
 )
 from core.logger import get_logger
-from core.retrieval.models import MemoryChunk
+from core.memory.retrieval.models import MemoryChunk
 from core.services import service_manager
 
 logger = get_logger(__name__)

@@ -32,7 +32,7 @@ from cognee.tasks.storage.add_data_points import add_data_points as cognee_add_d
 from core.memory.exceptions import (
     NodeSetCreationError,
 )
-from core.memory.graph_models import (
+from core.memory.graph.models import (
     ALL_MAIN_SECTORS,
     GLOBAL_ENTITY_NODESETS,
     GLOBAL_NODESET_NAME,

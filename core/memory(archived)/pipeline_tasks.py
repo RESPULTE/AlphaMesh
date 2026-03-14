@@ -33,7 +33,7 @@ from core.memory.exceptions import (
     NodeSetResolutionError,
 )
 from core.memory.graph_extraction import extract_financial_graph
-from core.memory.graph_models import (
+from core.memory.graph.models import (
     ALL_ENTITIES,
     ALL_MAIN_SECTORS,
     GLOBAL_FINANCIAL_EVENT_NODESET,

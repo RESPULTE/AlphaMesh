@@ -1,12 +1,17 @@
 """Tests for OrchestratorAgent flow."""
+
 from datetime import datetime, timezone
 
 import pytest
 from langchain_core.messages import HumanMessage
 
-from core.agents.models import CitedSource, NewsAgentOutput
 import core.agents.orchestrator_agent as orchestrator_module
-from core.agents.orchestrator_agent import FinalResponse, OrchestratorAgent, OrchestratorPlan
+from core.agents.models import CitedSource, NewsAgentOutput
+from core.agents.orchestrator_agent import (
+    FinalResponse,
+    OrchestratorAgent,
+    OrchestratorPlan,
+)
 from core.services import service_manager
 
 

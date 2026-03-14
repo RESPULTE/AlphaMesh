@@ -1,7 +1,8 @@
 """Unit tests for the ChromaDBAdapter."""
+
 import pytest
 
-from core.stores.chroma_adapter import ChromaDBAdapter
+from core.memory.stores.chroma_adapter import ChromaDBAdapter
 
 
 @pytest.mark.asyncio

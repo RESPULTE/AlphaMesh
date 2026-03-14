@@ -1,9 +1,10 @@
 """Composite re-ranker for MemoryChunk results."""
+
 from __future__ import annotations
 
 from typing import Dict, List
 
-from core.retrieval.models import MemoryChunk, RetrievedChunk
+from core.memory.retrieval.models import MemoryChunk, RetrievedChunk
 
 
 class CompositeReranker:

@@ -27,7 +27,7 @@ from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage import index_data_points, index_graph_edges
 from sqlalchemy import bindparam, text
 
-from core.memory.graph_models import ALL_ENTITIES, DATASET_NAME
+from core.memory.graph.models import ALL_ENTITIES, DATASET_NAME
 
 logger = logging.getLogger(__name__)
 

@@ -6,8 +6,8 @@ from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.graph.models import ChunkExtractionResult, EntityNode
-from core.retrieval.models import MemoryChunk
+from core.memory.graph.models import ChunkExtractionResult, EntityNode
+from core.memory.retrieval.models import MemoryChunk
 
 
 class BaseAgentInput(BaseModel):
@@ -66,7 +66,7 @@ class BaseAgentOutput(BaseModel, ABC):
         default_factory=list,
         description=(
             "List of enriched DataPoint objects resolved by this agent. "
-            "Must use classes from core.memory.graph_models. "
+            "Must use classes from core.memory.graph.models. "
             "Populated by each agent's final node before returning."
         ),
     )

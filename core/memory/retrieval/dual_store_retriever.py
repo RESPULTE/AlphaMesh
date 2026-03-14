@@ -8,8 +8,12 @@ from langgraph.graph import END, START, StateGraph
 
 from core.config import settings
 from core.logger import get_logger
-from core.retrieval.models import NodeSelectionOutput, RetrievedChunk, RetrieverState
-from core.retrieval.retrieval_prompts import build_node_selection_prompt
+from core.memory.retrieval.models import (
+    NodeSelectionOutput,
+    RetrievedChunk,
+    RetrieverState,
+)
+from core.memory.retrieval.retrieval_prompts import build_node_selection_prompt
 
 
 class DualStoreRetriever:
@@ -152,9 +156,7 @@ class DualStoreRetriever:
         selected = self._dedupe_keep_order(selected)
         selected = selected[: self._max_parallel_nodes]
 
-        updated_visited = self._extend_unique(
-            state["visited_entity_ids"], selected
-        )
+        updated_visited = self._extend_unique(state["visited_entity_ids"], selected)
 
         return {
             "candidate_neighbors": filtered_neighbors,

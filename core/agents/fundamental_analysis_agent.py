@@ -12,7 +12,7 @@ from core.agents.base_agent import AbstractAgent
 from core.agents.financial_db import FinancialDatabase
 from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.logger import get_logger
-from core.memory.graph_models import Company
+from core.memory.graph.models import Company
 from core.memory.pipeline_tasks import get_canonical_id
 from core.services import service_manager
 

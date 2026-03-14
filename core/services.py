@@ -79,7 +79,7 @@ class ServiceManager:
         return NewsApiClient(api_key=settings.NEWSAPI_KEY)
 
     def get_neo4j_adapter(self):
-        from core.stores.neo4j_adapter import Neo4jAdapter
+        from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
         if self._neo4j_adapter is None:
             try:
@@ -95,7 +95,7 @@ class ServiceManager:
         return self._neo4j_adapter
 
     def get_chroma_adapter(self):
-        from core.stores.chroma_adapter import ChromaDBAdapter
+        from core.memory.stores.chroma_adapter import ChromaDBAdapter
 
         if self._chroma_adapter is None:
             try:
@@ -109,7 +109,7 @@ class ServiceManager:
         return self._chroma_adapter
 
     def get_nodeset_manager(self):
-        from core.graph.nodeset_manager import NodeSetManager
+        from core.memory.graph.nodeset_manager import NodeSetManager
 
         if self._nodeset_manager is None:
             try:
@@ -120,8 +120,8 @@ class ServiceManager:
         return self._nodeset_manager
 
     def get_ingestor(self):
-        from core.ingestion.chunker import ArticleChunker
-        from core.ingestion.ingestor import DualStoreIngestor
+        from core.memory.ingestion.chunker import ArticleChunker
+        from core.memory.ingestion.ingestor import DualStoreIngestor
 
         if self._dual_store_ingestor is None:
             try:
@@ -142,7 +142,7 @@ class ServiceManager:
         return self._dual_store_ingestor
 
     def get_retriever(self):
-        from core.retrieval.dual_store_retriever import DualStoreRetriever
+        from core.memory.retrieval.dual_store_retriever import DualStoreRetriever
 
         if self._retriever is None:
             try:
@@ -158,7 +158,7 @@ class ServiceManager:
         return self._retriever
 
     def get_reranker(self):
-        from core.memory.reranker import CompositeReranker
+        from core.memory.retrieval.reranker import CompositeReranker
 
         if self._reranker is None:
             try:
@@ -173,7 +173,7 @@ class ServiceManager:
         return self._reranker
 
     def get_memory_retrieval_service(self):
-        from core.memory.retrieval_service import MemoryRetrievalService
+        from core.memory.retrieval.retrieval_service import MemoryRetrievalService
 
         if self._memory_retrieval_service is None:
             try:

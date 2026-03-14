@@ -46,7 +46,7 @@ from cognee.modules.retrieval.utils.brute_force_triplet_search import (
     brute_force_triplet_search,
 )
 
-from core.memory.graph_models import GLOBAL_NODESET_NAME
+from core.memory.graph.models import GLOBAL_NODESET_NAME
 
 logger = logging.getLogger(__name__)
 

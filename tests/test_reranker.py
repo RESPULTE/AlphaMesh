@@ -1,5 +1,5 @@
-from core.memory.reranker import CompositeReranker
-from core.retrieval.models import MemoryChunk, RetrievedChunk
+from core.memory.retrieval.models import MemoryChunk, RetrievedChunk
+from core.memory.retrieval.reranker import CompositeReranker
 
 
 def test_composite_reranker_ranks_correctly():

@@ -16,12 +16,13 @@ from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.logger import get_logger
-from core.memory.conversation_writeback import run_conversation_writeback
+
+# from core.memory.conversation_writeback import run_conversation_writeback
 from core.memory.prompts import (
     QUERY_REWRITE_SYSTEM_PROMPT,
     SYNTHESISER_WRITEBACK_SYSTEM_PROMPT,
 )
-from core.retrieval.models import RewrittenQueries
+from core.memory.retrieval.models import RewrittenQueries
 
 # --- Import Core Services ---
 from core.services import service_manager
@@ -267,14 +268,15 @@ class OrchestratorAgent:
         # --- Fire write-back asynchronously (non-blocking) ---
         # This runs after the node returns — user never waits for it
         if state.conversation_id:
-            asyncio.create_task(
-                run_conversation_writeback(
-                    relationships=relationships,
-                    enriched_entities=all_enriched_entities,
-                    user_email=None,  # pass from caller if multi-tenant needed
-                    conversation_id=state.conversation_id,
-                )
-            )
+            pass
+            # asyncio.create_task(
+            #     run_conversation_writeback(
+            #         relationships=relationships,
+            #         enriched_entities=all_enriched_entities,
+            #         user_email=None,  # pass from caller if multi-tenant needed
+            #         conversation_id=state.conversation_id,
+            #     )
+            # )
 
         return {
             "final_response": FinalResponse(
