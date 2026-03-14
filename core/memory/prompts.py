@@ -282,7 +282,20 @@ Generate the output structured strictly according to the `FinancialKnowledgeGrap
 # agent that resolves user preferences (e.g. verbosity, risk appetite framing)
 # before the query reaches the retriever.
 
+QUERY_REWRITE_SYSTEM_PROMPT = """\
+You are generating structured query rewrites for memory retrieval.
 
+RULES
+- Use the full message history to interpret the user's intent (not just the latest message).
+- Rewrite the latest user query into concise, keyword-dense retrieval strings for only relevant domains.
+- Domains: company, sector, market, knowledge.
+- For irrelevant domains, set the corresponding query field to null.
+- Populate active_domains only with domains that have a non-null query.
+- If the latest message is a greeting, pleasantry, or requires no data retrieval, set rewritten_queries to null.
+- Resolve pronouns and implicit references using prior messages (e.g. "its revenue" -> "AAPL revenue").
+
+Return only the structured fields required by the schema.
+"""
 FINANCIAL_SEARCH_SYSTEM_PROMPT = """\
 You are AlphaMesh, an expert financial research assistant with deep knowledge of \
 equity markets, macroeconomics, and sector dynamics.
@@ -336,14 +349,14 @@ Before writing the user response, reason about the relationships between
 the entities surfaced in the agent findings. This is your thinking step.
 
 Output a <relationships> block as a JSON array. Each entry must be:
-{
+{{
   "from_name": "<entity name>",
   "from_type": "Company | FinancialEvent | FinancialConcept | Sector",
   "relation": "<RELATION_TYPE>",
   "to_name": "<entity name>",
   "to_type": "Company | FinancialEvent | FinancialConcept | Sector",
   "confidence": "high | low"
-}
+}}
 
 Allowed RELATION_TYPE values (use exact strings):
   AFFECTS | CAUSED_BY | INCREASES | DECREASES | CORRELATED_WITH |

@@ -11,12 +11,14 @@ class ServiceManager:
     def __init__(self):
         self._llm = None
         self._embedding_func = None
-        self._memory_system = None
         self._financial_db = None
         self._neo4j_adapter = None
         self._chroma_adapter = None
         self._nodeset_manager = None
         self._dual_store_ingestor = None
+        self._retriever = None
+        self._reranker = None
+        self._memory_retrieval_service = None
 
     def get_agent(self, temperature=0.0):
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
@@ -70,17 +72,6 @@ class ServiceManager:
                 print(f"Error initializing Financial Database: {e}")
                 raise
         return self._financial_db
-
-    def get_memory_system(self):
-        from core.memory.memory_system import FinancialMemorySystem
-
-        if self._memory_system is None:
-            try:
-                self._memory_system = FinancialMemorySystem()
-            except Exception as e:
-                print(f"Error initializing Financial Memory System: {e}")
-                raise
-        return self._memory_system
 
     def get_news_api(self):
         from newsapi import NewsApiClient
@@ -149,6 +140,51 @@ class ServiceManager:
                 print(f"Error initializing DualStoreIngestor: {e}")
                 raise
         return self._dual_store_ingestor
+
+    def get_retriever(self):
+        from core.retrieval.dual_store_retriever import DualStoreRetriever
+
+        if self._retriever is None:
+            try:
+                self._retriever = DualStoreRetriever(
+                    neo4j_adapter=self.get_neo4j_adapter(),
+                    chroma_adapter=self.get_chroma_adapter(),
+                    embedding_func=self.get_embedding_func(),
+                    llm=self.get_agent(),
+                )
+            except Exception as e:
+                print(f"Error initializing DualStoreRetriever: {e}")
+                raise
+        return self._retriever
+
+    def get_reranker(self):
+        from core.memory.reranker import CompositeReranker
+
+        if self._reranker is None:
+            try:
+                self._reranker = CompositeReranker(
+                    alpha=settings.RERANK_ALPHA,
+                    beta=settings.RERANK_BETA,
+                    top_k=settings.RERANK_FINAL_TOP_K,
+                )
+            except Exception as e:
+                print(f"Error initializing CompositeReranker: {e}")
+                raise
+        return self._reranker
+
+    def get_memory_retrieval_service(self):
+        from core.memory.retrieval_service import MemoryRetrievalService
+
+        if self._memory_retrieval_service is None:
+            try:
+                self._memory_retrieval_service = MemoryRetrievalService(
+                    retriever=self.get_retriever(),
+                    reranker=self.get_reranker(),
+                )
+            except Exception as e:
+                print(f"Error initializing MemoryRetrievalService: {e}")
+                raise
+        return self._memory_retrieval_service
 
 
 service_manager = ServiceManager()

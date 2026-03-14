@@ -19,6 +19,7 @@ from core.agents.models import (
     NewsAgentState,
 )
 from core.logger import get_logger
+from core.retrieval.models import MemoryChunk
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -41,9 +42,7 @@ class NewsAnalysisAgent(AbstractAgent):
     @staticmethod
     def description() -> str:
         """Return the agent description."""
-        return (
-            "Ingests news into dual stores, schedules background extraction, and synthesizes analysis."
-        )
+        return "Ingests news into dual stores, schedules background extraction, and synthesizes analysis."
 
     @staticmethod
     def get_output_schema_class() -> Type[BaseModel]:
@@ -62,9 +61,12 @@ class NewsAnalysisAgent(AbstractAgent):
             ticker=input_data.ticker or "",
             start_date=start_date,
             end_date=end_date,
+            memory_task=input_data.memory_task,
         )
 
-        final_state = await self._graph.ainvoke(initial_state.model_dump())
+        state_payload = initial_state.model_dump()
+        state_payload["memory_task"] = input_data.memory_task
+        final_state = await self._graph.ainvoke(state_payload)
         return NewsAgentOutput(**final_state)
 
     def _build_graph(self):
@@ -74,12 +76,14 @@ class NewsAnalysisAgent(AbstractAgent):
         workflow.add_node("fetch_news", self._fetch_news_node)
         workflow.add_node("ingest_articles", self._ingest_articles_node)
         workflow.add_node("retrieve_chunks", self._retrieve_chunks_node)
+        workflow.add_node("rendezvous", self._rendezvous_node)
         workflow.add_node("analyse_news", self._analyse_news_node)
 
         workflow.add_edge(START, "fetch_news")
         workflow.add_edge("fetch_news", "ingest_articles")
         workflow.add_edge("ingest_articles", "retrieve_chunks")
-        workflow.add_edge("retrieve_chunks", "analyse_news")
+        workflow.add_edge("retrieve_chunks", "rendezvous")
+        workflow.add_edge("rendezvous", "analyse_news")
         workflow.add_edge("analyse_news", END)
 
         return workflow.compile()
@@ -99,6 +103,14 @@ class NewsAnalysisAgent(AbstractAgent):
     async def _fetch_news_node(self, state: NewsAgentState) -> dict:
         """Fetch raw news articles from NewsAPI."""
         loop = asyncio.get_running_loop()
+        now = datetime.now()
+        api_limit_date = now - timedelta(days=28)
+
+        if state.end_date > now:
+            state.end_date = now
+        if state.start_date < api_limit_date:
+            state.start_date = api_limit_date
+
         try:
             response = await loop.run_in_executor(
                 None,
@@ -141,49 +153,66 @@ class NewsAnalysisAgent(AbstractAgent):
         return {"chunk_ids": chunk_ids}
 
     async def _retrieve_chunks_node(self, state: NewsAgentState) -> dict:
-        """Retrieve relevant chunks from ChromaDB."""
-        embedding_func = service_manager.get_embedding_func()
-        chroma_adapter = service_manager.get_chroma_adapter()
+        """Retrieve relevant chunks from dual-store retriever."""
+        retriever = service_manager.get_retriever()
 
         try:
-            query_embedding = await embedding_func.aembed_query(state.query)
+            retrieved = await retriever.retrieve(state.query)
         except Exception as exc:
-            logger.error("Embedding query failed: %s", exc)
+            logger.error("Dual-store retrieval failed: %s", exc)
             raise
 
-        try:
-            result = await chroma_adapter.query(
-                query_embedding, n_results=20, where=None
+        chunk_results = [
+            ChunkResult(
+                chunk_id=c.chunk_id,
+                text=c.text,
+                metadata=c.metadata,
+                score=c.score if c.score is not None else 0.0,
             )
-        except Exception as exc:
-            logger.error("ChromaDB query failed: %s", exc)
-            raise
+            for c in retrieved
+        ]
+        logger.info("Retrieved %d chunks from DualStoreRetriever.", len(chunk_results))
+        return {"retrieved_chunks": chunk_results}
 
-        ids = (result.get("ids") or [[]])[0]
-        documents = (result.get("documents") or [[]])[0]
-        metadatas = (result.get("metadatas") or [[]])[0]
-        distances = (result.get("distances") or [[]])[0]
+    async def _rendezvous_node(self, state: NewsAgentState) -> dict:
+        """Merge memory retrieval results with freshly ingested chunks."""
+        memory_context = None
+        if state.memory_task is not None:
+            try:
+                memory_context = await state.memory_task
+            except Exception as exc:
+                logger.error("Memory retrieval task failed: %s", exc)
+                memory_context = None
 
-        retrieved: List[ChunkResult] = []
-        for idx, chunk_id in enumerate(ids):
-            retrieved.append(
-                ChunkResult(
-                    chunk_id=chunk_id,
-                    text=documents[idx] if idx < len(documents) else "",
-                    metadata=metadatas[idx] if idx < len(metadatas) else {},
-                    score=distances[idx] if idx < len(distances) else 0.0,
-                )
+        new_chunks = [
+            MemoryChunk(
+                chunk_id=chunk.chunk_id,
+                text=chunk.text,
+                source="vector",
+                domain="new",
+                embedding_score=chunk.score,
+                graph_depth=0,
+                composite_score=0.0,
+                metadata=chunk.metadata or {},
             )
-        logger.info("Retrieved %d chunks from ChromaDB.", len(retrieved))
-        return {"retrieved_chunks": retrieved}
+            for chunk in state.retrieved_chunks
+        ]
+
+        if memory_context is None:
+            final_ranked = service_manager.get_reranker().rank(new_chunks)
+            return {"final_chunks": final_ranked}
+
+        combined = new_chunks + memory_context.chunks
+        final_ranked = service_manager.get_reranker().rank(combined)
+        return {"final_chunks": final_ranked}
 
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""
-        if not state.retrieved_chunks:
+        if not state.final_chunks:
             return {"analysis": "No relevant news articles found.", "sources": []}
 
         sources: List[CitedSource] = []
-        for idx, chunk in enumerate(state.retrieved_chunks, start=1):
+        for idx, chunk in enumerate(state.final_chunks, start=1):
             metadata = chunk.metadata or {}
             sources.append(
                 CitedSource(
@@ -194,9 +223,14 @@ class NewsAnalysisAgent(AbstractAgent):
                 )
             )
 
-        context = "\n\n".join(
-            [f"[{s.source_id}] {s.title}\n{s.page_content}" for s in sources]
-        )
+        context_blocks = []
+        for chunk, source in zip(state.final_chunks, sources):
+            label = "NEW" if chunk.domain == "new" else f"MEMORY:{chunk.domain}"
+            context_blocks.append(
+                f"[{label} | score={chunk.composite_score:.2f}] {source.title}\n"
+                f"{source.page_content}"
+            )
+        context = "\n\n".join(context_blocks)
 
         system_prompt = (
             "You are a professional financial analyst. "

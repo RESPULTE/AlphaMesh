@@ -194,9 +194,7 @@ class DualStoreIngestor:
 
         status_map = await self._neo4j_adapter.get_chunk_extraction_status(chunk_ids)
         pending_chunk_ids = [
-            chunk_id
-            for chunk_id in chunk_ids
-            if status_map.get(chunk_id) == "PENDING"
+            chunk_id for chunk_id in chunk_ids if status_map.get(chunk_id) == "PENDING"
         ]
         if not pending_chunk_ids:
             return
@@ -228,7 +226,10 @@ class DualStoreIngestor:
 
         async def _extract_batch(chunks: List[dict]) -> BatchExtractionResult:
             chunk_blocks = "\n\n".join(
-                [f"[CHUNK_ID: {chunk['chunk_id']}]\n{chunk['text']}" for chunk in chunks]
+                [
+                    f"[CHUNK_ID: {chunk['chunk_id']}]\n{chunk['text']}"
+                    for chunk in chunks
+                ]
             )
             async with EXTRACTION_SEMAPHORE:
                 return await extraction_chain.ainvoke({"chunk_blocks": chunk_blocks})
@@ -249,7 +250,9 @@ class DualStoreIngestor:
         validated_results: List[ChunkExtractionResult] = []
         for result in results:
             if not result.chunk_id:
-                self._logger.warning("Skipping extraction result with missing chunk_id.")
+                self._logger.warning(
+                    "Skipping extraction result with missing chunk_id."
+                )
                 continue
             if result.chunk_id not in chunk_lookup:
                 self._logger.warning(

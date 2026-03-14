@@ -142,21 +142,79 @@ class Neo4jAdapter:
         props = {"id": nodeset_id, "name": name, "description": description}
         await self._execute_write(cypher, {"id": nodeset_id, "props": props})
 
-    # async def anchor_document_to_global(
-    #     self, document_id: str, global_anchor_id: str
-    # ) -> None:
-    #     """Anchor a document to the global anchor node."""
-    #     cypher = (
-    #         "MERGE (d:Document {id: $doc_id}) "
-    #         "MERGE (g:GlobalAnchor {id: $anchor_id}) "
-    #         "MERGE (d)-[:ANCHORED_TO]->(g)"
-    #     )
-    #     await self._execute_write(
-    #         cypher, {"doc_id": document_id, "anchor_id": global_anchor_id}
-    #     )
+    async def get_entities_for_chunks(self, chunk_ids: List[str]) -> List[dict]:
+        """Return entities mentioned by the provided chunk IDs."""
+        if not chunk_ids:
+            return []
+        cypher = (
+            "MATCH (c:Chunk)-[:MENTIONS_ENTITY]->(e:Entity) "
+            "WHERE c.id IN $chunk_ids "
+            "RETURN e.id AS entity_id, e.name AS entity_name, "
+            "e.entity_type AS entity_type, c.id AS source_chunk_id"
+        )
+        records = await self._execute_read(cypher, {"chunk_ids": chunk_ids})
+        self._logger.info(
+            "Fetched %d entities for %d chunks.", len(records), len(chunk_ids)
+        )
+        return records
+
+    async def get_entity_neighbors(
+        self, entity_ids: List[str], exclude_ids: List[str]
+    ) -> List[dict]:
+        """Return neighboring entities connected by edges."""
+        if not entity_ids:
+            return []
+        cypher = (
+            "MATCH (e:Entity)-[r]-(neighbor:Entity) "
+            "WHERE e.id IN $entity_ids "
+            "AND ($exclude_ids IS NULL OR NOT neighbor.id IN $exclude_ids) "
+            "RETURN e.id AS source_entity_id, "
+            "neighbor.id AS neighbor_entity_id, "
+            "neighbor.name AS neighbor_name, "
+            "neighbor.entity_type AS neighbor_type, "
+            "r.relationship_type AS relationship_type"
+        )
+        records = await self._execute_read(
+            cypher, {"entity_ids": entity_ids, "exclude_ids": exclude_ids}
+        )
+        self._logger.info(
+            "Fetched %d neighbors for %d entities.",
+            len(records),
+            len(entity_ids),
+        )
+        return records
+
+    async def get_chunks_for_entities(
+        self, entity_ids: List[str], exclude_chunk_ids: List[str]
+    ) -> List[dict]:
+        """Return chunks that mention the provided entities."""
+        if not entity_ids:
+            return []
+        cypher = (
+            "MATCH (c:Chunk)-[:MENTIONS_ENTITY]->(e:Entity) "
+            "WHERE e.id IN $entity_ids "
+            "AND ($exclude_chunk_ids IS NULL OR NOT c.id IN $exclude_chunk_ids) "
+            "RETURN c.id AS chunk_id, c.text AS chunk_text, "
+            "c.chunk_index AS chunk_index, c.document_id AS document_id, "
+            "c.published_at AS published_at"
+        )
+        records = await self._execute_read(
+            cypher,
+            {"entity_ids": entity_ids, "exclude_chunk_ids": exclude_chunk_ids},
+        )
+        self._logger.info(
+            "Fetched %d chunks for %d entities.",
+            len(records),
+            len(entity_ids),
+        )
+        return records
 
     async def close(self) -> None:
         """Close the underlying Neo4j driver."""
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
+
+    async def run_traversal(self, cypher: str, params: dict) -> List[dict]:
+        """Run a read-only traversal query."""
+        return await self._execute_read(cypher, params)

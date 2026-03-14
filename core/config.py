@@ -45,6 +45,21 @@ class Settings(BaseSettings):
     EXTRACTION_BATCH_SIZE: int = 6
     EXTRACTION_MAX_CONCURRENCY: int = 3
 
+    # Retriever Configuration
+    RETRIEVER_MAX_ITERATIONS: int = 3
+    RETRIEVER_SEED_TOP_K: int = 10
+    RETRIEVER_MAX_PARALLEL_NODES: int = 3
+    RETRIEVER_MAX_NEIGHBOR_CANDIDATES: int = 15
+
+    # Memory retrieval
+    MEMORY_VECTOR_TOP_K: int = 20
+    MEMORY_SIMILARITY_THRESHOLD: float = 0.72
+
+    # Re-ranking
+    RERANK_ALPHA: float = 0.8
+    RERANK_BETA: float = 0.2
+    RERANK_FINAL_TOP_K: int = 15
+
     # NewsAPI Configuration
     NEWSAPI_KEY: Optional[str] = None
 

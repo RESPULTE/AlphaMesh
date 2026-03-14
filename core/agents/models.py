@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.graph.models import ChunkExtractionResult, EntityNode
+from core.retrieval.models import MemoryChunk
 
 
 class BaseAgentInput(BaseModel):
@@ -31,6 +32,7 @@ class BaseAgentInput(BaseModel):
     end_date: Optional[datetime] = Field(
         default=None, description="End date (format: YYYY-MM-DD)."
     )
+    memory_task: Optional[Any] = Field(default=None, exclude=True)
 
     # @field_validator("start_date", "end_date", mode="before")
     # def parse_dates(cls, v):
@@ -111,8 +113,9 @@ class NewsAgentState(BaseModel):
     raw_articles: List[dict] = Field(default_factory=list)
     chunk_ids: List[str] = Field(default_factory=list)
     retrieved_chunks: List[ChunkResult] = Field(default_factory=list)
-    unextracted_chunk_ids: List[str] = Field(default_factory=list)
     extraction_results: List[ChunkExtractionResult] = Field(default_factory=list)
+    memory_task: Optional[Any] = Field(default=None, exclude=True)
+    final_chunks: List[MemoryChunk] = Field(default_factory=list)
     analysis: Optional[str] = None
     sources: List[CitedSource] = Field(default_factory=list)
     entities_enriched: List[EntityNode] = Field(default_factory=list)

@@ -17,7 +17,11 @@ from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.logger import get_logger
 from core.memory.conversation_writeback import run_conversation_writeback
-from core.memory.prompts import SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
+from core.memory.prompts import (
+    QUERY_REWRITE_SYSTEM_PROMPT,
+    SYNTHESISER_WRITEBACK_SYSTEM_PROMPT,
+)
+from core.retrieval.models import RewrittenQueries
 
 # --- Import Core Services ---
 from core.services import service_manager
@@ -50,10 +54,11 @@ class OrchestratorPlan(BaseAgentInput):
     final_answer: Optional[str] = Field(
         default=None, description="Direct answer if no agents needed (e.g. greetings)."
     )
+    rewritten_queries: Optional[RewrittenQueries] = Field(default=None)
 
 
 class OrchestratorState(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
 
     # Changed from query: str to messages: List[BaseMessage]
     messages: List[BaseMessage] = Field(default_factory=list)
@@ -65,6 +70,7 @@ class OrchestratorState(BaseModel):
     writeback_entities: List[Any] = Field(default_factory=list)
     conversation_id: Optional[str] = None  # passed in from caller
     graph_context: List[dict] = Field(default_factory=list)
+    memory_task: Optional[Any] = Field(default=None, exclude=True)
 
 
 class OrchestratorAgent:
@@ -137,7 +143,8 @@ class OrchestratorAgent:
             f"AVAILABLE AGENTS: {available_agents_desc}\n"
             "If the user's latest message is a greeting or doesn't require data, provide 'final_answer'.\n"
             "If the latest message refers to a company mentioned earlier (e.g., 'its revenue'), "
-            "ensure you extract the correct ticker from history."
+            "ensure you extract the correct ticker from history.\n\n"
+            f"{QUERY_REWRITE_SYSTEM_PROMPT}"
         )
 
         planner_llm = self._llm.with_structured_output(OrchestratorPlan)
@@ -153,7 +160,23 @@ class OrchestratorAgent:
         if plan.start_date is None:
             plan.start_date = plan.end_date - timedelta(days=365)
 
-        return {"plan": plan, "graph_context": graph_context}
+        memory_task = None
+        if (
+            plan.request_requires_agents
+            and plan.rewritten_queries
+            and plan.rewritten_queries.active_domains
+        ):
+            memory_task = asyncio.create_task(
+                service_manager.get_memory_retrieval_service().retrieve(
+                    plan.rewritten_queries
+                )
+            )
+
+        return {
+            "plan": plan,
+            "graph_context": graph_context,
+            "memory_task": memory_task,
+        }
 
     async def _query_user_graph_context(
         self, query: str, conversation_id: Optional[str]
@@ -169,7 +192,9 @@ class OrchestratorAgent:
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
         plan = state.plan
-        shared_input = BaseAgentInput(**plan.model_dump())
+        shared_input = BaseAgentInput(
+            **plan.model_dump(), memory_task=state.memory_task
+        )
 
         tasks = [
             self._agents[name].run(shared_input)
