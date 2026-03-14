@@ -8,7 +8,7 @@ CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     "You are an information extraction system. Extract entities and relationships from each "
     "news chunk provided. Only use information explicitly stated in each chunk. "
     "Do not infer relationships across multiple articles or chunks. "
-    "Allowed entity types: Company, Person, MacroIndicator, Event, GeoPoliticalRegion, Instrument. "
+    "Allowed entity types: Company, FinancialEvent, FinancialConcept, Sector. Each entity must include a short, single-sentence description drawn only from the chunk text. "
     "Return a JSON object matching the BatchExtractionResult schema. "
     "Each entity must include a temporary local_id used by relationships; "
     "relationships must reference entities by local_id. "
@@ -23,7 +23,7 @@ CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     '          "local_id": "<str>",\n'
     '          "id": "<uuid or placeholder>",\n'
     '          "name": "<str>",\n'
-    '          "entity_type": "<Company|Person|MacroIndicator|Event|GeoPoliticalRegion|Instrument>",\n'
+    '          "entity_type": "<Company|FinancialEvent|FinancialConcept|Sector>",\n          "description": "<short summary from chunk text>",\n'
     '          "aliases": ["<str>", "..."],\n'
     '          "nodeset_ids": ["<str>", "..."]\n'
     "        }}\n"
@@ -56,3 +56,4 @@ def build_extraction_prompt() -> ChatPromptTemplate:
             ("user", CHUNK_EXTRACTION_USER_TEMPLATE),
         ]
     )
+

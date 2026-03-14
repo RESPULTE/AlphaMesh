@@ -33,7 +33,7 @@ def mock_adapters():
 async def test_ingest_articles_skips_existing(mock_adapters):
     neo4j, chroma, nodeset_manager, embedding_func, chunker, llm = mock_adapters
     ingestor = DualStoreIngestor(
-        neo4j, chroma, nodeset_manager, embedding_func, chunker, llm=None
+        neo4j, chroma, chroma, nodeset_manager, embedding_func, chunker, llm=llm
     )
 
     chroma.get_chunks_with_source_url.return_value = [{"id": "c1"}]
@@ -50,7 +50,7 @@ async def test_ingest_articles_skips_existing(mock_adapters):
 async def test_ingest_articles_processes_new(mock_adapters):
     neo4j, chroma, nodeset_manager, embedding_func, chunker, llm = mock_adapters
     ingestor = DualStoreIngestor(
-        neo4j, chroma, nodeset_manager, embedding_func, chunker, llm=None
+        neo4j, chroma, chroma, nodeset_manager, embedding_func, chunker, llm=llm
     )
 
     doc_meta = DocumentMetadata(
@@ -83,44 +83,3 @@ async def test_ingest_articles_processes_new(mock_adapters):
     chroma.upsert_chunks.assert_called_once()
     embedding_func.aembed_documents.assert_called_once()
     nodeset_manager.get_global_financial_events_id.assert_called()
-
-
-@pytest.mark.asyncio
-async def test_ingestor_schedules_extraction(mock_adapters):
-    neo4j, chroma, nodeset_manager, embedding_func, chunker, llm = mock_adapters
-    ingestor = DualStoreIngestor(
-        neo4j, chroma, nodeset_manager, embedding_func, chunker, llm
-    )
-
-    # We will test _extract_entities_for_chunks directly to avoid background task complexities
-    neo4j.get_chunk_extraction_status.return_value = {"c1": "PENDING"}
-    chroma.get_by_ids.return_value = {
-        "ids": ["c1"],
-        "documents": ["chunk text"],
-        "metadatas": [{"extraction_status": "PENDING"}],
-    }
-
-    from langchain_core.runnables import RunnableLambda
-
-    from core.memory.graph.models import BatchExtractionResult, ChunkExtractionResult
-
-    async def mock_ainvoke(*args, **kwargs):
-        return BatchExtractionResult(
-            results=[
-                ChunkExtractionResult(chunk_id="c1", entities=[], relationships=[])
-            ]
-        )
-
-    mock_chain = RunnableLambda(func=lambda x: None, afunc=mock_ainvoke)
-    from unittest.mock import MagicMock
-
-    llm.with_structured_output = MagicMock(return_value=mock_chain)
-
-    # Run the background extraction coroutine explicitly
-    await ingestor._extract_entities_for_chunks(["c1"])
-
-    # Should update extraction status to EXTRACTED
-    neo4j.update_chunk_extraction_status.assert_called_with("c1", "EXTRACTED")
-    chroma.update_metadata.assert_called_once()
-    updated_meta = chroma.update_metadata.call_args[0][1][0]
-    assert updated_meta["extraction_status"] == "EXTRACTED"

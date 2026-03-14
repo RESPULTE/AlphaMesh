@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableLambda
 
 import core.agents.orchestrator_agent as orchestrator_module
 from core.agents.models import CitedSource, NewsAgentOutput
@@ -28,8 +29,49 @@ class StubNewsAgent:
 @pytest.mark.asyncio
 async def test_orchestrator_returns_final_answer(monkeypatch):
     monkeypatch.setattr(orchestrator_module, "AVAILABLE_AGENTS", [])
-    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0: object())
+
+    # Patch service_manager.get_agent to return a dummy LLM with with_structured_output
+    class DummyLLM:
+        def with_structured_output(self, schema):
+            if schema.__name__ == "OrchestratorPlan":
+
+                async def fake_plan_invoke(x):
+                    return plan
+
+                return RunnableLambda(fake_plan_invoke)
+            else:
+
+                async def fake_synth_invoke(x):
+                    return schema(relationships=[], response="hello")
+
+                return RunnableLambda(fake_synth_invoke)
+
+        async def ainvoke(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0: DummyLLM())
     agent = OrchestratorAgent()
+
+    # Patch agent._llm to a mock with with_structured_output
+    class DummyLLM2:
+        def with_structured_output(self, schema):
+            if schema.__name__ == "OrchestratorPlan":
+
+                async def fake_plan_invoke(x):
+                    return plan
+
+                return RunnableLambda(fake_plan_invoke)
+            else:
+
+                async def fake_synth_invoke(x):
+                    return schema(relationships=[], response="hello")
+
+                return RunnableLambda(fake_synth_invoke)
+
+        async def ainvoke(self, *args, **kwargs):
+            pass
+
+    agent._llm = DummyLLM2()
     plan = OrchestratorPlan(
         query="hi",
         vector_query="hi",
@@ -53,7 +95,27 @@ async def test_orchestrator_returns_final_answer(monkeypatch):
 @pytest.mark.asyncio
 async def test_orchestrator_runs_agent_and_synthesizes(monkeypatch):
     monkeypatch.setattr(orchestrator_module, "AVAILABLE_AGENTS", [])
-    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0: object())
+
+    # Patch service_manager.get_agent to return a dummy LLM with with_structured_output
+    class DummyLLM:
+        def with_structured_output(self, schema):
+            if schema.__name__ == "OrchestratorPlan":
+
+                async def fake_plan_invoke(x):
+                    return plan
+
+                return RunnableLambda(fake_plan_invoke)
+            else:
+
+                async def fake_synth_invoke(x):
+                    return schema(relationships=[], response="analysis")
+
+                return RunnableLambda(fake_synth_invoke)
+
+        async def ainvoke(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0: DummyLLM())
     agent = OrchestratorAgent()
     plan = OrchestratorPlan(
         query="test",
@@ -70,11 +132,7 @@ async def test_orchestrator_runs_agent_and_synthesizes(monkeypatch):
         return {"plan": plan}
 
     async def fake_synthesize(self, state):
-        return {
-            "final_response": FinalResponse(summary="analysis", sources=[]),
-            "writeback_relationships": [],
-            "writeback_entities": [],
-        }
+        return FinalResponse(summary="analysis", sources=[], fundamental_data=None)
 
     monkeypatch.setattr(OrchestratorAgent, "_plan_node", fake_plan)
     monkeypatch.setattr(OrchestratorAgent, "_synthesize_node", fake_synthesize)

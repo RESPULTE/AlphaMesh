@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from core.memory.retrieval.models import MemoryChunk, RetrievedChunk
+from core.memory.retrieval.models import MemoryChunk
 
 
 class CompositeReranker:
@@ -30,16 +30,3 @@ class CompositeReranker:
             deduped.values(), key=lambda item: item.composite_score, reverse=True
         )
         return ranked[: self._top_k]
-
-    @staticmethod
-    def from_retrieved_chunk(chunk: RetrievedChunk, domain: str) -> MemoryChunk:
-        return MemoryChunk(
-            chunk_id=chunk.chunk_id,
-            text=chunk.text,
-            source=chunk.source,
-            domain=domain,
-            embedding_score=chunk.score if chunk.score is not None else 0.0,
-            graph_depth=0 if chunk.source == "vector" else 1,
-            composite_score=0.0,
-            metadata=chunk.metadata or {},
-        )

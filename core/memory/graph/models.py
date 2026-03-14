@@ -49,24 +49,13 @@ class EntityNode(BaseModel):
     name: str
     entity_type: Literal[
         "Company",
-        "Person",
-        "MacroIndicator",
-        "Event",
-        "GeoPoliticalRegion",
-        "Instrument",
+        "FinancialEvent",
+        "FinancialConcept",
+        "Sector",
     ]
+    description: str
     aliases: List[str] = Field(default_factory=list)
     nodeset_ids: List[str] = Field(default_factory=list)
-
-
-class GlobalAnchorNode(BaseModel):
-    """Graph node contract for the global anchor."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    id: str
-    name: str = "Global Financial Events"
-    description: str
 
 
 class ExtractedRelationship(BaseModel):

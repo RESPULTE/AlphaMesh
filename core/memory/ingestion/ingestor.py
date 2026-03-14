@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timezone
-from typing import List
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.config import settings
 from core.logger import get_logger
@@ -16,13 +16,49 @@ from core.memory.graph.models import (
     ChunkExtractionResult,
     ChunkNode,
     DocumentNode,
+    EntityNode,
 )
 from core.memory.graph.nodeset_manager import NodeSetManager
 from core.memory.ingestion.chunker import ArticleChunker, ChunkRecord, DocumentMetadata
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
+from core.services import service_manager
+
+logger = get_logger(__name__)
 
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
+FUZZY_CANDIDATE_THRESHOLD = 0.50
+SEMANTIC_MERGE_THRESHOLD = 0.85
+VECTOR_TOP_K = 10
+
+_ALLOWED_ENTITY_TYPES = {"Company", "FinancialEvent", "FinancialConcept", "Sector"}
+
+
+def _canonical_entity_id(name: str, entity_type: str) -> str:
+    key = f"{name.lower()}::{entity_type.lower()}"
+    return str(uuid.uuid5(ENTITY_NAMESPACE, key))
+
+
+def _normalize_entity_type(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    entity_type = str(value).strip()
+    if entity_type in _ALLOWED_ENTITY_TYPES:
+        return entity_type
+    return None
+
+
+def _normalize_entity_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_entity_description(value: Any, fallback: str) -> str:
+    description = str(value or "").strip()
+    return description or fallback
+
+
+def _entity_key(name: str, entity_type: str) -> Tuple[str, str]:
+    return (name.lower(), entity_type)
 
 
 class DualStoreIngestor:
@@ -32,6 +68,7 @@ class DualStoreIngestor:
         self,
         neo4j_adapter: Neo4jAdapter,
         chroma_adapter: ChromaDBAdapter,
+        entity_chroma_adapter: Optional[ChromaDBAdapter],
         nodeset_manager: NodeSetManager,
         embedding_func,
         chunker: ArticleChunker,
@@ -40,6 +77,7 @@ class DualStoreIngestor:
         """Initialize the ingestor with adapters and utilities."""
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
+        self._entity_chroma_adapter = entity_chroma_adapter
         self._nodeset_manager = nodeset_manager
         self._embedding_func = embedding_func
         self._chunker = chunker
@@ -83,7 +121,7 @@ class DualStoreIngestor:
             await self._write_chunk_nodes(chunks, global_anchor_id)
             await self._write_vector_chunks(chunks, global_anchor_id)
             chunk_ids = [chunk.chunk_id for chunk in chunks]
-            self._schedule_extraction(chunk_ids)
+            # self._schedule_extraction(chunk_ids)
             return chunk_ids
         except Exception:
             self._logger.exception("Failed to ingest articles.")
@@ -170,13 +208,6 @@ class DualStoreIngestor:
         except Exception:
             self._logger.exception("Failed to write vector chunks.")
             raise
-
-    def _schedule_extraction(self, chunk_ids: List[str]) -> None:
-        """Schedule non-blocking entity extraction for chunk IDs."""
-        if not chunk_ids or self._llm is None:
-            return
-        task = asyncio.create_task(self._extract_entities_for_chunks(chunk_ids))
-        task.add_done_callback(self._log_extraction_task_result)
 
     def _log_extraction_task_result(self, task: asyncio.Task) -> None:
         """Log any exception raised by the background extraction task."""
@@ -265,6 +296,8 @@ class DualStoreIngestor:
         for result in validated_results:
             local_id_map = {}
             for entity in result.entities:
+                if not getattr(entity, "description", None):
+                    entity.description = entity.name
                 canonical_id = str(
                     uuid.uuid5(
                         ENTITY_NAMESPACE,
@@ -274,7 +307,7 @@ class DualStoreIngestor:
                 local_key = entity.local_id or canonical_id
                 entity.id = canonical_id
                 local_id_map[local_key] = entity
-                await self._neo4j_adapter.merge_entity_node(entity)
+                await self._persist_entity(entity)
                 await self._neo4j_adapter.merge_relationship(
                     result.chunk_id,
                     entity.id,
@@ -286,6 +319,11 @@ class DualStoreIngestor:
                 source_entity = local_id_map.get(rel.source_entity_local_id)
                 target_entity = local_id_map.get(rel.target_entity_local_id)
                 if not source_entity or not target_entity:
+                    logger.warning(
+                        "Skipping relationship with unresolved entities: %s -> %s",
+                        rel.source_entity_local_id,
+                        rel.target_entity_local_id,
+                    )
                     continue
                 await self._neo4j_adapter.merge_relationship(
                     source_entity.id,
@@ -309,3 +347,220 @@ class DualStoreIngestor:
                 await self._chroma_adapter.update_metadata(
                     [result.chunk_id], [updated_metadata]
                 )
+
+    async def run_conversation_writeback(
+        self,
+        relationships: List[dict],
+        enriched_entities: List[Any],
+        conversation_id: str,
+        user_email: Optional[str] = None,
+    ) -> None:
+        """
+        Write enriched entities and synthesiser-derived relationships to the graph.
+
+        Called fire-and-forget from OrchestratorAgent._synthesize_node.
+        All exceptions are caught and logged -- this function NEVER raises.
+        """
+        _ = user_email
+        try:
+            if not enriched_entities and not relationships:
+                logger.debug("write_back [%s]: nothing to write.", conversation_id)
+                return
+
+            embedding_func = service_manager.get_embedding_func()
+
+            entity_cache: Dict[tuple[str, str], str] = {}
+
+            # --- Step 1: Resolve + dedup enriched entities ---
+            for raw_entity in enriched_entities:
+                name = _normalize_entity_name(getattr(raw_entity, "name", None))
+                entity_type = _normalize_entity_type(
+                    getattr(raw_entity, "entity_type", None)
+                )
+                if not name or not entity_type:
+                    continue
+                await self._resolve_entity(
+                    name,
+                    entity_type,
+                    entity_cache,
+                    raw=raw_entity,
+                )
+            # --- Step 2: Write relationships ---
+            for rel in relationships or []:
+                from_name = _normalize_entity_name(rel.get("from_name"))
+                to_name = _normalize_entity_name(rel.get("to_name"))
+                relation_type = str(rel.get("relation", "")).strip()
+                confidence = str(rel.get("confidence", "low")).strip() or "low"
+
+                from_type = _normalize_entity_type(rel.get("from_type"))
+                to_type = _normalize_entity_type(rel.get("to_type"))
+
+                if not from_name or not to_name:
+                    continue
+                if not from_type or not to_type:
+                    continue
+                if not relation_type or not relation_type.isidentifier():
+                    continue
+
+                source_id = await self._resolve_entity(
+                    from_name,
+                    from_type,
+                    entity_cache,
+                )
+                target_id = await self._resolve_entity(
+                    to_name,
+                    to_type,
+                    entity_cache,
+                )
+                if not source_id or not target_id:
+                    continue
+
+                props = self._build_relationship_props(
+                    relation_type,
+                    confidence,
+                    conversation_id,
+                    from_type,
+                    to_type,
+                )
+                await self._neo4j_adapter.merge_relationship(
+                    source_id, target_id, relation_type, props
+                )
+                await self._neo4j_adapter.merge_relationship(
+                    source_id, target_id, "RELATED_TO", props
+                )
+
+        except Exception as exc:
+            logger.error(
+                "write_back [%s]: unhandled error (user response unaffected): %s",
+                conversation_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def _persist_entity(self, node: EntityNode) -> None:
+        await self._neo4j_adapter.merge_entity_node(node)
+        await self._entity_chroma_adapter.upsert_entity_embedding(
+            entity_id=node.id,
+            name=node.name,
+            description=node.description,
+            entity_type=node.entity_type,
+        )
+
+    async def _find_existing_entity(self, node: EntityNode) -> Optional[str]:
+        if await self._neo4j_adapter.entity_exists(node.id):
+            return node.id
+        return await self.find_similar_entities(node)
+
+    async def _resolve_entity(
+        self,
+        name: str,
+        entity_type: str,
+        entity_cache: Dict[Tuple[str, str], str],
+        *,
+        raw: Any = None,
+    ) -> Optional[str]:
+        key = _entity_key(name, entity_type)
+        if key in entity_cache:
+            return entity_cache[key]
+
+        if not entity_type or not name:
+            return None
+
+        entity_id = _canonical_entity_id(name, entity_type)
+        node = EntityNode(
+            id=entity_id,
+            name=name,
+            entity_type=entity_type,
+            description=_normalize_entity_description(
+                getattr(raw, "description", None) if raw else None,
+                name,
+            ),
+            aliases=list(getattr(raw, "aliases", []) or []) if raw else [],
+            nodeset_ids=list(getattr(raw, "nodeset_ids", []) or []) if raw else [],
+        )
+
+        existing_id = await self._find_existing_entity(node)
+        if existing_id:
+            entity_cache[key] = existing_id
+            return existing_id
+
+        await self._persist_entity(node)
+        if raw is not None:
+            await self._nodeset_manager.assign_to_node(
+                node.id,
+                node.entity_type,
+                node.nodeset_ids or [],
+            )
+
+        entity_cache[key] = node.id
+        return node.id
+
+    def _build_relationship_props(
+        self,
+        relation_type: str,
+        confidence: str,
+        conversation_id: str,
+        from_type: str,
+        to_type: str,
+    ) -> Dict[str, object]:
+        return {
+            "relationship_type": relation_type,
+            "confidence": confidence,
+            "source_conversation_id": conversation_id,
+            "from_type": from_type,
+            "to_type": to_type,
+        }
+
+    async def find_similar_entities(
+        self,
+        entity: EntityNode,
+    ) -> Optional[str]:
+        if self._chroma_adapter is None:
+            return None
+
+        name = _normalize_entity_name(entity.name)
+        if not name:
+            return None
+
+        description = _normalize_entity_description(entity.description, name)
+        text = f"{name}. {description}"
+
+        candidate_ids = None
+        try:
+            fuzzy_candidates = await self._neo4j_adapter.find_fuzzy_entity_candidates(
+                entity_type=entity.entity_type,
+                name=name,
+                exclude_id=entity.id,
+                threshold=FUZZY_CANDIDATE_THRESHOLD,
+                limit=VECTOR_TOP_K,
+            )
+            candidate_ids = set(fuzzy_candidates) if fuzzy_candidates else None
+        except Exception:
+            logger.exception("write_back: fuzzy candidate query failed.")
+
+        try:
+            result = await self._chroma_adapter.query_entity_similar(
+                text=text,
+                entity_type=entity.entity_type,
+                n_results=VECTOR_TOP_K,
+            )
+        except Exception:
+            logger.exception("write_back: entity embedding search failed.")
+            return None
+
+        ids_batch = (result.get("ids") or [[]])[0]
+        distances_batch = (result.get("distances") or [[]])[0]
+
+        for idx, candidate_id in enumerate(ids_batch):
+            if not candidate_id:
+                continue
+            distance = distances_batch[idx] if idx < len(distances_batch) else None
+            if distance is None:
+                continue
+            if candidate_ids is not None and candidate_id not in candidate_ids:
+                continue
+            similarity = 1.0 - float(distance)
+            if similarity >= SEMANTIC_MERGE_THRESHOLD:
+                return str(candidate_id)
+
+        return None

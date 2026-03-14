@@ -7,18 +7,6 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class RetrievedChunk(BaseModel):
-    """Represents a retrieved chunk from either vector or graph store."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    chunk_id: str
-    text: str
-    score: Optional[float] = None
-    source: Literal["vector", "graph"]
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
 class NodeSelectionOutput(BaseModel):
     """Structured output for selecting nodes to expand."""
 
@@ -48,20 +36,36 @@ class RewrittenQueries(BaseModel):
     )
 
 
-class MemoryChunk(BaseModel):
+class RetrievedChunk(BaseModel):
+    """Represents a retrieved chunk from either vector or graph store."""
+
+    model_config = ConfigDict(extra="ignore")
+
     chunk_id: str
     text: str
+    score: Optional[float] = None
     source: Literal["vector", "graph"]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryChunk(RetrievedChunk):
+    """RetrievedChunk enriched with domain context and composite scoring."""
+
     domain: str
     embedding_score: float = 0.0
     graph_depth: int = 0
     composite_score: float = 0.0
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_retrieved(cls, chunk: RetrievedChunk, domain: str) -> "MemoryChunk":
+        return cls(
+            **chunk.model_dump(),
+            domain=domain,
+            embedding_score=chunk.score or 0.0,
+            graph_depth=0 if chunk.source == "vector" else 1,
+        )
 
 
 class MemoryContext(BaseModel):
     chunks: List[MemoryChunk]
     rewritten_queries: RewrittenQueries
-
-
-

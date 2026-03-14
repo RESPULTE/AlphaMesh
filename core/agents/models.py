@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.memory.graph.models import ChunkExtractionResult, EntityNode
-from core.memory.retrieval.models import MemoryChunk
+from core.memory.retrieval.models import MemoryChunk, RetrievedChunk
 
 
 class BaseAgentInput(BaseModel):
@@ -90,17 +90,6 @@ class CitedSource(BaseModel):
     page_content: str = Field(description="The content of the article.")
 
 
-class ChunkResult(BaseModel):
-    """Lightweight container for retrieved chunk results."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    chunk_id: str
-    text: str
-    metadata: dict
-    score: float
-
-
 class NewsAgentState(BaseModel):
     """State container for the refactored news analysis agent."""
 
@@ -112,7 +101,7 @@ class NewsAgentState(BaseModel):
     end_date: datetime
     raw_articles: List[dict] = Field(default_factory=list)
     chunk_ids: List[str] = Field(default_factory=list)
-    retrieved_chunks: List[ChunkResult] = Field(default_factory=list)
+    retrieved_chunks: List[RetrievedChunk] = Field(default_factory=list)
     extraction_results: List[ChunkExtractionResult] = Field(default_factory=list)
     memory_task: Optional[Any] = Field(default=None, exclude=True)
     final_chunks: List[MemoryChunk] = Field(default_factory=list)

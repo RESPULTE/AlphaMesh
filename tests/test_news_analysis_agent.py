@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.agents.models import BaseAgentInput, ChunkResult
+from core.agents.models import BaseAgentInput
 from core.agents.news_analysis_agent import NewsAnalysisAgent
-from core.memory.retrieval.models import MemoryChunk, MemoryContext
+from core.memory.retrieval.models import MemoryChunk, MemoryContext, RetrievedChunk
 
 
 @pytest.fixture
@@ -28,10 +28,11 @@ def mock_service_manager(monkeypatch):
 
     mock_retriever = AsyncMock()
     mock_retriever.retrieve.return_value = [
-        ChunkResult(
+        RetrievedChunk(
             chunk_id="c1",
             text="Apple releases new iPad",
             score=0.9,
+            source="vector",
             metadata={"article_title": "Apple News"},
         )
     ]

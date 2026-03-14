@@ -99,6 +99,63 @@ class ChromaDBAdapter:
             self._logger.exception("Failed to upsert chunks to ChromaDB.")
             raise
 
+    async def upsert_entity_embedding(
+        self,
+        entity_id: str,
+        name: str,
+        description: str,
+        entity_type: str,
+        embedding_func=None,
+    ) -> None:
+        """Upsert a single entity embedding into this collection."""
+        if not entity_id:
+            return
+        cleaned_name = (name or "").strip()
+        if not cleaned_name:
+            return
+        cleaned_description = (description or "").strip() or cleaned_name
+        text = f"{cleaned_name}. {cleaned_description}"
+        embedder = embedding_func or self._embedding_function
+        if embedder is None:
+            raise ValueError("Embedding function is required for entity upsert.")
+        try:
+            embeddings = await embedder.aembed_documents([text])
+            metadata = {
+                "entity_id": entity_id,
+                "entity_type": entity_type,
+                "name": cleaned_name,
+            }
+            await self.upsert_chunks(
+                chunk_ids=[entity_id],
+                texts=[text],
+                embeddings=embeddings,
+                metadatas=[metadata],
+            )
+        except Exception:
+            self._logger.exception("Failed to upsert entity embedding.")
+            raise
+
+    async def query_entity_similar(
+        self,
+        text: str,
+        entity_type: str,
+        n_results: int,
+        embedding_func=None,
+    ):
+        """Query entity embeddings by text within a type filter."""
+        cleaned_text = (text or "").strip()
+        if not cleaned_text:
+            return {"ids": [[]], "distances": [[]], "metadatas": [[]]}
+        embedder = embedding_func or self._embedding_function
+        if embedder is None:
+            raise ValueError("Embedding function is required for entity query.")
+        embeddings = await embedder.aembed_documents([cleaned_text])
+        return await self.query(
+            embeddings[0],
+            n_results=n_results,
+            where={"entity_type": entity_type},
+        )
+
     async def query(
         self, query_embedding: List[float], n_results: int, where: Optional[dict] = None
     ):
@@ -139,8 +196,7 @@ class ChromaDBAdapter:
             collection = await self.get_or_create_collection(self._collection_name)
             await asyncio.to_thread(collection.delete, ids=ids)
         except Exception:
-            self._logger.exception("Failed to delete documents from ChromaDB.")
-            raise
+            self._logger.error("Failed to delete documents from ChromaDB.")
 
     async def update_metadata(self, ids: List[str], metadatas: List[dict]) -> None:
         """Update metadata for existing documents."""

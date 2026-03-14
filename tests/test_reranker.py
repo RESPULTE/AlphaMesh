@@ -79,7 +79,7 @@ def test_composite_reranker_deduplicates_by_chunk_id():
     assert ranked[0].text == "text 1 better"
 
 
-def test_composite_reranker_from_retrieved_chunk():
+def test_memory_chunk_from_retrieved():
     rc = RetrievedChunk(
         chunk_id="r1",
         text="text r",
@@ -87,7 +87,7 @@ def test_composite_reranker_from_retrieved_chunk():
         score=0.8,
         metadata={"meta": "data"},
     )
-    mc = CompositeReranker.from_retrieved_chunk(rc, domain="market")
+    mc = MemoryChunk.from_retrieved(rc, domain="market")
 
     assert mc.chunk_id == "r1"
     assert mc.domain == "market"
@@ -99,6 +99,6 @@ def test_composite_reranker_from_retrieved_chunk():
     rc2 = RetrievedChunk(
         chunk_id="r2", text="text r2", source="graph", score=None, metadata={}
     )
-    mc2 = CompositeReranker.from_retrieved_chunk(rc2, domain="sector")
+    mc2 = MemoryChunk.from_retrieved(rc2, domain="sector")
     assert mc2.embedding_score == 0.0
     assert mc2.graph_depth == 1

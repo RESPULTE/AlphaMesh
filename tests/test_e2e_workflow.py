@@ -1,7 +1,7 @@
 """Integration test for full AlphaMesh pipeline using live services."""
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -61,7 +61,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
 async def test_news_agent_pipeline_live() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    end_date = datetime.now(timezone.utc)
+    end_date = datetime.now()
     start_date = end_date - timedelta(days=3)
 
     agent = NewsAnalysisAgent()

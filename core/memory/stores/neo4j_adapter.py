@@ -12,11 +12,9 @@ from core.memory.graph.models import ChunkNode, DocumentNode, EntityNode
 
 _ALLOWED_ENTITY_TYPES = {
     "Company",
-    "Person",
-    "MacroIndicator",
-    "Event",
-    "GeoPoliticalRegion",
-    "Instrument",
+    "FinancialEvent",
+    "FinancialConcept",
+    "Sector",
 }
 
 
@@ -71,6 +69,42 @@ class Neo4jAdapter:
             self._logger.exception("Neo4j read failed.")
             raise
 
+
+    async def entity_exists(self, entity_id: str) -> bool:
+        if not entity_id:
+            return False
+        cypher = "MATCH (e:Entity {id: $id}) RETURN e.id AS id LIMIT 1"
+        records = await self._execute_read(cypher, {"id": entity_id})
+        return bool(records)
+
+    async def find_fuzzy_entity_candidates(
+        self,
+        entity_type: str,
+        name: str,
+        exclude_id: str = "",
+        threshold: float = 0.50,
+        limit: int = 10,
+    ) -> List[str]:
+        cypher = (
+            "MATCH (e:Entity) "
+            "WHERE e.entity_type = $entity_type AND e.name IS NOT NULL AND e.id <> $exclude_id "
+            "WITH e, apoc.text.sorensenDiceSimilarity(toLower(e.name), toLower($name)) AS sim "
+            "WHERE sim >= $threshold "
+            "RETURN e.id AS id "
+            "ORDER BY sim DESC "
+            "LIMIT $limit"
+        )
+        records = await self._execute_read(
+            cypher,
+            {
+                "entity_type": entity_type,
+                "name": name,
+                "exclude_id": exclude_id or "",
+                "threshold": threshold,
+                "limit": limit,
+            },
+        )
+        return [record.get("id") for record in records if record.get("id")]
     async def merge_document_node(self, node: DocumentNode) -> None:
         """Merge a document node and update its properties."""
         cypher = "MERGE (d:Document {id: $id}) SET d += $props"
@@ -218,3 +252,5 @@ class Neo4jAdapter:
     async def run_traversal(self, cypher: str, params: dict) -> List[dict]:
         """Run a read-only traversal query."""
         return await self._execute_read(cypher, params)
+
+

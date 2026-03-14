@@ -8,10 +8,6 @@ Public API for the AlphaMesh multi-tenant financial memory system (Cognee-based)
 
 from cognee.modules.engine.models.node_set import NodeSet
 
-from core.memory.conversation_writeback import (
-    EntityRelationship,
-    run_conversation_writeback,
-)
 from core.memory.exceptions import (
     DatasetInitError,
     IngestionError,
@@ -54,8 +50,6 @@ __all__ = [
     # User context retrieval (output type; method lives on FinancialMemorySystem)
     "UserContextRecord",
     # Conversation write-back
-    "EntityRelationship",
-    "run_conversation_writeback",
     # NodeSet management
     "hash_user_email",
     "get_user_nodeset_name",
@@ -84,3 +78,5 @@ __all__ = [
     "IngestionError",
     "QueryError",
 ]
+
+

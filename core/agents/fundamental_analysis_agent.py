@@ -12,8 +12,6 @@ from core.agents.base_agent import AbstractAgent
 from core.agents.financial_db import FinancialDatabase
 from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.logger import get_logger
-from core.memory.graph.models import Company
-from core.memory.pipeline_tasks import get_canonical_id
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -360,24 +358,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
         return FundamentalAnalysisOutput(
             financial_data=state.financial_data,
             analysis=response.content,
-            entities_enriched=[_build_company_entity(state.ticker, response.content)],
+            # entities_enriched=[_build_company_entity(state.ticker, response.content)],
         )
-
-
-def _build_company_entity(ticker: str, analysis_text: str) -> Company:
-    """
-    Build a minimal enriched Company DataPoint from what the fundamental agent knows.
-    The description is seeded from the analysis — this is the enrichment.
-    """
-    first_sentence = analysis_text.split(".")[0].strip() + "." if analysis_text else ""
-    return Company(
-        id=get_canonical_id(ticker.upper()),
-        ticker=ticker.upper(),
-        name=ticker.upper(),
-        description=first_sentence,
-        sector="",
-        industry=None,
-    )
 
 
 def add_units(x):

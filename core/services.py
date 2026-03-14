@@ -14,6 +14,7 @@ class ServiceManager:
         self._financial_db = None
         self._neo4j_adapter = None
         self._chroma_adapter = None
+        self._entity_chroma_adapter = None
         self._nodeset_manager = None
         self._dual_store_ingestor = None
         self._retriever = None
@@ -108,6 +109,21 @@ class ServiceManager:
                 raise
         return self._chroma_adapter
 
+    def get_entity_chroma_adapter(self):
+        from core.memory.stores.chroma_adapter import ChromaDBAdapter
+
+        if self._entity_chroma_adapter is None:
+            try:
+                self._entity_chroma_adapter = ChromaDBAdapter(
+                    collection_name=settings.CHROMA_COLLECTION_ENTITIES,
+                    persist_directory=settings.CHROMA_PATH,
+                    embedding_function=self.get_embedding_func(),
+                )
+            except Exception as e:
+                print(f"Error initializing Entity ChromaDB adapter: {e}")
+                raise
+        return self._entity_chroma_adapter
+
     def get_nodeset_manager(self):
         from core.memory.graph.nodeset_manager import NodeSetManager
 
@@ -131,6 +147,7 @@ class ServiceManager:
                 self._dual_store_ingestor = DualStoreIngestor(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
+                    entity_chroma_adapter=self.get_entity_chroma_adapter(),
                     nodeset_manager=self.get_nodeset_manager(),
                     embedding_func=self.get_embedding_func(),
                     chunker=chunker,
@@ -188,3 +205,7 @@ class ServiceManager:
 
 
 service_manager = ServiceManager()
+
+
+
+

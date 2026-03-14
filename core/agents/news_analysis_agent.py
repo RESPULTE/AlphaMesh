@@ -13,7 +13,6 @@ from pydantic import BaseModel
 from core.agents.base_agent import AbstractAgent
 from core.agents.models import (
     BaseAgentInput,
-    ChunkResult,
     CitedSource,
     NewsAgentOutput,
     NewsAgentState,
@@ -162,17 +161,8 @@ class NewsAnalysisAgent(AbstractAgent):
             logger.error("Dual-store retrieval failed: %s", exc)
             raise
 
-        chunk_results = [
-            ChunkResult(
-                chunk_id=c.chunk_id,
-                text=c.text,
-                metadata=c.metadata,
-                score=c.score if c.score is not None else 0.0,
-            )
-            for c in retrieved
-        ]
-        logger.info("Retrieved %d chunks from DualStoreRetriever.", len(chunk_results))
-        return {"retrieved_chunks": chunk_results}
+        logger.info("Retrieved %d chunks from DualStoreRetriever.", len(retrieved))
+        return {"retrieved_chunks": retrieved}
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge memory retrieval results with freshly ingested chunks."""
@@ -185,16 +175,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 memory_context = None
 
         new_chunks = [
-            MemoryChunk(
-                chunk_id=chunk.chunk_id,
-                text=chunk.text,
-                source="vector",
-                domain="new",
-                embedding_score=chunk.score,
-                graph_depth=0,
-                composite_score=0.0,
-                metadata=chunk.metadata or {},
-            )
+            MemoryChunk.from_retrieved(chunk, domain="new")
             for chunk in state.retrieved_chunks
         ]
 

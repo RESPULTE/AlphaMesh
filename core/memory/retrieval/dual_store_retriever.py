@@ -24,6 +24,7 @@ class DualStoreRetriever:
         self._chroma_adapter = chroma_adapter
         self._embedding_func = embedding_func
         self._llm = llm
+
         self._logger = get_logger(__name__)
 
         self._max_iterations = settings.RETRIEVER_MAX_ITERATIONS

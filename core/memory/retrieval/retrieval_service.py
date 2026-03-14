@@ -51,9 +51,7 @@ class MemoryRetrievalService:
                 continue
             for chunk in result:
                 if isinstance(chunk, RetrievedChunk):
-                    all_chunks.append(
-                        CompositeReranker.from_retrieved_chunk(chunk, domain=domain)
-                    )
+                    all_chunks.append(MemoryChunk.from_retrieved(chunk, domain=domain))
 
         ranked = self._reranker.rank(all_chunks)
         return MemoryContext(chunks=ranked, rewritten_queries=rewritten_queries)

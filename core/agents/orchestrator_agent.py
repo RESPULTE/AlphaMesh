@@ -1,6 +1,4 @@
 import asyncio
-import json
-import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Type
 
@@ -15,13 +13,11 @@ from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
 from core.agents.news_analysis_agent import NewsAnalysisAgent
-from core.logger import get_logger
-
-# from core.memory.conversation_writeback import run_conversation_writeback
-from core.memory.prompts import (
+from core.agents.prompts import (
     QUERY_REWRITE_SYSTEM_PROMPT,
     SYNTHESISER_WRITEBACK_SYSTEM_PROMPT,
 )
+from core.logger import get_logger
 from core.memory.retrieval.models import RewrittenQueries
 
 # --- Import Core Services ---
@@ -74,6 +70,14 @@ class OrchestratorState(BaseModel):
     memory_task: Optional[Any] = Field(default=None, exclude=True)
 
 
+class SynthesizedResponse(BaseModel):
+    relationships: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of relationship dictionaries representing the reasoning.",
+    )
+    response: str = Field(description="The final user-facing analysis response.")
+
+
 class OrchestratorAgent:
     def __init__(self):
         self._llm = service_manager.get_agent(temperature=0)
@@ -92,7 +96,7 @@ class OrchestratorAgent:
         )
 
     def _build_graph(self):
-        workflow = StateGraph(OrchestratorState)
+        workflow = StateGraph(OrchestratorState, output_schema=FinalResponse)
         workflow.add_node("planner", self._plan_node)
         workflow.add_node("Execute_Selected_Agents", self._execute_node)
         workflow.add_node("portfolio_analyst", self._synthesize_node)
@@ -121,13 +125,7 @@ class OrchestratorAgent:
         )
         final_state = await self._graph.ainvoke(initial_state)
 
-        if final_state.get("final_response"):
-            return final_state["final_response"]
-
-        return FinalResponse(
-            summary=final_state["plan"].final_answer
-            or "I couldn't process that request."
-        )
+        return FinalResponse(**final_state)
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
         now = datetime.now()
@@ -244,46 +242,28 @@ class OrchestratorAgent:
             ]
         )
 
-        chain = prompt | self._llm
-        response = await chain.ainvoke(
+        chain = prompt | self._llm.with_structured_output(SynthesizedResponse)
+        response_data = await chain.ainvoke(
             {"history": state.messages, "context": "\n\n".join(context_parts)}
         )
-        raw = response.content.strip()
 
-        # --- Parse <relationships> block (fault-tolerant) ---
-        relationships = []
-        rel_match = re.search(r"<relationships>(.*?)</relationships>", raw, re.DOTALL)
-        if rel_match:
-            try:
-                relationships = json.loads(rel_match.group(1).strip())
-                if not isinstance(relationships, list):
-                    relationships = []
-            except json.JSONDecodeError:
-                relationships = []  # malformed JSON must NOT break user response
-
-        # --- Parse <response> block ---
-        resp_match = re.search(r"<response>(.*?)</response>", raw, re.DOTALL)
-        user_response = resp_match.group(1).strip() if resp_match else raw
+        relationships = response_data.relationships if response_data else []
+        user_response = response_data.response if response_data else ""
 
         # --- Fire write-back asynchronously (non-blocking) ---
         # This runs after the node returns — user never waits for it
         if state.conversation_id:
-            pass
-            # asyncio.create_task(
-            #     run_conversation_writeback(
-            #         relationships=relationships,
-            #         enriched_entities=all_enriched_entities,
-            #         user_email=None,  # pass from caller if multi-tenant needed
-            #         conversation_id=state.conversation_id,
-            #     )
-            # )
+            asyncio.create_task(
+                service_manager.get_ingestor().run_conversation_writeback(
+                    relationships=relationships,
+                    enriched_entities=all_enriched_entities,
+                    user_email=None,  # pass from caller if multi-tenant needed
+                    conversation_id=state.conversation_id,
+                )
+            )
 
         return {
-            "final_response": FinalResponse(
-                summary=user_response,
-                fundamental_data=fundamental_df,
-                sources=news_sources,
-            ),
-            "writeback_relationships": relationships,
-            "writeback_entities": all_enriched_entities,
+            "summary": user_response,
+            "fundamental_data": fundamental_df,
+            "sources": news_sources,
         }
