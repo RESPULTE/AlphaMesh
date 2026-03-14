@@ -228,7 +228,7 @@ class Neo4jAdapter:
             "MATCH (c:Chunk)-[:MENTIONS_ENTITY]->(e:Entity) "
             "WHERE e.id IN $entity_ids "
             "AND ($exclude_chunk_ids IS NULL OR NOT c.id IN $exclude_chunk_ids) "
-            "RETURN c.id AS chunk_id, c.text AS chunk_text, "
+            "RETURN c.id AS chunk_id, c.text AS chunk_text, c.article_title AS article_title, c.source_url AS source_url, "
             "c.chunk_index AS chunk_index, c.document_id AS document_id, "
             "c.published_at AS published_at"
         )
@@ -252,5 +252,6 @@ class Neo4jAdapter:
     async def run_traversal(self, cypher: str, params: dict) -> List[dict]:
         """Run a read-only traversal query."""
         return await self._execute_read(cypher, params)
+
 
 

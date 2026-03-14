@@ -3,7 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.memory.ingestion.chunker import ChunkRecord, DocumentMetadata
+from core.memory.graph.models import ChunkNode
+from core.memory.ingestion.chunker import DocumentMetadata
 from core.memory.ingestion.ingestor import DualStoreIngestor
 
 
@@ -60,9 +61,9 @@ async def test_ingest_articles_processes_new(mock_adapters):
         published_at=datetime.now(timezone.utc),
         companies_involved=["TEST"],
     )
-    chunk = ChunkRecord(
+    chunk = ChunkNode(
         document_id="d1",
-        chunk_id="c1",
+        id="c1",
         chunk_index=0,
         text="chunk text",
         article_title="title",
@@ -83,3 +84,6 @@ async def test_ingest_articles_processes_new(mock_adapters):
     chroma.upsert_chunks.assert_called_once()
     embedding_func.aembed_documents.assert_called_once()
     nodeset_manager.get_global_financial_events_id.assert_called()
+
+
+

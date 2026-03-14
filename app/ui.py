@@ -83,7 +83,10 @@ class AlphaMeshUI:
 
             async def init():
                 service_manager.get_neo4j_adapter()
-                await service_manager.get_nodeset_manager().get_global_financial_events_id()
+
+                # Batch initialize the global and 12 sector nodesets for Graph Memory
+                await service_manager.get_nodeset_manager().initialize_default_nodesets()
+
                 chroma_adapter = service_manager.get_chroma_adapter()
                 await chroma_adapter.get_or_create_collection(
                     settings.CHROMA_COLLECTION_NEWS

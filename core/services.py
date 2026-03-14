@@ -168,6 +168,7 @@ class ServiceManager:
                     chroma_adapter=self.get_chroma_adapter(),
                     embedding_func=self.get_embedding_func(),
                     llm=self.get_agent(),
+                    reranker=self.get_reranker(),
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreRetriever: {e}")
@@ -189,23 +190,5 @@ class ServiceManager:
                 raise
         return self._reranker
 
-    def get_memory_retrieval_service(self):
-        from core.memory.retrieval.retrieval_service import MemoryRetrievalService
-
-        if self._memory_retrieval_service is None:
-            try:
-                self._memory_retrieval_service = MemoryRetrievalService(
-                    retriever=self.get_retriever(),
-                    reranker=self.get_reranker(),
-                )
-            except Exception as e:
-                print(f"Error initializing MemoryRetrievalService: {e}")
-                raise
-        return self._memory_retrieval_service
-
 
 service_manager = ServiceManager()
-
-
-
-

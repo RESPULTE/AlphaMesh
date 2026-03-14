@@ -10,6 +10,28 @@ from pydantic import BaseModel, ConfigDict, Field
 
 ENTITY_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 
+GLOBAL_NODESET_NAME = "GLOBAL"
+
+GLOBAL_ENTITY_NODESETS = {
+    "Global Financial Wisdom": "A global anchor nodeset containing overarching FinancialConcept entities.",
+    "Global Financial Events": "A global anchor nodeset containing broad FinancialEvent entities.",
+}
+
+ALL_MAIN_SECTORS = {
+    "Technology": "Companies involved in research, development, and manufacturing of technologically based goods and services.",
+    "Healthcare": "Companies providing medical services, manufacturing medical equipment or drugs, providing medical insurance.",
+    "Financials": "Firms engaged in banking, investment services, insurance, and real estate.",
+    "Consumer Discretionary": "Businesses that sell non-essential goods and services.",
+    "Consumer Staples": "Companies that produce essential products used by consumers.",
+    "Energy": "Companies involved in the exploration, production, refining, and marketing of oil, gas, and renewable energy.",
+    "Materials": "Companies that discover, extract, and process raw materials.",
+    "Industrials": "Firms that produce capital goods used in manufacturing, resource extraction, and construction.",
+    "Utilities": "Companies providing essential public services such as water, gas, and electricity.",
+    "Real Estate": "Companies involved in the development, operation, and management of real estate.",
+    "Communication Services": "Companies that facilitate communication and offer entertainment content.",
+    "Transportation": "Companies involved in the movement of goods and people.",
+}
+
 
 class DocumentNode(BaseModel):
     """Graph node contract for a document-level anchor."""
@@ -34,9 +56,12 @@ class ChunkNode(BaseModel):
     text: str
     chunk_index: int
     document_id: str
+    article_title: str
+    source_url: str
+    published_at: datetime
     companies_involved: List[str] = Field(default_factory=list)
     nodeset_ids: List[str] = Field(default_factory=list)
-    extraction_status: Literal["PENDING", "EXTRACTED"]
+    extraction_status: Literal["PENDING", "EXTRACTED"] = "PENDING"
 
 
 class EntityNode(BaseModel):
@@ -87,3 +112,4 @@ class BatchExtractionResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     results: List[ChunkExtractionResult] = Field(default_factory=list)
+

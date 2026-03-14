@@ -17,7 +17,7 @@ class RetrieverState(TypedDict):
     """LangGraph state for the dual-store retriever."""
 
     query: str
-    accumulated_chunks: List[RetrievedChunk]
+    accumulated_chunks: List["RetrievedChunk"]
     visited_entity_ids: List[str]
     visited_chunk_ids: List[str]
     current_frontier: List[str]
@@ -47,25 +47,23 @@ class RetrievedChunk(BaseModel):
     source: Literal["vector", "graph"]
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
-
-class MemoryChunk(RetrievedChunk):
-    """RetrievedChunk enriched with domain context and composite scoring."""
-
-    domain: str
+    # Enrichment fields used during ranking/analysis.
+    domain: Optional[str] = None
     embedding_score: float = 0.0
     graph_depth: int = 0
     composite_score: float = 0.0
 
     @classmethod
-    def from_retrieved(cls, chunk: RetrievedChunk, domain: str) -> "MemoryChunk":
-        return cls(
-            **chunk.model_dump(),
-            domain=domain,
-            embedding_score=chunk.score or 0.0,
-            graph_depth=0 if chunk.source == "vector" else 1,
+    def with_domain(cls, chunk: "RetrievedChunk", domain: str) -> "RetrievedChunk":
+        return chunk.model_copy(
+            update={
+                "domain": domain,
+                "embedding_score": chunk.score or 0.0,
+                "graph_depth": 0 if chunk.source == "vector" else 1,
+            }
         )
 
 
 class MemoryContext(BaseModel):
-    chunks: List[MemoryChunk]
+    chunks: List[RetrievedChunk]
     rewritten_queries: RewrittenQueries

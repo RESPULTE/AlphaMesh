@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core import logger
 from core.logger import get_logger
+from core.memory.graph.models import ChunkNode
 
 logger = get_logger(__name__)
 
@@ -27,23 +28,8 @@ class DocumentMetadata(BaseModel):
     companies_involved: List[str] = Field(default_factory=list)
 
 
-class ChunkRecord(BaseModel):
-    """Metadata and text for a single chunk."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    document_id: str
-    chunk_id: str
-    chunk_index: int
-    text: str
-    article_title: str
-    source_url: str
-    published_at: datetime
-    companies_involved: List[str] = Field(default_factory=list)
-
-
 class ArticleChunker:
-    """Converts a raw article dict into chunk records."""
+    """Converts a raw article dict into chunk nodes."""
 
     def __init__(self, chunk_size: int, chunk_overlap: int) -> None:
         """Initialize the chunker with size and overlap settings."""
@@ -62,8 +48,8 @@ class ArticleChunker:
 
     def chunk_article(
         self, article: dict, companies_involved: List[str]
-    ) -> Tuple[DocumentMetadata, List[ChunkRecord]]:
-        """Split a NewsAPI article into document metadata and chunk records."""
+    ) -> Tuple[DocumentMetadata, List[ChunkNode]]:
+        """Split a NewsAPI article into document metadata and chunk nodes."""
         title = (article.get("title") or "").strip()
         description = (article.get("description") or "").strip()
         content = (article.get("content") or "").strip()
@@ -92,14 +78,14 @@ class ArticleChunker:
 
         logger.info("Chunking article '%s' into %d chunks.", title, len(chunks))
 
-        chunk_records: List[ChunkRecord] = []
+        chunk_records: List[ChunkNode] = []
         for idx, chunk_text in enumerate(chunks):
             chunk_records.append(
-                ChunkRecord(
+                ChunkNode(
                     document_id=document_id,
-                    chunk_id=str(uuid4()),
                     chunk_index=idx,
                     text=chunk_text,
+                    id=str(uuid4()),
                     article_title=title,
                     source_url=source_url,
                     published_at=published_at,
@@ -108,3 +94,5 @@ class ArticleChunker:
             )
 
         return document_meta, chunk_records
+
+

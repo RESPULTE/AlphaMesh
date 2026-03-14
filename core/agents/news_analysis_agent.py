@@ -18,7 +18,7 @@ from core.agents.models import (
     NewsAgentState,
 )
 from core.logger import get_logger
-from core.memory.retrieval.models import MemoryChunk
+from core.memory.retrieval.models import RetrievedChunk
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -74,14 +74,12 @@ class NewsAnalysisAgent(AbstractAgent):
 
         workflow.add_node("fetch_news", self._fetch_news_node)
         workflow.add_node("ingest_articles", self._ingest_articles_node)
-        workflow.add_node("retrieve_chunks", self._retrieve_chunks_node)
         workflow.add_node("rendezvous", self._rendezvous_node)
         workflow.add_node("analyse_news", self._analyse_news_node)
 
         workflow.add_edge(START, "fetch_news")
         workflow.add_edge("fetch_news", "ingest_articles")
-        workflow.add_edge("ingest_articles", "retrieve_chunks")
-        workflow.add_edge("retrieve_chunks", "rendezvous")
+        workflow.add_edge("ingest_articles", "rendezvous")
         workflow.add_edge("rendezvous", "analyse_news")
         workflow.add_edge("analyse_news", END)
 
@@ -151,19 +149,6 @@ class NewsAnalysisAgent(AbstractAgent):
         logger.info("Ingested articles into memory. #Chunk IDs: %s", len(chunk_ids))
         return {"chunk_ids": chunk_ids}
 
-    async def _retrieve_chunks_node(self, state: NewsAgentState) -> dict:
-        """Retrieve relevant chunks from dual-store retriever."""
-        retriever = service_manager.get_retriever()
-
-        try:
-            retrieved = await retriever.retrieve(state.query)
-        except Exception as exc:
-            logger.error("Dual-store retrieval failed: %s", exc)
-            raise
-
-        logger.info("Retrieved %d chunks from DualStoreRetriever.", len(retrieved))
-        return {"retrieved_chunks": retrieved}
-
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge memory retrieval results with freshly ingested chunks."""
         memory_context = None
@@ -175,7 +160,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 memory_context = None
 
         new_chunks = [
-            MemoryChunk.from_retrieved(chunk, domain="new")
+            RetrievedChunk.with_domain(chunk, domain="new")
             for chunk in state.retrieved_chunks
         ]
 
@@ -236,3 +221,4 @@ class NewsAnalysisAgent(AbstractAgent):
             raise
 
         return {"analysis": analysis_text, "sources": sources}
+

@@ -8,7 +8,6 @@ from typing import List
 from core.logger import get_logger
 from core.memory.retrieval.dual_store_retriever import DualStoreRetriever
 from core.memory.retrieval.models import (
-    MemoryChunk,
     MemoryContext,
     RetrievedChunk,
     RewrittenQueries,
@@ -37,10 +36,13 @@ class MemoryRetrievalService:
             if domain in rewritten_queries.active_domains and query is not None
         }
 
-        tasks = [self._retriever.retrieve(query) for query in active_queries.values()]
+        tasks = [
+            self._retriever.comprehensive_retrieve(query)
+            for query in active_queries.values()
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        all_chunks: List[MemoryChunk] = []
+        all_chunks: List[RetrievedChunk] = []
         for (domain, _query), result in zip(active_queries.items(), results):
             if isinstance(result, Exception):
                 self._logger.error(
@@ -51,7 +53,9 @@ class MemoryRetrievalService:
                 continue
             for chunk in result:
                 if isinstance(chunk, RetrievedChunk):
-                    all_chunks.append(MemoryChunk.from_retrieved(chunk, domain=domain))
+                    all_chunks.append(RetrievedChunk.with_domain(chunk, domain))
 
         ranked = self._reranker.rank(all_chunks)
         return MemoryContext(chunks=ranked, rewritten_queries=rewritten_queries)
+
+

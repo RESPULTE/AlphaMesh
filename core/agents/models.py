@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.memory.graph.models import ChunkExtractionResult, EntityNode
-from core.memory.retrieval.models import MemoryChunk, RetrievedChunk
+from core.memory.retrieval.models import RetrievedChunk
 
 
 class BaseAgentInput(BaseModel):
@@ -104,7 +104,8 @@ class NewsAgentState(BaseModel):
     retrieved_chunks: List[RetrievedChunk] = Field(default_factory=list)
     extraction_results: List[ChunkExtractionResult] = Field(default_factory=list)
     memory_task: Optional[Any] = Field(default=None, exclude=True)
-    final_chunks: List[MemoryChunk] = Field(default_factory=list)
+
+    final_chunks: List[RetrievedChunk] = Field(default_factory=list)
     analysis: Optional[str] = None
     sources: List[CitedSource] = Field(default_factory=list)
     entities_enriched: List[EntityNode] = Field(default_factory=list)
@@ -132,3 +133,4 @@ class NewsAgentOutput(BaseAgentOutput):
             ]
         )
         return f"{header}{self.analysis}\n\n### SOURCES\n{sources_block}"
+

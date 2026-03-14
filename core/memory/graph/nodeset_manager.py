@@ -6,7 +6,11 @@ import uuid
 from typing import Dict, Optional
 
 from core.logger import get_logger
-from core.memory.graph.models import ENTITY_NAMESPACE
+from core.memory.graph.models import (
+    ALL_MAIN_SECTORS,
+    ENTITY_NAMESPACE,
+    GLOBAL_ENTITY_NODESETS,
+)
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 
@@ -85,3 +89,23 @@ class NodeSetManager:
         """Get or create the GlobalFinancialEvents NodeSet ID."""
         description = "Global anchor NodeSet for financial news ingestion."
         return await self.get_or_create("GlobalFinancialEvents", description)
+
+    async def initialize_default_nodesets(self) -> None:
+        """
+        Batch initialize the global nodesets and all main sector nodesets.
+        This adapts the archived Cognee logic to the current Neo4j adapter cleanly.
+        """
+        self._logger.info("Initializing default global and sector nodesets...")
+
+        # 1. Global anchor nodesets
+        for name, description in GLOBAL_ENTITY_NODESETS.items():
+            await self.get_or_create(name, description)
+
+        # Ensure the specific financial events node exists for backward compatibility
+        await self.get_global_financial_events_id()
+
+        # 2. The 12 primary sectors
+        for sector_name, description in ALL_MAIN_SECTORS.items():
+            await self.get_or_create(sector_name, description)
+
+        self._logger.info("Default nodeset initialization complete.")

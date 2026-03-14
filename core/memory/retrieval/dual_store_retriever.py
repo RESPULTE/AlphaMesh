@@ -1,7 +1,8 @@
-"""LangGraph-powered dual-store retriever for vector + graph traversal."""
+"""LangGraph-powered dual-store retriever for vector + graph traversal, fanned out across domains."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, List, Sequence
 
 from langgraph.graph import END, START, StateGraph
@@ -9,21 +10,32 @@ from langgraph.graph import END, START, StateGraph
 from core.config import settings
 from core.logger import get_logger
 from core.memory.retrieval.models import (
+    MemoryContext,
     NodeSelectionOutput,
     RetrievedChunk,
     RetrieverState,
+    RewrittenQueries,
 )
+from core.memory.retrieval.reranker import CompositeReranker
 from core.memory.retrieval.retrieval_prompts import build_node_selection_prompt
 
 
 class DualStoreRetriever:
     """Retrieve chunks by seeding vector search and expanding through the graph."""
 
-    def __init__(self, neo4j_adapter, chroma_adapter, embedding_func, llm) -> None:
+    def __init__(
+        self,
+        neo4j_adapter,
+        chroma_adapter,
+        embedding_func,
+        llm,
+        reranker: CompositeReranker,
+    ) -> None:
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
         self._embedding_func = embedding_func
         self._llm = llm
+        self._reranker = reranker
 
         self._logger = get_logger(__name__)
 
@@ -41,16 +53,14 @@ class DualStoreRetriever:
         workflow.add_node("extract_seed_entities", self._extract_seed_entities_node)
         workflow.add_node("agent_select_nodes", self._agent_select_nodes_node)
         workflow.add_node("expand_nodes", self._expand_and_fetch_node)
-        workflow.add_node("accumulate_chunks", self._accumulate_chunks_node)
 
         workflow.add_edge(START, "vector_seed")
         workflow.add_edge("vector_seed", "extract_seed_entities")
         workflow.add_edge("extract_seed_entities", "agent_select_nodes")
         workflow.add_edge("agent_select_nodes", "expand_nodes")
-        workflow.add_edge("expand_nodes", "accumulate_chunks")
 
         workflow.add_conditional_edges(
-            "accumulate_chunks",
+            "expand_nodes",
             self._should_continue,
             {"agent_select_nodes": "agent_select_nodes", END: END},
         )
@@ -194,6 +204,8 @@ class DualStoreRetriever:
                     metadata={
                         "chunk_index": row.get("chunk_index"),
                         "document_id": row.get("document_id"),
+                        "article_title": row.get("article_title"),
+                        "source_url": row.get("source_url"),
                         "published_at": row.get("published_at"),
                     },
                 )
@@ -215,10 +227,6 @@ class DualStoreRetriever:
             "iteration": state["iteration"] + 1,
         }
 
-    async def _accumulate_chunks_node(self, state: RetrieverState) -> dict:
-        _ = state
-        return {}
-
     def _should_continue(self, state: RetrieverState) -> str:
         if state["should_continue"] and state["iteration"] < self._max_iterations:
             return "agent_select_nodes"
@@ -237,6 +245,45 @@ class DualStoreRetriever:
         }
         final_state = await self._graph.ainvoke(initial_state)
         return final_state["accumulated_chunks"]
+
+    async def comprehensive_retrieve(
+        self, rewritten_queries: RewrittenQueries
+    ) -> MemoryContext:
+        """Fans out the LangGraph traversal across active domains and reranks results."""
+        domain_map = {
+            "company": rewritten_queries.company_query,
+            "sector": rewritten_queries.sector_query,
+            "market": rewritten_queries.market_query,
+            "knowledge": rewritten_queries.knowledge_query,
+        }
+
+        active_queries = {
+            domain: query
+            for domain, query in domain_map.items()
+            if domain in rewritten_queries.active_domains and query is not None
+        }
+
+        # Concurrently run the graph traversal for each domain
+        tasks = [self.retrieve(query) for query in active_queries.values()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_chunks: List[RetrievedChunk] = []
+        for (domain, _query), result in zip(active_queries.items(), results):
+            if isinstance(result, Exception):
+                self._logger.error(
+                    "Memory retrieval failed for domain %s: %s", domain, result
+                )
+                continue
+            if not isinstance(result, list):
+                continue
+
+            for chunk in result:
+                if isinstance(chunk, RetrievedChunk):
+                    all_chunks.append(RetrievedChunk.with_domain(chunk, domain))
+
+        # Rerank and return combined context
+        ranked = self._reranker.rank(all_chunks)
+        return MemoryContext(chunks=ranked, rewritten_queries=rewritten_queries)
 
     def _limit_neighbors_per_source(self, neighbors: Sequence[dict]) -> List[dict]:
         if not neighbors:
@@ -287,3 +334,8 @@ class DualStoreRetriever:
             seen.add(item)
             updated.append(item)
         return updated
+
+
+
+
+

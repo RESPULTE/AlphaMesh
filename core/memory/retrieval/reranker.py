@@ -1,10 +1,10 @@
-"""Composite re-ranker for MemoryChunk results."""
+"""Composite re-ranker for RetrievedChunk results."""
 
 from __future__ import annotations
 
 from typing import Dict, List
 
-from core.memory.retrieval.models import MemoryChunk
+from core.memory.retrieval.models import RetrievedChunk
 
 
 class CompositeReranker:
@@ -13,8 +13,8 @@ class CompositeReranker:
         self._beta = beta
         self._top_k = top_k
 
-    def rank(self, chunks: List[MemoryChunk]) -> List[MemoryChunk]:
-        deduped: Dict[str, MemoryChunk] = {}
+    def rank(self, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        deduped: Dict[str, RetrievedChunk] = {}
         for chunk in chunks:
             current = deduped.get(chunk.chunk_id)
             if current is None or chunk.embedding_score > current.embedding_score:

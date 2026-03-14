@@ -166,7 +166,7 @@ class OrchestratorAgent:
             and plan.rewritten_queries.active_domains
         ):
             memory_task = asyncio.create_task(
-                service_manager.get_memory_retrieval_service().retrieve(
+                service_manager.get_retriever().comprehensive_retrieve(
                     plan.rewritten_queries
                 )
             )

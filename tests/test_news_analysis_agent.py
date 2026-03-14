@@ -5,7 +5,7 @@ import pytest
 
 from core.agents.models import BaseAgentInput
 from core.agents.news_analysis_agent import NewsAnalysisAgent
-from core.memory.retrieval.models import MemoryChunk, MemoryContext, RetrievedChunk
+from core.memory.retrieval.models import MemoryContext, RetrievedChunk
 
 
 @pytest.fixture
@@ -97,7 +97,7 @@ async def test_news_agent_with_memory_task(mock_service_manager):
     from core.memory.retrieval.models import RewrittenQueries
 
     # Pre-resolved memory context
-    memory_chunk = MemoryChunk(
+    memory_chunk = RetrievedChunk(
         chunk_id="mc1",
         text="Past memory",
         domain="company",
@@ -141,3 +141,4 @@ async def test_news_agent_with_memory_task(mock_service_manager):
 
     assert output.agent_name == "news_agent"
     assert "Apple has released a new iPad" in output.analysis
+

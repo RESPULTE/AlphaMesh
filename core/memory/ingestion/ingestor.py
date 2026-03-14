@@ -19,7 +19,7 @@ from core.memory.graph.models import (
     EntityNode,
 )
 from core.memory.graph.nodeset_manager import NodeSetManager
-from core.memory.ingestion.chunker import ArticleChunker, ChunkRecord, DocumentMetadata
+from core.memory.ingestion.chunker import ArticleChunker, DocumentMetadata
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 from core.services import service_manager
@@ -93,7 +93,7 @@ class DualStoreIngestor:
                 await self._nodeset_manager.get_global_financial_events_id()
             )
             documents: List[DocumentMetadata] = []
-            chunks: List[ChunkRecord] = []
+            chunks: List[ChunkNode] = []
             for article in articles:
                 source_url = (article.get("url") or "").strip()
 
@@ -120,7 +120,7 @@ class DualStoreIngestor:
             await self._write_document_nodes(documents, global_anchor_id)
             await self._write_chunk_nodes(chunks, global_anchor_id)
             await self._write_vector_chunks(chunks, global_anchor_id)
-            chunk_ids = [chunk.chunk_id for chunk in chunks]
+            chunk_ids = [chunk.id for chunk in chunks]
             # self._schedule_extraction(chunk_ids)
             return chunk_ids
         except Exception:
@@ -152,19 +152,16 @@ class DualStoreIngestor:
             raise
 
     async def _write_chunk_nodes(
-        self, chunks: List[ChunkRecord], global_anchor_id: str
+        self, chunks: List[ChunkNode], global_anchor_id: str
     ) -> None:
         """Write chunk nodes to Neo4j."""
         try:
             for chunk in chunks:
-                node = ChunkNode(
-                    id=chunk.chunk_id,
-                    text=chunk.text,
-                    chunk_index=chunk.chunk_index,
-                    document_id=chunk.document_id,
-                    companies_involved=chunk.companies_involved,
-                    nodeset_ids=[global_anchor_id],
-                    extraction_status="PENDING",
+                node = chunk.model_copy(
+                    update={
+                        "nodeset_ids": [global_anchor_id],
+                        "extraction_status": "PENDING",
+                    }
                 )
                 await self._neo4j_adapter.merge_chunk_node(node)
         except Exception:
@@ -172,7 +169,7 @@ class DualStoreIngestor:
             raise
 
     async def _write_vector_chunks(
-        self, chunks: List[ChunkRecord], global_anchor_id: str
+        self, chunks: List[ChunkNode], global_anchor_id: str
     ) -> None:
         """Write chunk vectors and metadata to ChromaDB."""
         try:
@@ -183,7 +180,7 @@ class DualStoreIngestor:
             metadatas = []
             for chunk in chunks:
                 metadata = {
-                    "chunk_id": chunk.chunk_id,
+                    "chunk_id": chunk.id,
                     "document_id": chunk.document_id,
                     "article_title": chunk.article_title,
                     "source_url": chunk.source_url,
@@ -200,7 +197,7 @@ class DualStoreIngestor:
                 )
 
             await self._chroma_adapter.upsert_chunks(
-                chunk_ids=[chunk.chunk_id for chunk in chunks],
+                chunk_ids=[chunk.id for chunk in chunks],
                 texts=[chunk.text for chunk in chunks],
                 embeddings=embeddings,
                 metadatas=metadatas,
@@ -564,3 +561,7 @@ class DualStoreIngestor:
                 return str(candidate_id)
 
         return None
+
+
+
+
