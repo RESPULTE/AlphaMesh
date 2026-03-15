@@ -82,6 +82,15 @@ REQUIRED OUTPUT FORMAT (strictly):
 Do not output anything outside these two blocks.
 """.strip()
 
+NEWS_ANALYSIS_USER_PROMPT = """\
+Question: {query}
+
+{entities_section}Context:
+{context}
+
+Provide a concise, evidence-based analysis. When extracting relationships, you may use the known entities list; do not invent new entities.
+""".strip()
+
 
 LEAN_SUMMARY_SYSTEM_PROMPT = """\
 Extract financial facts. Output 1-2 sentences only.

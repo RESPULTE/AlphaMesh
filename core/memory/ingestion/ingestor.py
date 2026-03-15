@@ -310,7 +310,10 @@ class DualStoreIngestor:
 
         async def _extract_batch(chunks: List[dict]) -> BatchExtractionResult:
             chunk_blocks = "\n\n".join(
-                [f"{idx}. {chunk['text']}" for idx, chunk in enumerate(chunks, 1)]
+                [
+                    f"[CHUNK_ID:{chunk['chunk_id']}|{chunk['text']}]"
+                    for idx, chunk in enumerate(chunks, 1)
+                ]
             )
             async with EXTRACTION_SEMAPHORE:
                 return await extraction_chain.ainvoke({"chunk_blocks": chunk_blocks})

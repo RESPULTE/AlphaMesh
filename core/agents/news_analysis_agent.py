@@ -19,6 +19,7 @@ from core.agents.models import (
     NewsAgentState,
 )
 from core.agents.news_fetcher import build_news_query, fetch_articles
+from core.agents.prompts import NEWS_ANALYSIS_USER_PROMPT
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import (
@@ -56,9 +57,9 @@ def _merge_cached_entities(conversation_id: str, entities: List[dict]) -> None:
         return
     cache = _ENTITY_CACHE.setdefault(conversation_id, {})
     for entity in entities:
-        entity_id = entity.get("entity_id")
-        entity_name = entity.get("entity_name")
-        entity_type = entity.get("entity_type")
+        entity_id = getattr(entity, "id", None)
+        entity_name = getattr(entity, "name", None)
+        entity_type = getattr(entity, "entity_type", None)
         if not entity_id or not entity_name or not entity_type:
             continue
 
@@ -297,16 +298,12 @@ class NewsAnalysisAgent(AbstractAgent):
                 + "\n".join(known_entities_lines)
             )
 
-        prompt_parts = [f"Question: {state.query}"]
-        if known_entities_block:
-            prompt_parts.append(known_entities_block)
-        prompt_parts.append(f"Context:\n{context}")
-        prompt_parts.append(
-            "Provide a concise, evidence-based analysis. "
-            "When extracting relationships, you may use the known entities list; "
-            "do not invent new entities."
+        entities_section = f"{known_entities_block}\n\n" if known_entities_block else ""
+        user_prompt = NEWS_ANALYSIS_USER_PROMPT.format(
+            query=state.query,
+            entities_section=entities_section,
+            context=context,
         )
-        user_prompt = "\n\n".join(prompt_parts)
 
         try:
             result = await extract_with_retry(
