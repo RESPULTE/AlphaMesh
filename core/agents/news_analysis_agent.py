@@ -140,14 +140,14 @@ class NewsAnalysisAgent(AbstractAgent):
 
         companies_involved = self._extract_companies(state.raw_articles, state.ticker)
         try:
-            chunk_ids = await service_manager.get_ingestor().ingest_articles(
+            chunk_ids, chunks = await service_manager.get_ingestor().ingest_articles(
                 state.raw_articles, companies_involved
             )
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
             raise
         logger.info("Ingested articles into memory. #Chunk IDs: %s", len(chunk_ids))
-        return {"chunk_ids": chunk_ids}
+        return {"chunk_ids": chunk_ids, "retrieved_chunks": chunks}
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge memory retrieval results with freshly ingested chunks."""
@@ -221,4 +221,3 @@ class NewsAnalysisAgent(AbstractAgent):
             raise
 
         return {"analysis": analysis_text, "sources": sources}
-

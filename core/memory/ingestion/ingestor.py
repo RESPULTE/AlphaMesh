@@ -122,7 +122,7 @@ class DualStoreIngestor:
             await self._write_vector_chunks(chunks, global_anchor_id)
             chunk_ids = [chunk.id for chunk in chunks]
             # self._schedule_extraction(chunk_ids)
-            return chunk_ids
+            return (chunk_ids, chunks)
         except Exception:
             self._logger.exception("Failed to ingest articles.")
             raise
@@ -561,7 +561,3 @@ class DualStoreIngestor:
                 return str(candidate_id)
 
         return None
-
-
-
-
