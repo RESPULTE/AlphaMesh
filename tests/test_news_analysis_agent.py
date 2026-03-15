@@ -2,6 +2,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from langchain_core.documents import Document
 
 from core.agents.models import BaseAgentInput
 from core.agents.news_analysis_agent import NewsAnalysisAgent
@@ -25,6 +26,15 @@ def mock_service_manager(monkeypatch):
 
     mock_ingestor = AsyncMock()
     mock_ingestor.ingest_articles.return_value = (["c1"], [])
+
+    mock_chroma_adapter = AsyncMock()
+    mock_chroma_adapter.get_documents_by_ids.return_value = [
+        Document(
+            page_content="Apple releases new iPad",
+            metadata={"article_title": "Apple News", "source_url": "http://apple.com"},
+            id="c1",
+        )
+    ]
 
     mock_retriever = AsyncMock()
     mock_retriever.retrieve.return_value = [
@@ -54,6 +64,10 @@ def mock_service_manager(monkeypatch):
         lambda: mock_ingestor,
     )
     monkeypatch.setattr(
+        "core.agents.news_analysis_agent.service_manager.get_chroma_adapter",
+        lambda: mock_chroma_adapter,
+    )
+    monkeypatch.setattr(
         "core.agents.news_analysis_agent.service_manager.get_retriever",
         lambda: mock_retriever,
     )
@@ -65,7 +79,14 @@ def mock_service_manager(monkeypatch):
         "core.agents.news_analysis_agent.service_manager.get_agent", lambda: mock_llm
     )
 
-    return mock_news_api, mock_ingestor, mock_retriever, mock_reranker, mock_llm
+    return (
+        mock_news_api,
+        mock_ingestor,
+        mock_chroma_adapter,
+        mock_retriever,
+        mock_reranker,
+        mock_llm,
+    )
 
 
 @pytest.mark.asyncio
@@ -115,9 +136,7 @@ async def test_news_agent_with_memory_task(mock_service_manager):
         market_query=None,
         knowledge_query=None,
     )
-    memory_context = MemoryContext(
-        chunks=[memory_chunk], rewritten_queries=mock_queries
-    )
+    memory_context = MemoryContext(chunks=[memory_chunk], rewritten_queries=mock_queries)
 
     import asyncio
 

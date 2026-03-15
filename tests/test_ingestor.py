@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from langchain_core.documents import Document
 
 from core.memory.graph.models import ChunkNode, DocumentMetadata
 from core.memory.ingestion.ingestor import DualStoreIngestor
@@ -14,13 +15,13 @@ def mock_adapters():
 
     chroma = AsyncMock()
     chroma.get_chunks_with_source_url.return_value = []
+    chroma.get_documents_by_ids.return_value = []
 
     nodeset_manager = AsyncMock()
     nodeset_manager.get_global_financial_events_id.return_value = "global_id"
     nodeset_manager.assign_to_chunk_metadata = MagicMock(side_effect=lambda x, y: x)
 
     embedding_func = AsyncMock()
-    embedding_func.aembed_documents.return_value = [[0.1, 0.2]]
 
     chunker = MagicMock()
 
@@ -36,12 +37,17 @@ async def test_ingest_articles_skips_existing(mock_adapters):
         neo4j, chroma, chroma, nodeset_manager, embedding_func, chunker, llm=llm
     )
 
-    chroma.get_chunks_with_source_url.return_value = [{"id": "c1"}]
+    chroma.get_chunks_with_source_url.return_value = [
+        Document(page_content="text", metadata={}, id="c1")
+    ]
+    chroma.get_documents_by_ids.return_value = [
+        Document(page_content="text", metadata={}, id="c1")
+    ]
 
     articles = [{"url": "https://example.com"}]
     chunk_ids, _chunks = await ingestor.ingest_articles(articles)
 
-    assert chunk_ids == []
+    assert chunk_ids == ["c1"]
     chunker.chunk_article.assert_not_called()
     neo4j.merge_document_node.assert_not_called()
 
@@ -72,6 +78,9 @@ async def test_ingest_articles_processes_new(mock_adapters):
     )
 
     chunker.chunk_article.return_value = (doc_meta, [chunk])
+    chroma.get_documents_by_ids.return_value = [
+        Document(page_content="chunk text", metadata={}, id="c1")
+    ]
 
     articles = [{"url": "https://example.com/2"}]
     chunk_ids, _chunks = await ingestor.ingest_articles(articles)
@@ -81,5 +90,5 @@ async def test_ingest_articles_processes_new(mock_adapters):
     neo4j.merge_document_node.assert_called_once()
     neo4j.merge_chunk_node.assert_called_once()
     chroma.upsert_chunks.assert_called_once()
-    embedding_func.aembed_documents.assert_called_once()
+    chroma.get_documents_by_ids.assert_called_once()
     nodeset_manager.get_global_financial_events_id.assert_called()

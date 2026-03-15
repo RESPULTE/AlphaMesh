@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Dict, List, Sequence
 
+from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 
 from core.config import settings
@@ -29,15 +30,13 @@ class DualStoreRetriever:
         self,
         neo4j_adapter: Neo4jAdapter,
         chroma_adapter: ChromaDBAdapter,
-        embedding_func: callable,
-        llm: callable,
+        llm: ChatGoogleGenerativeAI,
         reranker: CompositeReranker,
     ) -> None:
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
-        self._embedding_func = embedding_func
-        self._llm = llm
         self._reranker = reranker
+        self._llm = llm
 
         self._logger = get_logger(__name__)
 
@@ -71,32 +70,21 @@ class DualStoreRetriever:
 
     async def _vector_seed_node(self, state: RetrieverState) -> dict:
         query = state["query"]
-        embedding = await self._embedding_func.aembed_query(query)
-        result = await self._chroma_adapter.query(
-            embedding, n_results=self._seed_top_k, where=None
+        results = await self._chroma_adapter.query(
+            query_text=query,
+            n_results=self._seed_top_k,
+            search_type="similarity",
         )
-
-        ids = (result.get("ids") or [[]])[0]
-        documents = (result.get("documents") or [[]])[0]
-        metadatas = (result.get("metadatas") or [[]])[0]
-        distances = (result.get("distances") or [[]])[0]
 
         retrieved: List[RetrievedChunk] = []
         visited_chunk_ids: List[str] = []
 
-        for idx, chunk_id in enumerate(ids):
-            if chunk_id in visited_chunk_ids:
+        for doc, score in results:
+            chunk = RetrievedChunk.from_document(doc, score=score, source="vector")
+            if not chunk.chunk_id or chunk.chunk_id in visited_chunk_ids:
                 continue
-            retrieved.append(
-                RetrievedChunk(
-                    chunk_id=chunk_id,
-                    text=documents[idx] if idx < len(documents) else "",
-                    metadata=metadatas[idx] if idx < len(metadatas) else {},
-                    score=distances[idx] if idx < len(distances) else None,
-                    source="vector",
-                )
-            )
-            visited_chunk_ids.append(chunk_id)
+            retrieved.append(chunk)
+            visited_chunk_ids.append(chunk.chunk_id)
 
         self._logger.info("Vector seed retrieved %d chunks.", len(retrieved))
 

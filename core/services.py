@@ -104,6 +104,7 @@ class ServiceManager:
                 self._chroma_adapter = ChromaDBAdapter(
                     collection_name=settings.CHROMA_COLLECTION_NEWS,
                     persist_directory=settings.CHROMA_PATH,
+                    embedding_function=self.get_embedding_func(),
                 )
             except Exception as e:
                 print(f"Error initializing ChromaDB adapter: {e}")
@@ -167,7 +168,6 @@ class ServiceManager:
                 self._retriever = DualStoreRetriever(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
-                    embedding_func=self.get_embedding_func(),
                     llm=self.get_agent(),
                     reranker=self.get_reranker(),
                 )
@@ -205,5 +205,5 @@ class ServiceManager:
                 raise
         return self._user_context_service
 
-service_manager = ServiceManager()
 
+service_manager = ServiceManager()

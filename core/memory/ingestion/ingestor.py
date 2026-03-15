@@ -6,6 +6,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from langchain_core.documents import Document
 
 from core.config import settings
 from core.logger import get_logger
@@ -86,7 +87,7 @@ class DualStoreIngestor:
 
     async def ingest_articles(
         self, articles: List[dict]
-    ) -> Tuple[List[str], List[ChunkNode]]:
+    ) -> Tuple[List[str], List[Document]]:
         """Ingest a batch of articles into both stores."""
         try:
             global_anchor_id = (
@@ -95,7 +96,7 @@ class DualStoreIngestor:
             documents_to_ingest: List[DocumentMetadata] = []
             chunks_to_ingest: List[ChunkNode] = []
 
-            existing_chunks_to_return: List[ChunkNode] = []
+            existing_chunks_to_return: List[Document] = []
             for article in articles:
                 source_url = (article.get("url") or "").strip()
 
@@ -118,11 +119,18 @@ class DualStoreIngestor:
                 await self._write_vector_chunks(chunks_to_ingest, global_anchor_id)
 
             new_chunk_ids = [chunk.id for chunk in chunks_to_ingest]
-            existing_chunk_ids = [chunk.id for chunk in existing_chunks_to_return]
+            existing_chunk_ids = [
+                doc.id or (doc.metadata or {}).get("chunk_id") or ""
+                for doc in existing_chunks_to_return
+            ]
+            existing_chunk_ids = [cid for cid in existing_chunk_ids if cid]
             chunk_ids = new_chunk_ids + existing_chunk_ids
 
-            involved_chunks = chunks_to_ingest + existing_chunks_to_return
-
+            involved_chunks: List[Document] = []
+            if chunk_ids:
+                involved_chunks = await self._chroma_adapter.get_documents_by_ids(
+                    chunk_ids
+                )
             # self._schedule_extraction(chunk_ids)
             return (chunk_ids, involved_chunks)
         except Exception as exec:
@@ -222,18 +230,17 @@ class DualStoreIngestor:
         if not pending_chunk_ids:
             return
 
-        chunk_payload = await self._chroma_adapter.get_by_ids(pending_chunk_ids)
-        ids = chunk_payload.get("ids") or []
-        documents = chunk_payload.get("documents") or []
-        metadatas = chunk_payload.get("metadatas") or []
+        chunk_docs = await self._chroma_adapter.get_documents_by_ids(pending_chunk_ids)
 
         chunk_lookup = {}
-        for idx, chunk_id in enumerate(ids):
+        for doc in chunk_docs:
+            chunk_id = doc.id or (doc.metadata or {}).get("chunk_id")
+            if not chunk_id:
+                continue
             chunk_lookup[chunk_id] = {
-                "text": documents[idx] if idx < len(documents) else "",
-                "metadata": metadatas[idx] if idx < len(metadatas) else {},
+                "text": doc.page_content or "",
+                "metadata": doc.metadata or {},
             }
-
         chunks_to_process = [
             {"chunk_id": chunk_id, **chunk_lookup[chunk_id]}
             for chunk_id in pending_chunk_ids
@@ -551,13 +558,10 @@ class DualStoreIngestor:
             logger.exception("write_back: entity embedding search failed.")
             return None
 
-        ids_batch = (result.get("ids") or [[]])[0]
-        distances_batch = (result.get("distances") or [[]])[0]
-
-        for idx, candidate_id in enumerate(ids_batch):
+        for doc, distance in result:
+            candidate_id = doc.id or (doc.metadata or {}).get("entity_id")
             if not candidate_id:
                 continue
-            distance = distances_batch[idx] if idx < len(distances_batch) else None
             if distance is None:
                 continue
             if candidate_ids is not None and candidate_id not in candidate_ids:
@@ -565,5 +569,11 @@ class DualStoreIngestor:
             similarity = 1.0 - float(distance)
             if similarity >= SEMANTIC_MERGE_THRESHOLD:
                 return str(candidate_id)
-
         return None
+
+
+
+
+
+
+

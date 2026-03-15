@@ -53,3 +53,5 @@ class MemoryRetrievalService:
 
         ranked = self._reranker.rank(all_chunks)
         return MemoryContext(chunks=ranked, rewritten_queries=rewritten_queries)
+
+

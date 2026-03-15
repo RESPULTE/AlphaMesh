@@ -56,7 +56,6 @@ class DocumentNode(BaseModel):
     source_url: str
     published_at: datetime
     ingested_at: datetime
-    companies_involved: List[str] = Field(default_factory=list)
     nodeset_ids: List[str] = Field(default_factory=list)
 
 

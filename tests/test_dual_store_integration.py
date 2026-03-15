@@ -129,8 +129,8 @@ async def test_chroma_adapter_client_is_cached() -> None:
 
     chroma_adapter = service_manager.get_chroma_adapter()
 
-    first_client = await chroma_adapter._get_collection()
-    second_client = await chroma_adapter._get_collection()
+    first_client = await chroma_adapter._get_vectorstore()
+    second_client = await chroma_adapter._get_vectorstore()
 
     assert first_client is second_client
 
@@ -188,3 +188,5 @@ async def test_dual_store_ingestion_creates_multiple_chunks_when_overflowing() -
             await neo4j_adapter._execute_write(cleanup_cypher, {"ids": chunk_ids})
         except Exception:
             pass
+
+

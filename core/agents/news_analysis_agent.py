@@ -126,14 +126,25 @@ class NewsAnalysisAgent(AbstractAgent):
             return {"chunk_ids": []}
 
         try:
-            chunk_ids, chunks = await service_manager.get_ingestor().ingest_articles(
+            chunk_ids, _ = await service_manager.get_ingestor().ingest_articles(
                 state.raw_articles
             )
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
             raise
+
+        retrieved_chunks: List[RetrievedChunk] = []
+        if chunk_ids:
+            docs = await service_manager.get_chroma_adapter().get_documents_by_ids(
+                chunk_ids
+            )
+            retrieved_chunks = [
+                RetrievedChunk.from_document(doc, score=None, source="vector", domain="new")
+                for doc in docs
+            ]
+
         logger.info("Ingested articles into memory. #Chunk IDs: %s", len(chunk_ids))
-        return {"chunk_ids": chunk_ids, "retrieved_chunks": chunks}
+        return {"chunk_ids": chunk_ids, "retrieved_chunks": retrieved_chunks}
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge memory retrieval results with freshly ingested chunks."""
@@ -145,10 +156,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 logger.error("Memory retrieval task failed: %s", exc)
                 memory_context = None
 
-        new_chunks = [
-            RetrievedChunk.from_raw_chunk(chunk, domain="new")
-            for chunk in state.retrieved_chunks
-        ]
+        new_chunks = list(state.retrieved_chunks)
 
         if memory_context is None:
             final_ranked = service_manager.get_reranker().rank(new_chunks)
@@ -207,3 +215,4 @@ class NewsAnalysisAgent(AbstractAgent):
             raise
 
         return {"analysis": analysis_text, "sources": sources}
+
