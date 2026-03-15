@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import uuid
 from typing import Dict, Optional
 
 from core.logger import get_logger
-from core.memory.graph.models import (
-    ALL_MAIN_SECTORS,
-    ENTITY_NAMESPACE,
-    GLOBAL_ENTITY_NODESETS,
-)
+from core.memory.graph.models import ALL_MAIN_SECTORS, GLOBAL_ENTITY_NODESETS
+from core.memory.graph.utils import canonical_nodeset_id
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 
@@ -60,7 +56,7 @@ class NodeSetManager:
     async def get_or_create(self, name: str, description: str = "") -> str:
         """Get an existing NodeSet ID or create it deterministically."""
         await self._ensure_initialized()
-        nodeset_id = str(uuid.uuid5(ENTITY_NAMESPACE, name))
+        nodeset_id = canonical_nodeset_id(name)
         await self._neo4j_adapter.merge_nodeset_node(nodeset_id, name, description)
         self._registry[name] = nodeset_id
         return nodeset_id

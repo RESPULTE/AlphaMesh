@@ -4,12 +4,24 @@ import operator
 from typing import Annotated, List, Optional, Type
 
 import pandas as pd
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.financial_db import FinancialDatabase
+from core.config import settings
+from core.memory.graph.extraction_prompts import (
+    ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+    COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
+)
+from core.memory.graph.relationship_extractor import (
+    extract_with_retry,
+    retry_relationships_only,
+)
+from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
+from core.memory.stores.subgraph_store import SubgraphStore
 from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.logger import get_logger
 from core.services import service_manager
@@ -331,17 +343,19 @@ class FundamentalAnalysisAgent(AbstractAgent):
     async def _generate_analysis(self, state: _AgentState) -> FundamentalAnalysisOutput:
         logger.info("--- [Node] Analyst ---")
 
-        # Format dataframe for readability
         if state.financial_data is None or state.financial_data.empty:
             return FundamentalAnalysisOutput(
-                financial_data=None, analysis="No data found."
+                financial_data=None,
+                analysis="No data found.",
+                relationships_extracted=False,
             )
 
         human_readable = state.financial_data.map(
             lambda x: add_units(x) if isinstance(x, (int, float)) else x
         ).to_string()
 
-        msg = (
+        system_prompt = COMBINED_ANALYSIS_RELATIONSHIP_PROMPT
+        user_prompt = (
             f"Analyze the following financial data for {state.ticker}.\n"
             f"Data (Rows=Metrics, Cols=Dates):\n{human_readable}\n\n"
             f"User Question: {state.query}\n\n"
@@ -352,13 +366,59 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "(Million, Billion, Trillion). For example, convert '1.5e9' to '1.5 Billion'."
         )
 
-        # Use ainvoke for async LLM call
-        response = await service_manager.get_agent(temperature=0.7).ainvoke(msg)
+        try:
+            result = await extract_with_retry(
+                service_manager.get_agent(temperature=0.7),
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ],
+            )
+            analysis_text = result.analysis
+            relationships = result.relationships
+            relationships_extracted = result.parse_success
+        except Exception as exc:
+            logger.error("Analysis generation failed: %s", exc)
+            raise
+
+        subgraph_id = None
+        if settings.EXTRACTION_ENABLED and state.conversation_id:
+            builder = InMemorySubgraphBuilder(
+                embedding_func=service_manager.get_embedding_func(),
+                fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
+                semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
+            )
+            store = service_manager.get_subgraph_store()
+            subgraph_id = SubgraphStore.make_key(self.name(), state.conversation_id)
+
+            async def _build_and_store():
+                graph = await builder.build(relationships, source_agent=self.name())
+                await store.save(subgraph_id, graph)
+
+            if relationships_extracted:
+                task = asyncio.create_task(_build_and_store())
+            else:
+                task = asyncio.create_task(
+                    retry_relationships_only(
+                        service_manager.get_agent(temperature=0.7),
+                        analysis_text,
+                        self.name(),
+                        state.conversation_id,
+                        builder,
+                        store,
+                        subgraph_id,
+                        ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+                    )
+                )
+
+            if settings.EXTRACTION_IMMEDIATE:
+                await task
 
         return FundamentalAnalysisOutput(
             financial_data=state.financial_data,
-            analysis=response.content,
-            # entities_enriched=[_build_company_entity(state.ticker, response.content)],
+            analysis=analysis_text,
+            relationships_extracted=relationships_extracted,
+            subgraph_id=subgraph_id,
         )
 
 
@@ -413,3 +473,5 @@ if __name__ == "__main__":
     #     f.write(png_bytes)
 
     # logger.info("Saved graph as graph.png")
+
+

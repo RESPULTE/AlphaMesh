@@ -4,8 +4,8 @@ import uuid
 
 import pytest
 
-from core.memory.graph.models import ENTITY_NAMESPACE
 from core.memory.graph.nodeset_manager import NodeSetManager
+from core.memory.graph.utils import canonical_nodeset_id
 
 
 class DummyResult:
@@ -36,8 +36,8 @@ class FakeNeo4jAdapter:
 async def test_get_or_create_registers_nodeset():
     adapter = FakeNeo4jAdapter()
     manager = NodeSetManager(adapter)
-    nodeset_id = await manager.get_or_create("TestSet", "desc")
-    assert nodeset_id == str(uuid.uuid5(ENTITY_NAMESPACE, "TestSet"))
+    nodeset_id = await manager.get_or_create("TestSet")
+    assert nodeset_id == canonical_nodeset_id("TestSet")
     assert await manager.get_id("TestSet") == nodeset_id
 
 

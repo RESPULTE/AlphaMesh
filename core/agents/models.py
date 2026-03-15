@@ -33,6 +33,7 @@ class BaseAgentInput(BaseModel):
         default=None, description="End date (format: YYYY-MM-DD)."
     )
     memory_task: Optional[Any] = Field(default=None, exclude=True)
+    conversation_id: Optional[str] = Field(default=None, exclude=True)
 
     # @field_validator("start_date", "end_date", mode="before")
     # def parse_dates(cls, v):
@@ -70,6 +71,8 @@ class BaseAgentOutput(BaseModel, ABC):
             "Populated by each agent's final node before returning."
         ),
     )
+    subgraph_id: Optional[str] = Field(default=None, exclude=True)
+    relationships_extracted: bool = Field(default=False)
 
     @abstractmethod
     def get_llm_context_str(self) -> str:
@@ -103,6 +106,7 @@ class NewsAgentState(BaseModel):
     chunk_ids: List[str] = Field(default_factory=list)
     retrieved_chunks: List[RetrievedChunk] = Field(default_factory=list)
     extraction_results: List[ChunkExtractionResult] = Field(default_factory=list)
+    conversation_id: Optional[str] = Field(default=None)
     memory_task: Optional[Any] = Field(default=None, exclude=True)
 
     final_chunks: List[RetrievedChunk] = Field(default_factory=list)
@@ -133,5 +137,3 @@ class NewsAgentOutput(BaseAgentOutput):
             ]
         )
         return f"{header}{self.analysis}\n\n### SOURCES\n{sources_block}"
-
-

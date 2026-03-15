@@ -45,6 +45,23 @@ class Settings(BaseSettings):
     # Extraction Configuration
     EXTRACTION_BATCH_SIZE: int = 6
     EXTRACTION_MAX_CONCURRENCY: int = 3
+    EXTRACTION_ENABLED: bool = True
+    EXTRACTION_IMMEDIATE: bool = True
+    EXTRACTION_LLM_RETRY_ATTEMPTS: int = 3
+    EXTRACTION_NEO4J_RETRY_ATTEMPTS: int = 3
+
+    # Subgraph store
+    REDIS_URL: str = (
+        "redis://default:iKcTNrBuxIxVawVtMQN54jwhrNFj7ApB@redis-16593.c334.asia-southeast2-1.gce.cloud.redislabs.com:16593"
+    )
+    SUBGRAPH_TTL_SECONDS: int = 3600
+
+    # In-memory dedup thresholds
+    EXTRACTION_FUZZY_THRESHOLD: float = 85.0
+    EXTRACTION_SEMANTIC_THRESHOLD: float = 0.85
+
+    # Portfolio
+    PORTFOLIO_JSON_PATH: str = "data/portfolio.json"
 
     # Retriever Configuration
     RETRIEVER_MAX_ITERATIONS: int = 2

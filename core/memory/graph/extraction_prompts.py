@@ -56,3 +56,41 @@ def build_extraction_prompt() -> ChatPromptTemplate:
             ("user", CHUNK_EXTRACTION_USER_TEMPLATE),
         ]
     )
+
+
+COMBINED_ANALYSIS_RELATIONSHIP_PROMPT = """\
+You are a financial analyst. Given the context below, produce TWO sections in this exact format:
+
+<analysis>
+[Your detailed financial analysis here. Cite sources with [N] notation where applicable.]
+</analysis>
+
+<relationships>
+[JSON array of relationships between entities already mentioned in the analysis.
+Only reference entity names that appear in the context. Do NOT create new entities.
+Each entry: {"from_name": str, "from_type": "Company|FinancialConcept|FinancialEvent|Sector",
+ "relation": "AFFECTS|CAUSED_BY|INCREASES|DECREASES|CORRELATED_WITH|EXPOSES_TO|MITIGATES|COMPETES_WITH|ACQUIRED_BY|REPORTED_BY|RELATED_TO",
+ "to_name": str, "to_type": str, "confidence": "high|low", "reason": "1-3 sentences"}]
+</relationships>
+
+Rules:
+- <analysis> must always be populated. Never leave it empty.
+- <relationships> may be an empty array [] if no clear relationships exist.
+- Confidence "high" = explicitly stated in context; "low" = inferred.
+- reason field: 1-3 short sentences explaining why this relationship holds.
+""".strip()
+
+
+ANALYSIS_ONLY_RELATIONSHIP_PROMPT = """\
+Given the analysis below, extract only relationships between entities already mentioned.
+Return ONLY:
+<relationships>
+[JSON array of relationships between entities already mentioned in the analysis.
+Each entry: {"from_name": str, "from_type": "Company|FinancialConcept|FinancialEvent|Sector",
+ "relation": "AFFECTS|CAUSED_BY|INCREASES|DECREASES|CORRELATED_WITH|EXPOSES_TO|MITIGATES|COMPETES_WITH|ACQUIRED_BY|REPORTED_BY|RELATED_TO",
+ "to_name": str, "to_type": str, "confidence": "high|low", "reason": "1-3 sentences"}]
+</relationships>
+
+Analysis:
+{analysis_text}
+""".strip()

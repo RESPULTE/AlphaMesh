@@ -19,7 +19,9 @@ async def test_full_orchestrator_pipeline_live() -> None:
     messages = [HumanMessage(content="What is the recent news of Apple?")]
 
     try:
-        output = await agent.run(messages, conversation_id="test-e2e-1234")
+        output = await agent.run(
+            messages, conversation_id="test-e2e-1234", user_email="test-user@gmail.com"
+        )
     except Exception as exc:
         exc_str = str(exc).lower()
         exc_type = str(type(exc).__name__).lower()

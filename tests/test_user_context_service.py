@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from core.memory.graph.models import ENTITY_NAMESPACE, UserInvestmentInterestNode
+from core.memory.graph.models import UserInvestmentInterestNode
+from core.memory.graph.utils import generate_uuid5
 from core.memory.user_context_service import UserContextService
 
 
@@ -76,5 +77,5 @@ async def test_schedule_upsert_deterministic_id():
     stored_node, nodeset_id = adapter.upserted_nodes[0]
     assert nodeset_id == "nodeset-1"
     expected_key = "user@example.com|Interested|UserInvestmentInterestNode|a,b"
-    expected_id = str(__import__("uuid").uuid5(ENTITY_NAMESPACE, expected_key))
+    expected_id = generate_uuid5(expected_key)
     assert stored_node.id == expected_id

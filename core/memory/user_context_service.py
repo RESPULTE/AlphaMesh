@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,11 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.logger import get_logger
 from core.memory.graph.models import (
-    ENTITY_NAMESPACE,
     UserInvestmentInterestNode,
     UserLearningInterestNode,
 )
 from core.memory.graph.nodeset_manager import NodeSetManager
+from core.memory.graph.utils import generate_uuid5
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 _STATUS_RANK: Dict[str, int] = {
@@ -69,7 +68,7 @@ class UserContextService:
         normalized = self._normalize_email(user_email)
         sorted_ids = sorted({tid for tid in target_ids if tid})
         key = f"{normalized}|{status}|{interest_type}|{','.join(sorted_ids)}"
-        return str(uuid.uuid5(ENTITY_NAMESPACE, key))
+        return generate_uuid5(key)
 
     async def load_for_user(self, user_email: str) -> UserContext:
         normalized = self._normalize_email(user_email)

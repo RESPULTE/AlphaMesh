@@ -21,6 +21,7 @@ class ServiceManager:
         self._reranker = None
         self._memory_retrieval_service = None
         self._user_context_service = None
+        self._subgraph_store = None
 
     def get_agent(self, temperature=0.0):
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
@@ -154,6 +155,7 @@ class ServiceManager:
                     embedding_func=self.get_embedding_func(),
                     chunker=chunker,
                     llm=self.get_agent(),
+                    subgraph_store=self.get_subgraph_store(),
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreIngestor: {e}")
@@ -204,6 +206,20 @@ class ServiceManager:
                 print(f"Error initializing UserContextService: {e}")
                 raise
         return self._user_context_service
+
+    def get_subgraph_store(self):
+        from core.memory.stores.subgraph_store import SubgraphStore
+
+        if self._subgraph_store is None:
+            try:
+                self._subgraph_store = SubgraphStore(
+                    redis_url=settings.REDIS_URL,
+                    ttl=settings.SUBGRAPH_TTL_SECONDS,
+                )
+            except Exception as e:
+                print(f"Error initializing SubgraphStore: {e}")
+                raise
+        return self._subgraph_store
 
 
 service_manager = ServiceManager()

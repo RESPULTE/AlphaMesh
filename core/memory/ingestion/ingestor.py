@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+import networkx as nx
 
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import build_extraction_prompt
 from core.memory.graph.models import (
-    ALLOWED_ENTITY_TYPES,
-    ALLOWED_RELATIONSHIP_TYPES,
-    ENTITY_NAMESPACE,
     BatchExtractionResult,
     ChunkExtractionResult,
     DocumentMetadata,
@@ -21,10 +19,19 @@ from core.memory.graph.models import (
     EntityNode,
 )
 from core.memory.graph.nodeset_manager import NodeSetManager
+from core.memory.graph.utils import (
+    canonical_entity_id,
+    entity_key,
+    normalize_entity_description,
+    normalize_entity_name,
+    normalize_entity_type,
+    normalize_relationship_type,
+)
 from core.memory.ingestion.chunker import ArticleChunker
 from core.memory.retrieval.models import RetrievedChunk
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
+from core.memory.stores.subgraph_store import SubgraphStore
 
 logger = get_logger(__name__)
 
@@ -32,44 +39,6 @@ EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 FUZZY_CANDIDATE_THRESHOLD = 0.50
 SEMANTIC_MERGE_THRESHOLD = 0.85
 VECTOR_TOP_K = 10
-
-
-_ALLOWED_REL_SET = set(ALLOWED_RELATIONSHIP_TYPES)
-
-
-def _normalize_relationship_type(value: str) -> str:
-    """Normalize to canonical type or fall back to RELATED_TO."""
-    normalized = str(value or "").strip().upper().replace(" ", "_")
-    if normalized in _ALLOWED_REL_SET:
-        return normalized
-    return "RELATED_TO"
-
-
-def _canonical_entity_id(name: str, entity_type: str) -> str:
-    key = f"{name.lower()}::{entity_type.lower()}"
-    return str(uuid.uuid5(ENTITY_NAMESPACE, key))
-
-
-def _normalize_entity_type(value: Any) -> Optional[str]:
-    if not value:
-        return None
-    entity_type = str(value).strip()
-    if entity_type in ALLOWED_ENTITY_TYPES:
-        return entity_type
-    return None
-
-
-def _normalize_entity_name(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def _normalize_entity_description(value: Any, fallback: str) -> str:
-    description = str(value or "").strip()
-    return description or fallback
-
-
-def _entity_key(name: str, entity_type: str) -> Tuple[str, str]:
-    return (name.lower(), entity_type)
 
 
 class DualStoreIngestor:
@@ -84,6 +53,7 @@ class DualStoreIngestor:
         embedding_func,
         chunker: ArticleChunker,
         llm=None,
+        subgraph_store=None,
     ) -> None:
         """Initialize the ingestor with adapters and utilities."""
         self._neo4j_adapter = neo4j_adapter
@@ -93,6 +63,7 @@ class DualStoreIngestor:
         self._embedding_func = embedding_func
         self._chunker = chunker
         self._llm = llm
+        self._subgraph_store = subgraph_store
         self._logger = get_logger(__name__)
 
     async def ingest_articles(
@@ -231,17 +202,87 @@ class DualStoreIngestor:
         except Exception:
             self._logger.exception("Background extraction task failed.")
 
-    async def _extract_entities_for_chunks(self, chunk_ids: List[str]) -> None:
+    async def _upsert_with_retry(
+        self,
+        coro_factory,
+        chunk_id: Optional[str] = None,
+        max_attempts: int = settings.EXTRACTION_NEO4J_RETRY_ATTEMPTS,
+    ) -> bool:
+        for attempt in range(max_attempts):
+            try:
+                await coro_factory()
+                return True
+            except Exception:
+                if attempt == max_attempts - 1:
+                    self._logger.error(
+                        "Neo4j upsert failed after %d attempts for chunk %s",
+                        max_attempts,
+                        chunk_id,
+                    )
+                    await self._mark_chunk_pending(chunk_id)
+                    return False
+                await asyncio.sleep(2**attempt)
+        return False
+
+    async def _mark_chunk_pending(self, chunk_id: Optional[str]) -> None:
+        if not chunk_id:
+            return
+        try:
+            await self._neo4j_adapter.update_chunk_extraction_status(
+                chunk_id, "PENDING"
+            )
+        except Exception:
+            self._logger.exception(
+                "Failed to mark chunk %s pending in Neo4j.", chunk_id
+            )
+
+        try:
+            docs = await self._chroma_adapter.get_documents_by_ids([chunk_id])
+            if not docs:
+                return
+            meta = dict(docs[0].metadata or {})
+            meta["extraction_status"] = "PENDING"
+            await self._chroma_adapter.update_metadata([chunk_id], [meta])
+        except Exception:
+            self._logger.exception(
+                "Failed to mark chunk %s pending in ChromaDB.", chunk_id
+            )
+
+    async def extract_entities_for_chunks(
+        self, chunk_ids: List[str], force: bool = False
+    ) -> List[EntityNode]:
+        """Extract entities for the given chunks and return a deduped list."""
+        if not chunk_ids:
+            return []
+        if self._llm is None:
+            self._logger.warning("Entity extraction requested but no LLM configured.")
+            return []
+        try:
+            return await self._extract_entities_for_chunks(chunk_ids, force=force)
+        except Exception:
+            self._logger.exception("Entity extraction failed for chunks.")
+            return []
+
+    async def _extract_entities_for_chunks(
+        self, chunk_ids: List[str], force: bool = False
+    ) -> List[EntityNode]:
         """Extract entities/relationships for pending chunks in the background."""
         if not chunk_ids:
-            return
+            return []
 
-        status_map = await self._neo4j_adapter.get_chunk_extraction_status(chunk_ids)
-        pending_chunk_ids = [
-            chunk_id for chunk_id in chunk_ids if status_map.get(chunk_id) == "PENDING"
-        ]
+        if force:
+            pending_chunk_ids = list(chunk_ids)
+        else:
+            status_map = await self._neo4j_adapter.get_chunk_extraction_status(
+                chunk_ids
+            )
+            pending_chunk_ids = [
+                chunk_id
+                for chunk_id in chunk_ids
+                if status_map.get(chunk_id) == "PENDING"
+            ]
         if not pending_chunk_ids:
-            return
+            return await self._neo4j_adapter.get_entities_for_chunks(chunk_ids)
 
         chunk_docs = await self._chroma_adapter.get_documents_by_ids(pending_chunk_ids)
 
@@ -260,7 +301,7 @@ class DualStoreIngestor:
             if chunk_id in chunk_lookup
         ]
         if not chunks_to_process:
-            return
+            return []
 
         prompt = build_extraction_prompt()
         extraction_chain = prompt | self._llm.with_structured_output(
@@ -269,10 +310,7 @@ class DualStoreIngestor:
 
         async def _extract_batch(chunks: List[dict]) -> BatchExtractionResult:
             chunk_blocks = "\n\n".join(
-                [
-                    f"[CHUNK_ID: {chunk['chunk_id']}]\n{chunk['text']}"
-                    for chunk in chunks
-                ]
+                [f"{idx}. {chunk['text']}" for idx, chunk in enumerate(chunks, 1)]
             )
             async with EXTRACTION_SEMAPHORE:
                 return await extraction_chain.ainvoke({"chunk_blocks": chunk_blocks})
@@ -305,27 +343,55 @@ class DualStoreIngestor:
                 continue
             validated_results.append(result)
 
+        deduped_entities: Dict[str, EntityNode] = {}
+
         for result in validated_results:
             local_id_map = {}
+            chunk_failed = False
+            chunk_entities: Dict[str, EntityNode] = {}
             for entity in result.entities:
                 if not getattr(entity, "description", None):
                     entity.description = entity.name
-                canonical_id = str(
-                    uuid.uuid5(
-                        ENTITY_NAMESPACE,
-                        f"{entity.name.lower()}::{entity.entity_type.lower()}",
-                    )
-                )
+                canonical_id = canonical_entity_id(entity.name, entity.entity_type)
                 local_key = entity.local_id or canonical_id
                 entity.id = canonical_id
                 local_id_map[local_key] = entity
-                await self._persist_entity(entity)
-                await self._neo4j_adapter.merge_relationship(
+                chunk_entities[entity.id] = entity
+
+                if not await self._upsert_with_retry(
+                    lambda: self._neo4j_adapter.merge_entity_node(entity),
                     result.chunk_id,
-                    entity.id,
-                    "MENTIONS_ENTITY",
-                    {"confidence": 1.0},
-                )
+                ):
+                    chunk_failed = True
+                    break
+
+                if self._entity_chroma_adapter is not None:
+                    try:
+                        await self._entity_chroma_adapter.upsert_entity_embedding(
+                            entity_id=entity.id,
+                            name=entity.name,
+                            description=entity.description,
+                            entity_type=entity.entity_type,
+                        )
+                    except Exception:
+                        self._logger.exception(
+                            "Failed to upsert entity embedding for %s", entity.id
+                        )
+
+                if not await self._upsert_with_retry(
+                    lambda: self._neo4j_adapter.merge_relationship(
+                        result.chunk_id,
+                        entity.id,
+                        "MENTIONS_ENTITY",
+                        {"confidence": 1.0},
+                    ),
+                    result.chunk_id,
+                ):
+                    chunk_failed = True
+                    break
+
+            if chunk_failed:
+                continue
 
             for rel in result.relationships:
                 source_entity = local_id_map.get(rel.source_entity_local_id)
@@ -337,29 +403,51 @@ class DualStoreIngestor:
                         rel.target_entity_local_id,
                     )
                     continue
-                rel_type = _normalize_relationship_type(rel.relationship_type)
-                await self._neo4j_adapter.merge_relationship(
-                    source_entity.id,
-                    target_entity.id,
-                    "RELATED_TO",
-                    {
-                        "relationship_type": rel_type,
-                        "source_chunk_id": result.chunk_id,
-                        "confidence": rel.confidence,
-                    },
-                )
+                rel_type = normalize_relationship_type(rel.relationship_type)
+                if not await self._upsert_with_retry(
+                    lambda: self._neo4j_adapter.merge_relationship(
+                        source_entity.id,
+                        target_entity.id,
+                        "RELATED_TO",
+                        {
+                            "relationship_type": rel_type,
+                            "source_chunk_id": result.chunk_id,
+                            "confidence": rel.confidence,
+                        },
+                    ),
+                    result.chunk_id,
+                ):
+                    chunk_failed = True
+                    break
 
-            await self._neo4j_adapter.update_chunk_extraction_status(
-                result.chunk_id, "EXTRACTED"
-            )
+            if chunk_failed:
+                continue
+
+            if not await self._upsert_with_retry(
+                lambda: self._neo4j_adapter.update_chunk_extraction_status(
+                    result.chunk_id, "EXTRACTED"
+                ),
+                result.chunk_id,
+            ):
+                continue
 
             chunk_meta = chunk_lookup.get(result.chunk_id)
             if chunk_meta:
                 updated_metadata = dict(chunk_meta.get("metadata") or {})
                 updated_metadata["extraction_status"] = "EXTRACTED"
-                await self._chroma_adapter.update_metadata(
-                    [result.chunk_id], [updated_metadata]
-                )
+                try:
+                    await self._chroma_adapter.update_metadata(
+                        [result.chunk_id], [updated_metadata]
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "Failed to update chunk metadata for %s", result.chunk_id
+                    )
+
+            for entity_id, entity in chunk_entities.items():
+                deduped_entities[entity_id] = entity
+
+        return list(deduped_entities.values())
 
     async def run_conversation_writeback(
         self,
@@ -384,8 +472,8 @@ class DualStoreIngestor:
 
             # --- Step 1: Resolve + dedup enriched entities ---
             for raw_entity in enriched_entities:
-                name = _normalize_entity_name(getattr(raw_entity, "name", None))
-                entity_type = _normalize_entity_type(
+                name = normalize_entity_name(getattr(raw_entity, "name", None))
+                entity_type = normalize_entity_type(
                     getattr(raw_entity, "entity_type", None)
                 )
                 if not name or not entity_type:
@@ -398,13 +486,15 @@ class DualStoreIngestor:
                 )
             # --- Step 2: Write relationships ---
             for rel in relationships or []:
-                from_name = _normalize_entity_name(rel.get("from_name"))
-                to_name = _normalize_entity_name(rel.get("to_name"))
-                relation_type = _normalize_relationship_type(rel.get("relation", ""))
+                from_name = normalize_entity_name(rel.get("from_name"))
+                to_name = normalize_entity_name(rel.get("to_name"))
+                relation_type = normalize_relationship_type(rel.get("relation", ""))
                 confidence = str(rel.get("confidence", "low")).strip() or "low"
+                reason = str(rel.get("reason", "")).strip()
+                derived_for_user_email = rel.get("derived_for_user_email")
 
-                from_type = _normalize_entity_type(rel.get("from_type"))
-                to_type = _normalize_entity_type(rel.get("to_type"))
+                from_type = normalize_entity_type(rel.get("from_type"))
+                to_type = normalize_entity_type(rel.get("to_type"))
 
                 if not from_name or not to_name:
                     continue
@@ -446,6 +536,75 @@ class DualStoreIngestor:
                 exc_info=True,
             )
 
+    async def _upsert_graph_to_neo4j(
+        self, graph: nx.DiGraph, conversation_id: str
+    ) -> None:
+        if graph is None:
+            return
+
+        if self._subgraph_store is not None and conversation_id:
+            try:
+                key = SubgraphStore.make_key("orchestrator", conversation_id)
+                await self._subgraph_store.save(key, graph)
+            except Exception:
+                self._logger.exception(
+                    "Failed to persist merged subgraph for %s", conversation_id
+                )
+
+        entity_cache: Dict[tuple[str, str], str] = {}
+        for source_id, target_id, attrs in graph.edges(data=True):
+            source_node = graph.nodes.get(source_id, {})
+            target_node = graph.nodes.get(target_id, {})
+            from_name = normalize_entity_name(source_node.get("name"))
+            to_name = normalize_entity_name(target_node.get("name"))
+            from_type = normalize_entity_type(source_node.get("entity_type"))
+            to_type = normalize_entity_type(target_node.get("entity_type"))
+            if not from_name or not to_name or not from_type or not to_type:
+                continue
+
+            resolved_source = await self._resolve_entity(
+                from_name,
+                from_type,
+                entity_cache,
+            )
+            resolved_target = await self._resolve_entity(
+                to_name,
+                to_type,
+                entity_cache,
+            )
+            if not resolved_source or not resolved_target:
+                continue
+
+            relation_type = str(attrs.get("relation_type", "RELATED_TO")).strip()
+            confidence = str(attrs.get("confidence", "low")).strip() or "low"
+            reason = str(attrs.get("reason", "")).strip()
+            derived_for_user_email = attrs.get("derived_for_user_email")
+            source_agent = attrs.get("source_agent")
+
+            props = self._build_relationship_props(
+                relation_type,
+                confidence,
+                conversation_id,
+                from_type,
+                to_type,
+                reason=reason,
+                derived_for_user_email=derived_for_user_email,
+                source_agent=source_agent,
+            )
+
+            await self._upsert_with_retry(
+                lambda: self._neo4j_adapter.merge_relationship(
+                    resolved_source, resolved_target, relation_type, props
+                ),
+                None,
+            )
+            await self._upsert_with_retry(
+                lambda: self._neo4j_adapter.merge_relationship(
+                    resolved_source, resolved_target, "RELATED_TO", props
+                ),
+                None,
+            )
+
     async def _persist_entity(self, node: EntityNode) -> None:
         await self._neo4j_adapter.merge_entity_node(node)
         await self._entity_chroma_adapter.upsert_entity_embedding(
@@ -480,19 +639,19 @@ class DualStoreIngestor:
         *,
         raw: Any = None,
     ) -> Optional[str]:
-        key = _entity_key(name, entity_type)
+        key = entity_key(name, entity_type)
         if key in entity_cache:
             return entity_cache[key]
 
         if not entity_type or not name:
             return None
 
-        entity_id = _canonical_entity_id(name, entity_type)
+        entity_id = canonical_entity_id(name, entity_type)
         node = EntityNode(
             id=entity_id,
             name=name,
             entity_type=entity_type,
-            description=_normalize_entity_description(
+            description=normalize_entity_description(
                 getattr(raw, "description", None) if raw else None,
                 name,
             ),
@@ -522,14 +681,24 @@ class DualStoreIngestor:
         conversation_id: str,
         from_type: str,
         to_type: str,
+        reason: Optional[str] = None,
+        derived_for_user_email: Optional[str] = None,
+        source_agent: Optional[str] = None,
     ) -> Dict[str, object]:
-        return {
+        props = {
             "relationship_type": relation_type,
             "confidence": confidence,
             "source_conversation_id": conversation_id,
             "from_type": from_type,
             "to_type": to_type,
         }
+        if reason:
+            props["reason"] = reason
+        if derived_for_user_email:
+            props["derived_for_user_email"] = derived_for_user_email
+        if source_agent:
+            props["source_agent"] = source_agent
+        return props
 
     async def find_similar_entities(
         self,
@@ -538,11 +707,11 @@ class DualStoreIngestor:
         if self._chroma_adapter is None:
             return None
 
-        name = _normalize_entity_name(entity.name)
+        name = normalize_entity_name(entity.name)
         if not name:
             return None
 
-        description = _normalize_entity_description(entity.description, name)
+        description = normalize_entity_description(entity.description, name)
         text = f"{name}. {description}"
 
         candidate_ids = None

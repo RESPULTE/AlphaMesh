@@ -262,6 +262,26 @@ class Neo4jAdapter:
         )
         return records
 
+    async def update_targets_last_analysis_summary(
+        self, user_email: str, target_entity_id: str, summary: str
+    ) -> None:
+        if not user_email or not target_entity_id:
+            return
+        cypher = (
+            "MATCH (u)-[r:TARGETS]->(t:Entity {id: $target_id}) "
+            "WHERE (u:UserInvestmentInterestNode OR u:UserLearningInterestNode) "
+            "AND u.user_email = $user_email "
+            "SET r.last_analysis_summary = $summary"
+        )
+        await self._execute_write(
+            cypher,
+            {
+                "user_email": user_email,
+                "target_id": target_entity_id,
+                "summary": summary,
+            },
+        )
+
     async def close(self) -> None:
         """Close the underlying Neo4j driver."""
         if self._driver is not None:
