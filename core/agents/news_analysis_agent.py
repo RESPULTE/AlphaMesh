@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import List, Type
 
@@ -17,6 +16,7 @@ from core.agents.models import (
     NewsAgentOutput,
     NewsAgentState,
 )
+from core.agents.news_fetcher import build_news_query, fetch_articles
 from core.logger import get_logger
 from core.memory.retrieval.models import RetrievedChunk
 from core.services import service_manager
@@ -86,38 +86,67 @@ class NewsAnalysisAgent(AbstractAgent):
         return workflow.compile()
 
     async def _fetch_news_node(self, state: NewsAgentState) -> dict:
-        """Fetch raw news articles from NewsAPI."""
-        loop = asyncio.get_running_loop()
+        """
+        Fetch news articles from NewsAPI and enrich them with full content
+        scraped by trafilatura.
+
+        Changes vs. the original node
+        ──────────────────────────────
+        • build_news_query() constructs a boolean NewsAPI query that combines
+          the ticker symbol with optional company name / keywords.
+        • Results are filtered to a curated list of trusted financial domains.
+        • trafilatura replaces the truncated NewsAPI `content` field (~200 chars)
+          with the full article body, which the downstream chunker/embedder can
+          use without losing context.
+        • Falls back gracefully to the NewsAPI snippet when scraping fails
+          (e.g. paywalled pages).
+        """
         now = datetime.now()
         api_limit_date = now - timedelta(days=28)
 
-        if state.end_date > now:
-            state.end_date = now
-        if state.start_date < api_limit_date:
-            state.start_date = api_limit_date
+        # Clamp dates to NewsAPI's allowed window
+        start = state.start_date
+        end = state.end_date
+
+        if end > now:
+            end = now
+        if start < api_limit_date:
+            start = api_limit_date
+
+        # ── Build an advanced boolean query ─────────────────────────────────
+        # Modify must_include / must_exclude / any_of to taste, or expose them
+        # as fields on NewsAgentState for per-request customisation.
+        q = build_news_query(
+            ticker=state.ticker,
+            # company_name="Apple Inc",      # optional: improves recall
+            # must_include=["earnings"],     # optional: narrow to a topic
+            # must_exclude=["crypto"],       # optional: filter noise
+            # any_of=["revenue", "profit"],  # optional: OR group
+            # exact_phrase="quarterly results",  # optional: exact match
+        )
+        logger.info("NewsAPI query: %s", q)
 
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: service_manager.get_news_api().get_everything(
-                    q=state.ticker,
-                    from_param=state.start_date.date().isoformat(),
-                    to=state.end_date.date().isoformat(),
-                    language="en",
-                    sort_by="relevancy",
-                    page=1,
-                    page_size=50,
-                ),
+            articles = await fetch_articles(
+                q=q,
+                from_date=start.date().isoformat(),
+                to_date=end.date().isoformat(),
+                language="en",
+                sort_by="relevancy",
+                page=1,
+                page_size=50,
             )
         except Exception as exc:
-            logger.error("NewsAPI request failed: %s", exc)
+            logger.error("News fetch pipeline failed: %s", exc)
             raise
 
-        if response.get("status") != "ok":
-            raise RuntimeError(response.get("message", "NewsAPI error"))
-
-        articles = [a for a in response.get("articles", []) if a.get("content")]
-        logger.info("Fetched %d articles from NewsAPI.", len(articles))
+        logger.info(
+            "Fetched %d articles for ticker '%s' (%s → %s).",
+            len(articles),
+            state.ticker,
+            start.date(),
+            end.date(),
+        )
         return {"raw_articles": articles}
 
     async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
@@ -139,7 +168,9 @@ class NewsAnalysisAgent(AbstractAgent):
                 chunk_ids
             )
             retrieved_chunks = [
-                RetrievedChunk.from_document(doc, score=None, source="vector", domain="new")
+                RetrievedChunk.from_document(
+                    doc, score=None, source="vector", domain="new"
+                )
                 for doc in docs
             ]
 
@@ -215,4 +246,3 @@ class NewsAnalysisAgent(AbstractAgent):
             raise
 
         return {"analysis": analysis_text, "sources": sources}
-

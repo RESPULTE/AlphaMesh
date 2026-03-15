@@ -64,5 +64,37 @@ class Settings(BaseSettings):
     # NewsAPI Configuration
     NEWSAPI_KEY: Optional[str] = None
 
+    FINANCIAL_DOMAINS: str = ",".join(
+        [
+            "reuters.com",
+            "bbc.co.uk",
+            "bbc.com",
+            "theguardian.com",
+            "ft.com",
+            "bloomberg.com",
+            "wsj.com",
+            "cnbc.com",
+            "marketwatch.com",
+            "forbes.com",
+            "businessinsider.com",
+            "economist.com",
+            "apnews.com",
+            "finance.yahoo.com",
+            "seekingalpha.com",
+            "investing.com",
+            "morningstar.com",
+            "barrons.com",
+        ]
+    )
+
+    # How many URLs to scrape concurrently.  Keeps us polite to servers.
+    _SCRAPE_CONCURRENCY = 8
+
+    # Timeout (seconds) for each individual HTTP download inside trafilatura.
+    _SCRAPE_TIMEOUT = 12
+
+    # Minimum character count for scraped body to be considered useful.
+    _MIN_BODY_LENGTH = 150
+
 
 settings = Settings()

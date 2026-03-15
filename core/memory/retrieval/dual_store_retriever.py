@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 
 from core.config import settings
 from core.logger import get_logger
+from core.memory.graph.models import _ENTITY_TYPE_WEIGHTS, _RELATIONSHIP_WEIGHTS
 from core.memory.retrieval.models import (
     MemoryContext,
     RetrievedChunk,
@@ -19,27 +20,6 @@ from core.memory.retrieval.models import (
 from core.memory.retrieval.reranker import CompositeReranker
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
-
-_RELATIONSHIP_WEIGHTS: dict[str, float] = {
-    "AFFECTS": 1.0,
-    "CAUSED_BY": 0.95,
-    "INCREASES": 0.85,
-    "DECREASES": 0.85,
-    "CORRELATED_WITH": 0.70,
-    "EXPOSES_TO": 0.65,
-    "MITIGATES": 0.55,
-    "COMPETES_WITH": 0.45,
-    "ACQUIRED_BY": 0.40,
-    "REPORTED_BY": 0.25,
-    "RELATED_TO": 0.10,  # generic fallback — lowest priority
-}
-
-_ENTITY_TYPE_WEIGHTS: dict[str, float] = {
-    "Company": 1.0,
-    "FinancialEvent": 0.90,
-    "FinancialConcept": 0.65,
-    "Sector": 0.45,
-}
 
 
 class DualStoreRetriever:

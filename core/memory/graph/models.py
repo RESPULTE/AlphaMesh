@@ -42,7 +42,6 @@ ALLOWED_RELATIONSHIP_TYPES = [
     "MITIGATES",
     "COMPETES_WITH",
     "ACQUIRED_BY",
-    "REPORTED_BY",
     "RELATED_TO",
 ]
 
@@ -59,6 +58,26 @@ RelationshipType = Literal[
     "REPORTED_BY",
     "RELATED_TO",
 ]
+
+_RELATIONSHIP_WEIGHTS: dict[str, float] = {
+    "AFFECTS": 1.0,
+    "CAUSED_BY": 0.95,
+    "BOOSTS": 0.85,
+    "DRAGS": 0.85,
+    "CORRELATED_WITH": 0.70,
+    "EXPOSES_TO": 0.65,
+    "MITIGATES": 0.55,
+    "COMPETES_WITH": 0.45,
+    "ACQUIRED_BY": 0.40,
+    "RELATED_TO": 0.10,  # generic fallback — lowest priority
+}
+
+_ENTITY_TYPE_WEIGHTS: dict[str, float] = {
+    "Company": 1.0,
+    "FinancialEvent": 0.90,
+    "FinancialConcept": 0.65,
+    "Sector": 0.45,
+}
 
 
 class DocumentMetadata(BaseModel):
