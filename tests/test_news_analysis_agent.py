@@ -24,7 +24,7 @@ def mock_service_manager(monkeypatch):
     }
 
     mock_ingestor = AsyncMock()
-    mock_ingestor.ingest_articles.return_value = ["c1"]
+    mock_ingestor.ingest_articles.return_value = (["c1"], [])
 
     mock_retriever = AsyncMock()
     mock_retriever.retrieve.return_value = [
@@ -141,4 +141,3 @@ async def test_news_agent_with_memory_task(mock_service_manager):
 
     assert output.agent_name == "news_agent"
     assert "Apple has released a new iPad" in output.analysis
-

@@ -18,6 +18,8 @@ from core.memory.retrieval.models import (
 )
 from core.memory.retrieval.reranker import CompositeReranker
 from core.memory.retrieval.retrieval_prompts import build_node_selection_prompt
+from core.memory.stores.chroma_adapter import ChromaDBAdapter
+from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 
 class DualStoreRetriever:
@@ -25,10 +27,10 @@ class DualStoreRetriever:
 
     def __init__(
         self,
-        neo4j_adapter,
-        chroma_adapter,
-        embedding_func,
-        llm,
+        neo4j_adapter: Neo4jAdapter,
+        chroma_adapter: ChromaDBAdapter,
+        embedding_func: callable,
+        llm: callable,
         reranker: CompositeReranker,
     ) -> None:
         self._neo4j_adapter = neo4j_adapter
@@ -279,7 +281,7 @@ class DualStoreRetriever:
 
             for chunk in result:
                 if isinstance(chunk, RetrievedChunk):
-                    all_chunks.append(RetrievedChunk.with_domain(chunk, domain))
+                    all_chunks.append(RetrievedChunk.from_raw_chunk(chunk, domain))
 
         # Rerank and return combined context
         ranked = self._reranker.rank(all_chunks)
@@ -334,8 +336,3 @@ class DualStoreRetriever:
             seen.add(item)
             updated.append(item)
         return updated
-
-
-
-
-

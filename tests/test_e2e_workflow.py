@@ -16,11 +16,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
     logging.basicConfig(level=logging.INFO)
 
     agent = OrchestratorAgent()
-    messages = [
-        HumanMessage(
-            content="What is the recent news and financial health of Apple (AAPL)?"
-        )
-    ]
+    messages = [HumanMessage(content="What is the recent news of Apple?")]
 
     try:
         output = await agent.run(messages, conversation_id="test-e2e-1234")

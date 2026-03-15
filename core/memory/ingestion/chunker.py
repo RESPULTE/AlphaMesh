@@ -7,25 +7,12 @@ from typing import List, Tuple
 from uuid import uuid4
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pydantic import BaseModel, ConfigDict, Field
 
 from core import logger
 from core.logger import get_logger
-from core.memory.graph.models import ChunkNode
+from core.memory.graph.models import ChunkNode, DocumentMetadata
 
 logger = get_logger(__name__)
-
-
-class DocumentMetadata(BaseModel):
-    """Metadata contract for a document node."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    document_id: str
-    title: str
-    source_url: str
-    published_at: datetime
-    companies_involved: List[str] = Field(default_factory=list)
 
 
 class ArticleChunker:
@@ -46,9 +33,7 @@ class ArticleChunker:
             self._logger.exception("Failed to parse publishedAt: %s", value)
             return datetime.now(timezone.utc)
 
-    def chunk_article(
-        self, article: dict, companies_involved: List[str]
-    ) -> Tuple[DocumentMetadata, List[ChunkNode]]:
+    def chunk_article(self, article: dict) -> Tuple[DocumentMetadata, List[ChunkNode]]:
         """Split a NewsAPI article into document metadata and chunk nodes."""
         title = (article.get("title") or "").strip()
         description = (article.get("description") or "").strip()
@@ -73,7 +58,6 @@ class ArticleChunker:
             title=title,
             source_url=source_url,
             published_at=published_at,
-            companies_involved=companies_involved,
         )
 
         logger.info("Chunking article '%s' into %d chunks.", title, len(chunks))
@@ -89,10 +73,7 @@ class ArticleChunker:
                     article_title=title,
                     source_url=source_url,
                     published_at=published_at,
-                    companies_involved=companies_involved,
                 )
             )
 
         return document_meta, chunk_records
-
-

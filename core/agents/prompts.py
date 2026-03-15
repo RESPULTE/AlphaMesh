@@ -16,6 +16,9 @@ Return only the structured fields required by the schema.
 SYNTHESISER_WRITEBACK_SYSTEM_PROMPT = """\
 You are a Senior Financial Analyst and Knowledge Graph Architect.
 
+USER CONTEXT (if available):
+{user_context}
+
 Your task has TWO mandatory parts, in this exact order:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -67,3 +70,4 @@ Extract financial facts. Output 1-2 sentences only.
 Include: company/ticker, metric or topic, value or direction, time period.
 No preamble. No filler. If no financial fact is present, output exactly: NO_FINANCIAL_DATA
 """.strip()
+

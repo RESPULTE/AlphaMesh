@@ -7,11 +7,7 @@ from typing import List
 
 from core.logger import get_logger
 from core.memory.retrieval.dual_store_retriever import DualStoreRetriever
-from core.memory.retrieval.models import (
-    MemoryContext,
-    RetrievedChunk,
-    RewrittenQueries,
-)
+from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.memory.retrieval.reranker import CompositeReranker
 
 
@@ -53,9 +49,7 @@ class MemoryRetrievalService:
                 continue
             for chunk in result:
                 if isinstance(chunk, RetrievedChunk):
-                    all_chunks.append(RetrievedChunk.with_domain(chunk, domain))
+                    all_chunks.append(RetrievedChunk.from_raw_chunk(chunk, domain))
 
         ranked = self._reranker.rank(all_chunks)
         return MemoryContext(chunks=ranked, rewritten_queries=rewritten_queries)
-
-

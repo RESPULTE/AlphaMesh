@@ -11,15 +11,17 @@ from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import build_extraction_prompt
 from core.memory.graph.models import (
+    ALLOWED_ENTITY_TYPES,
     ENTITY_NAMESPACE,
     BatchExtractionResult,
     ChunkExtractionResult,
     ChunkNode,
+    DocumentMetadata,
     DocumentNode,
     EntityNode,
 )
 from core.memory.graph.nodeset_manager import NodeSetManager
-from core.memory.ingestion.chunker import ArticleChunker, DocumentMetadata
+from core.memory.ingestion.chunker import ArticleChunker
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 from core.services import service_manager
@@ -31,8 +33,6 @@ FUZZY_CANDIDATE_THRESHOLD = 0.50
 SEMANTIC_MERGE_THRESHOLD = 0.85
 VECTOR_TOP_K = 10
 
-_ALLOWED_ENTITY_TYPES = {"Company", "FinancialEvent", "FinancialConcept", "Sector"}
-
 
 def _canonical_entity_id(name: str, entity_type: str) -> str:
     key = f"{name.lower()}::{entity_type.lower()}"
@@ -43,7 +43,7 @@ def _normalize_entity_type(value: Any) -> Optional[str]:
     if not value:
         return None
     entity_type = str(value).strip()
-    if entity_type in _ALLOWED_ENTITY_TYPES:
+    if entity_type in ALLOWED_ENTITY_TYPES:
         return entity_type
     return None
 
@@ -85,15 +85,17 @@ class DualStoreIngestor:
         self._logger = get_logger(__name__)
 
     async def ingest_articles(
-        self, articles: List[dict], companies_involved: List[str]
-    ) -> List[str]:
+        self, articles: List[dict]
+    ) -> Tuple[List[str], List[ChunkNode]]:
         """Ingest a batch of articles into both stores."""
         try:
             global_anchor_id = (
                 await self._nodeset_manager.get_global_financial_events_id()
             )
-            documents: List[DocumentMetadata] = []
-            chunks: List[ChunkNode] = []
+            documents_to_ingest: List[DocumentMetadata] = []
+            chunks_to_ingest: List[ChunkNode] = []
+
+            existing_chunks_to_return: List[ChunkNode] = []
             for article in articles:
                 source_url = (article.get("url") or "").strip()
 
@@ -104,27 +106,27 @@ class DualStoreIngestor:
                     self._logger.info(
                         "Skipping article with existing source URL: %s", source_url
                     )
+                    existing_chunks_to_return.extend(existing_chunks)
                     continue
-                doc_meta, chunk_records = self._chunker.chunk_article(
-                    article, companies_involved
-                )
-                documents.append(doc_meta)
-                chunks.extend(chunk_records)
+                doc_meta, chunk_records = self._chunker.chunk_article(article)
+                documents_to_ingest.append(doc_meta)
+                chunks_to_ingest.extend(chunk_records)
 
-            if not documents:
-                self._logger.info(
-                    "No new articles to ingest after filtering by source URL."
-                )
-                return []
+            if documents_to_ingest:
+                await self._write_document_nodes(documents_to_ingest, global_anchor_id)
+                await self._write_chunk_nodes(chunks_to_ingest, global_anchor_id)
+                await self._write_vector_chunks(chunks_to_ingest, global_anchor_id)
 
-            await self._write_document_nodes(documents, global_anchor_id)
-            await self._write_chunk_nodes(chunks, global_anchor_id)
-            await self._write_vector_chunks(chunks, global_anchor_id)
-            chunk_ids = [chunk.id for chunk in chunks]
+            new_chunk_ids = [chunk.id for chunk in chunks_to_ingest]
+            existing_chunk_ids = [chunk.id for chunk in existing_chunks_to_return]
+            chunk_ids = new_chunk_ids + existing_chunk_ids
+
+            involved_chunks = chunks_to_ingest + existing_chunks_to_return
+
             # self._schedule_extraction(chunk_ids)
-            return (chunk_ids, chunks)
-        except Exception:
-            self._logger.exception("Failed to ingest articles.")
+            return (chunk_ids, involved_chunks)
+        except Exception as exec:
+            self._logger.exception("Failed to ingest articles. %s", str(exec))
             raise
 
     async def _write_document_nodes(
@@ -140,7 +142,6 @@ class DualStoreIngestor:
                     source_url=doc.source_url,
                     published_at=doc.published_at,
                     ingested_at=ingested_at,
-                    companies_involved=doc.companies_involved,
                     nodeset_ids=[global_anchor_id],
                 )
                 await self._neo4j_adapter.merge_document_node(node)
@@ -173,10 +174,6 @@ class DualStoreIngestor:
     ) -> None:
         """Write chunk vectors and metadata to ChromaDB."""
         try:
-            embeddings = await self._embedding_func.aembed_documents(
-                [chunk.text for chunk in chunks]
-            )
-
             metadatas = []
             for chunk in chunks:
                 metadata = {
@@ -186,7 +183,6 @@ class DualStoreIngestor:
                     "source_url": chunk.source_url,
                     "published_at": chunk.published_at.isoformat(),
                     "chunk_index": chunk.chunk_index,
-                    "companies_involved": chunk.companies_involved,
                     "nodeset_ids": [global_anchor_id],
                     "extraction_status": "PENDING",
                 }
@@ -199,7 +195,6 @@ class DualStoreIngestor:
             await self._chroma_adapter.upsert_chunks(
                 chunk_ids=[chunk.id for chunk in chunks],
                 texts=[chunk.text for chunk in chunks],
-                embeddings=embeddings,
                 metadatas=metadatas,
             )
         except Exception:
@@ -448,6 +443,18 @@ class DualStoreIngestor:
             return node.id
         return await self.find_similar_entities(node)
 
+    async def resolve_entity_id(
+        self,
+        name: str,
+        entity_type: str,
+        *,
+        raw: Any = None,
+        entity_cache: Optional[Dict[Tuple[str, str], str]] = None,
+    ) -> Optional[str]:
+        """Public wrapper for entity resolution to avoid duplicate logic."""
+        cache = entity_cache if entity_cache is not None else {}
+        return await self._resolve_entity(name, entity_type, cache, raw=raw)
+
     async def _resolve_entity(
         self,
         name: str,
@@ -472,7 +479,6 @@ class DualStoreIngestor:
                 getattr(raw, "description", None) if raw else None,
                 name,
             ),
-            aliases=list(getattr(raw, "aliases", []) or []) if raw else [],
             nodeset_ids=list(getattr(raw, "nodeset_ids", []) or []) if raw else [],
         )
 

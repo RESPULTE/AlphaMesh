@@ -87,7 +87,7 @@ def test_memory_chunk_from_retrieved():
         score=0.8,
         metadata={"meta": "data"},
     )
-    mc = RetrievedChunk.with_domain(rc, domain="market")
+    mc = RetrievedChunk.from_raw_chunk(rc, domain="market")
 
     assert mc.chunk_id == "r1"
     assert mc.domain == "market"
@@ -99,7 +99,6 @@ def test_memory_chunk_from_retrieved():
     rc2 = RetrievedChunk(
         chunk_id="r2", text="text r2", source="graph", score=None, metadata={}
     )
-    mc2 = RetrievedChunk.with_domain(rc2, domain="sector")
+    mc2 = RetrievedChunk.from_raw_chunk(rc2, domain="sector")
     assert mc2.embedding_score == 0.0
     assert mc2.graph_depth == 1
-

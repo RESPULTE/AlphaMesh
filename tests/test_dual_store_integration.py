@@ -32,7 +32,6 @@ async def test_dual_store_ingestion_writes_to_vector_and_graph_store() -> None:
                 "content": "Integration test content. This is a deterministic payload.",
             }
         ]
-        companies_involved = ["TEST_INTEGRATION"]
 
         ingestor = service_manager.get_ingestor()
         chroma_adapter = service_manager.get_chroma_adapter()
@@ -40,7 +39,7 @@ async def test_dual_store_ingestion_writes_to_vector_and_graph_store() -> None:
         nodeset_manager = service_manager.get_nodeset_manager()
 
         # --- Act ---
-        chunk_ids = await ingestor.ingest_articles(articles, companies_involved)
+        chunk_ids, _chunks = await ingestor.ingest_articles(articles)
 
         # --- Assert ---
         assert chunk_ids, "Expected at least one chunk ID to be returned."
@@ -150,12 +149,11 @@ async def test_dual_store_ingestion_creates_multiple_chunks_when_overflowing() -
                 "content": long_content,
             }
         ]
-        companies_involved = ["TEST_OVERFLOW"]
 
         ingestor = service_manager.get_ingestor()
         chroma_adapter = service_manager.get_chroma_adapter()
         neo4j_adapter = service_manager.get_neo4j_adapter()
-        chunk_ids = await ingestor.ingest_articles(articles, companies_involved)
+        chunk_ids, _chunks = await ingestor.ingest_articles(articles)
 
         assert (
             len(chunk_ids) > 1

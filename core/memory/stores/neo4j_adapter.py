@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 from neo4j import AsyncDriver, AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.logger import get_logger
-from core.memory.graph.models import ChunkNode, DocumentNode, EntityNode
+from core.memory.graph.models import (
+    ALLOWED_ENTITY_TYPES,
+    ChunkNode,
+    DocumentNode,
+    EntityNode,
+)
 
-_ALLOWED_ENTITY_TYPES = {
-    "Company",
-    "FinancialEvent",
-    "FinancialConcept",
-    "Sector",
-}
+
+class RelationshipType(Enum):
+    TARGETS = "TARGETS"
+    BELONGS_TO_NODESET = "BELONGS_TO_NODESET"
+    MENTIONS_ENTITY = "MENTIONS_ENTITY"
+    RELATED_TO = "RELATED_TO"
+    BELONGS_TO_DOCUMENT = "BELONGS_TO_DOCUMENT"
 
 
 class Neo4jAdapter:
@@ -69,7 +76,6 @@ class Neo4jAdapter:
             self._logger.exception("Neo4j read failed.")
             raise
 
-
     async def entity_exists(self, entity_id: str) -> bool:
         if not entity_id:
             return False
@@ -105,6 +111,7 @@ class Neo4jAdapter:
             },
         )
         return [record.get("id") for record in records if record.get("id")]
+
     async def merge_document_node(self, node: DocumentNode) -> None:
         """Merge a document node and update its properties."""
         cypher = "MERGE (d:Document {id: $id}) SET d += $props"
@@ -113,20 +120,26 @@ class Neo4jAdapter:
 
     async def merge_chunk_node(self, node: ChunkNode) -> None:
         """Merge a chunk node and connect it to its document."""
+        belongs_to = RelationshipType.BELONGS_TO_DOCUMENT.value
         cypher = (
             "MERGE (d:Document {id: $doc_id}) "
             "MERGE (c:Chunk {id: $id}) "
             "SET c += $props "
-            "MERGE (c)-[:BELONGS_TO_DOCUMENT]->(d)"
+            f"MERGE (c)-[:{belongs_to}]->(d)"
         )
-        props = node.model_dump()
+        props = {k: v for k, v in node.model_dump().items() if k != "id"}
         await self._execute_write(
-            cypher, {"id": node.id, "doc_id": node.document_id, "props": props}
+            cypher,
+            {
+                "id": node.id,
+                "doc_id": node.document_id,
+                "props": props,
+            },
         )
 
     async def merge_entity_node(self, node: EntityNode) -> None:
         """Merge an entity node with a dynamic label."""
-        if node.entity_type not in _ALLOWED_ENTITY_TYPES:
+        if node.entity_type not in ALLOWED_ENTITY_TYPES:
             raise ValueError(f"Unsupported entity_type: {node.entity_type}")
 
         cypher = (
@@ -180,8 +193,9 @@ class Neo4jAdapter:
         """Return entities mentioned by the provided chunk IDs."""
         if not chunk_ids:
             return []
+        mentions = RelationshipType.MENTIONS_ENTITY.value
         cypher = (
-            "MATCH (c:Chunk)-[:MENTIONS_ENTITY]->(e:Entity) "
+            f"MATCH (c:Chunk)-[:{mentions}]->(e:Entity) "
             "WHERE c.id IN $chunk_ids "
             "RETURN e.id AS entity_id, e.name AS entity_name, "
             "e.entity_type AS entity_type, c.id AS source_chunk_id"
@@ -253,5 +267,57 @@ class Neo4jAdapter:
         """Run a read-only traversal query."""
         return await self._execute_read(cypher, params)
 
+    async def get_user_investment_interests(self, user_email: str) -> List[dict]:
+        """Fetch user investment interests with targets."""
+        targets = RelationshipType.TARGETS.value
+        cypher = (
+            "MATCH (u:UserInvestmentInterestNode {user_email: $user_email}) "
+            f"OPTIONAL MATCH (u)-[:{targets}]->(t:Entity) "
+            "RETURN u AS node, "
+            "collect({id: t.id, name: t.name, entity_type: t.entity_type}) AS targets "
+            "ORDER BY u.updated_at DESC"
+        )
+        records = await self._execute_read(cypher, {"user_email": user_email})
+        return records
 
+    async def get_user_learning_interests(self, user_email: str) -> List[dict]:
+        """Fetch user learning interests with targets."""
+        targets = RelationshipType.TARGETS.value
+        cypher = (
+            "MATCH (u:UserLearningInterestNode {user_email: $user_email}) "
+            f"OPTIONAL MATCH (u)-[:{targets}]->(t:Entity) "
+            "RETURN u AS node, "
+            "collect({id: t.id, name: t.name, entity_type: t.entity_type}) AS targets "
+            "ORDER BY u.updated_at DESC"
+        )
+        records = await self._execute_read(cypher, {"user_email": user_email})
+        return records
 
+    async def upsert_user_connected_nodes(self, node: Any, nodeset_id: str) -> None:
+        """Upsert a user-connected node and its relationships."""
+        label = node.__class__.__name__
+        belongs_to = RelationshipType.BELONGS_TO_NODESET.value
+        targets = RelationshipType.TARGETS.value
+
+        cypher = (
+            f"MERGE (u:{label} {{id: $id}}) "
+            "SET u += $props "
+            "WITH u "
+            f"MERGE (s:NodeSet {{id: $nodeset_id}}) "
+            f"MERGE (u)-[:{belongs_to}]->(s) "
+            "WITH u "
+            f"FOREACH (tid IN $target_ids | "
+            f"  MERGE (t:Entity {{id: tid}}) "
+            f"  MERGE (u)-[:{targets}]->(t)"
+            ")"
+        )
+        props = {k: v for k, v in node.model_dump().items() if k != "id"}
+        await self._execute_write(
+            cypher,
+            {
+                "id": str(node.id),
+                "props": props,
+                "nodeset_id": nodeset_id,
+                "target_ids": getattr(node, "target_entity_ids", []) or [],
+            },
+        )

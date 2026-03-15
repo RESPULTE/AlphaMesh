@@ -30,13 +30,11 @@ def test_article_chunker_splits_article_correctly():
         "url": "https://example.com/test",
         "publishedAt": "2026-03-14T12:00:00Z",
     }
-    companies = ["TEST"]
 
-    doc_meta, chunks = chunker.chunk_article(article, companies)
+    doc_meta, chunks = chunker.chunk_article(article)
 
     assert doc_meta.title == "Test Article"
     assert doc_meta.source_url == "https://example.com/test"
-    assert doc_meta.companies_involved == ["TEST"]
 
     assert len(chunks) > 1
     for i, chunk in enumerate(chunks):
@@ -44,6 +42,4 @@ def test_article_chunker_splits_article_correctly():
         assert chunk.chunk_index == i
         assert chunk.article_title == "Test Article"
         assert chunk.source_url == "https://example.com/test"
-        assert chunk.companies_involved == ["TEST"]
         assert isinstance(chunk.id, str)
-

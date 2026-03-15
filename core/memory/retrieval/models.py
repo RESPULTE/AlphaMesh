@@ -53,16 +53,6 @@ class RetrievedChunk(BaseModel):
     graph_depth: int = 0
     composite_score: float = 0.0
 
-    @classmethod
-    def with_domain(cls, chunk: "RetrievedChunk", domain: str) -> "RetrievedChunk":
-        return chunk.model_copy(
-            update={
-                "domain": domain,
-                "embedding_score": chunk.score or 0.0,
-                "graph_depth": 0 if chunk.source == "vector" else 1,
-            }
-        )
-
 
 class MemoryContext(BaseModel):
     chunks: List[RetrievedChunk]

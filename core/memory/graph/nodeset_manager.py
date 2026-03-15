@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Dict, Optional
 
@@ -12,6 +13,20 @@ from core.memory.graph.models import (
     GLOBAL_ENTITY_NODESETS,
 )
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
+
+
+def hash_user_email(email: str) -> str:
+    """Deterministically hash a user email to a stable short identifier."""
+    if not email or not isinstance(email, str):
+        raise ValueError(f"Invalid email for hashing: {email!r}")
+    normalized = email.strip().lower()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def get_user_nodeset_name(user_email: str) -> str:
+    """Return the canonical NodeSet name for a given user email."""
+    return f"USER_{hash_user_email(user_email)}"
 
 
 class NodeSetManager:
@@ -89,6 +104,12 @@ class NodeSetManager:
         """Get or create the GlobalFinancialEvents NodeSet ID."""
         description = "Global anchor NodeSet for financial news ingestion."
         return await self.get_or_create("GlobalFinancialEvents", description)
+
+    async def get_or_create_user_nodeset(self, user_email: str) -> tuple[str, str]:
+        """Get or create the private NodeSet for a user."""
+        nodeset_name = get_user_nodeset_name(user_email)
+        nodeset_id = await self.get_or_create(nodeset_name)
+        return nodeset_name, nodeset_id
 
     async def initialize_default_nodesets(self) -> None:
         """

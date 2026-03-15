@@ -49,11 +49,11 @@ no longer wired into the active pipeline.
 
 # 5. **FinancialEvent** — a specific financial or economic event (e.g. "Fed Rate Cut").
 
-# 6. **UserInvestmentInterest** — user's buy/sell/hold/short intent on an asset or sector.
+# 6. **UserInvestmentInterestNode** — user's buy/sell/hold/short intent on an asset or sector.
 #    Trigger: the user implies investment action. Name it descriptively
 #    (e.g. "Alice's MSFT Investment Thesis").
 
-# 7. **UserLearningInterest** — user want to learn about a concept or event.
+# 7. **UserLearningInterestNode** — user want to learn about a concept or event.
 #    Trigger: user asks for clarification or expresses confusion.
 #    Name it descriptively (e.g. "Alice's GDP Question").
 

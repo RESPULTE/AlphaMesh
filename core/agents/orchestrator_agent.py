@@ -1,9 +1,9 @@
 import asyncio
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Type
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Literal, Optional, Type
 
 import pandas as pd
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,7 +18,12 @@ from core.agents.prompts import (
     SYNTHESISER_WRITEBACK_SYSTEM_PROMPT,
 )
 from core.logger import get_logger
+from core.memory.graph.models import (
+    UserInvestmentInterestNode,
+    UserLearningInterestNode,
+)
 from core.memory.retrieval.models import RewrittenQueries
+from core.memory.user_context_service import UserContext
 
 # --- Import Core Services ---
 from core.services import service_manager
@@ -41,17 +46,54 @@ class FinalResponse(BaseModel):
     sources: List[CitedSource] = Field(default_factory=list)
 
 
+class UserInterestEntity(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    entity_name: str
+    entity_type: Literal["Company", "FinancialConcept", "FinancialEvent", "Sector"]
+
+
+class InvestmentSignalDetection(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    target_entities: List[UserInterestEntity] = Field(
+        default_factory=list,
+        description="List of entities the user expressed an investment stance towards.",
+    )
+    status: Literal["Bought", "Interested", "Sold", "Avoids"]
+
+
+class LearningSignalDetection(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    target_entities: List[UserInterestEntity] = Field(
+        default_factory=list,
+        description="List of entities the user expressed a learning interest in.",
+    )
+    status: Literal["Interested", "Understood", "Confused", "Not Interested"]
+
+
 class OrchestratorPlan(BaseAgentInput):
     model_config = ConfigDict(extra="ignore")
 
-    target_agents: List[str] = Field(description="Agents to activate.")
-    request_requires_agents: bool = Field(
-        description="True if query needs agent tools."
+    target_agents: List[str] = Field(
+        default_factory=list, description="Agents to activate."
     )
     final_answer: Optional[str] = Field(
         default=None, description="Direct answer if no agents needed (e.g. greetings)."
     )
+    target_entities: List[str] = Field(
+        default_factory=list,
+        description="Entities explicitly mentioned in the query for disambiguation.",
+    )
+
     rewritten_queries: Optional[RewrittenQueries] = Field(default=None)
+    detected_investment_signals: List[InvestmentSignalDetection] = Field(
+        default_factory=list
+    )
+    detected_learning_signals: List[LearningSignalDetection] = Field(
+        default_factory=list
+    )
 
 
 class OrchestratorState(BaseModel):
@@ -62,11 +104,12 @@ class OrchestratorState(BaseModel):
     plan: Optional[OrchestratorPlan] = None
     agent_outputs: Dict[str, BaseAgentOutput] = Field(default_factory=dict)
     final_response: Optional[FinalResponse] = None
+
     # NEW: write-back payload populated by _synthesize_node
-    writeback_relationships: List[dict] = Field(default_factory=list)
-    writeback_entities: List[Any] = Field(default_factory=list)
     conversation_id: Optional[str] = None  # passed in from caller
-    graph_context: List[dict] = Field(default_factory=list)
+    user_email: Optional[str] = None
+    user_context: Optional[UserContext] = None
+    user_context_block: str = ""
     memory_task: Optional[Any] = Field(default=None, exclude=True)
 
 
@@ -91,7 +134,7 @@ class OrchestratorAgent:
             return "END"
         return (
             "Execute_Selected_Agents"
-            if state.plan.request_requires_agents
+            if state.plan.target_agents
             else "portfolio_analyst"
         )
 
@@ -116,12 +159,34 @@ class OrchestratorAgent:
         return workflow.compile()
 
     async def run(
-        self, messages: List[BaseMessage], conversation_id: Optional[str] = None
+        self,
+        messages: List[BaseMessage],
+        conversation_id: Optional[str] = None,
+        user_email: Optional[str] = None,
     ) -> FinalResponse:
         """Entry point accepting a list of LangChain messages."""
+        user_context = None
+        user_context_block = "USER CONTEXT: None"
+        if user_email:
+            user_context = (
+                await service_manager.get_user_context_service().load_for_user(
+                    user_email
+                )
+            )
+
+            user_context_block = (
+                service_manager.get_user_context_service().get_formatted_context(
+                    user_email, limit=15
+                )
+                if user_email
+                else "USER CONTEXT: None"
+            )
         initial_state = OrchestratorState(
             messages=messages,
             conversation_id=conversation_id,
+            user_email=user_email,
+            user_context=user_context,
+            user_context_block=user_context_block,
         )
         final_state = await self._graph.ainvoke(initial_state)
 
@@ -132,14 +197,15 @@ class OrchestratorAgent:
         available_agents_desc = ", ".join(
             [f"{a.name()}: {a.description()}" for a in AVAILABLE_AGENTS]
         )
-        graph_context = await self._query_user_graph_context(
-            query=state.messages[-1].content if state.messages else "",
-            conversation_id=state.conversation_id,
-        )
 
         system_prompt = (
             "You are a Financial Orchestrator. Review the chat history and decide which agents to call.\n"
             f"AVAILABLE AGENTS: {available_agents_desc}\n"
+            f"USER CONTEXT:\n{state.user_context_block}\n"
+            "Use user context to influence query rewrites and agent selection.\n"
+            "Only populate detected_* signals when the user explicitly states intent or confusion.\n"
+            "For investment signals, require explicit stance verbs (buy, bought, sell, sold, avoid, avoids, interested).\n"
+            "For learning signals, require explicit learning intent or confusion.\n"
             "If the user's latest message is a greeting or doesn't require data, provide 'final_answer'.\n"
             "If the latest message refers to a company mentioned earlier (e.g., 'its revenue'), "
             "ensure you extract the correct ticker from history.\n\n"
@@ -161,7 +227,7 @@ class OrchestratorAgent:
 
         memory_task = None
         if (
-            plan.request_requires_agents
+            plan.target_agents
             and plan.rewritten_queries
             and plan.rewritten_queries.active_domains
         ):
@@ -173,7 +239,6 @@ class OrchestratorAgent:
 
         return {
             "plan": plan,
-            "graph_context": graph_context,
             "memory_task": memory_task,
         }
 
@@ -244,7 +309,11 @@ class OrchestratorAgent:
 
         chain = prompt | self._llm.with_structured_output(SynthesizedResponse)
         response_data = await chain.ainvoke(
-            {"history": state.messages, "context": "\n\n".join(context_parts)}
+            {
+                "history": state.messages,
+                "context": "\n\n".join(context_parts),
+                "user_context": state.user_context_block,
+            }
         )
 
         relationships = response_data.relationships if response_data else []
@@ -261,6 +330,66 @@ class OrchestratorAgent:
                     conversation_id=state.conversation_id,
                 )
             )
+
+        if state.user_email and state.plan:
+            user_message = ""
+            for msg in reversed(state.messages):
+                if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human":
+                    user_message = msg.content
+                    break
+            if not user_message and state.messages:
+                user_message = state.messages[-1].content
+
+            ingestor = service_manager.get_ingestor()
+            user_context_service = service_manager.get_user_context_service()
+            entity_cache = {}
+            wrote_any = False
+
+            for signal in state.plan.detected_investment_signals or []:
+                resolved_id = await ingestor.resolve_entity_id(
+                    signal.entity_name,
+                    signal.entity_type,
+                    entity_cache=entity_cache,
+                )
+                if not resolved_id:
+                    continue
+                node = UserInvestmentInterestNode(
+                    id="",
+                    user_email=state.user_email,
+                    status=signal.status,
+                    reason=user_message,
+                    confidence="high",
+                    updated_at=datetime.now(timezone.utc),
+                    target_entity_ids=[resolved_id],
+                )
+                user_context_service.schedule_upsert_fire_and_forget(
+                    node, state.user_email
+                )
+                wrote_any = True
+
+            for signal in state.plan.detected_learning_signals or []:
+                resolved_id = await ingestor.resolve_entity_id(
+                    signal.entity_name,
+                    signal.entity_type,
+                    entity_cache=entity_cache,
+                )
+                if not resolved_id:
+                    continue
+                node = UserLearningInterestNode(
+                    id="",
+                    user_email=state.user_email,
+                    status=signal.status,
+                    reason=user_message,
+                    updated_at=datetime.now(timezone.utc),
+                    target_entity_ids=[resolved_id],
+                )
+                user_context_service.schedule_upsert_fire_and_forget(
+                    node, state.user_email
+                )
+                wrote_any = True
+
+            if wrote_any:
+                user_context_service.invalidate(state.user_email)
 
         return {
             "summary": user_response,

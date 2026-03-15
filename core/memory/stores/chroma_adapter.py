@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from langchain_chroma import Chroma
 
 from core.logger import get_logger
+from core.memory.graph.models import ChunkNode
 
 _LIST_FIELDS = {"companies_involved", "nodeset_ids"}
 
@@ -81,12 +82,12 @@ class ChromaDBAdapter:
         self,
         chunk_ids: List[str],
         texts: List[str],
-        embeddings: List[List[float]],
         metadatas: List[dict],
     ) -> None:
         """Batch upsert chunk vectors with metadata."""
         try:
             collection = await self.get_or_create_collection(self._collection_name)
+            embeddings = await self._embedding_function.aembed_documents(texts)
             serialized = [self._serialize_metadata(m) for m in metadatas]
             payload = {
                 "ids": chunk_ids,
@@ -215,11 +216,27 @@ class ChromaDBAdapter:
         try:
             collection = await self.get_or_create_collection(self._collection_name)
             result = await asyncio.to_thread(
-                collection.get, where={"source_url": source_url}, limit=1
+                collection, where={"source_url": source_url}, limit=1
             )
             if not result["ids"] or not result["documents"] or not result["metadatas"]:
-                return {}
-            return result
-        except Exception:
-            self._logger.exception("Failed to check ChromaDB for source URL.")
+                return None
+
+            records = zip(result["ids"], result["documents"], result["metadatas"])
+            chunks = []
+            for id, document, metadata in records:
+
+                nodeset_ids = metadata.get("nodeset_ids", [])
+                if nodeset_ids:
+                    if isinstance(nodeset_ids, str):
+                        nodeset_ids = [nodeset_ids]
+                    del metadata["nodeset_ids"]
+
+                chunk = ChunkNode(
+                    id=id, text=document, nodeset_ids=nodeset_ids, **metadata
+                )
+                chunks.append(chunk)
+            return chunks
+
+        except Exception as exec:
+            self._logger.exception("Failed to check ChromaDB for source URL.: %s", exec)
             raise

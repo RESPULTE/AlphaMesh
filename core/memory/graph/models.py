@@ -32,6 +32,19 @@ ALL_MAIN_SECTORS = {
     "Transportation": "Companies involved in the movement of goods and people.",
 }
 
+ALLOWED_ENTITY_TYPES = {"Company", "FinancialEvent", "FinancialConcept", "Sector"}
+
+
+class DocumentMetadata(BaseModel):
+    """Metadata contract for a document node."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    document_id: str
+    title: str
+    source_url: str
+    published_at: datetime
+
 
 class DocumentNode(BaseModel):
     """Graph node contract for a document-level anchor."""
@@ -59,7 +72,6 @@ class ChunkNode(BaseModel):
     article_title: str
     source_url: str
     published_at: datetime
-    companies_involved: List[str] = Field(default_factory=list)
     nodeset_ids: List[str] = Field(default_factory=list)
     extraction_status: Literal["PENDING", "EXTRACTED"] = "PENDING"
 
@@ -81,6 +93,33 @@ class EntityNode(BaseModel):
     description: str
     aliases: List[str] = Field(default_factory=list)
     nodeset_ids: List[str] = Field(default_factory=list)
+
+
+class UserInvestmentInterestNode(BaseModel):
+    """User-scoped investment interest node (not a domain entity)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    user_email: str
+    status: Literal["Bought", "Interested", "Sold", "Avoids"]
+    reason: str
+    confidence: Literal["high", "low"] = "low"
+    updated_at: datetime
+    target_entity_ids: List[str] = Field(default_factory=list)
+
+
+class UserLearningInterestNode(BaseModel):
+    """User-scoped learning interest node (not a domain entity)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    user_email: str
+    status: Literal["Interested", "Understood", "Confused", "Not Interested"]
+    reason: str
+    updated_at: datetime
+    target_entity_ids: List[str] = Field(default_factory=list)
 
 
 class ExtractedRelationship(BaseModel):
@@ -112,4 +151,3 @@ class BatchExtractionResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     results: List[ChunkExtractionResult] = Field(default_factory=list)
-

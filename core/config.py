@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     EXTRACTION_MAX_CONCURRENCY: int = 3
 
     # Retriever Configuration
-    RETRIEVER_MAX_ITERATIONS: int = 3
+    RETRIEVER_MAX_ITERATIONS: int = 2
     RETRIEVER_SEED_TOP_K: int = 10
     RETRIEVER_MAX_PARALLEL_NODES: int = 3
     RETRIEVER_MAX_NEIGHBOR_CANDIDATES: int = 15
@@ -66,4 +66,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-

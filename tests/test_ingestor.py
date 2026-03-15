@@ -3,8 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.memory.graph.models import ChunkNode
-from core.memory.ingestion.chunker import DocumentMetadata
+from core.memory.graph.models import ChunkNode, DocumentMetadata
 from core.memory.ingestion.ingestor import DualStoreIngestor
 
 
@@ -40,7 +39,7 @@ async def test_ingest_articles_skips_existing(mock_adapters):
     chroma.get_chunks_with_source_url.return_value = [{"id": "c1"}]
 
     articles = [{"url": "https://example.com"}]
-    chunk_ids = await ingestor.ingest_articles(articles, ["TEST"])
+    chunk_ids, _chunks = await ingestor.ingest_articles(articles)
 
     assert chunk_ids == []
     chunker.chunk_article.assert_not_called()
@@ -75,7 +74,7 @@ async def test_ingest_articles_processes_new(mock_adapters):
     chunker.chunk_article.return_value = (doc_meta, [chunk])
 
     articles = [{"url": "https://example.com/2"}]
-    chunk_ids = await ingestor.ingest_articles(articles, ["TEST"])
+    chunk_ids, _chunks = await ingestor.ingest_articles(articles)
 
     assert chunk_ids == ["c1"]
 
@@ -84,6 +83,3 @@ async def test_ingest_articles_processes_new(mock_adapters):
     chroma.upsert_chunks.assert_called_once()
     embedding_func.aembed_documents.assert_called_once()
     nodeset_manager.get_global_financial_events_id.assert_called()
-
-
-

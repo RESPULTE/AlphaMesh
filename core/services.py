@@ -20,6 +20,7 @@ class ServiceManager:
         self._retriever = None
         self._reranker = None
         self._memory_retrieval_service = None
+        self._user_context_service = None
 
     def get_agent(self, temperature=0.0):
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
@@ -190,5 +191,19 @@ class ServiceManager:
                 raise
         return self._reranker
 
+    def get_user_context_service(self):
+        from core.memory.user_context_service import UserContextService
+
+        if self._user_context_service is None:
+            try:
+                self._user_context_service = UserContextService(
+                    neo4j_adapter=self.get_neo4j_adapter(),
+                    nodeset_manager=self.get_nodeset_manager(),
+                )
+            except Exception as e:
+                print(f"Error initializing UserContextService: {e}")
+                raise
+        return self._user_context_service
 
 service_manager = ServiceManager()
+

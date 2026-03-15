@@ -85,18 +85,6 @@ class NewsAnalysisAgent(AbstractAgent):
 
         return workflow.compile()
 
-    def _extract_companies(self, articles: List[dict], ticker: str) -> List[str]:
-        """Derive a companies-involved list from article metadata."""
-        companies = set()
-        if ticker:
-            companies.add(ticker.upper())
-        for article in articles:
-            source = article.get("source") or {}
-            name = source.get("name")
-            if name:
-                companies.add(name)
-        return sorted(companies)
-
     async def _fetch_news_node(self, state: NewsAgentState) -> dict:
         """Fetch raw news articles from NewsAPI."""
         loop = asyncio.get_running_loop()
@@ -130,7 +118,6 @@ class NewsAnalysisAgent(AbstractAgent):
 
         articles = [a for a in response.get("articles", []) if a.get("content")]
         logger.info("Fetched %d articles from NewsAPI.", len(articles))
-        _ = self._extract_companies(articles, state.ticker)
         return {"raw_articles": articles}
 
     async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
@@ -138,10 +125,9 @@ class NewsAnalysisAgent(AbstractAgent):
         if not state.raw_articles:
             return {"chunk_ids": []}
 
-        companies_involved = self._extract_companies(state.raw_articles, state.ticker)
         try:
             chunk_ids, chunks = await service_manager.get_ingestor().ingest_articles(
-                state.raw_articles, companies_involved
+                state.raw_articles
             )
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
@@ -160,7 +146,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 memory_context = None
 
         new_chunks = [
-            RetrievedChunk.with_domain(chunk, domain="new")
+            RetrievedChunk.from_raw_chunk(chunk, domain="new")
             for chunk in state.retrieved_chunks
         ]
 
