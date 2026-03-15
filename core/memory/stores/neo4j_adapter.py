@@ -9,12 +9,8 @@ from neo4j import AsyncDriver, AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from core.logger import get_logger
-from core.memory.graph.models import (
-    ALLOWED_ENTITY_TYPES,
-    ChunkNode,
-    DocumentNode,
-    EntityNode,
-)
+from core.memory.graph.models import ALLOWED_ENTITY_TYPES, DocumentNode, EntityNode
+from core.memory.retrieval.models import RetrievedChunk
 
 
 class RelationshipType(Enum):
@@ -118,7 +114,7 @@ class Neo4jAdapter:
         props = node.model_dump()
         await self._execute_write(cypher, {"id": node.id, "props": props})
 
-    async def merge_chunk_node(self, node: ChunkNode) -> None:
+    async def merge_chunk_node(self, node: RetrievedChunk) -> None:
         """Merge a chunk node and connect it to its document."""
         belongs_to = RelationshipType.BELONGS_TO_DOCUMENT.value
         cypher = (
@@ -127,11 +123,20 @@ class Neo4jAdapter:
             "SET c += $props "
             f"MERGE (c)-[:{belongs_to}]->(d)"
         )
-        props = {k: v for k, v in node.model_dump().items() if k != "id"}
+        props = {
+            "text": node.text,
+            "chunk_index": node.chunk_index,
+            "document_id": node.document_id,
+            "article_title": node.article_title,
+            "source_url": node.source_url,
+            "published_at": node.published_at,
+            "nodeset_ids": node.nodeset_ids,
+            "extraction_status": node.extraction_status,
+        }
         await self._execute_write(
             cypher,
             {
-                "id": node.id,
+                "id": node.chunk_id,
                 "doc_id": node.document_id,
                 "props": props,
             },

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from langchain_core.documents import Document
-
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -49,7 +49,13 @@ class RetrievedChunk(BaseModel):
     source: Literal["vector", "graph"]
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    # Enrichment fields used during ranking/analysis.
+    document_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+    article_title: Optional[str] = None
+    source_url: Optional[str] = None
+    published_at: Optional[datetime] = None
+    nodeset_ids: List[str] = Field(default_factory=list)
+    extraction_status: Literal["PENDING", "EXTRACTED"] = "PENDING"
     domain: Optional[str] = None
     embedding_score: float = 0.0
     graph_depth: int = 0
@@ -67,6 +73,9 @@ class RetrievedChunk(BaseModel):
         """Build a RetrievedChunk from a LangChain Document."""
         metadata = document.metadata or {}
         chunk_id = document.id or metadata.get("chunk_id") or ""
+        nodeset_ids = metadata.get("nodeset_ids") or []
+        if isinstance(nodeset_ids, str):
+            nodeset_ids = [nodeset_ids]
         return cls(
             chunk_id=chunk_id,
             text=document.page_content,
@@ -74,6 +83,13 @@ class RetrievedChunk(BaseModel):
             source=source,
             metadata=metadata,
             domain=domain,
+            document_id=metadata.get("document_id"),
+            chunk_index=metadata.get("chunk_index"),
+            article_title=metadata.get("article_title"),
+            source_url=metadata.get("source_url"),
+            published_at=metadata.get("published_at"),
+            nodeset_ids=nodeset_ids,
+            extraction_status=metadata.get("extraction_status", "PENDING"),
         )
 
     @classmethod
@@ -95,14 +111,19 @@ class RetrievedChunk(BaseModel):
             source=chunk.source,
             metadata=chunk.metadata or {},
             domain=domain,
+            document_id=chunk.document_id,
+            chunk_index=chunk.chunk_index,
+            article_title=chunk.article_title,
+            source_url=chunk.source_url,
+            published_at=chunk.published_at,
+            nodeset_ids=chunk.nodeset_ids,
+            extraction_status=chunk.extraction_status,
             embedding_score=embedding_score,
             graph_depth=graph_depth,
             composite_score=chunk.composite_score,
         )
 
+
 class MemoryContext(BaseModel):
     chunks: List[RetrievedChunk]
     rewritten_queries: RewrittenQueries
-
-
-

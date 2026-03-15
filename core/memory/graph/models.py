@@ -10,8 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 ENTITY_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 
-GLOBAL_NODESET_NAME = "GLOBAL"
-
 GLOBAL_ENTITY_NODESETS = {
     "Global Financial Wisdom": "A global anchor nodeset containing overarching FinancialConcept entities.",
     "Global Financial Events": "A global anchor nodeset containing broad FinancialEvent entities.",
@@ -33,6 +31,34 @@ ALL_MAIN_SECTORS = {
 }
 
 ALLOWED_ENTITY_TYPES = {"Company", "FinancialEvent", "FinancialConcept", "Sector"}
+
+ALLOWED_RELATIONSHIP_TYPES = [
+    "AFFECTS",
+    "CAUSED_BY",
+    "INCREASES",
+    "DECREASES",
+    "CORRELATED_WITH",
+    "EXPOSES_TO",
+    "MITIGATES",
+    "COMPETES_WITH",
+    "ACQUIRED_BY",
+    "REPORTED_BY",
+    "RELATED_TO",
+]
+
+RelationshipType = Literal[
+    "AFFECTS",
+    "CAUSED_BY",
+    "INCREASES",
+    "DECREASES",
+    "CORRELATED_WITH",
+    "EXPOSES_TO",
+    "MITIGATES",
+    "COMPETES_WITH",
+    "ACQUIRED_BY",
+    "REPORTED_BY",
+    "RELATED_TO",
+]
 
 
 class DocumentMetadata(BaseModel):
@@ -57,22 +83,6 @@ class DocumentNode(BaseModel):
     published_at: datetime
     ingested_at: datetime
     nodeset_ids: List[str] = Field(default_factory=list)
-
-
-class ChunkNode(BaseModel):
-    """Graph node contract for a chunk of a document."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    id: str
-    text: str
-    chunk_index: int
-    document_id: str
-    article_title: str
-    source_url: str
-    published_at: datetime
-    nodeset_ids: List[str] = Field(default_factory=list)
-    extraction_status: Literal["PENDING", "EXTRACTED"] = "PENDING"
 
 
 class EntityNode(BaseModel):
@@ -128,7 +138,7 @@ class ExtractedRelationship(BaseModel):
 
     source_entity_local_id: str
     target_entity_local_id: str
-    relationship_type: str
+    relationship_type: RelationshipType
     confidence: float
 
 

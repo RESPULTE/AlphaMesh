@@ -42,4 +42,5 @@ def test_article_chunker_splits_article_correctly():
         assert chunk.chunk_index == i
         assert chunk.article_title == "Test Article"
         assert chunk.source_url == "https://example.com/test"
-        assert isinstance(chunk.id, str)
+        assert isinstance(chunk.chunk_id, str)
+

@@ -12,15 +12,34 @@ from core.config import settings
 from core.logger import get_logger
 from core.memory.retrieval.models import (
     MemoryContext,
-    NodeSelectionOutput,
     RetrievedChunk,
     RetrieverState,
     RewrittenQueries,
 )
 from core.memory.retrieval.reranker import CompositeReranker
-from core.memory.retrieval.retrieval_prompts import build_node_selection_prompt
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
+
+_RELATIONSHIP_WEIGHTS: dict[str, float] = {
+    "AFFECTS": 1.0,
+    "CAUSED_BY": 0.95,
+    "INCREASES": 0.85,
+    "DECREASES": 0.85,
+    "CORRELATED_WITH": 0.70,
+    "EXPOSES_TO": 0.65,
+    "MITIGATES": 0.55,
+    "COMPETES_WITH": 0.45,
+    "ACQUIRED_BY": 0.40,
+    "REPORTED_BY": 0.25,
+    "RELATED_TO": 0.10,  # generic fallback — lowest priority
+}
+
+_ENTITY_TYPE_WEIGHTS: dict[str, float] = {
+    "Company": 1.0,
+    "FinancialEvent": 0.90,
+    "FinancialConcept": 0.65,
+    "Sector": 0.45,
+}
 
 
 class DualStoreRetriever:
@@ -113,6 +132,7 @@ class DualStoreRetriever:
         }
 
     async def _agent_select_nodes_node(self, state: RetrieverState) -> dict:
+        """Deterministic neighbor selection — no LLM required."""
         frontier = state["current_frontier"]
         if not frontier:
             return {
@@ -133,30 +153,21 @@ class DualStoreRetriever:
                 "should_continue": False,
             }
 
-        prompt = build_node_selection_prompt()
-        structured_llm = self._llm.with_structured_output(NodeSelectionOutput)
-        formatted_candidates = self._format_candidates(filtered_neighbors)
+        # Score each candidate deterministically
+        def score(neighbor: dict) -> float:
+            rel = neighbor.get("relationship_type") or "RELATED_TO"
+            etype = neighbor.get("neighbor_type") or "FinancialConcept"
+            return _RELATIONSHIP_WEIGHTS.get(rel, 0.1) * _ENTITY_TYPE_WEIGHTS.get(
+                etype, 0.5
+            )
 
-        result: NodeSelectionOutput = await (prompt | structured_llm).ainvoke(
-            {
-                "query": state["query"],
-                "iteration": state["iteration"],
-                "max_iterations": self._max_iterations,
-                "candidate_neighbors": formatted_candidates,
-                "already_retrieved_count": len(state["accumulated_chunks"]),
-                "max_parallel_nodes": self._max_parallel_nodes,
-            }
-        )
-
-        candidate_ids = {c.get("neighbor_entity_id") for c in filtered_neighbors}
+        sorted_neighbors = sorted(filtered_neighbors, key=score, reverse=True)
         selected = [
-            entity_id
-            for entity_id in result.selected_entity_ids
-            if entity_id in candidate_ids
+            n["neighbor_entity_id"]
+            for n in sorted_neighbors[: self._max_parallel_nodes]
+            if n.get("neighbor_entity_id")
         ]
         selected = self._dedupe_keep_order(selected)
-        selected = selected[: self._max_parallel_nodes]
-
         updated_visited = self._extend_unique(state["visited_entity_ids"], selected)
 
         return {

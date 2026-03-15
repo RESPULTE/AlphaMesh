@@ -10,7 +10,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core import logger
 from core.logger import get_logger
-from core.memory.graph.models import ChunkNode, DocumentMetadata
+from core.memory.graph.models import DocumentMetadata
+from core.memory.retrieval.models import RetrievedChunk
 
 logger = get_logger(__name__)
 
@@ -33,7 +34,7 @@ class ArticleChunker:
             self._logger.exception("Failed to parse publishedAt: %s", value)
             return datetime.now(timezone.utc)
 
-    def chunk_article(self, article: dict) -> Tuple[DocumentMetadata, List[ChunkNode]]:
+    def chunk_article(self, article: dict) -> Tuple[DocumentMetadata, List[RetrievedChunk]]:
         """Split a NewsAPI article into document metadata and chunk nodes."""
         title = (article.get("title") or "").strip()
         description = (article.get("description") or "").strip()
@@ -62,14 +63,15 @@ class ArticleChunker:
 
         logger.info("Chunking article '%s' into %d chunks.", title, len(chunks))
 
-        chunk_records: List[ChunkNode] = []
+        chunk_records: List[RetrievedChunk] = []
         for idx, chunk_text in enumerate(chunks):
             chunk_records.append(
-                ChunkNode(
+                RetrievedChunk(
+                    source="vector",
                     document_id=document_id,
                     chunk_index=idx,
                     text=chunk_text,
-                    id=str(uuid4()),
+                    chunk_id=str(uuid4()),
                     article_title=title,
                     source_url=source_url,
                     published_at=published_at,
@@ -77,3 +79,6 @@ class ArticleChunker:
             )
 
         return document_meta, chunk_records
+
+
+

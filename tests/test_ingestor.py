@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.documents import Document
 
-from core.memory.graph.models import ChunkNode, DocumentMetadata
+from core.memory.graph.models import DocumentMetadata
+from core.memory.retrieval.models import RetrievedChunk
 from core.memory.ingestion.ingestor import DualStoreIngestor
 
 
@@ -66,9 +67,10 @@ async def test_ingest_articles_processes_new(mock_adapters):
         published_at=datetime.now(timezone.utc),
         companies_involved=["TEST"],
     )
-    chunk = ChunkNode(
+    chunk = RetrievedChunk(
+        source="vector",
         document_id="d1",
-        id="c1",
+        chunk_id="c1",
         chunk_index=0,
         text="chunk text",
         article_title="title",
@@ -92,3 +94,5 @@ async def test_ingest_articles_processes_new(mock_adapters):
     chroma.upsert_chunks.assert_called_once()
     chroma.get_documents_by_ids.assert_called_once()
     nodeset_manager.get_global_financial_events_id.assert_called()
+
+

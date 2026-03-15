@@ -6,26 +6,25 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from langchain_core.documents import Document
 
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import build_extraction_prompt
 from core.memory.graph.models import (
     ALLOWED_ENTITY_TYPES,
+    ALLOWED_RELATIONSHIP_TYPES,
     ENTITY_NAMESPACE,
     BatchExtractionResult,
     ChunkExtractionResult,
-    ChunkNode,
     DocumentMetadata,
     DocumentNode,
     EntityNode,
 )
 from core.memory.graph.nodeset_manager import NodeSetManager
 from core.memory.ingestion.chunker import ArticleChunker
+from core.memory.retrieval.models import RetrievedChunk
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
-from core.services import service_manager
 
 logger = get_logger(__name__)
 
@@ -33,6 +32,17 @@ EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 FUZZY_CANDIDATE_THRESHOLD = 0.50
 SEMANTIC_MERGE_THRESHOLD = 0.85
 VECTOR_TOP_K = 10
+
+
+_ALLOWED_REL_SET = set(ALLOWED_RELATIONSHIP_TYPES)
+
+
+def _normalize_relationship_type(value: str) -> str:
+    """Normalize to canonical type or fall back to RELATED_TO."""
+    normalized = str(value or "").strip().upper().replace(" ", "_")
+    if normalized in _ALLOWED_REL_SET:
+        return normalized
+    return "RELATED_TO"
 
 
 def _canonical_entity_id(name: str, entity_type: str) -> str:
@@ -87,16 +97,16 @@ class DualStoreIngestor:
 
     async def ingest_articles(
         self, articles: List[dict]
-    ) -> Tuple[List[str], List[Document]]:
+    ) -> Tuple[List[str], List[RetrievedChunk]]:
         """Ingest a batch of articles into both stores."""
         try:
             global_anchor_id = (
                 await self._nodeset_manager.get_global_financial_events_id()
             )
             documents_to_ingest: List[DocumentMetadata] = []
-            chunks_to_ingest: List[ChunkNode] = []
+            chunks_to_ingest: List[RetrievedChunk] = []
 
-            existing_chunks_to_return: List[Document] = []
+            existing_chunks_to_return: List[RetrievedChunk] = []
             for article in articles:
                 source_url = (article.get("url") or "").strip()
 
@@ -107,6 +117,10 @@ class DualStoreIngestor:
                     self._logger.info(
                         "Skipping article with existing source URL: %s", source_url
                     )
+                    existing_chunks = [
+                        RetrievedChunk.from_document(doc, source="vector")
+                        for doc in existing_chunks
+                    ]
                     existing_chunks_to_return.extend(existing_chunks)
                     continue
                 doc_meta, chunk_records = self._chunker.chunk_article(article)
@@ -118,20 +132,19 @@ class DualStoreIngestor:
                 await self._write_chunk_nodes(chunks_to_ingest, global_anchor_id)
                 await self._write_vector_chunks(chunks_to_ingest, global_anchor_id)
 
-            new_chunk_ids = [chunk.id for chunk in chunks_to_ingest]
-            existing_chunk_ids = [
-                doc.id or (doc.metadata or {}).get("chunk_id") or ""
-                for doc in existing_chunks_to_return
-            ]
+            new_chunk_ids = [chunk.chunk_id for chunk in chunks_to_ingest]
+            existing_chunk_ids = [chunk.chunk_id for chunk in existing_chunks_to_return]
             existing_chunk_ids = [cid for cid in existing_chunk_ids if cid]
             chunk_ids = new_chunk_ids + existing_chunk_ids
 
-            involved_chunks: List[Document] = []
+            involved_chunks: List[RetrievedChunk] = []
             if chunk_ids:
-                involved_chunks = await self._chroma_adapter.get_documents_by_ids(
-                    chunk_ids
-                )
+                docs = await self._chroma_adapter.get_documents_by_ids(chunk_ids)
+                involved_chunks = [
+                    RetrievedChunk.from_document(doc, source="vector") for doc in docs
+                ]
             # self._schedule_extraction(chunk_ids)
+            return (chunk_ids, involved_chunks)
             return (chunk_ids, involved_chunks)
         except Exception as exec:
             self._logger.exception("Failed to ingest articles. %s", str(exec))
@@ -161,7 +174,7 @@ class DualStoreIngestor:
             raise
 
     async def _write_chunk_nodes(
-        self, chunks: List[ChunkNode], global_anchor_id: str
+        self, chunks: List[RetrievedChunk], global_anchor_id: str
     ) -> None:
         """Write chunk nodes to Neo4j."""
         try:
@@ -178,14 +191,14 @@ class DualStoreIngestor:
             raise
 
     async def _write_vector_chunks(
-        self, chunks: List[ChunkNode], global_anchor_id: str
+        self, chunks: List[RetrievedChunk], global_anchor_id: str
     ) -> None:
         """Write chunk vectors and metadata to ChromaDB."""
         try:
             metadatas = []
             for chunk in chunks:
                 metadata = {
-                    "chunk_id": chunk.id,
+                    "chunk_id": chunk.chunk_id,
                     "document_id": chunk.document_id,
                     "article_title": chunk.article_title,
                     "source_url": chunk.source_url,
@@ -201,7 +214,7 @@ class DualStoreIngestor:
                 )
 
             await self._chroma_adapter.upsert_chunks(
-                chunk_ids=[chunk.id for chunk in chunks],
+                chunk_ids=[chunk.chunk_id for chunk in chunks],
                 texts=[chunk.text for chunk in chunks],
                 metadatas=metadatas,
             )
@@ -324,12 +337,13 @@ class DualStoreIngestor:
                         rel.target_entity_local_id,
                     )
                     continue
+                rel_type = _normalize_relationship_type(rel.relationship_type)
                 await self._neo4j_adapter.merge_relationship(
                     source_entity.id,
                     target_entity.id,
                     "RELATED_TO",
                     {
-                        "relationship_type": rel.relationship_type,
+                        "relationship_type": rel_type,
                         "source_chunk_id": result.chunk_id,
                         "confidence": rel.confidence,
                     },
@@ -366,8 +380,6 @@ class DualStoreIngestor:
                 logger.debug("write_back [%s]: nothing to write.", conversation_id)
                 return
 
-            embedding_func = service_manager.get_embedding_func()
-
             entity_cache: Dict[tuple[str, str], str] = {}
 
             # --- Step 1: Resolve + dedup enriched entities ---
@@ -388,7 +400,7 @@ class DualStoreIngestor:
             for rel in relationships or []:
                 from_name = _normalize_entity_name(rel.get("from_name"))
                 to_name = _normalize_entity_name(rel.get("to_name"))
-                relation_type = str(rel.get("relation", "")).strip()
+                relation_type = _normalize_relationship_type(rel.get("relation", ""))
                 confidence = str(rel.get("confidence", "low")).strip() or "low"
 
                 from_type = _normalize_entity_type(rel.get("from_type"))
@@ -397,8 +409,6 @@ class DualStoreIngestor:
                 if not from_name or not to_name:
                     continue
                 if not from_type or not to_type:
-                    continue
-                if not relation_type or not relation_type.isidentifier():
                     continue
 
                 source_id = await self._resolve_entity(
@@ -570,10 +580,3 @@ class DualStoreIngestor:
             if similarity >= SEMANTIC_MERGE_THRESHOLD:
                 return str(candidate_id)
         return None
-
-
-
-
-
-
-

@@ -19,6 +19,7 @@ from core.agents.prompts import (
 )
 from core.logger import get_logger
 from core.memory.graph.models import (
+    RelationshipType,
     UserInvestmentInterestNode,
     UserLearningInterestNode,
 )
@@ -113,11 +114,21 @@ class OrchestratorState(BaseModel):
     memory_task: Optional[Any] = Field(default=None, exclude=True)
 
 
+class RelationshipEntry(BaseModel):
+    """Typed relationship for synthesizer writeback."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    from_name: str
+    from_type: Literal["Company", "FinancialEvent", "FinancialConcept", "Sector"]
+    relation: RelationshipType  # enforced enum — was Dict key "relation": str
+    to_name: str
+    to_type: Literal["Company", "FinancialEvent", "FinancialConcept", "Sector"]
+    confidence: Literal["high", "low"]
+
+
 class SynthesizedResponse(BaseModel):
-    relationships: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="List of relationship dictionaries representing the reasoning.",
-    )
+    relationships: List[RelationshipEntry]
     response: str = Field(description="The final user-facing analysis response.")
 
 
@@ -316,7 +327,11 @@ class OrchestratorAgent:
             }
         )
 
-        relationships = response_data.relationships if response_data else []
+        relationships = (
+            [r.model_dump() for r in response_data.relationships]
+            if response_data
+            else []
+        )
         user_response = response_data.response if response_data else ""
 
         # --- Fire write-back asynchronously (non-blocking) ---

@@ -32,7 +32,7 @@ CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     "        {{\n"
     '          "source_entity_local_id": "<str>",\n'
     '          "target_entity_local_id": "<str>",\n'
-    '          "relationship_type": "<str>",\n'
+    '          "relationship_type": "<one of: AFFECTS|CAUSED_BY|INCREASES|DECREASES|CORRELATED_WITH|EXPOSES_TO|MITIGATES|COMPETES_WITH|ACQUIRED_BY|REPORTED_BY|RELATED_TO>",\\n'
     '          "confidence": <float>\n'
     "        }}\n"
     "      ]\n"
@@ -56,4 +56,3 @@ def build_extraction_prompt() -> ChatPromptTemplate:
             ("user", CHUNK_EXTRACTION_USER_TEMPLATE),
         ]
     )
-
