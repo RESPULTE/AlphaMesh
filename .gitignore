@@ -208,3 +208,6 @@ __marimo__/
 
 
 .agent/rules/AGENTS.md
+
+# Local data directory
+data/
