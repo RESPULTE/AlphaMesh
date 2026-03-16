@@ -127,6 +127,14 @@ class OrchestratorPlan(BaseAgentInput):
 
     target_agents: List[str] = Field(default_factory=list)
     final_answer: Optional[str] = Field(default=None)
+    needs_memory: bool = Field(
+        default=False,
+        description=(
+            "Set True when the user's question requires their personal investment or "
+            "learning context to answer well (e.g. questions about their portfolio, "
+            "holdings, watchlist, personalised recommendations, or interests)."
+        ),
+    )
     target_entities: List[str] = Field(default_factory=list)
     rewritten_queries: Optional[RewrittenQueries] = Field(default=None)
     detected_investment_signals: List[InvestmentSignalDetection] = Field(
@@ -149,6 +157,7 @@ class OrchestratorState(BaseModel):
     user_email: Optional[str] = None
     user_context: Optional[UserContext] = None
     user_context_block: str = ""
+    user_context_loaded: bool = False
     memory_task: Optional[Any] = Field(default=None, exclude=True)
 
     # FIX 2: summary lives in state so the direct-answer node can write it
@@ -251,39 +260,66 @@ class OrchestratorAgent:
     # ── Graph wiring ──────────────────────────────────────────────
 
     def _router(self, state: OrchestratorState) -> str:
-        # FIX 3: Guard against plan being None (e.g. _plan_node raised)
+        """
+        Three-way split after the planner:
+
+        1. final_answer set          ? direct_answer
+        2. needs_memory = True       ? load_context
+        3. agents needed, no memory  ? execute_agents
+        4. no agents, no memory      ? synthesiser
+        """
         if state.plan is None:
-            logger.warning(
-                "_router: plan is None — routing to synthesiser with empty context"
-            )
+            logger.warning("_router: plan is None � falling back to synthesiser")
             return "synthesiser"
 
         if state.plan.final_answer is not None:
             return "direct_answer"
+
+        if state.plan.needs_memory:
+            return "load_context"
 
         if state.plan.target_agents:
             return "execute_agents"
 
         return "synthesiser"
 
+    def _post_context_router(self, state: OrchestratorState) -> str:
+        """Called after load_context. Decides whether agents are needed."""
+        if state.plan and state.plan.target_agents:
+            return "execute_agents"
+        return "synthesiser"
+
     def _build_graph(self):
         workflow = StateGraph(OrchestratorState, output_schema=FinalResponse)
 
         workflow.add_node("planner", self._plan_node)
-        workflow.add_node("direct_answer", self._direct_answer_node)  # FIX 2
+        workflow.add_node("load_context", self._load_context_node)
+        workflow.add_node("direct_answer", self._direct_answer_node)
         workflow.add_node("execute_agents", self._execute_node)
         workflow.add_node("synthesiser", self._synthesize_node)
 
         workflow.add_edge(START, "planner")
+
         workflow.add_conditional_edges(
             "planner",
             self._router,
             {
                 "direct_answer": "direct_answer",
+                "load_context": "load_context",
                 "execute_agents": "execute_agents",
                 "synthesiser": "synthesiser",
             },
         )
+
+        workflow.add_conditional_edges(
+            "load_context",
+            self._post_context_router,
+            {
+                "execute_agents": "execute_agents",
+                "synthesiser": "synthesiser",
+            },
+        )
+
         workflow.add_edge("direct_answer", END)
         workflow.add_edge("execute_agents", "synthesiser")
         workflow.add_edge("synthesiser", END)
@@ -306,31 +342,13 @@ class OrchestratorAgent:
           • None                    (should no longer happen with direct_answer node,
                                      but guarded defensively)
         """
-        user_context = None
-        user_context_block = "USER CONTEXT: None"
-
-        if user_email:
-            try:
-                user_context = (
-                    await service_manager.get_user_context_service().load_for_user(
-                        user_email
-                    )
-                )
-                user_context_block = (
-                    service_manager.get_user_context_service().get_formatted_context(
-                        user_email, limit=15
-                    )
-                    or "USER CONTEXT: None"
-                )
-            except Exception:
-                logger.exception("Failed to load user context for %s", user_email)
-
         initial_state = OrchestratorState(
             messages=messages,
             conversation_id=conversation_id,
             user_email=user_email,
-            user_context=user_context,
-            user_context_block=user_context_block,
+            user_context=None,
+            user_context_block="USER CONTEXT: None",
+            user_context_loaded=False,
         )
 
         try:
@@ -380,17 +398,30 @@ class OrchestratorAgent:
             f"{a.name()}: {a.description()}" for a in AVAILABLE_AGENTS
         )
         system_prompt = (
-            "You are a Financial Orchestrator. Review the chat history and decide which agents to call.\n"
+            "You are a Financial AI Orchestrator. Analyse the conversation and produce a structured routing plan.\n\n"
+            "-- DECISION 1: Is this trivial? --\n"
+            "Set `final_answer` (non-null string) ONLY when the message requires NO financial data, "
+            "NO user context, and NO agent � e.g. pure greetings ('hi', 'thanks'), "
+            "purely factual general-knowledge questions unrelated to the user's finances, "
+            "or simple clarifications that can be answered from the conversation history alone.\n"
+            "If `final_answer` is set, leave `needs_memory`, `target_agents`, and all rewrite fields empty.\n\n"
+            "-- DECISION 2: Does the user need their personal context? --\n"
+            "Set `needs_memory = true` when the answer genuinely improves by knowing the user's "
+            "investment holdings, watchlist, portfolio, learning interests, or past signals. "
+            "Examples: 'how is my portfolio doing?', 'should I add more to my position?', "
+            "'what stocks am I watching?', 'based on my interests, what should I look at?'. "
+            "Set `needs_memory = false` for generic market or company questions with no personal angle.\n\n"
+            "-- DECISION 3: Which agents to call? --\n"
             f"AVAILABLE AGENTS: {available_agents_desc}\n"
-            f"USER CONTEXT:\n{state.user_context_block}\n"
-            "Use user context to influence query rewrites and agent selection.\n"
-            "Only populate detected_* signals when the user explicitly states intent or confusion.\n"
-            "For investment signals, require explicit stance verbs "
-            "(buy, bought, sell, sold, avoid, avoids, interested).\n"
-            "For learning signals, require explicit learning intent or confusion.\n"
-            "If the user's latest message is a greeting or doesn't require data, provide 'final_answer'.\n"
-            "If the latest message refers to a company mentioned earlier (e.g., 'its revenue'), "
-            "ensure you extract the correct ticker from history.\n\n"
+            "Populate `target_agents` with the agent names whose job descriptions match the query. "
+            "Leave empty if no agent is needed (e.g. the synthesiser can answer from user context alone).\n\n"
+            "-- OTHER RULES --\n"
+            "Only populate detected_investment_signals when the user explicitly uses stance verbs "
+            "(buy, bought, sell, sold, avoid, avoids, interested in [company]).\n"
+            "Only populate detected_learning_signals when the user explicitly signals confusion or "
+            "a desire to understand a concept.\n"
+            "If the latest message refers to a company mentioned earlier (e.g. 'its revenue'), "
+            "extract the correct ticker from conversation history.\n\n"
             f"{QUERY_REWRITE_SYSTEM_PROMPT}"
         )
 
@@ -453,6 +484,34 @@ class OrchestratorAgent:
             "_direct_answer_node: returning direct answer (%d chars)", len(answer)
         )
         return {"summary": answer, "sources": [], "fundamental_data": None}
+
+    async def _load_context_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        """
+        Load user context from UserContextService (cache-first, cold-start hits Neo4j).
+        Only reached when the planner set needs_memory=True.
+        On failure, continues with empty context so the rest of the graph still runs.
+        """
+        if not state.user_email:
+            logger.warning("_load_context_node: no user_email in state, skipping")
+            return {"user_context_loaded": True}
+
+        try:
+            svc = service_manager.get_user_context_service()
+            user_context = await svc.load_for_user(state.user_email)
+            user_context_block = (
+                svc.get_formatted_context(state.user_email) or "USER CONTEXT: None"
+            )
+            logger.info("_load_context_node: context loaded for %s", state.user_email)
+            return {
+                "user_context": user_context,
+                "user_context_block": user_context_block,
+                "user_context_loaded": True,
+            }
+        except Exception:
+            logger.exception(
+                "_load_context_node: failed to load context for %s", state.user_email
+            )
+            return {"user_context_loaded": True}
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
         """
@@ -532,12 +591,18 @@ class OrchestratorAgent:
         portfolio = self.get_portfolio(settings.PORTFOLIO_JSON_PATH)
         portfolio_block = json.dumps(portfolio, indent=2) if portfolio else "[]"
         multi_agent = len(state.agent_outputs) > 1
+        user_context_section = (
+            f"USER PORTFOLIO & INTERESTS:\n{state.user_context_block}\n\n"
+            "When the user context above is not 'USER CONTEXT: None', you MUST reference the "
+            "user's relevant holdings, watchlist entries, or interests in your final response "
+            "where they are pertinent to the question. Do not silently ignore them.\n\n"
+        )
 
         user_response = ""
         cross_relationships: List[dict] = []
 
         # ── LLM synthesis ─────────────────────────────────────────
-        if not context_parts:
+        if not context_parts and not state.user_context_block and not portfolio_block:
             # All agents failed or no agents ran — produce a safe fallback
             logger.warning(
                 "_synthesize_node: no context from agents, skipping LLM synthesis"
@@ -553,7 +618,8 @@ class OrchestratorAgent:
                         [
                             (
                                 "system",
-                                SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
+                                user_context_section
+                                + SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
                                 + "\n\nAgent Findings:\n{context}",
                             ),
                             MessagesPlaceholder(variable_name="history"),
@@ -588,7 +654,8 @@ class OrchestratorAgent:
                         [
                             (
                                 "system",
-                                SYNTHESISER_SINGLE_AGENT_PROMPT
+                                user_context_section
+                                + SYNTHESISER_SINGLE_AGENT_PROMPT
                                 + "\n\nAgent Findings:\n{context}",
                             ),
                             MessagesPlaceholder(variable_name="history"),
@@ -743,12 +810,6 @@ class OrchestratorAgent:
                         "_write_user_signals: learning signal failed for '%s'",
                         entity.entity_name,
                     )
-
-        if wrote_any:
-            try:
-                user_context_service.invalidate(state.user_email)
-            except Exception:
-                logger.exception("_write_user_signals: cache invalidation failed")
 
         # ── User interest subgraph ────────────────────────────────
         detected_investment = state.plan.detected_investment_signals or []

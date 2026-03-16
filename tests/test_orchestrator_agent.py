@@ -79,7 +79,7 @@ async def test_orchestrator_returns_final_answer(monkeypatch):
         start_date=datetime.now(timezone.utc),
         end_date=datetime.now(timezone.utc),
         target_agents=[],
-        request_requires_agents=False,
+        needs_memory=False,
         final_answer="hello",
     )
 
@@ -124,7 +124,7 @@ async def test_orchestrator_runs_agent_and_synthesizes(monkeypatch):
         start_date=datetime.now(timezone.utc),
         end_date=datetime.now(timezone.utc),
         target_agents=["news_agent"],
-        request_requires_agents=True,
+        needs_memory=False,
         final_answer=None,
     )
 
@@ -140,3 +140,43 @@ async def test_orchestrator_runs_agent_and_synthesizes(monkeypatch):
 
     result = await agent.run([HumanMessage(content="test")])
     assert result.summary == "analysis"
+
+
+@pytest.mark.asyncio
+async def test_load_context_node_called_when_needs_memory_true(monkeypatch):
+    """When planner returns needs_memory=True, load_context node must run."""
+    load_context_called = []
+
+    async def fake_load_context(self, state):
+        load_context_called.append(True)
+        return {
+            "user_context": None,
+            "user_context_block": "USER INVESTMENT PROFILE:\n1. [Bought] AAPL",
+            "user_context_loaded": True,
+        }
+
+    async def fake_synthesize(self, state):
+        return FinalResponse(summary="done", sources=[], fundamental_data=None)
+
+    monkeypatch.setattr(OrchestratorAgent, "_load_context_node", fake_load_context)
+    monkeypatch.setattr(OrchestratorAgent, "_synthesize_node", fake_synthesize)
+
+    agent = OrchestratorAgent()
+    plan = OrchestratorPlan(
+        query="how is my portfolio?",
+        vector_query="portfolio performance",
+        ticker=None,
+        start_date=datetime.now(timezone.utc),
+        end_date=datetime.now(timezone.utc),
+        target_agents=[],
+        needs_memory=True,
+        final_answer=None,
+    )
+
+    async def fake_plan(self, state):
+        return {"plan": plan}
+
+    monkeypatch.setattr(OrchestratorAgent, "_plan_node", fake_plan)
+    result = await agent.run([HumanMessage(content="how is my portfolio?")])
+    assert load_context_called, "load_context must be called when needs_memory=True"
+    assert isinstance(result, FinalResponse)

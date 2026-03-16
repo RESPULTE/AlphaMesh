@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +25,16 @@ _STATUS_RANK: Dict[str, int] = {
     "Avoids": 5,
     "Not Interested": 6,
 }
+
+CACHE_MAX_INTERESTS = 10  # max entries kept per user in the in-process cache
+
+
+@dataclass
+class InterestCacheEntry:
+    kind: Literal["investment", "learning"]
+    node: Union[UserInvestmentInterestNode, UserLearningInterestNode]
+    target_names: List[str]
+    cached_at: datetime
 
 
 class UserContext(BaseModel):
@@ -70,45 +81,63 @@ class UserContextService:
         key = f"{normalized}|{status}|{interest_type}|{','.join(sorted_ids)}"
         return generate_uuid5(key)
 
+    def _rank_and_cap(
+        self, entries: List[InterestCacheEntry]
+    ) -> List[InterestCacheEntry]:
+        """Sort by cached_at DESC, then updated_at DESC, then truncate."""
+        entries.sort(
+            key=lambda e: (
+                -(e.cached_at.timestamp() if e.cached_at else 0),
+                -(e.node.updated_at.timestamp() if e.node.updated_at else 0),
+            )
+        )
+        return entries[:CACHE_MAX_INTERESTS]
+
+    def _build_user_context(self, entries: List[InterestCacheEntry]) -> UserContext:
+        """Reconstruct a UserContext from a (possibly truncated) entries list."""
+        return UserContext(
+            investment_interests=[e.node for e in entries if e.kind == "investment"],
+            learning_interests=[e.node for e in entries if e.kind == "learning"],
+        )
+
     async def load_for_user(self, user_email: str) -> UserContext:
         normalized = self._normalize_email(user_email)
         if not normalized:
             return UserContext()
 
         cached = self._cache.get(normalized)
-        if cached and "context" in cached:
-            return cached["context"]  # type: ignore[return-value]
+        if cached and "entries" in cached:
+            return self._build_user_context(cached["entries"])
 
         await self._nodeset_manager.get_or_create_user_nodeset(normalized)
 
-        investment_task = self._neo4j_adapter.get_user_investment_interests(normalized)
-        learning_task = self._neo4j_adapter.get_user_learning_interests(normalized)
         investment_rows, learning_rows = await asyncio.gather(
-            investment_task, learning_task
+            self._neo4j_adapter.get_user_investment_interests(normalized),
+            self._neo4j_adapter.get_user_learning_interests(normalized),
         )
 
-        investment_nodes: List[UserInvestmentInterestNode] = []
-        learning_nodes: List[UserLearningInterestNode] = []
-        target_names: Dict[str, List[str]] = {}
+        now = datetime.now(timezone.utc)
+        entries: List[InterestCacheEntry] = []
+        target_names_lookup: Dict[str, List[str]] = {}
 
         for row in investment_rows or []:
             node_raw = row.get("node") if isinstance(row, dict) else None
             props = dict(node_raw) if node_raw is not None else {}
             targets = row.get("targets") if isinstance(row, dict) else []
             target_ids = [t.get("id") for t in targets or [] if t and t.get("id")]
-            target_names[props.get("id", "")] = [
-                t.get("name") for t in targets or [] if t and t.get("name")
-            ]
-            investment_nodes.append(
-                UserInvestmentInterestNode(
-                    id=str(props.get("id") or ""),
-                    user_email=str(props.get("user_email") or normalized),
-                    status=str(props.get("status") or ""),
-                    reason=str(props.get("reason") or ""),
-                    confidence=str(props.get("confidence") or "low"),
-                    updated_at=self._parse_dt(props.get("updated_at")),
-                    target_entity_ids=target_ids,
-                )
+            names = [t.get("name") for t in targets or [] if t and t.get("name")]
+            target_names_lookup[props.get("id", "")] = names
+            node = UserInvestmentInterestNode(
+                id=str(props.get("id") or ""),
+                user_email=str(props.get("user_email") or normalized),
+                status=str(props.get("status") or ""),
+                reason=str(props.get("reason") or ""),
+                confidence=str(props.get("confidence") or "low"),
+                updated_at=self._parse_dt(props.get("updated_at")),
+                target_entity_ids=target_ids,
+            )
+            entries.append(
+                InterestCacheEntry("investment", node, names, cached_at=now)
             )
 
         for row in learning_rows or []:
@@ -116,78 +145,83 @@ class UserContextService:
             props = dict(node_raw) if node_raw is not None else {}
             targets = row.get("targets") if isinstance(row, dict) else []
             target_ids = [t.get("id") for t in targets or [] if t and t.get("id")]
-            target_names[props.get("id", "")] = [
-                t.get("name") for t in targets or [] if t and t.get("name")
-            ]
-            learning_nodes.append(
-                UserLearningInterestNode(
-                    id=str(props.get("id") or ""),
-                    user_email=str(props.get("user_email") or normalized),
-                    status=str(props.get("status") or ""),
-                    reason=str(props.get("reason") or ""),
-                    updated_at=self._parse_dt(props.get("updated_at")),
-                    target_entity_ids=target_ids,
-                )
+            names = [t.get("name") for t in targets or [] if t and t.get("name")]
+            target_names_lookup[props.get("id", "")] = names
+            node = UserLearningInterestNode(
+                id=str(props.get("id") or ""),
+                user_email=str(props.get("user_email") or normalized),
+                status=str(props.get("status") or ""),
+                reason=str(props.get("reason") or ""),
+                updated_at=self._parse_dt(props.get("updated_at")),
+                target_entity_ids=target_ids,
             )
+            entries.append(InterestCacheEntry("learning", node, names, cached_at=now))
 
-        context = UserContext(
-            investment_interests=investment_nodes,
-            learning_interests=learning_nodes,
-        )
-        self._cache[normalized] = {"context": context, "target_names": target_names}
-        return context
+        entries = self._rank_and_cap(entries)
+        self._cache[normalized] = {
+            "entries": entries,
+            "target_names": target_names_lookup,
+            "loaded_at": now,
+        }
+        return self._build_user_context(entries)
 
-    def get_formatted_context(self, user_email: Optional[str], limit: int = 15) -> str:
+    def get_formatted_context(
+        self, user_email: Optional[str], limit: int = CACHE_MAX_INTERESTS
+    ) -> str:
         if not user_email:
             return "USER CONTEXT: None"
         normalized = self._normalize_email(user_email)
         cached = self._cache.get(normalized)
-        if not cached:
+        if not cached or "entries" not in cached:
             return "USER CONTEXT: None"
 
-        context: UserContext = cached.get("context")  # type: ignore[assignment]
-        target_names: Dict[str, List[str]] = cached.get("target_names", {})  # type: ignore[assignment]
-
-        if not context.investment_interests and not context.learning_interests:
+        entries: List[InterestCacheEntry] = cached["entries"][:limit]
+        if not entries:
             return "USER CONTEXT: None"
 
-        def sort_key(node):
-            status_rank = _STATUS_RANK.get(node.status, 99)
-            ts = node.updated_at.timestamp() if node.updated_at else 0
-            return (status_rank, -ts)
-
-        combined: List[Tuple[str, object]] = []
-        for node in context.investment_interests:
-            combined.append(("investment", node))
-        for node in context.learning_interests:
-            combined.append(("learning", node))
-
-        combined.sort(key=lambda item: sort_key(item[1]))
-        top = combined[:limit]
-
-        investment_sorted = [node for kind, node in top if kind == "investment"]
-        learning_sorted = [node for kind, node in top if kind == "learning"]
+        investment_entries = [e for e in entries if e.kind == "investment"]
+        learning_entries = [e for e in entries if e.kind == "learning"]
 
         blocks: List[str] = []
 
-        if investment_sorted:
+        if investment_entries:
             lines = []
-            for idx, node in enumerate(investment_sorted, start=1):
-                names = target_names.get(node.id) or node.target_entity_ids
-                target_str = ", ".join([n for n in names if n]) or "(unknown target)"
-                reason = node.reason.strip() if node.reason else ""
+            for idx, entry in enumerate(investment_entries, start=1):
+                target_str = (
+                    ", ".join(entry.target_names)
+                    if entry.target_names
+                    else ", ".join(entry.node.target_entity_ids) or "(unknown target)"
+                )
+                reason = entry.node.reason.strip() if entry.node.reason else ""
                 tail = f" - {reason}" if reason else ""
-                lines.append(f"{idx}. [{node.status}] {target_str}{tail}")
+                cached_ts = (
+                    entry.cached_at.strftime("%Y-%m-%d %H:%M UTC")
+                    if entry.cached_at
+                    else "unknown"
+                )
+                lines.append(
+                    f"{idx}. [{entry.node.status}] {target_str}{tail}  (cached {cached_ts})"
+                )
             blocks.append("USER INVESTMENT PROFILE:\n" + "\n".join(lines))
 
-        if learning_sorted:
+        if learning_entries:
             lines = []
-            for idx, node in enumerate(learning_sorted, start=1):
-                names = target_names.get(node.id) or node.target_entity_ids
-                target_str = ", ".join([n for n in names if n]) or "(unknown target)"
-                reason = node.reason.strip() if node.reason else ""
+            for idx, entry in enumerate(learning_entries, start=1):
+                target_str = (
+                    ", ".join(entry.target_names)
+                    if entry.target_names
+                    else ", ".join(entry.node.target_entity_ids) or "(unknown target)"
+                )
+                reason = entry.node.reason.strip() if entry.node.reason else ""
                 tail = f" - {reason}" if reason else ""
-                lines.append(f"{idx}. [{node.status}] {target_str}{tail}")
+                cached_ts = (
+                    entry.cached_at.strftime("%Y-%m-%d %H:%M UTC")
+                    if entry.cached_at
+                    else "unknown"
+                )
+                lines.append(
+                    f"{idx}. [{entry.node.status}] {target_str}{tail}  (cached {cached_ts})"
+                )
             blocks.append("USER LEARNING PROFILE:\n" + "\n".join(lines))
 
         return "\n\n".join(blocks)
@@ -218,6 +252,25 @@ class UserContextService:
             await self._neo4j_adapter.upsert_user_connected_nodes(
                 interest_node, nodeset_id
             )
+
+            now = datetime.now(timezone.utc)
+            kind: Literal["investment", "learning"] = (
+                "investment"
+                if isinstance(interest_node, UserInvestmentInterestNode)
+                else "learning"
+            )
+            new_entry = InterestCacheEntry(
+                kind=kind,
+                node=interest_node,
+                target_names=[],
+                cached_at=now,
+            )
+            cached = self._cache.get(normalized)
+            if cached and "entries" in cached:
+                existing: List[InterestCacheEntry] = cached["entries"]
+                existing = [e for e in existing if e.node.id != interest_node.id]
+                existing.append(new_entry)
+                self._cache[normalized]["entries"] = self._rank_and_cap(existing)
         except Exception:
             self._logger.exception(
                 "UserContextService.schedule_upsert failed for user %s", user_email
