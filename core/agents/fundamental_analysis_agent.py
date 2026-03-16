@@ -1,17 +1,59 @@
+"""
+core/agents/fundamental_analysis_agent.py
+
+Fundamental Analysis Agent — Tool-Calling LangGraph Architecture
+=================================================================
+
+Graph
+─────
+  START
+    │
+    ▼
+  data_prep     — Concurrently: update EDGAR cache, fetch price data,
+    │               load available concepts from DB.
+    │               Output: financial_data (DataFrame), available_concepts (List[str])
+    ▼
+  tool_planner  — LLM picks from TOOL_REGISTRY which tools to run
+    │               and maps available concept names to each tool's parameters.
+    │               Produces a ToolPlan (ordered list of ToolCallSpec objects).
+    ▼
+  tool_executor — Validates and executes each ToolCallSpec in order.
+    │               Merges computed rows back into financial_data.
+    │               Accumulates ToolResult objects for the analyst.
+    ▼
+  analyst       — Generates a natural-language analysis from the enriched
+    │               DataFrame + tool results summaries.
+    │               Runs relationship extraction for the memory graph.
+    ▼
+  END
+
+Why this is better than the original pipeline
+─────────────────────────────────────────────
+  • parser/decomposer merged — was two LLM hops; now one (tool_planner)
+  • pandas eval() replaced by typed FinancialTool.execute() calls
+  • Available concepts now sourced from get_all_concepts() — never empty
+  • output_schema removed from StateGraph; result built explicitly in run()
+  • asyncio.gather() in data_prep parallelises EDGAR + price fetching
+  • Tool selection is LLM-driven and extensible (just add to TOOL_REGISTRY)
+"""
+
+from __future__ import annotations
+
 import asyncio
-import difflib
 import operator
-from typing import Annotated, List, Optional, Type
+from typing import Annotated, Any, Dict, List, Optional, Type
 
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.financial_db import FinancialDatabase
+from core.agents.financial_tools import TOOL_REGISTRY, ToolResult, get_tool_descriptions
+from core.agents.models import BaseAgentInput, BaseAgentOutput
 from core.config import settings
+from core.logger import get_logger
 from core.memory.graph.extraction_prompts import (
     ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
     COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
@@ -22,69 +64,194 @@ from core.memory.graph.relationship_extractor import (
 )
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
 from core.memory.stores.subgraph_store import SubgraphStore
-from core.agents.models import BaseAgentInput, BaseAgentOutput
-from core.logger import get_logger
 from core.services import service_manager
 
 logger = get_logger(__name__)
 
-# --- 1. Internal Structured Output Models ---
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Planner LLM Output Models
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-class CalculatedMetric(BaseModel):
-    target_metric_name: str = Field(
-        description="The name of the new metric to calculate, use camel case _ instead of spaces."
+class ToolCallSpec(BaseModel):
+    """Specification for a single tool call as produced by the planner LLM."""
+
+    tool_name: str = Field(
+        description=(
+            "Exact name of the tool to call from the registry "
+            "(e.g. 'cagr', 'dcf_intrinsic_value', 'profitability_ratios')."
+        )
     )
-    pandas_eval_expression: str = Field(
-        description="The mathematical formula compatible with pandas.eval(). Example: 'A / B'"
+    parameters: Dict[str, Any] = Field(
+        description=(
+            "Parameter dict matching the tool's parameters_schema exactly. "
+            "All metric fields MUST reference concept names that exist in the "
+            "'Available Concepts' list provided."
+        )
     )
-    dependencies: List[str] = Field(
-        description="A list of the base financial concepts required for this formula."
+    reasoning: str = Field(
+        description="One-sentence justification for why this tool is being called for this query."
     )
 
 
-class DecompositionPlan(BaseModel):
-    calculations: List[CalculatedMetric]
+class ToolPlan(BaseModel):
+    """Ordered execution plan produced by the planner LLM."""
+
+    calls: List[ToolCallSpec] = Field(
+        description=(
+            "Ordered list of tool calls. Execute them in sequence. "
+            "Return an empty list if the user only wants raw data with no derived metrics."
+        )
+    )
+    data_summary: str = Field(
+        description=(
+            "Brief (1-2 sentence) summary of what financial data is available "
+            "and what the plan will compute."
+        )
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Agent Output
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class FundamentalAnalysisOutput(BaseAgentOutput):
-    """Data container for the Fundamental Analysis Agent."""
+    """Public output returned by FundamentalAnalysisAgent.run()."""
 
     agent_name: str = "fundamentals_agent"
     financial_data: Optional[pd.DataFrame] = Field(default=None)
+    tool_results: List[ToolResult] = Field(default_factory=list)
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def get_llm_context_str(self) -> str:
-        """Formats the DataFrame into a readable string for the analyst LLM."""
         if self.financial_data is None or self.financial_data.empty:
-            return "### REPORT FROM fundamentals_agent\nNo financial data was found or calculated."
-
+            return (
+                "### REPORT FROM fundamentals_agent\n"
+                "No financial data was found or calculated."
+            )
         header = "### REPORT FROM fundamentals_agent (Quantitative Financial Data)\n"
-        # Using to_string() is effective for LLM consumption
-        data_str = self.financial_data.to_string(max_rows=20, float_format="%.2f")
-        return f"{header}Data (Rows=Metrics, Columns=Dates):\n{data_str}"
+        data_str = self.financial_data.to_string(max_rows=30, float_format="%.4g")
+
+        tool_section = ""
+        if self.tool_results:
+            summaries = [
+                f"  [{r.tool_name}] {'✓' if r.success else '✗'} {r.summary or r.error or ''}"
+                for r in self.tool_results
+            ]
+            reasoning_entries = [
+                f"\n  [{r.tool_name} reasoning]\n  {r.reasoning}"
+                for r in self.tool_results
+                if r.reasoning
+            ]
+            tool_section = (
+                "\n\n### TOOL EXECUTION RESULTS\n"
+                + "\n".join(summaries)
+                + "".join(reasoning_entries)
+            )
+
+        return f"{header}Data (Rows=Metrics, Columns=Dates):\n{data_str}{tool_section}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Internal Graph State
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class _AgentState(BaseAgentInput):
-    metrics_to_fetch: Annotated[List[str], operator.add] = Field(default_factory=list)
-    calculations_to_run: List[CalculatedMetric] = Field(default_factory=list)
+    """Internal state carried through the LangGraph nodes."""
+
+    # Populated by data_prep
+    available_concepts: List[str] = Field(default_factory=list)
     financial_data: Optional[pd.DataFrame] = None
+
+    # Populated by tool_planner
+    tool_plan: Optional[ToolPlan] = None
+
+    # Accumulated by tool_executor (Annotated → LangGraph merges lists on parallel branches)
+    tool_results: Annotated[List[ToolResult], operator.add] = Field(
+        default_factory=list
+    )
+
+    # Populated by analyst — MUST be declared here so LangGraph retains the
+    # values in the final state dict. Without these fields, LangGraph silently
+    # discards any key returned by _analyst_node that is not in the schema,
+    # causing final_state.get("analysis") to always return the default "".
+    analysis: str = Field(default="")
+    relationships_extracted: bool = Field(default=False)
+    subgraph_id: Optional[str] = Field(default=None)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
-# --- 2. The Agent Class ---
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Prompts
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TOOL_PLANNER_SYSTEM = """\
+You are a quantitative financial analysis planner. Your role is to produce \
+a ToolPlan that will answer the user's financial question using the data \
+and tools available.
+
+═══ CORE RULES ═══
+1. CONCEPT MATCHING: Every metric parameter you provide MUST be a name that \
+   appears EXACTLY in the "Available Concepts" list. If you cannot find an \
+   exact match, use the closest available name or use custom_formula.
+
+2. DCF REQUIREMENTS: When calling dcf_intrinsic_value you MUST provide:
+   - wacc: a decimal (e.g. 0.10). Estimate it from the company's apparent \
+     risk profile, sector, and capital structure visible in the data.
+   - terminal_growth_rate: a decimal (e.g. 0.025). Justify with GDP trends, \
+     sector maturity, and the company's recent revenue CAGR.
+   - wacc_reasoning: detailed written justification (2-3 sentences).
+   - terminal_growth_reasoning: detailed written justification (1-2 sentences).
+
+3. CUSTOM FORMULA: Use the custom_formula tool for any user-requested metric \
+   not covered by the other tools. Write the expression using EXACT concept \
+   names from the Available Concepts list as variable names.
+
+4. ORDERING: Run CAGR or fetch-only tools before DCF, as DCF may reference \
+   concepts that only exist after earlier tools add rows.
+
+5. EMPTY PLAN: If the user only wants raw financial statements with no \
+   derived analysis, return an empty calls list.
+
+6. TOOL SELECTION: Do NOT call a tool if its required input metrics are absent \
+   from the Available Concepts list — explain this in data_summary instead.
+"""
+
+_TOOL_PLANNER_USER = """\
+User Query: {query}
+Ticker: {ticker}
+Date Range: {start_date} to {end_date}
+
+Available Concepts ({n_concepts} stored in DB):
+{concepts_block}
+
+Available Tools:
+{tool_descriptions}
+
+Produce the ToolPlan to best answer the query.
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  The Agent
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class FundamentalAnalysisAgent(AbstractAgent):
     """
-    Refactored Async Agent focused on fetching and calculating financial data.
+    Async LangGraph agent that fetches EDGAR financial data and runs a
+    dynamically-selected suite of financial analysis tools.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self._graph = self._build_graph()
         self.db = FinancialDatabase()
+        self._graph = self._build_graph()
 
     @staticmethod
     def name() -> str:
@@ -92,278 +259,341 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     @staticmethod
     def description() -> str:
-        return "Fetches and calculates quantitative financial data (ratios, statements). Returns raw data."
+        return (
+            "Fetches standardised EDGAR financial statements and computes "
+            "quantitative metrics (CAGR, DCF, ratios) via a dynamic tool-calling "
+            "pipeline. Returns enriched financial data and a written analysis."
+        )
 
     @staticmethod
     def get_output_schema_class() -> Type[BaseModel]:
         return FundamentalAnalysisOutput
 
+    # ── Public entry point ────────────────────────────────────────────────────
+
     async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
-        """Async entry point for the agent."""
-        logger.info(f"--- [Agent: {self.name}] Started for {input_data.ticker} ---")
+        logger.info("[Agent: %s] Started for %s", self.name(), input_data.ticker)
         await self.db.initialize()
 
-        final_state = await self._graph.ainvoke(input_data.model_dump())
+        # Note: output_schema is intentionally NOT set on StateGraph; we
+        # construct FundamentalAnalysisOutput explicitly below to avoid
+        # LangGraph schema-projection bugs when fields contain DataFrames.
+        final_state: Dict = await self._graph.ainvoke(
+            input_data.model_dump(exclude_none=False),
+            config={"recursion_limit": 10},
+        )
 
         return FundamentalAnalysisOutput(
             financial_data=final_state.get("financial_data"),
-            analysis=final_state.get("analysis"),
+            analysis=final_state.get("analysis", ""),
+            tool_results=final_state.get("tool_results", []),
             entities_enriched=final_state.get("entities_enriched", []),
+            subgraph_id=final_state.get("subgraph_id"),
+            relationships_extracted=final_state.get("relationships_extracted", False),
         )
 
-    def _build_graph(self):
-        workflow = StateGraph(_AgentState, output_schema=FundamentalAnalysisOutput)
+    # ── Graph wiring ──────────────────────────────────────────────────────────
 
-        workflow.add_node("parser", self._parser_node)
-        workflow.add_node("decomposer", self._decomposer_node)
-        workflow.add_node("fetch_data", self._fetch_data_node)
-        workflow.add_node("calculator", self._calculator_node)
-        workflow.add_node("analyst", self._generate_analysis)
+    def _build_graph(self) -> Any:
+        workflow = StateGraph(_AgentState)
 
-        workflow.add_edge(START, "parser")
+        workflow.add_node("data_prep", self._data_prep_node)
+        workflow.add_node("tool_planner", self._tool_planner_node)
+        workflow.add_node("tool_executor", self._tool_executor_node)
+        workflow.add_node("analyst", self._analyst_node)
 
-        # Conditional: If parser found unknown metrics, go to decomposer. Else fetch data directly.
-        workflow.add_conditional_edges(
-            "parser",
-            lambda state: "decomposer" if state.calculations_to_run else "fetch_data",
-            {"decomposer": "decomposer", "fetch_data": "fetch_data"},
-        )
-
-        workflow.add_edge("decomposer", "fetch_data")
-        workflow.add_edge("fetch_data", "calculator")
-        workflow.add_edge("calculator", "analyst")
+        workflow.add_edge(START, "data_prep")
+        workflow.add_edge("data_prep", "tool_planner")
+        workflow.add_edge("tool_planner", "tool_executor")
+        workflow.add_edge("tool_executor", "analyst")
         workflow.add_edge("analyst", END)
 
         return workflow.compile()
 
-    # --- Node Implementations ---
+    # ── Node: data_prep ───────────────────────────────────────────────────────
 
-    async def _parser_node(self, state: _AgentState) -> dict:
+    async def _data_prep_node(self, state: _AgentState) -> Dict:
         """
-        Checks which metrics are raw DB columns vs. which need to be calculated.
-        """
-        # REWRITTEN: Use state.attribute access
-        logger.info("--- [Node] Parser ---")
+        Concurrently:
+          1. Ensures EDGAR data is cached for the requested years (10-K)
+          2. Fetches price data from yfinance if needed
+          3. Loads the full concept catalogue from the local DB
 
-        await self.db.update_financials(
+        Then assembles financial_data (wide DataFrame) and available_concepts.
+        """
+        logger.info(
+            "[Node] data_prep — %s %s→%s",
             state.ticker,
-            list(range(state.start_date.year, state.end_date.year + 1)),
-            "10-K",
+            state.start_date,
+            state.end_date,
         )
 
-        to_fetch = []
-        unknown_metrics = []
+        years = list(range(state.start_date.year, state.end_date.year + 1))
+        ticker = state.ticker
 
-        available_labels_df = await self.db.search_label(state.ticker, [])
-        if available_labels_df.empty:
-            unknown_metrics = state.metrics
-        else:
-            available_labels = set(available_labels_df.index)
-            for metric in state.metrics:
-                close_matches = difflib.get_close_matches(
-                    metric, available_labels, n=1, cutoff=0.8
-                )
-                if close_matches:
-                    found_label = close_matches[0]
-                    logger.info(f"Resolving '{metric}' to fuzzy match '{found_label}'")
-                    to_fetch.append(found_label)
-                else:
-                    unknown_metrics.append(metric.replace(" ", "_"))
+        # Run EDGAR update and price fetch concurrently
+        async def _edgar_update():
+            await self.db.update_financials(ticker, years, "10-K")
 
-        placeholders = [
-            CalculatedMetric(
-                target_metric_name=m, pandas_eval_expression="", dependencies=[]
+        async def _price_fetch():
+            return await self.db.get_price_data(
+                ticker,
+                start=state.start_date.strftime("%Y-%m-%d"),
+                end=state.end_date.strftime("%Y-%m-%d"),
+                interval="yearly",
             )
-            for m in unknown_metrics
-        ]
+
+        edgar_task = asyncio.create_task(_edgar_update())
+        price_task = asyncio.create_task(_price_fetch())
+        await edgar_task  # must finish before we query DB
+        price_df: pd.DataFrame = await price_task
+
+        # Fetch the complete financial statement data from DB
+        financial_df = await self.db.search_label(
+            ticker,
+            keywords=await self.db.get_all_concepts(ticker),
+            start_date=(
+                state.start_date.strftime("%Y-%m-%d") if state.start_date else None
+            ),
+            end_date=state.end_date.strftime("%Y-%m-%d") if state.end_date else None,
+        )
+
+        # Also get all available concept names for the planner
+        available_concepts = await self.db.get_all_concepts(ticker)
+
+        # Merge price data into the financial DataFrame
+        if not price_df.empty and "stock_price" in price_df.columns:
+            price_t = price_df[["stock_price"]].T
+            price_t.columns = pd.to_datetime(price_t.columns).strftime("%Y-%m-%d")
+            if not financial_df.empty:
+                financial_df.columns = pd.to_datetime(financial_df.columns).strftime(
+                    "%Y-%m-%d"
+                )
+                # Align columns to the intersection + union
+                all_cols = sorted(set(financial_df.columns) | set(price_t.columns))
+                financial_df = financial_df.reindex(columns=all_cols)
+                price_t = price_t.reindex(columns=all_cols)
+            financial_df = pd.concat([financial_df, price_t])
+            if "stock_price" not in available_concepts:
+                available_concepts.append("stock_price")
+
+        if financial_df.empty:
+            logger.warning(
+                "[data_prep] No financial data found for %s in the requested range.",
+                ticker,
+            )
 
         return {
-            "calculations_to_run": placeholders,
-            "metrics_to_fetch": to_fetch,
+            "financial_data": financial_df,
+            "available_concepts": available_concepts,
         }
 
-    async def _decomposer_node(self, state: _AgentState) -> dict:
+    # ── Node: tool_planner ────────────────────────────────────────────────────
+
+    async def _tool_planner_node(self, state: _AgentState) -> Dict:
         """
-        Uses LLM to decompose complex metrics into formulas based on available data.
-        Handles multi-level decomposition (e.g., Price -> FCF -> [OCF - CapEx]).
+        Sends the user query + available concepts + tool catalogue to the LLM.
+        The LLM returns a structured ToolPlan deciding which tools to call and
+        with which parameters (all mapped to real concept names).
         """
-        targets = [
-            c.target_metric_name
-            for c in state.calculations_to_run
-            if not c.pandas_eval_expression
-        ]
+        logger.info("[Node] tool_planner — planning tools for: %s", state.query)
 
-        if not targets:
-            return {}
+        if not state.available_concepts:
+            logger.warning(
+                "[tool_planner] No concepts available — skipping tool planning."
+            )
+            return {
+                "tool_plan": ToolPlan(
+                    calls=[], data_summary="No financial data available."
+                )
+            }
 
-        logger.info(f"--- [Node] Decomposer: Deriving formulas for {targets} ---")
+        # Format the concept list (truncate display at 200 for token efficiency;
+        # the full list is still passed so the LLM can reference any of them)
+        concepts_display = "\n".join(
+            f"  • {c}" for c in sorted(state.available_concepts)[:200]
+        )
+        if len(state.available_concepts) > 200:
+            concepts_display += f"\n  … and {len(state.available_concepts) - 200} more"
 
-        available_concepts = await self.db.get_labels(state.ticker)
-
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "You are an expert financial quant and data engineer. Decompose the requested metrics into mathematical formulas executable in pandas.\n\n"
-                    "RULES:\n"
-                    "1. **Check 'Available Concepts':** If a requested metric relies on data NOT in the list (e.g., 'Free Cash Flow'), you must create an **Intermediate Calculation** first.\n"
-                    "2. **CRITICAL - UNIT CONSISTENCY (Per Share vs. Total):**\n"
-                    "   - The variable 'stock_price' represents the price of ONE share.\n"
-                    "   - You generally cannot divide 'stock_price' by a total company metric (like 'Total Revenue' or 'Total Free Cash Flow').\n"
-                    "   - If calculating a valuation ratio (e.g., 'Price to Free Cash Flow'), you MUST:\n"
-                    "       a) Identify the total metric (e.g., Free Cash Flow).\n"
-                    "       b) Identify 'Shares Outstanding' (or 'Weighted Average Shares') from the available concepts.\n"
-                    "       c) Calculate the **Per Share** metric (e.g., `fcf_per_share = free_cash_flow / shares_outstanding`).\n"
-                    "       d) Calculate the final ratio using the per-share metric (e.g., `price_to_fcf = stock_price / fcf_per_share`).\n"
-                    "3. **Order matters:** Define intermediate variables (like Total FCF, then FCF Per Share) BEFORE using them in the final formula.\n"
-                    "4. **Naming:** In 'pandas_eval_expression' and 'target_metric_name', replace ALL spaces with underscores '_'.\n"
-                    "5. **Standard Definitions** (Use these if specific tags are missing):\n"
-                    "   - Free Cash Flow = Net Cash provided by (used in) operating activities - Payments for (proceeds from) capital expenditures\n"
-                    "   - Working Capital = Current assets - Current liabilities\n"
-                    "   - Shares: Look for 'Weighted Average Shares', 'Common Stock Shares Outstanding', or similar.\n\n"
-                    "EXAMPLE CALCULATION PLAN (Price to Free Cash Flow):\n"
-                    "1. free_cash_flow = Cash_Flow_from_Operations - Capital_Expenditures\n"
-                    "2. free_cash_flow_per_share = free_cash_flow / Weighted_Average_Shares_Outstanding\n"
-                    "3. price_to_free_cash_flow = stock_price / free_cash_flow_per_share",
-                ),
-                (
-                    "human",
-                    f"Available Concepts (Raw Data): {available_concepts}\n\n"
-                    f"Metrics to decompose: {targets}\n\n"
-                    "Provide a calculation plan. Ensure you normalize total metrics to 'per share' before comparing them to 'stock_price'.",
-                ),
-            ]
+        user_msg = _TOOL_PLANNER_USER.format(
+            query=state.query,
+            ticker=state.ticker,
+            start_date=(
+                state.start_date.strftime("%Y-%m-%d") if state.start_date else "N/A"
+            ),
+            end_date=state.end_date.strftime("%Y-%m-%d") if state.end_date else "N/A",
+            n_concepts=len(state.available_concepts),
+            concepts_block=concepts_display,
+            tool_descriptions=get_tool_descriptions(),
         )
 
         llm = service_manager.get_agent(temperature=0)
-        structured_llm = llm.with_structured_output(DecompositionPlan)
-        result: DecompositionPlan = await (prompt | structured_llm).ainvoke({})
+        structured_llm = llm.with_structured_output(ToolPlan)
 
-        # Extract dependencies (both raw data and newly created intermediates)
-        # Note: Depending on your architecture, you might need to filter 'new_dependencies'
-        # to ensure you only fetch raw data, not the intermediate metrics you just invented.
-        # usually, the fetcher will ignore metrics it can't find in the DB,
-        # but it is safer if the LLM output distinguishes between 'fetch' and 'calculate'.
-
-        new_dependencies = [
-            dep for calc in result.calculations for dep in calc.dependencies
-        ]
-
-        # Clean up dependencies: Only fetch things that are NOT being calculated in this very plan
-        calculated_vars = {c.target_metric_name for c in result.calculations}
-        metrics_to_fetch = [d for d in new_dependencies if d not in calculated_vars]
-        metrics_to_fetch.extend([t for t in targets if t not in calculated_vars])
-
-        logger.info("   -> New dependencies to fetch: ")
-        for m in metrics_to_fetch:
-            logger.info(f"      - {m}")
-
-        logger.info("   -> Calculations to perform:")
-        for i, calc in enumerate(result.calculations, 1):
-            logger.info(
-                f"      {i}. {calc.target_metric_name} = {calc.pandas_eval_expression}"
+        try:
+            tool_plan: ToolPlan = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=_TOOL_PLANNER_SYSTEM),
+                    HumanMessage(content=user_msg),
+                ]
+            )
+        except Exception as exc:
+            logger.error("[tool_planner] LLM call failed: %s", exc)
+            tool_plan = ToolPlan(
+                calls=[],
+                data_summary=f"Tool planning failed: {exc}. Proceeding with raw data only.",
             )
 
-        return {
-            "calculations_to_run": result.calculations,
-            "metrics_to_fetch": metrics_to_fetch,
-        }
-
-    async def _fetch_data_node(self, state: _AgentState) -> dict:
-        """
-        Retrieves the actual data values from the database.
-        """
-        # REWRITTEN: Use state.attribute access
-        logger.info("--- [Node] Fetcher ---")
-        metrics_to_query = list(set(state.metrics_to_fetch))
-
-        if not metrics_to_query:
-            return {"financial_data": pd.DataFrame()}
-
-        financial_df = await self.db.search_label(
-            state.ticker, metrics_to_query, state.start_date, state.end_date
+        logger.info(
+            "[tool_planner] Plan: %d tool call(s). Summary: %s",
+            len(tool_plan.calls),
+            tool_plan.data_summary,
         )
+        for i, spec in enumerate(tool_plan.calls, 1):
+            logger.info("  %d. %s — %s", i, spec.tool_name, spec.reasoning)
 
-        if any("stock_price" in m.lower() for m in metrics_to_query):
-            price_df = await self.db.get_price_data(
-                state.ticker, state.start_date, state.end_date, "yearly"
-            )
-            if not price_df.empty and "stock_price" in price_df.columns:
-                price_t = price_df[["stock_price"]].T
-                price_t.columns = [d.strftime("%Y-%m-%d") for d in price_t.columns]
+        return {"tool_plan": tool_plan}
 
-                # Align column types if necessary before combining
-                if not financial_df.empty:
-                    financial_df.columns = pd.to_datetime(
-                        financial_df.columns
-                    ).strftime("%Y-%m-%d")
-                    price_t.columns = financial_df.columns
+    # ── Node: tool_executor ───────────────────────────────────────────────────
 
-                financial_df = pd.concat([financial_df, price_t])
-
-        return {"financial_data": financial_df}
-
-    async def _calculator_node(self, state: _AgentState) -> dict:
+    async def _tool_executor_node(self, state: _AgentState) -> Dict:
         """
-        Executes the formulas from the decomposer using pandas eval.
-        """
-        # REWRITTEN: Use state.attribute access
-        logger.info("--- [Node] Calculator ---")
-        df = state.financial_data
-        calculations = state.calculations_to_run
+        Iterates over state.tool_plan.calls in order:
+          1. Validates that the tool name is in TOOL_REGISTRY
+          2. Instantiates the tool's parameters_schema from spec.parameters
+          3. Calls tool.execute(df, params) — synchronous but lightweight
+          4. On success, merges added_rows back into financial_data
+          5. Appends ToolResult to tool_results
 
-        if df is None or df.empty or not calculations:
+        Failures are recorded in ToolResult.error and never raise exceptions,
+        ensuring the analyst node always runs.
+        """
+        logger.info("[Node] tool_executor")
+
+        plan = state.tool_plan
+        if not plan or not plan.calls:
+            logger.info("[tool_executor] No tools to run.")
             return {}
 
-        df_eval = df.T
+        df: pd.DataFrame = (
+            state.financial_data.copy()
+            if state.financial_data is not None and not state.financial_data.empty
+            else pd.DataFrame()
+        )
+        results: List[ToolResult] = []
 
-        for calc in calculations:
+        for spec in plan.calls:
+            tool = TOOL_REGISTRY.get(spec.tool_name)
+            if tool is None:
+                msg = (
+                    f"Tool '{spec.tool_name}' not found in registry. "
+                    f"Available: {list(TOOL_REGISTRY.keys())}"
+                )
+                logger.warning("[tool_executor] %s", msg)
+                results.append(
+                    ToolResult(tool_name=spec.tool_name, success=False, error=msg)
+                )
+                continue
+
+            # Validate parameters against the tool's Pydantic schema
             try:
-                expr = calc.pandas_eval_expression
-                target = calc.target_metric_name
-                logger.info(f"[Calculator] {target} = {expr}")
+                params = tool.parameters_schema(**spec.parameters)
+            except Exception as exc:
+                msg = f"Invalid parameters for '{spec.tool_name}': {exc}"
+                logger.error("[tool_executor] %s", msg)
+                results.append(
+                    ToolResult(tool_name=spec.tool_name, success=False, error=msg)
+                )
+                continue
 
-                missing_deps = [
-                    d for d in calc.dependencies if d not in df_eval.columns
-                ]
-                if missing_deps:
-                    logger.warning(
-                        f"[Calculator] Warning: Missing dependencies for {target}: {missing_deps}"
+            if df.empty:
+                results.append(
+                    ToolResult(
+                        tool_name=spec.tool_name,
+                        success=False,
+                        error="Cannot execute tool — financial_data is empty.",
                     )
-                    continue
+                )
+                continue
 
-                df_eval.eval(f"{target} = {expr}", inplace=True)
-            except Exception as e:
-                logger.error(
-                    f"[Calculator] Error calculating {calc.target_metric_name}: {e}"
+            # Execute the tool
+            try:
+                result: ToolResult = tool.execute(df, params)
+            except Exception as exc:
+                result = ToolResult(
+                    tool_name=spec.tool_name, success=False, error=str(exc)
                 )
 
-        return {"financial_data": df_eval.T}
+            results.append(result)
 
-    async def _generate_analysis(self, state: _AgentState) -> FundamentalAnalysisOutput:
-        logger.info("--- [Node] Analyst ---")
+            # Merge new rows into the DataFrame for subsequent tools to use
+            if result.success and result.added_rows:
+                new_rows = pd.DataFrame.from_dict(result.added_rows, orient="index")
+                # Align columns before concat
+                all_cols = df.columns.union(new_rows.columns)
+                df = df.reindex(columns=all_cols)
+                new_rows = new_rows.reindex(columns=all_cols)
+                df = pd.concat([df, new_rows])
+                logger.info(
+                    "[tool_executor] Merged %d new row(s) from %s: %s",
+                    len(result.added_rows),
+                    spec.tool_name,
+                    list(result.added_rows.keys()),
+                )
+
+        return {
+            "financial_data": df if not df.empty else state.financial_data,
+            "tool_results": results,
+        }
+
+    # ── Node: analyst ─────────────────────────────────────────────────────────
+
+    async def _analyst_node(self, state: _AgentState) -> Dict:
+        """
+        Generates a natural-language analysis of the enriched financial data.
+        Runs the relationship extraction pipeline for the memory graph.
+        """
+        logger.info("[Node] analyst")
 
         if state.financial_data is None or state.financial_data.empty:
-            return FundamentalAnalysisOutput(
-                financial_data=None,
-                analysis="No data found.",
-                relationships_extracted=False,
-            )
+            return {
+                "analysis": "No financial data was retrieved for this query.",
+                "relationships_extracted": False,
+            }
 
+        # Build human-readable DataFrame for the LLM
         human_readable = state.financial_data.map(
-            lambda x: add_units(x) if isinstance(x, (int, float)) else x
-        ).to_string()
+            lambda x: _format_value(x) if isinstance(x, (int, float)) else x
+        ).to_string(max_rows=30)
+
+        # Build tool results summary
+        tool_summary_parts = []
+        for r in state.tool_results:
+            status = "✓" if r.success else f"✗ ERROR: {r.error}"
+            tool_summary_parts.append(f"[{r.tool_name}] {status}\n  {r.summary}")
+            if r.reasoning:
+                tool_summary_parts.append(f"  Assumptions: {r.reasoning}")
+        tool_summary = (
+            "\n\n".join(tool_summary_parts)
+            if tool_summary_parts
+            else "No tools were run."
+        )
 
         system_prompt = COMBINED_ANALYSIS_RELATIONSHIP_PROMPT
         user_prompt = (
-            f"Analyze the following financial data for {state.ticker}.\n"
-            f"Data (Rows=Metrics, Cols=Dates):\n{human_readable}\n\n"
+            f"Analyse the following financial data for {state.ticker}.\n\n"
+            f"Data (Rows=Metrics, Columns=Dates):\n{human_readable}\n\n"
+            f"--- Tool Analysis Results ---\n{tool_summary}\n\n"
             f"User Question: {state.query}\n\n"
-            "### Analysis Instructions:\n"
+            "### Instructions:\n"
             "1. Highlight key trends, risks, and positives.\n"
-            "2. **Number Formatting:** When citing numbers from the data, you MUST automatically convert "
-            "scientific notation (e.g., 1.5e9) or large raw integers into human-readable denominations "
-            "(Million, Billion, Trillion). For example, convert '1.5e9' to '1.5 Billion'."
+            "2. Reference and interpret the tool results (CAGR, ratios, DCF etc.) where available.\n"
+            "3. For DCF: always state the WACC and terminal growth assumptions and explain "
+            "   whether the intrinsic value suggests the stock is over- or under-valued.\n"
+            "4. Convert large raw numbers to human-readable form "
+            "   (e.g. 1.5e9 → '1.5 Billion', 2.3e12 → '2.3 Trillion').\n"
+            "5. Be concise but comprehensive."
         )
 
         try:
@@ -374,14 +604,15 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     HumanMessage(content=user_prompt),
                 ],
             )
-            analysis_text = result.analysis
+            analysis_text: str = result.analysis
             relationships = result.relationships
-            relationships_extracted = result.parse_success
+            relationships_extracted: bool = result.parse_success
         except Exception as exc:
-            logger.error("Analysis generation failed: %s", exc)
+            logger.error("[analyst] Analysis generation failed: %s", exc)
             raise
 
-        subgraph_id = None
+        # ── Memory graph extraction ────────────────────────────────────────────
+        subgraph_id: Optional[str] = None
         if settings.EXTRACTION_ENABLED and state.conversation_id:
             builder = InMemorySubgraphBuilder(
                 embedding_func=service_manager.get_embedding_func(),
@@ -389,10 +620,14 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
             )
             store = service_manager.get_subgraph_store()
-            subgraph_id = SubgraphStore.make_key(self.name(), state.conversation_id)
+            subgraph_id = SubgraphStore.make_key(
+                FundamentalAnalysisAgent.name(), state.conversation_id
+            )
 
             async def _build_and_store():
-                graph = await builder.build(relationships, source_agent=self.name())
+                graph = await builder.build(
+                    relationships, source_agent=FundamentalAnalysisAgent.name()
+                )
                 await store.save(subgraph_id, graph)
 
             if relationships_extracted:
@@ -402,7 +637,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     retry_relationships_only(
                         service_manager.get_agent(temperature=0.7),
                         analysis_text,
-                        self.name(),
+                        FundamentalAnalysisAgent.name(),
                         state.conversation_id,
                         builder,
                         store,
@@ -414,64 +649,63 @@ class FundamentalAnalysisAgent(AbstractAgent):
             if settings.EXTRACTION_IMMEDIATE:
                 await task
 
-        return FundamentalAnalysisOutput(
-            financial_data=state.financial_data,
-            analysis=analysis_text,
-            relationships_extracted=relationships_extracted,
-            subgraph_id=subgraph_id,
-        )
+        return {
+            "analysis": analysis_text,
+            "relationships_extracted": relationships_extracted,
+            "subgraph_id": subgraph_id,
+        }
 
 
-def add_units(x):
-    if (x > 0 and x >= 1_000_000_000) or (x < 0 and x <= -1_000_000_000):
-        return f"{x/1_000_000_000:.2f} Billion"
-    elif (x > 0 and x >= 1_000_000) or (x < 0 and x <= -1_000_000):
-        return f"{x/1_000_000:.2f} Million"
-    elif (x > 0 and x >= 1_000) or (x < 0 and x <= -1_000):
-        return f"{x/1_000:.2f} Thousand"
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    return f"{x:.2f}"
 
+def _format_value(x: float) -> str:
+    """Converts a raw numeric value to a human-readable denomination string."""
+    abs_x = abs(x)
+    if abs_x >= 1_000_000_000_000:
+        return f"{x / 1_000_000_000_000:.2f} Trillion"
+    if abs_x >= 1_000_000_000:
+        return f"{x / 1_000_000_000:.2f} Billion"
+    if abs_x >= 1_000_000:
+        return f"{x / 1_000_000:.2f} Million"
+    if abs_x >= 1_000:
+        return f"{x / 1_000:.2f} Thousand"
+    return f"{x:.4g}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smoke test  (python -m core.agents.fundamental_analysis_agent)
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from datetime import datetime
 
     async def main():
         agent = FundamentalAnalysisAgent()
-
-        logger.info("--- Running Scenario: Complex Metric (Net Profit Margin) ---")
         input_data = BaseAgentInput(
             ticker="MSFT",
-            metrics=["stock_price"],
-            vector_query="MSFT",
-            start_date="2020-01-01",
-            end_date="2022-12-31",
-            query="Get MSFT's price from 2020 to 2022.",
+            query="What is MSFT's revenue CAGR and is the stock undervalued based on DCF?",
+            vector_query="MSFT revenue growth DCF valuation",
+            metrics=[],
+            start_date=datetime(2019, 1, 1),
+            end_date=datetime(2023, 12, 31),
         )
-        output_complex = await agent.run(input_data)
-        logger.info("\n--- RAW AGENT OUTPUT ---\n")
-
-        logger.info("[analysis]")
-        logger.info(output_complex.analysis)
-
-        logger.info("-" * 60)
-
-        logger.info("\n[financial_data]")
-        human_readable = output_complex.financial_data.map(
-            lambda x: add_units(x) if isinstance(x, (int, float)) else x
-        ).to_string()
-        logger.info(human_readable)
+        output = await agent.run(input_data)
+        print("\n=== ANALYSIS ===")
+        print(output.analysis)
+        print("\n=== TOOL RESULTS ===")
+        for r in output.tool_results:
+            print(f"[{r.tool_name}] {'OK' if r.success else 'FAIL'}: {r.summary}")
+            if r.reasoning:
+                print(f"  Reasoning: {r.reasoning}")
+        print("\n=== FINANCIAL DATA ===")
+        if output.financial_data is not None:
+            print(
+                output.financial_data.map(
+                    lambda x: _format_value(x) if isinstance(x, (int, float)) else x
+                ).to_string()
+            )
 
     asyncio.run(main())
-
-    # agent = FundamentalAnalysisAgent()
-    # graph = agent._graph.get_graph()
-    # png_bytes = graph.draw_mermaid_png(
-    #     frontmatter_config={"chartOrientation": "horizontal"}
-    # )
-
-    # with open("statisstical_analysis.png", "wb") as f:
-    #     f.write(png_bytes)
-
-    # logger.info("Saved graph as graph.png")
-
-

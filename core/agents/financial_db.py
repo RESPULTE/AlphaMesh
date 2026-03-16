@@ -1,19 +1,48 @@
+"""
+core/agents/financial_db.py
+
+Manages fetching (via SEC EDGAR), caching (SQLite), and querying of
+standardised financial statement data, plus stock price history (yfinance).
+
+Key changes vs original
+───────────────────────
+1. _fetch_edgar_data_sync: signature fixed (year: int → years: List[int]).
+   Fetches all filings for the form type in a thread-safe way via asyncio.to_thread.
+
+2. _process_statement: now resolves labels in priority order:
+     standard_concept  (edgartools standardised name, most consistent)
+     → concept tag stripped of namespace prefix  (e.g. "us-gaap:Revenues" → "Revenues")
+     → raw label  (human-readable but can change between filings)
+   This eliminates the primary source of label inconsistency.
+
+3. get_all_concepts: new method that returns every label stored for a ticker.
+   Replaces the broken pattern search_label(ticker, []) which always returned
+   an empty DataFrame (the keywords guard short-circuits on an empty list).
+
+4. asyncio.get_event_loop() usage replaced with asyncio.to_thread().
+
+5. _fetch_edgar_data_sync robustly handles multi-year fetches for both
+   10-K and 10-Q form types.
+"""
+
 import asyncio
+import re
 from typing import Dict, List, Literal, Optional, Set, Tuple, TypeAlias, Union
 
 import aiosqlite
 import pandas as pd
 from edgar import Company, MultiFinancials, set_identity
+
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# --- TYPE DEFINITIONS AND CONFIGURATION ---
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Define clear type aliases for better readability and maintainability
 FormType: TypeAlias = Literal["10-K", "10-Q"]
 StatementType: TypeAlias = Literal["income", "balance", "cashflow"]
-# A Period can be a year (for 10-K) or a (year, quarter) tuple (for 10-Q)
 Period: TypeAlias = Union[int, Tuple[int, int]]
 
 USER_AGENT = "FundamentalAnalysisBot yeapzing@utar.edu.my"
@@ -22,6 +51,14 @@ set_identity(USER_AGENT)
 DB_PATH = "./data/financial_data.db"
 ALL_STATEMENT_TYPES: List[StatementType] = ["income", "balance", "cashflow"]
 SUPPORTED_FORM_TYPES: List[FormType] = ["10-K", "10-Q"]
+
+# Namespace prefix regex — strips e.g. "us-gaap:" from XBRL concept tags
+_NS_PREFIX_RE = re.compile(r"^[a-zA-Z0-9\-]+:")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FinancialDatabase
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class FinancialDatabase:
@@ -32,153 +69,158 @@ class FinancialDatabase:
     def __init__(self, db_name: str = DB_PATH):
         self.db_name = db_name
 
-    async def initialize(self):
-        """
-        Initializes the database, creating the table and indexes if they don't exist.
-        The schema now includes the 'form_type' to distinguish annual vs. quarterly data.
-        """
+    async def initialize(self) -> None:
+        """Creates the table and indexes if they do not already exist."""
         async with aiosqlite.connect(self.db_name) as db:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS financials (
-                    company TEXT,
-                    period_date TEXT,
-                    form_type TEXT,
+                    company        TEXT,
+                    period_date    TEXT,
+                    form_type      TEXT,
                     statement_type TEXT,
-                    label TEXT,
-                    value REAL,
+                    label          TEXT,
+                    value          REAL,
                     PRIMARY KEY (company, period_date, form_type, statement_type, label)
                 );
                 """
             )
-            # Add indexes for common query patterns
             await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_company_form_date ON financials (company, form_type, period_date);"
+                "CREATE INDEX IF NOT EXISTS idx_company_form_date "
+                "ON financials (company, form_type, period_date);"
             )
             await db.commit()
-            logger.info("[DB] Database initialized successfully.")
+            logger.info("[DB] Initialized.")
 
-    # --- 1. CORE DATA FETCHING AND PROCESSING ---
+    # ─────────────────────────────────────────────────────────────────────────
+    # 1.  CORE DATA FETCHING AND PROCESSING
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def update_financials(
-        self, ticker: str, period: List[Period], form_type: FormType
+        self, ticker: str, periods: List[Period], form_type: FormType
     ) -> None:
-        uncoverd_periods = await self.find_uncovered_periods(ticker, period, form_type)
-        if len(uncoverd_periods) == 0:
-            logger.info(f"All periods for {ticker} are already covered.")
+        """Fetches and stores any periods not yet cached in the local DB."""
+        uncovered = await self.find_uncovered_periods(ticker, periods, form_type)
+        if not uncovered:
+            logger.info("[DB] All requested periods for %s already cached.", ticker)
             return
-
-        logger.info(f"Uncovered periods: {uncoverd_periods}")
-
-        await self.fetch_and_store_period(ticker, uncoverd_periods, form_type)
+        logger.info("[DB] Uncovered periods to fetch: %s", uncovered)
+        await self.fetch_and_store_period(ticker, uncovered, form_type)
 
     async def fetch_and_store_period(
         self, ticker: str, periods: List[Period], form_type: FormType
     ) -> None:
         """
-        High-level function to fetch, process, and store data for a list of specified periods.
-
-        Args:
-            ticker: The stock ticker (e.g., "AAPL").
-            periods: A list of periods to fetch, e.g., [2022, 2021] for 10-K or
-                     [(2023, 1), (2023, 2)] for 10-Q.
-            form_type: The type of form to fetch ('10-K' or '10-Q').
+        Fetches financial data from EDGAR for all required years, processes it
+        into long format, filters to exactly the requested periods, and persists
+        to SQLite.
         """
         if not periods:
-            logger.warning("No periods specified to fetch.")
             return
 
-        # Extract all unique years required for the API call
-        years = sorted(list(set(p if isinstance(p, int) else p[0] for p in periods)))
+        years = sorted(set(p if isinstance(p, int) else p[0] for p in periods))
+        logger.info("[EDGAR] Fetching %s %s for years %s …", ticker, form_type, years)
 
-        logger.info(f"--- [API] Fetching {form_type} data for {ticker} for years {years} ---")
-
-        # 1. Fetch data from EDGAR in a separate thread
         try:
             dfs_map = await self._fetch_edgar_data_sync(ticker, years, form_type)
-        except Exception as e:
-            logger.error(f"Error fetching data for {ticker}: {e}")
+        except Exception as exc:
+            logger.error("[EDGAR] Fetch failed for %s: %s", ticker, exc)
             return
 
-        if not any(not df.empty for df in dfs_map.values()):
-            logger.warning(f"No financials found for {ticker} in years {years}")
+        if not dfs_map or not any(not df.empty for df in dfs_map.values()):
+            logger.warning(
+                "[EDGAR] No financials returned for %s years=%s", ticker, years
+            )
             return
 
-        # 2. Process and combine the dataframes
-        all_data = []
+        all_rows: List[pd.DataFrame] = []
+
         for stmt_type, df in dfs_map.items():
             processed = self._process_statement(df, ticker, stmt_type, form_type)
+            if processed.empty:
+                continue
+
+            processed["period_date_dt"] = pd.to_datetime(processed["period_date"])
+
+            if form_type == "10-Q":
+                actual_periods = processed.apply(
+                    lambda row: (
+                        row["period_date_dt"].year,
+                        row["period_date_dt"].quarter,
+                    ),
+                    axis=1,
+                )
+                processed = processed[actual_periods.isin(periods)]
+            else:  # 10-K
+                processed = processed[processed["period_date_dt"].dt.year.isin(years)]
+
+            processed = processed.drop(columns=["period_date_dt"])
             if not processed.empty:
-                # --- START: REGENERATED FILTERING LOGIC ---
+                all_rows.append(processed)
 
-                # Convert date column to datetime objects for filtering
-                processed["period_date_dt"] = pd.to_datetime(processed["period_date"])
-
-                # If it's a quarterly request, filter for the correct quarters.
-                if form_type == "10-Q":
-                    # Create a Series of (year, quarter) tuples from the processed data
-                    actual_periods = processed.apply(
-                        lambda row: (
-                            row["period_date_dt"].year,
-                            row["period_date_dt"].quarter,
-                        ),
-                        axis=1,
-                    )
-                    # Create a boolean mask where the actual period is in our desired list
-                    mask = actual_periods.isin(periods)
-                    processed = processed[mask]
-
-                # If it's an annual request, filter for the correct years.
-                elif form_type == "10-K":
-                    mask = processed["period_date_dt"].dt.year.isin(periods)
-                    processed = processed[mask]
-
-                # Drop the temporary datetime column
-                processed = processed.drop(columns=["period_date_dt"])
-
-                # --- END: REGENERATED FILTERING LOGIC ---
-
-                if not processed.empty:
-                    all_data.append(processed)
-
-        if not all_data:
-            logger.warning(f"No data found for the specific periods {periods} after filtering.")
+        if not all_rows:
+            logger.warning(
+                "[DB] No rows remained after period filtering for %s.", ticker
+            )
             return
 
-        final_df = pd.concat(all_data, ignore_index=True)
-
-        # 3. Bulk insert into the database
-        await self._bulk_insert(final_df)
+        await self._bulk_insert(pd.concat(all_rows, ignore_index=True))
 
     async def _fetch_edgar_data_sync(
         self,
         ticker: str,
-        year: int,
+        years: List[int],  # FIX: was `year: int` — now correctly accepts a list
         form_type: FormType,
     ) -> Dict[StatementType, pd.DataFrame]:
         """
-        Runs the blocking edgar network requests in a separate thread.
+        Runs blocking EDGAR network I/O in a thread via asyncio.to_thread().
+
+        Strategy: fetch all filings for the form type (EDGAR returns them in
+        reverse-chronological order). MultiFinancials combines them into aligned
+        DataFrames.  Downstream period filtering in fetch_and_store_period
+        then trims to only the requested years.
         """
 
-        def _fetch():
+        def _fetch() -> Dict[StatementType, pd.DataFrame]:
             company = Company(ticker)
-            filings = company.get_filings(form=form_type, year=year)
+            # Fetch all filings of the requested form; period filtering happens
+            # after we have the data (more robust against EDGAR date edge cases).
+            filings = company.get_filings(form=form_type)
             if not filings:
+                logger.warning("[EDGAR] No %s filings found for %s", form_type, ticker)
                 return {}
 
-            multi_financials = MultiFinancials.extract(filings)
-            return {
-                "income": multi_financials.income_statement().to_dataframe(),
-                "balance": multi_financials.balance_sheet().to_dataframe(),
-                "cashflow": multi_financials.cashflow_statement().to_dataframe(),
-            }
+            try:
+                mf = MultiFinancials.extract(filings)
+            except Exception as exc:
+                logger.error(
+                    "[EDGAR] MultiFinancials.extract failed for %s: %s", ticker, exc
+                )
+                return {}
 
-        # Use type assertion for clarity
-        loop = asyncio.get_event_loop()
-        result: Dict[StatementType, pd.DataFrame] = await loop.run_in_executor(
-            None, _fetch
-        )
-        return result
+            result: Dict[StatementType, pd.DataFrame] = {}
+
+            for stmt_type, method_name in [
+                ("income", "income_statement"),
+                ("balance", "balance_sheet"),
+                ("cashflow", "cashflow_statement"),
+            ]:
+                try:
+                    stmt_obj = getattr(mf, method_name)()
+                    df = stmt_obj.to_dataframe()
+                    result[stmt_type] = df if df is not None else pd.DataFrame()
+                except Exception as exc:
+                    logger.warning(
+                        "[EDGAR] Could not extract %s for %s: %s",
+                        stmt_type,
+                        ticker,
+                        exc,
+                    )
+                    result[stmt_type] = pd.DataFrame()
+
+            return result
+
+        return await asyncio.to_thread(_fetch)
 
     def _process_statement(
         self,
@@ -187,115 +229,166 @@ class FinancialDatabase:
         stmt_type: StatementType,
         form_type: FormType,
     ) -> pd.DataFrame:
-        """Transforms a raw dataframe from EDGAR into a long-format for DB storage."""
+        """
+        Transforms a raw edgartools DataFrame into long-format rows for DB storage.
+
+        Label resolution priority (most → least consistent across companies/years):
+          1. standard_concept column  ← edgartools normalised name (e.g. "Revenues")
+          2. concept column stripped  ← XBRL tag sans namespace  (e.g. "us-gaap:Revenues" → "Revenues")
+          3. label column             ← human-readable string    (can change between filings)
+
+        The goal is that the DB stores concept names that are consistent across
+        companies and fiscal years, eliminating the fuzzy-matching workaround.
+        """
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # The 'concept' column is redundant if 'label' is the index
+        df = df.copy()
+
+        # ── Normalise to a flat wide DataFrame with a "label" column ──────────
+        # edgartools to_dataframe() can return either:
+        #   A) Wide format with concept/label as a column + date columns
+        #   B) Wide format with concept/label as the index
+
+        if "label" not in df.columns:
+            # Case B: the index holds the concept names — reset it to a column
+            df = df.reset_index()
+            first_col = df.columns[0]
+            df = df.rename(columns={first_col: "label"})
+
+        # ── Resolve the best available label ──────────────────────────────────
+        if "standard_concept" in df.columns:
+            # Use standardised concept name where available, fall back to raw label
+            mask_has_std = df["standard_concept"].notna() & (
+                df["standard_concept"] != ""
+            )
+            df["label"] = df["standard_concept"].where(mask_has_std, other=df["label"])
+            df = df.drop(columns=["standard_concept"])
+
         if "concept" in df.columns:
+            # Strip XBRL namespace prefix (e.g. "us-gaap:Revenues" → "Revenues")
+            cleaned = (
+                df["concept"]
+                .astype(str)
+                .str.replace(r"^[a-zA-Z0-9\-]+:", "", regex=True)
+            )
+            # Override label only where the label still looks like a raw XBRL tag
+            raw_tag_mask = df["label"].astype(str).str.contains(":", na=False)
+            df.loc[raw_tag_mask, "label"] = cleaned[raw_tag_mask]
             df = df.drop(columns=["concept"])
 
-        melted = df.melt(id_vars=["label"], var_name="period_date", value_name="value")
+        # ── Melt from wide to long ─────────────────────────────────────────────
+        non_date_cols = [
+            c for c in df.columns if c in ("label",) or not _looks_like_date(str(c))
+        ]
+        date_cols = [c for c in df.columns if c not in non_date_cols]
 
-        # Clean up label for consistency
-        melted["label"] = (
-            melted["label"]
-            .str.replace(" ", "_")
-            .str.replace(",", "_")
-            .str.replace("/", "|")
-            .str.replace("(", "")
-            .str.replace(")", "")
+        if not date_cols:
+            logger.warning(
+                "[DB] No date columns found in %s %s for %s",
+                stmt_type,
+                form_type,
+                ticker,
+            )
+            return pd.DataFrame()
+
+        melted = df.melt(
+            id_vars=["label"],
+            value_vars=date_cols,
+            var_name="period_date",
+            value_name="value",
         )
 
-        # Add metadata columns
+        # ── Clean labels ──────────────────────────────────────────────────────
+        melted["label"] = (
+            melted["label"]
+            .astype(str)
+            .str.strip()
+            .str.replace(r"\s+", "_", regex=True)
+            .str.replace(",", "_", regex=False)
+            .str.replace("/", "|", regex=False)
+            .str.replace(r"[()]", "", regex=True)
+        )
+
+        # ── Attach metadata ────────────────────────────────────────────────────
         melted["company"] = ticker.upper()
         melted["form_type"] = form_type
         melted["statement_type"] = stmt_type
 
-        # Coerce value to numeric and drop rows with invalid data
+        # ── Coerce & filter ────────────────────────────────────────────────────
         melted["value"] = pd.to_numeric(melted["value"], errors="coerce")
-        melted = melted.dropna(subset=["value"])
+        melted = melted.dropna(subset=["value", "label"])
+        melted = melted[melted["label"].str.len() > 0]
 
-        # Ensure date is in a consistent string format
-        melted["period_date"] = pd.to_datetime(melted["period_date"]).dt.strftime(
-            "%Y-%m-%d"
-        )
+        melted["period_date"] = pd.to_datetime(
+            melted["period_date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+        melted = melted.dropna(subset=["period_date"])
 
         return melted[
             ["company", "period_date", "form_type", "statement_type", "label", "value"]
         ]
 
-    async def _bulk_insert(self, df: pd.DataFrame):
-        """Performs a bulk INSERT OR REPLACE into the database."""
-        if df.empty:
-            return
-
-        logger.info(f"[DB] Saving {len(df)} rows for {df['company'].iloc[0]}...")
-        records = list(df.itertuples(index=False, name=None))
-
-        async with aiosqlite.connect(self.db_name) as db:
-            await db.executemany(
-                """
-                INSERT OR REPLACE INTO financials (company, period_date, form_type, statement_type, label, value)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                records,
-            )
-            await db.commit()
-        logger.info("[DB] Save complete.")
-
-    # --- 2. PERIOD COVERAGE CHECKS ---
+    # ─────────────────────────────────────────────────────────────────────────
+    # 2.  PERIOD COVERAGE
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def get_covered_periods(self, ticker: str) -> Dict[FormType, Set[Period]]:
-        """
-        Scans the database to find all periods for which data is already stored.
-
-        Returns:
-            A dictionary mapping form type to a set of covered periods.
-            Example: {'10-K': {2022, 2021}, '10-Q': {(2023, 1), (2023, 2)}}
-        """
+        """Returns a dict of already-cached periods per form type."""
         ticker = ticker.upper()
-        query = (
-            "SELECT DISTINCT form_type, period_date FROM financials WHERE company = ?"
-        )
-
         async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute(query, (ticker,)) as cursor:
+            async with db.execute(
+                "SELECT DISTINCT form_type, period_date FROM financials WHERE company = ?",
+                (ticker,),
+            ) as cursor:
                 rows = await cursor.fetchall()
 
         covered: Dict[FormType, Set[Period]] = {
             ft: set() for ft in SUPPORTED_FORM_TYPES
         }
-        if not rows:
-            return covered
-
         for form_type_str, date_str in rows:
-            form_type = form_type_str  # Assuming it's already of FormType
-            if form_type in covered:
+            if form_type_str in covered:
                 ts = pd.Timestamp(date_str)
-                if form_type == "10-K":
-                    covered[form_type].add(ts.year)
-                elif form_type == "10-Q":
-                    covered[form_type].add((ts.year, ts.quarter))
-
+                if form_type_str == "10-K":
+                    covered[form_type_str].add(ts.year)
+                else:
+                    covered[form_type_str].add((ts.year, ts.quarter))
         return covered
 
     async def find_uncovered_periods(
         self, ticker: str, desired_periods: List[Period], form_type: FormType
     ) -> List[Period]:
-        """
-        Compares a list of desired periods against the database to find what's missing.
-        """
+        """Returns periods in desired_periods that are not yet in the DB."""
         if not desired_periods:
             return []
+        covered = (await self.get_covered_periods(ticker)).get(form_type, set())
+        return [p for p in desired_periods if p not in covered]
 
-        covered_periods = await self.get_covered_periods(ticker)
-        covered = covered_periods.get(form_type, set())
-        uncovered = [p for p in desired_periods if p not in covered]
+    # ─────────────────────────────────────────────────────────────────────────
+    # 3.  DATA RETRIEVAL
+    # ─────────────────────────────────────────────────────────────────────────
 
-        return uncovered
+    async def get_all_concepts(self, ticker: str) -> List[str]:
+        """
+        Returns every unique label (concept name) stored for the given ticker.
 
-    # --- 3. DATA RETRIEVAL AND QUERYING ---
+        NOTE: This is the correct replacement for the broken pattern
+              search_label(ticker, []) which always returned an empty DataFrame
+              because the keywords guard `if not keywords: return pd.DataFrame()`
+              short-circuits on an empty list.
+        """
+        ticker = ticker.upper()
+        async with aiosqlite.connect(self.db_name) as db:
+            async with db.execute(
+                "SELECT DISTINCT label FROM financials WHERE company = ? ORDER BY label ASC",
+                (ticker,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def get_labels(self, ticker: str) -> List[str]:
+        """Alias for get_all_concepts — kept for backward compatibility."""
+        return await self.get_all_concepts(ticker)
 
     async def get_data(
         self,
@@ -303,137 +396,29 @@ class FinancialDatabase:
         statement_types: List[StatementType] = ALL_STATEMENT_TYPES,
         form_types: Optional[List[FormType]] = None,
     ) -> pd.DataFrame:
-        """
-        Retrieves and pivots financial data from the database, with optional form_type filtering.
-        """
+        """Retrieves and pivots financial data from the DB with optional filtering."""
         ticker = ticker.upper()
-
         conditions = [
             "company = ?",
-            f"statement_type IN ({','.join(['?']*len(statement_types))})",
+            f"statement_type IN ({','.join(['?'] * len(statement_types))})",
         ]
-        params: List[Union[str, int]] = [ticker] + statement_types
+        params: List[Union[str, int]] = [ticker, *statement_types]
 
         if form_types:
-            conditions.append(f"form_type IN ({','.join(['?']*len(form_types))})")
+            conditions.append(f"form_type IN ({','.join(['?'] * len(form_types))})")
             params.extend(form_types)
 
-        query = f"""
-            SELECT * FROM financials
-            WHERE {" AND ".join(conditions)}
-            ORDER BY period_date DESC
-        """
+        where = " AND ".join(conditions)
+        query = f"SELECT * FROM financials WHERE {where} ORDER BY period_date DESC"
 
         async with aiosqlite.connect(self.db_name) as db:
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
-                cols = [desc[0] for desc in cursor.description]
+                cols = [d[0] for d in cursor.description]
 
         if not rows:
             return pd.DataFrame()
-
-        df = pd.DataFrame(rows, columns=cols)
-        return df.pivot_table(
-            index="label", columns=["period_date", "form_type"], values="value"
-        )
-
-    async def get_price_data(
-        self,
-        ticker: str,
-        start: str = None,
-        end: str = None,
-        interval: Literal["daily", "monthly", "quarterly", "yearly"] = "daily",
-    ) -> pd.DataFrame:
-        """
-        Get OHLCV price data for a ticker at daily, monthly, quarterly, or yearly frequency.
-
-        Parameters
-        ----------
-        ticker : str
-            Stock ticker symbol, e.g. "AAPL"
-        start : str, optional
-            Start date in "YYYY-MM-DD" format. If None, Yahoo default is used.
-        end : str, optional
-            End date in "YYYY-MM-DD" format. If None, Yahoo default is used.
-        interval : str
-            One of: "daily", "monthly", "quarterly", "yearly"
-
-        Returns
-        -------
-        pd.DataFrame
-            Resampled OHLCV price data.
-        """
-
-        import yfinance as yf
-
-        def _data_fetcher():
-            # Normalize interval string
-            preiod = interval.lower()
-
-            # Yahoo supports daily and monthly directly
-            if preiod == "daily":
-                base = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
-
-            elif preiod == "monthly":
-                base = yf.Ticker(ticker).history(start=start, end=end, interval="1mo")
-
-            # For quarterly and yearly, download daily then resample
-            elif preiod in ("quarterly", "yearly"):
-                base = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
-
-                rule = "Q" if preiod == "quarterly" else "Y"
-
-                base = base.resample(rule).agg(
-                    {
-                        "Open": "first",
-                        "High": "max",
-                        "Low": "min",
-                        "Close": "last",
-                        "Volume": "sum",
-                    }
-                )
-
-            else:
-                raise ValueError(
-                    "interval must be: 'daily', 'monthly', 'quarterly', or 'yearly'"
-                )
-            base = base.dropna(how="all")
-            if not base.empty:
-                base["stock_price"] = (base["High"] + base["Low"]) / 2
-                rename_mapping = {
-                    "Open": "stock_price_open",
-                    "High": "stock_price_high",
-                    "Low": "stock_price_low",
-                    "Close": "stock_price_close",
-                    "Volume": "stock_price_volume",
-                }
-                base = base.rename(columns=rename_mapping)
-
-            # Drop empty rows (occurs if date range is too tight)
-            return base
-
-        df = await asyncio.to_thread(_data_fetcher)
-        return df
-
-    def pivot_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.pivot_table(index="label", columns="period_date", values="value")
-
-    async def get_labels(self, ticker: str) -> List[str]:
-        """
-        Efficiently retrieves all unique labels available for a specific ticker
-        using a distinct SQL query.
-        """
-        ticker = ticker.upper()
-        query = (
-            "SELECT DISTINCT label FROM financials WHERE company = ? ORDER BY label ASC"
-        )
-
-        async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute(query, (ticker,)) as cursor:
-                rows = await cursor.fetchall()
-
-        # Flatten list of tuples: [('Label A',), ('Label B',)] -> ['Label A', 'Label B']
-        return [row[0] for row in rows]
+        return self.pivot_df(pd.DataFrame(rows, columns=cols))
 
     async def search_label(
         self,
@@ -443,90 +428,183 @@ class FinancialDatabase:
         end_date: Optional[str] = None,
     ) -> pd.DataFrame:
         """
-        Search for specific labels (rows) across the data using one or multiple keywords,
-        with optional date filtering.
+        Searches for labels matching one or more keywords (SQL LIKE).
+
+        Parameters
+        ----------
+        ticker   : stock ticker
+        keywords : one keyword string or a list; each is matched with LIKE %keyword%
+                   Pass a non-empty list — for listing ALL concepts use get_all_concepts().
+        start_date, end_date : optional ISO date strings "YYYY-MM-DD"
         """
         ticker = ticker.upper()
 
-        if start_date:
-            start_date = pd.to_datetime(start_date).strftime("%Y-%m-%d")
-
-        if end_date:
-            end_date = pd.to_datetime(end_date).strftime("%Y-%m-%d")
-
-        # Normalize keywords into a list
         if isinstance(keywords, str):
             keywords = [keywords]
 
         if not keywords:
+            logger.warning(
+                "[DB] search_label called with empty keywords for %s — "
+                "use get_all_concepts() to list all labels.",
+                ticker,
+            )
             return pd.DataFrame()
 
+        if start_date:
+            start_date = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+        if end_date:
+            end_date = pd.to_datetime(end_date).strftime("%Y-%m-%d")
+
         conditions = ["company = ?"]
-        params = [ticker]
+        sql_params: List[str] = [ticker]
 
-        label_conditions = " OR ".join(["label LIKE ?" for _ in keywords])
-        conditions.append(f"({label_conditions})")
-        params.extend([f"%{k}%" for k in keywords])
+        label_cond = " OR ".join(["label LIKE ?" for _ in keywords])
+        conditions.append(f"({label_cond})")
+        sql_params.extend(f"%{k}%" for k in keywords)
 
-        # Date filters
         if start_date:
             conditions.append("period_date >= ?")
-            params.append(start_date)
-
+            sql_params.append(start_date)
         if end_date:
             conditions.append("period_date <= ?")
-            params.append(end_date)
+            sql_params.append(end_date)
 
-        # Final SQL
-        where_clause = " AND ".join(conditions)
-
-        query = f"""
-            SELECT * FROM financials
-            WHERE {where_clause}
-            ORDER BY period_date DESC
-        """
+        where = " AND ".join(conditions)
+        query = f"SELECT * FROM financials WHERE {where} ORDER BY period_date DESC"
 
         async with aiosqlite.connect(self.db_name) as db:
-            async with db.execute(query, params) as cursor:
+            async with db.execute(query, sql_params) as cursor:
                 rows = await cursor.fetchall()
-                cols = [description[0] for description in cursor.description]
+                cols = [d[0] for d in cursor.description]
 
         if not rows:
             return pd.DataFrame()
-
         return self.pivot_df(pd.DataFrame(rows, columns=cols))
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # 4.  STOCK PRICE DATA  (yfinance)
+    # ─────────────────────────────────────────────────────────────────────────
 
-# --- EXAMPLE USAGE: SMART UPDATE WORKFLOW ---
+    async def get_price_data(
+        self,
+        ticker: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        interval: str = "yearly",
+    ) -> pd.DataFrame:
+        """
+        Fetches OHLCV price data from Yahoo Finance and resamples as requested.
+
+        Parameters
+        ----------
+        ticker   : stock ticker symbol
+        start    : start date "YYYY-MM-DD" (passed to yfinance)
+        end      : end date   "YYYY-MM-DD"
+        interval : one of "daily", "monthly", "quarterly", "yearly"
+
+        Returns a DataFrame with a 'stock_price' column (midpoint of High and Low).
+        """
+        import yfinance as yf
+
+        def _fetch() -> pd.DataFrame:
+            freq = interval.lower()
+            if freq == "daily":
+                base = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
+            elif freq == "monthly":
+                base = yf.Ticker(ticker).history(start=start, end=end, interval="1mo")
+            elif freq in ("quarterly", "yearly"):
+                base = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
+                rule = "QE" if freq == "quarterly" else "YE"
+                base = base.resample(rule).agg(
+                    {
+                        "Open": "first",
+                        "High": "max",
+                        "Low": "min",
+                        "Close": "last",
+                        "Volume": "sum",
+                    }
+                )
+            else:
+                raise ValueError(
+                    f"interval must be 'daily', 'monthly', 'quarterly', or 'yearly', got '{interval}'"
+                )
+
+            base = base.dropna(how="all")
+            if not base.empty:
+                base["stock_price"] = (base["High"] + base["Low"]) / 2
+                base = base.rename(
+                    columns={
+                        "Open": "stock_price_open",
+                        "High": "stock_price_high",
+                        "Low": "stock_price_low",
+                        "Close": "stock_price_close",
+                        "Volume": "stock_price_volume",
+                    }
+                )
+            return base
+
+        return await asyncio.to_thread(_fetch)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 5.  HELPERS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def pivot_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Pivots a long-format DB result into wide format:
+          rows   = label (metric / concept name)
+          columns = period_date
+        """
+        if df.empty:
+            return df
+        return df.pivot_table(
+            index="label", columns="period_date", values="value", aggfunc="first"
+        )
+
+    async def _bulk_insert(self, df: pd.DataFrame) -> None:
+        """Bulk INSERT OR REPLACE into the financials table."""
+        if df.empty:
+            return
+        ticker = df["company"].iloc[0]
+        logger.info("[DB] Saving %d rows for %s …", len(df), ticker)
+        records = list(df.itertuples(index=False, name=None))
+        async with aiosqlite.connect(self.db_name) as db:
+            await db.executemany(
+                """INSERT OR REPLACE INTO financials
+                   (company, period_date, form_type, statement_type, label, value)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                records,
+            )
+            await db.commit()
+        logger.info("[DB] Save complete.")
 
 
-async def smart_update_workflow():
-    """Demonstrates the efficient workflow for updating the database."""
-    db = FinancialDatabase()
-    await db.initialize()
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    TICKER = "MSFT"
 
-    # 1. Define all the periods we want to ensure we have locally.
-    desired_periods: List[Period] = [
-        (2023, 1),  # Q1 2023 report
-        (2023, 2),  # Q2 2023 report
-        (2022, 4),  # Q4 2022 report
-    ]
-    logger.info(f"--- Starting Smart Update for {TICKER} ---")
-    logger.info(f"Desired periods: {desired_periods}")
+def _looks_like_date(s: str) -> bool:
+    """Heuristic: does this string look like a period-date column header?"""
+    return bool(
+        s[:4].isdigit()  # starts with 4-digit year
+        or (len(s) >= 7 and s[4] in ("-", "/", "Q"))
+    )
 
-    await db.update_financials(TICKER, desired_periods, "10-Q")
 
-    # 4. Demonstrate retrieving the data with filtering
-    logger.info("\n--- Retrieving 2022 & 2021 Annual (10-K) Data Only ---")
-    annual_data = await db.get_data(TICKER, form_types=["10-K"])
-    logger.info(annual_data.head())
-
-    logger.info("\n--- Retrieving 2023 Quarterly (10-Q) Data Only ---")
-    quarterly_data = await db.get_data(TICKER, form_types=["10-Q"])
-    logger.info(quarterly_data.head())
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Quick smoke-test  (python -m core.agents.financial_db)
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    asyncio.run(smart_update_workflow())
+    import asyncio as _asyncio
+
+    async def _smoke():
+        db = FinancialDatabase()
+        await db.initialize()
+        await db.update_financials("MSFT", [2022, 2023], "10-K")
+        concepts = await db.get_all_concepts("MSFT")
+        print(f"MSFT has {len(concepts)} concepts stored.")
+        print(concepts[:20])
+
+    _asyncio.run(_smoke())

@@ -24,9 +24,9 @@ class ServiceManager:
         self._subgraph_store = None
 
     def get_agent(self, temperature=0.0):
+        """Initializes and returns the language model instance."""
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
 
-        """Initializes and returns the language model instance."""
         if self._llm is None:
             try:
                 self._llm = ChatGoogleGenerativeAI(
@@ -43,9 +43,9 @@ class ServiceManager:
         return self._llm
 
     def get_embedding_func(self):
+        """Initializes and returns the embedding model instance."""
         from langchain_google_genai.embeddings import GoogleGenerativeAIEmbeddings
 
-        """Initializes and returns the embedding model instance."""
         if self._embedding_func is None:
             try:
                 self._embedding_func = GoogleGenerativeAIEmbeddings(
@@ -66,7 +66,8 @@ class ServiceManager:
         return "chunks"
 
     def get_financial_database(self):
-        from core.agents.get_financial_data import FinancialDatabase
+        # FIX: was importing from non-existent 'core.agents.get_financial_data'
+        from core.agents.financial_db import FinancialDatabase
 
         if self._financial_db is None:
             try:
