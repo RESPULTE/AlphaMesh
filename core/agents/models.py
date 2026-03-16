@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,21 +32,19 @@ class BaseAgentInput(BaseModel):
     end_date: Optional[datetime] = Field(
         default=None, description="End date (format: YYYY-MM-DD)."
     )
+    # ── Fundamental agent granularity ────────────────────────────────────────
+    granularity: Literal["yearly", "quarterly"] = Field(
+        default="yearly",
+        description=(
+            "Data granularity for the fundamental agent. "
+            "'yearly' fetches 10-K annual filings over a 5-year window (default). "
+            "'quarterly' fetches 10-Q filings — the orchestrator should set this "
+            "when the user explicitly asks for quarterly trends or TTM figures."
+        ),
+    )
+    # ── Internal / excluded from serialisation ────────────────────────────────
     memory_task: Optional[Any] = Field(default=None, exclude=True)
     conversation_id: Optional[str] = Field(default=None, exclude=True)
-
-    # @field_validator("start_date", "end_date", mode="before")
-    # def parse_dates(cls, v):
-    #     if v is None:
-    #         return None
-    #     if isinstance(v, datetime):
-    #         return v
-    #     if isinstance(v, str):
-    #         try:
-    #             return datetime.strptime(v, "%Y-%m-%d")
-    #         except ValueError:
-    #             return datetime.fromisoformat(v)
-    #     return v
 
 
 class BaseAgentOutput(BaseModel, ABC):

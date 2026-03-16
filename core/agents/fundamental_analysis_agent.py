@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import operator
+from datetime import datetime
 from typing import Annotated, Any, Dict, List, Optional, Type
 
 import pandas as pd
@@ -315,64 +316,114 @@ class FundamentalAnalysisAgent(AbstractAgent):
     async def _data_prep_node(self, state: _AgentState) -> Dict:
         """
         Concurrently:
-          1. Ensures EDGAR data is cached for the requested years (10-K)
-          2. Fetches price data from yfinance if needed
-          3. Loads the full concept catalogue from the local DB
+          1. Ensures EDGAR data is cached for the requested periods
+          2. Fetches price data from yfinance at matching granularity
+          3. Loads financial data from local DB and normalises period dates
 
-        Then assembles financial_data (wide DataFrame) and available_concepts.
+        Granularity behaviour
+        ─────────────────────
+        yearly   (default) — fetches 10-K filings, 5-year window.
+                             Normalises all EDGAR fiscal year-end dates to
+                             YYYY-12-31 so they align with yfinance YE prices.
+        quarterly          — fetches 10-Q filings, last 8 quarters.
+                             Normalises to quarter-end (YYYY-MM-30/31) so they
+                             align with yfinance QE prices.
+
+        This normalisation is the fix for the NaN-column problem: companies
+        with non-calendar fiscal years (e.g. Apple ending 2025-09-27) would
+        produce a column that never matches the yfinance 2025-12-31 column,
+        filling every cell with NaN after the union merge.
         """
+        from datetime import timedelta
+
+        ticker = state.ticker
+        granularity = getattr(state, "granularity", "yearly")
+
+        # ── Resolve date window ───────────────────────────────────────────────
+        end_dt = state.end_date or datetime.now()
+        if granularity == "yearly":
+            # Default: 5-year window ending at end_dt
+            default_start = datetime(end_dt.year - 4, 1, 1)
+            start_dt = state.start_date if state.start_date else default_start
+            # Always guarantee at least 5 years so CAGR/DCF have enough data
+            if (end_dt.year - start_dt.year) < 4:
+                start_dt = datetime(end_dt.year - 4, 1, 1)
+            form_type = "10-K"
+            price_interval = "yearly"
+            periods = list(range(start_dt.year, end_dt.year + 1))
+        else:
+            # Quarterly: default last 8 quarters (~2 years)
+            default_start = end_dt - timedelta(days=2 * 365)
+            start_dt = state.start_date if state.start_date else default_start
+            form_type = "10-Q"
+            price_interval = "quarterly"
+            periods = _quarterly_periods(start_dt, end_dt)
+
         logger.info(
-            "[Node] data_prep — %s %s→%s",
-            state.ticker,
-            state.start_date,
-            state.end_date,
+            "[Node] data_prep — %s | granularity=%s | %s → %s | periods=%s",
+            ticker,
+            granularity,
+            start_dt.date(),
+            end_dt.date(),
+            periods,
         )
 
-        years = list(range(state.start_date.year, state.end_date.year + 1))
-        ticker = state.ticker
-
-        # Run EDGAR update and price fetch concurrently
+        # ── Concurrent EDGAR cache update + price fetch ───────────────────────
         async def _edgar_update():
-            await self.db.update_financials(ticker, years, "10-K")
+            await self.db.update_financials(ticker, periods, form_type)
 
         async def _price_fetch():
             return await self.db.get_price_data(
                 ticker,
-                start=state.start_date.strftime("%Y-%m-%d"),
-                end=state.end_date.strftime("%Y-%m-%d"),
-                interval="yearly",
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                interval=price_interval,
             )
 
         edgar_task = asyncio.create_task(_edgar_update())
         price_task = asyncio.create_task(_price_fetch())
-        await edgar_task  # must finish before we query DB
+        await edgar_task  # DB must be populated before we query it
         price_df: pd.DataFrame = await price_task
 
-        # Fetch the complete financial statement data from DB
-        financial_df = await self.db.search_label(
-            ticker,
-            keywords=await self.db.get_all_concepts(ticker),
-            start_date=(
-                state.start_date.strftime("%Y-%m-%d") if state.start_date else None
-            ),
-            end_date=state.end_date.strftime("%Y-%m-%d") if state.end_date else None,
-        )
+        # ── Fetch financial data from DB (form-type filtered, then date-trim) ─
+        # Using get_data() avoids the O(n-concepts) LIKE anti-pattern that
+        # search_label(all_concepts) would produce.
+        financial_df = await self.db.get_data(ticker, form_types=[form_type])
 
-        # Also get all available concept names for the planner
-        available_concepts = await self.db.get_all_concepts(ticker)
+        if not financial_df.empty:
+            # Trim to the requested date window
+            try:
+                col_dates = pd.to_datetime(financial_df.columns, errors="coerce")
+                keep_mask = (col_dates >= pd.Timestamp(start_dt)) & (
+                    col_dates <= pd.Timestamp(end_dt)
+                )
+                financial_df = financial_df.loc[:, keep_mask]
+            except Exception as exc:
+                logger.warning("[data_prep] Date trimming failed: %s", exc)
 
-        # Merge price data into the financial DataFrame
+        # ── Normalise EDGAR period dates to canonical period-end ──────────────
+        # ROOT CAUSE FIX: EDGAR stores Apple FY2025 as "2025-09-27" (actual
+        # fiscal year-end).  yfinance YE resampling produces "2025-12-31".
+        # Unioning these produces three columns where two are all-NaN.
+        # Normalising both to the same canonical date (YYYY-12-31 for yearly,
+        # quarter-end for quarterly) before the merge eliminates all NaN columns.
+        if not financial_df.empty:
+            financial_df = _normalize_period_ends(financial_df, granularity)
+
+        available_concepts = list(financial_df.index) if not financial_df.empty else []
+
+        # ── Merge stock price row ─────────────────────────────────────────────
         if not price_df.empty and "stock_price" in price_df.columns:
             price_t = price_df[["stock_price"]].T
-            price_t.columns = pd.to_datetime(price_t.columns).strftime("%Y-%m-%d")
+            # Normalise price columns to the same canonical format
+            price_t.columns = _canonical_date_strs(price_t.columns, granularity)
+
             if not financial_df.empty:
-                financial_df.columns = pd.to_datetime(financial_df.columns).strftime(
-                    "%Y-%m-%d"
-                )
-                # Align columns to the intersection + union
+                # Both are now on the same canonical dates — a clean inner union
                 all_cols = sorted(set(financial_df.columns) | set(price_t.columns))
                 financial_df = financial_df.reindex(columns=all_cols)
                 price_t = price_t.reindex(columns=all_cols)
+
             financial_df = pd.concat([financial_df, price_t])
             if "stock_price" not in available_concepts:
                 available_concepts.append("stock_price")
@@ -380,6 +431,13 @@ class FundamentalAnalysisAgent(AbstractAgent):
         if financial_df.empty:
             logger.warning(
                 "[data_prep] No financial data found for %s in the requested range.",
+                ticker,
+            )
+        else:
+            logger.info(
+                "[data_prep] Ready: %d concepts × %d periods for %s",
+                len(financial_df.index),
+                len(financial_df.columns),
                 ticker,
             )
 
@@ -659,6 +717,68 @@ class FundamentalAnalysisAgent(AbstractAgent):
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _quarterly_periods(start: datetime, end: datetime):
+    """
+    Returns a list of (year, quarter) tuples covering start..end inclusive.
+    """
+    periods = []
+    year, month = start.year, start.month
+    while datetime(year, month, 1) <= end:
+        quarter = (month - 1) // 3 + 1
+        if (year, quarter) not in periods:
+            periods.append((year, quarter))
+        month += 3
+        if month > 12:
+            month -= 12
+            year += 1
+    return periods
+
+
+def _normalize_period_ends(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    """
+    Renames DataFrame columns from raw EDGAR fiscal-period dates to
+    canonical period-end dates so they align with yfinance resampled prices.
+
+    yearly    : any date in year YYYY  →  YYYY-12-31
+                e.g. Apple's  2025-09-27  →  2025-12-31
+    quarterly : any date in quarter Q  →  last day of that quarter
+                e.g. 2025-09-27  →  2025-09-30  (Q3 end)
+    """
+    rename: Dict[str, str] = {}
+    for col in df.columns:
+        try:
+            ts = pd.Timestamp(col)
+            if granularity == "yearly":
+                rename[col] = ts.replace(month=12, day=31).strftime("%Y-%m-%d")
+            else:
+                rename[col] = (
+                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
+                )
+        except Exception:
+            rename[col] = str(col)
+    return df.rename(columns=rename)
+
+
+def _canonical_date_strs(index, granularity: str) -> list:
+    """
+    Converts a DatetimeIndex (or any iterable of date-like values) to
+    canonical period-end date strings matching _normalize_period_ends output.
+    """
+    result = []
+    for val in index:
+        try:
+            ts = pd.Timestamp(val)
+            if granularity == "yearly":
+                result.append(ts.replace(month=12, day=31).strftime("%Y-%m-%d"))
+            else:
+                result.append(
+                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
+                )
+        except Exception:
+            result.append(str(val))
+    return result
 
 
 def _format_value(x: float) -> str:
