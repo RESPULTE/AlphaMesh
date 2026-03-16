@@ -4,7 +4,7 @@ AlphaMesh — Streamlit Chat Front-End
 Design Philosophy: Claude.ai-inspired comfort
   • Soft warm-ivory background, not pure white
   • Rounded cards and bubbles
-  • Dm Serif Display (headings) + DM Sans (body)
+  • DM Serif Display (headings) + DM Sans (body)
   • Accent: warm amber/gold for AI, soft slate for user
   • Subtle pulse animation while agent is running
   • Citations: inline [N] badges with hover tooltip showing title + URL
@@ -18,6 +18,7 @@ import re
 import uuid
 from typing import Optional
 
+import markdown as md_lib
 import pandas as pd
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
@@ -184,6 +185,45 @@ st.markdown(
         border-top-right-radius: 4px;
     }
 
+    /* ── Markdown typography inside bubbles ────────────────────────── */
+    .chat-bubble p          { margin: 0 0 10px; }
+    .chat-bubble p:last-child { margin-bottom: 0; }
+    .chat-bubble h1,
+    .chat-bubble h2,
+    .chat-bubble h3         { font-family: var(--font-display);
+                               color: var(--text-primary);
+                               margin: 14px 0 6px;
+                               line-height: 1.3; }
+    .chat-bubble h1         { font-size: 18px; }
+    .chat-bubble h2         { font-size: 16px; }
+    .chat-bubble h3         { font-size: 14.5px; }
+    .chat-bubble strong     { font-weight: 600; color: var(--text-primary); }
+    .chat-bubble em         { font-style: italic; color: var(--text-secondary); }
+    .chat-bubble ul,
+    .chat-bubble ol         { margin: 6px 0 10px 20px; padding: 0; }
+    .chat-bubble li         { margin-bottom: 4px; }
+    .chat-bubble code       { font-family: 'Fira Code', monospace;
+                               font-size: 12.5px;
+                               background: var(--surface-2);
+                               border: 1px solid var(--border);
+                               border-radius: 4px;
+                               padding: 1px 5px; }
+    .chat-bubble pre        { background: var(--surface-2);
+                               border: 1px solid var(--border);
+                               border-radius: var(--radius-sm);
+                               padding: 10px 14px;
+                               overflow-x: auto;
+                               margin: 8px 0; }
+    .chat-bubble pre code   { background: none; border: none; padding: 0; }
+    .chat-bubble blockquote { border-left: 3px solid var(--accent);
+                               margin: 8px 0;
+                               padding: 4px 12px;
+                               color: var(--text-secondary); }
+    .chat-bubble hr         { border: none;
+                               border-top: 1px solid var(--border);
+                               margin: 12px 0; }
+    .chat-bubble a          { color: var(--accent-dark); text-decoration: underline; }
+
     /* ── Citation badges ───────────────────────────────────────────── */
     .cite {
         display: inline-flex;
@@ -199,10 +239,11 @@ st.markdown(
         border: 1px solid rgba(200,149,74,0.35);
         cursor: help;
         position: relative;
-        text-decoration: none;
+        text-decoration: none !important;
         vertical-align: middle;
         margin: 0 1px;
         transition: background 0.15s, transform 0.15s;
+        white-space: nowrap;
     }
     .cite:hover {
         background: var(--accent);
@@ -271,9 +312,7 @@ st.markdown(
         color: var(--text-secondary);
         animation: fadeSlideIn 0.3s ease both;
     }
-    .dots {
-        display: flex; gap: 4px; align-items: center;
-    }
+    .dots { display: flex; gap: 4px; align-items: center; }
     .dot {
         width: 6px; height: 6px;
         background: var(--accent);
@@ -290,13 +329,6 @@ st.markdown(
     }
 
     /* ── Data table wrapper ────────────────────────────────────────── */
-    .am-table-wrap {
-        margin-top: 12px;
-        border-radius: var(--radius-md);
-        overflow: hidden;
-        border: 1px solid var(--border);
-        box-shadow: var(--shadow-sm);
-    }
     .am-table-label {
         font-size: 11px;
         font-weight: 600;
@@ -329,16 +361,13 @@ st.markdown(
         font-size: 12.5px;
     }
     .source-num {
-        min-width: 20px;
-        height: 20px;
+        min-width: 20px; height: 20px;
         background: var(--accent-light);
         color: var(--accent-dark);
-        font-weight: 700;
-        font-size: 10.5px;
+        font-weight: 700; font-size: 10.5px;
         border-radius: 50%;
         display: flex; align-items: center; justify-content: center;
-        flex-shrink: 0;
-        margin-top: 1px;
+        flex-shrink: 0; margin-top: 1px;
     }
     .source-link {
         color: var(--accent-dark);
@@ -367,11 +396,7 @@ st.markdown(
         padding: 60px 20px;
         color: var(--text-muted);
     }
-    .am-empty-icon {
-        font-size: 40px;
-        margin-bottom: 16px;
-        opacity: 0.6;
-    }
+    .am-empty-icon  { font-size: 40px; margin-bottom: 16px; opacity: 0.6; }
     .am-empty-title {
         font-family: var(--font-display);
         font-size: 22px;
@@ -379,17 +404,12 @@ st.markdown(
         margin-bottom: 8px;
     }
     .am-empty-sub {
-        font-size: 14px;
-        line-height: 1.6;
-        max-width: 420px;
-        margin: 0 auto;
+        font-size: 14px; line-height: 1.6;
+        max-width: 420px; margin: 0 auto;
     }
     .am-suggestions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        justify-content: center;
-        margin-top: 24px;
+        display: flex; flex-wrap: wrap; gap: 8px;
+        justify-content: center; margin-top: 24px;
     }
     .am-suggestion {
         background: var(--surface);
@@ -424,15 +444,18 @@ st.markdown(
 
 def _init_state():
     if "messages" not in st.session_state:
-        st.session_state.messages = []  # list[dict] with role/content/sources/df
+        st.session_state.messages = []
     if "lc_history" not in st.session_state:
-        st.session_state.lc_history = []  # list[BaseMessage] for the agent
+        st.session_state.lc_history = []
     if "agent" not in st.session_state:
         st.session_state.agent = OrchestratorAgent()
     if "conversation_id" not in st.session_state:
         st.session_state.conversation_id = str(uuid.uuid4())
     if "running" not in st.session_state:
         st.session_state.running = False
+    if "pending_query" not in st.session_state:
+        # Holds a suggestion chip text until the next render loop picks it up
+        st.session_state.pending_query = None
 
 
 _init_state()
@@ -441,7 +464,6 @@ _init_state()
 # DataFrame formatting helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Row labels that represent ratios / percentages.
 _RATIO_LABEL_RE = re.compile(
     r"(margin|ratio|cagr|yield|growth|rate|return|roe|roa|roic|roc|coverage"
     r"|turnover|efficiency|payout|pe_ratio|pb_ratio|ps_ratio|ev_|price_to"
@@ -451,13 +473,6 @@ _RATIO_LABEL_RE = re.compile(
 
 
 def _is_ratio_row(label: str, series: pd.Series) -> bool:
-    """
-    Heuristic: treat a row as a ratio/percentage when EITHER:
-      1. Its label matches known ratio keywords, OR
-      2. All non-null numeric values fall in (-20, 20)  — catches computed
-         ratios stored as decimals (e.g. gross_margin = 0.42) or small
-         multiples (e.g. pe_ratio = 28.3).
-    """
     if _RATIO_LABEL_RE.search(str(label)):
         return True
     numeric = pd.to_numeric(series, errors="coerce").dropna()
@@ -467,7 +482,6 @@ def _is_ratio_row(label: str, series: pd.Series) -> bool:
 
 
 def _fmt_financial(value: float) -> str:
-    """Format a raw dollar / unit number with B / M / K suffixes."""
     if pd.isna(value):
         return "—"
     abs_v = abs(value)
@@ -483,11 +497,6 @@ def _fmt_financial(value: float) -> str:
 
 
 def _fmt_ratio(value: float) -> str:
-    """
-    Format a ratio as a percentage string.
-    Decimal form (≤ 1.5 abs) → multiply by 100 first.
-    Already-scaled form (e.g. pe_ratio = 28.3, cagr = 12.5) → use as-is.
-    """
     if pd.isna(value):
         return "—"
     try:
@@ -500,11 +509,6 @@ def _fmt_ratio(value: float) -> str:
 
 
 def _format_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return a string-valued display copy of the DataFrame:
-      • Ratio / margin / rate rows  →  percentage strings
-      • All other rows              →  B / M / K suffix strings
-    """
     display = df.copy().astype(object)
     for label in display.index:
         row = df.loc[label]
@@ -530,37 +534,81 @@ def _format_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Helpers
+# Citation + Markdown helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Matches [N] citation markers that are NOT already inside an HTML tag.
+# Uses a negative look-behind for '>' to avoid double-processing.
+_CITE_RE = re.compile(r"(?<![>])\[(\d+)\]")
+
+
+def _citation_badge(num: int, src) -> str:
+    """Build the HTML for a single hoverable citation badge."""
+    safe_title = src.title.replace('"', "&quot;").replace("'", "&#39;")
+    display_url = src.url[:55] + "…" if len(src.url) > 58 else src.url
+    safe_url = display_url.replace('"', "&quot;").replace("'", "&#39;")
+    return (
+        f'<span class="cite">[{num}]'
+        f'<span class="tooltip">'
+        f'<span class="t-title">{safe_title}</span>'
+        f'<span class="t-url">{safe_url}</span>'
+        f"</span></span>"
+    )
+
+
+def _render_ai_content(text: str, sources) -> str:
+    """
+    Convert an AI response to display HTML:
+      1. Protect [N] citation markers from the markdown parser by replacing
+         them with unique placeholders.
+      2. Run the full text through the markdown library (bold, italic, headers,
+         lists, code blocks, blockquotes all get converted to HTML).
+      3. Restore citation markers as hoverable badge HTML.
+    """
+    src_map = {s.source_id: s for s in (sources or [])}
+
+    # Step 1 — stash citation markers so markdown doesn't mangle them
+    placeholders: dict[str, str] = {}
+
+    def _stash(m: re.Match) -> str:
+        num = int(m.group(1))
+        token = f"\x00CITE{num}\x00"
+        placeholders[token] = num
+        return token
+
+    protected = _CITE_RE.sub(_stash, text)
+
+    # Step 2 — convert markdown → HTML
+    html = md_lib.markdown(
+        protected,
+        extensions=["extra", "nl2br"],  # tables, fenced code, smart line-breaks
+    )
+
+    # Step 3 — replace placeholder tokens with badge HTML
+    for token, num in placeholders.items():
+        src = src_map.get(num)
+        if src:
+            badge = _citation_badge(num, src)
+        else:
+            # Source not in map: render a plain badge with no tooltip
+            badge = f'<span class="cite">[{num}]<span class="tooltip"><span class="t-title">Source {num}</span></span></span>'
+        html = html.replace(token, badge)
+
+    return html
+
+
+def _render_user_content(text: str) -> str:
+    """Convert user message markdown to HTML (no citations)."""
+    return md_lib.markdown(text, extensions=["extra", "nl2br"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Message renderer
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _build_citation_html(text: str, sources) -> str:
-    """Replace [N] markers in text with hoverable citation badges."""
-    if not sources:
-        return text
-    src_map = {s.source_id: s for s in sources}
-
-    def _replace(m):
-        num = int(m.group(1))
-        src = src_map.get(num)
-        if src is None:
-            return m.group(0)
-        safe_title = src.title.replace('"', "&quot;").replace("'", "&#39;")
-        safe_url = src.url.replace('"', "&quot;").replace("'", "&#39;")
-        display_url = src.url[:55] + "…" if len(src.url) > 58 else src.url
-        return (
-            f'<span class="cite">[{num}]'
-            f'<span class="tooltip">'
-            f'<span class="t-title">{safe_title}</span>'
-            f'<span class="t-url">{display_url}</span>'
-            f"</span></span>"
-        )
-
-    return re.sub(r"\[(\d+)\]", _replace, text)
-
-
 def _render_message(msg: dict):
-    role = msg["role"]  # "user" | "assistant"
+    role = msg["role"]
     content = msg.get("content", "")
     sources = msg.get("sources", [])
     df: Optional[pd.DataFrame] = msg.get("df")
@@ -571,14 +619,13 @@ def _render_message(msg: dict):
     avatar_cls = "chat-avatar avatar-user" if is_user else "chat-avatar avatar-ai"
     avatar_icon = "U" if is_user else "✦"
 
-    # Build inner HTML for the bubble
-    if is_user:
-        inner_html = content.replace("\n", "<br>")
-    else:
-        inner_html = _build_citation_html(content, sources)
-        inner_html = inner_html.replace("\n", "<br>")
+    inner_html = (
+        _render_user_content(content)
+        if is_user
+        else _render_ai_content(content, sources)
+    )
 
-    # Sources block inside bubble
+    # Sources footer (AI only)
     sources_html = ""
     if sources and not is_user:
         items = "".join(
@@ -602,7 +649,7 @@ def _render_message(msg: dict):
         unsafe_allow_html=True,
     )
 
-    # Render DataFrame outside the bubble (Streamlit limitation)
+    # DataFrame below the bubble
     if df is not None and not df.empty:
         st.markdown(
             '<div class="am-table-label">Financial Data</div>', unsafe_allow_html=True
@@ -611,10 +658,7 @@ def _render_message(msg: dict):
         with st.container():
             st.dataframe(
                 display_df.style.set_properties(
-                    **{
-                        "font-size": "12.5px",
-                        "font-family": "'DM Sans', sans-serif",
-                    }
+                    **{"font-size": "12.5px", "font-family": "'DM Sans', sans-serif"}
                 ).set_table_styles(
                     [
                         {
@@ -651,11 +695,14 @@ def _render_message(msg: dict):
             )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent runner
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 def _run_agent_sync(query: str) -> FinalResponse:
-    """Run the async agent in a blocking call."""
     queue = get_queue()
     queue.start_response("orchestrator")
-
     lc_msgs = st.session_state.lc_history + [HumanMessage(content=query)]
     loop = asyncio.new_event_loop()
     try:
@@ -676,9 +723,7 @@ _THINKING_HTML = """
   <div class="chat-avatar avatar-ai">✦</div>
   <div class="am-thinking">
     <div class="dots">
-      <div class="dot"></div>
-      <div class="dot"></div>
-      <div class="dot"></div>
+      <div class="dot"></div><div class="dot"></div><div class="dot"></div>
     </div>
     {label}
   </div>
@@ -689,7 +734,6 @@ _THINKING_HTML = """
 # Layout
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Header
 st.markdown(
     """
     <div class="am-header">
@@ -704,7 +748,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Message history ──────────────────────────────────────────────────────────
+_SUGGESTIONS = [
+    "AAPL revenue growth over 5 years",
+    "NVIDIA latest earnings sentiment",
+    "DCF valuation for MSFT",
+    "Tesla news this month",
+]
+
 if not st.session_state.messages:
     st.markdown(
         """
@@ -716,30 +766,49 @@ if not st.session_state.messages:
             portfolio insights. I'll analyse multiple sources and synthesise
             a grounded answer for you.
           </div>
-          <div class="am-suggestions">
-            <div class="am-suggestion">AAPL revenue growth over 5 years</div>
-            <div class="am-suggestion">NVIDIA latest earnings sentiment</div>
-            <div class="am-suggestion">DCF valuation for MSFT</div>
-            <div class="am-suggestion">Tesla news this month</div>
-          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    # Render suggestion chips as real Streamlit buttons inside a flex row.
+    # CSS below overrides the default button appearance to match .am-suggestion.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
+            background: var(--surface) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 20px !important;
+            padding: 7px 14px !important;
+            font-size: 13px !important;
+            font-family: var(--font-body) !important;
+            color: var(--text-secondary) !important;
+            transition: all 0.15s !important;
+            box-shadow: none !important;
+        }
+        div[data-testid="stHorizontalBlock"] button[kind="secondary"]:hover {
+            border-color: var(--accent) !important;
+            color: var(--accent-dark) !important;
+            background: var(--accent-light) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(len(_SUGGESTIONS))
+    for col, suggestion in zip(cols, _SUGGESTIONS):
+        with col:
+            if st.button(suggestion, key=f"sug_{suggestion}", use_container_width=True):
+                st.session_state.pending_query = suggestion
+                st.rerun()
 else:
     for msg in st.session_state.messages:
         _render_message(msg)
 
-# ── Single thinking + event placeholders, always appended AFTER history ──────
-# Placing these here (outside the running check) means Streamlit allocates
-# exactly one slot per render pass.  When running=False they remain empty.
-# This eliminates the N-loading-bars bug where each st.rerun() re-executed
-# the old thinking_placeholder.markdown() calls that were inside the history
-# loop on previous passes.
+# Single thinking + event placeholders — always after history, never duplicated
 thinking_placeholder = st.empty()
 event_placeholder = st.empty()
 
-# ── Chat input ───────────────────────────────────────────────────────────────
 user_input = st.chat_input(
     placeholder="Ask about a ticker, financials, news, or your portfolio…",
     disabled=st.session_state.running,
@@ -749,12 +818,16 @@ user_input = st.chat_input(
 # Handle submission
 # ══════════════════════════════════════════════════════════════════════════════
 
-if user_input and not st.session_state.running:
-    st.session_state.messages.append({"role": "user", "content": user_input})
+# Resolve the query from either the chat input or a suggestion chip click
+_submitted = user_input or st.session_state.pending_query
+if _submitted:
+    st.session_state.pending_query = None  # consume it
+
+if _submitted and not st.session_state.running:
+    st.session_state.messages.append({"role": "user", "content": _submitted})
     st.session_state.running = True
     st.rerun()
 
-# ── Execute agent when running flag is set ────────────────────────────────────
 if (
     st.session_state.running
     and st.session_state.messages
@@ -762,13 +835,11 @@ if (
 ):
     query = st.session_state.messages[-1]["content"]
 
-    # Fill the single placeholder with the animated indicator
     thinking_placeholder.markdown(
         _THINKING_HTML.format(label="Analysing with multi-agent pipeline…"),
         unsafe_allow_html=True,
     )
 
-    # Attach StreamlitSink for live event display
     queue = get_queue()
     queue.add_sink(
         StreamlitSink(placeholder=event_placeholder, min_level=EventLevel.INFO)
@@ -776,15 +847,12 @@ if (
 
     result: FinalResponse = _run_agent_sync(query)
 
-    # Clear thinking UI
     thinking_placeholder.empty()
     event_placeholder.empty()
 
-    # Update LangChain history
     st.session_state.lc_history.append(HumanMessage(content=query))
     st.session_state.lc_history.append(AIMessage(content=result.summary))
 
-    # Store assistant message
     st.session_state.messages.append(
         {
             "role": "assistant",

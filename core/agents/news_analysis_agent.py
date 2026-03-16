@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Type
+from typing import Dict, List, Tuple, Type
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -62,13 +62,60 @@ def _merge_cached_entities(conversation_id: str, entities: List[dict]) -> None:
         entity_type = getattr(entity, "entity_type", None)
         if not entity_id or not entity_name or not entity_type:
             continue
-
         cache[entity_id] = {
             "id": entity_id,
             "name": entity_name,
             "entity_type": entity_type,
         }
     _ENTITY_CACHE_TS[conversation_id] = time.time()
+
+
+def _build_deduplicated_sources(
+    chunks: List[RetrievedChunk],
+) -> Tuple[List[CitedSource], Dict[int, int]]:
+    """
+    Deduplicate chunks by article (title + url) and return:
+      - sources: one CitedSource per unique article, numbered 1..N
+      - chunk_to_source_id: maps the original chunk index (0-based) to its
+        canonical source_id so context blocks can reference the right number.
+
+    Multiple chunks from the same article get the same source_id. The
+    CitedSource.page_content accumulates all unique chunk texts for that
+    article so the tooltip remains informative.
+    """
+    # Ordered dict: (title, url) -> (source_id, accumulated_texts)
+    article_map: Dict[Tuple[str, str], Tuple[int, List[str]]] = {}
+    chunk_to_source_id: Dict[int, int] = {}
+    next_id = 1
+
+    for chunk_idx, chunk in enumerate(chunks):
+        metadata = chunk.metadata or {}
+        title = metadata.get("article_title") or chunk.article_title or "Unknown Title"
+        url = metadata.get("source_url") or chunk.source_url or ""
+        key = (title, url)
+
+        if key not in article_map:
+            article_map[key] = (next_id, [chunk.text])
+            next_id += 1
+        else:
+            sid, texts = article_map[key]
+            if chunk.text not in texts:
+                texts.append(chunk.text)
+
+        chunk_to_source_id[chunk_idx] = article_map[key][0]
+
+    sources: List[CitedSource] = []
+    for (title, url), (source_id, texts) in article_map.items():
+        sources.append(
+            CitedSource(
+                source_id=source_id,
+                title=title,
+                url=url,
+                page_content="\n\n".join(texts),
+            )
+        )
+
+    return sources, chunk_to_source_id
 
 
 class NewsAnalysisAgent(AbstractAgent):
@@ -161,17 +208,7 @@ class NewsAnalysisAgent(AbstractAgent):
         if start < api_limit_date:
             start = api_limit_date
 
-        # ── Build an advanced boolean query ─────────────────────────────────
-        # Modify must_include / must_exclude / any_of to taste, or expose them
-        # as fields on NewsAgentState for per-request customisation.
-        q = build_news_query(
-            ticker=state.ticker,
-            # company_name="Apple Inc",      # optional: improves recall
-            # must_include=["earnings"],     # optional: narrow to a topic
-            # must_exclude=["crypto"],       # optional: filter noise
-            # any_of=["revenue", "profit"],  # optional: OR group
-            # exact_phrase="quarterly results",  # optional: exact match
-        )
+        q = build_news_query(ticker=state.ticker)
         logger.info("NewsAPI query: %s", q)
 
         try:
@@ -265,24 +302,23 @@ class NewsAnalysisAgent(AbstractAgent):
         else:
             cached_entities = []
 
-        sources: List[CitedSource] = []
-        for idx, chunk in enumerate(state.final_chunks, start=1):
-            metadata = chunk.metadata or {}
-            sources.append(
-                CitedSource(
-                    source_id=idx,
-                    title=metadata.get("article_title", "Unknown Title"),
-                    url=metadata.get("source_url", ""),
-                    page_content=chunk.text,
-                )
-            )
+        # ── Deduplicate chunks by article so chunks from the same article
+        #    share one source_id. The LLM sees e.g. [1] for all chunks of
+        #    article 1 rather than [1], [2], [3] all pointing at the same URL.
+        sources, chunk_to_source_id = _build_deduplicated_sources(state.final_chunks)
 
+        # Build context blocks; each chunk is labelled with its canonical [N]
         context_blocks = []
-        for chunk, source in zip(state.final_chunks, sources):
+        for chunk_idx, chunk in enumerate(state.final_chunks):
+            sid = chunk_to_source_id[chunk_idx]
             label = "NEW" if chunk.domain == "new" else f"MEMORY:{chunk.domain}"
+            metadata = chunk.metadata or {}
+            title = (
+                metadata.get("article_title") or chunk.article_title or "Unknown Title"
+            )
             context_blocks.append(
-                f"[{label} | score={chunk.composite_score:.2f}] {source.title}\n"
-                f"{source.page_content}"
+                f"[Source {sid} | {label} | score={chunk.composite_score:.2f}] {title}\n"
+                f"{chunk.text}"
             )
         context = "\n\n".join(context_blocks)
 
