@@ -124,6 +124,13 @@ class FundamentalAnalysisOutput(BaseAgentOutput):
     agent_name: str = "fundamentals_agent"
     financial_data: Optional[pd.DataFrame] = Field(default=None)
     tool_results: List[ToolResult] = Field(default_factory=list)
+    analysis: str = Field(default="")
+    entities_enriched: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of enriched entities for memory graph storage.",
+    )
+    subgraph_id: Optional[str] = Field(default=None)
+    relationships_extracted: bool = Field(default=False)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -394,8 +401,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             # Trim to the requested date window
             try:
                 col_dates = pd.to_datetime(financial_df.columns, errors="coerce")
-                keep_mask = (col_dates >= pd.Timestamp(start_dt)) & (
-                    col_dates <= pd.Timestamp(end_dt)
+                keep_mask = (col_dates >= pd.Timestamp(start_dt).tz_localize(None)) & (
+                    col_dates <= pd.Timestamp(end_dt).tz_localize(None)
                 )
                 financial_df = financial_df.loc[:, keep_mask]
             except Exception as exc:
