@@ -18,7 +18,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
     agent = OrchestratorAgent()
     messages = [
         HumanMessage(
-            content="check perform cagr of apple's stock price from 2015 to 2020"
+            content="check the news for the recent Apple stock price and summarize the findings with cited sources, also check its fcf cagr for the past 5 years too"
         )
     ]
 
