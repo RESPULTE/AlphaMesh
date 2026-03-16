@@ -99,7 +99,7 @@ from core.services import service_manager
 logger = get_logger(__name__)
 
 # ── Iteration ceiling ─────────────────────────────────────────────────────────
-MAX_TOOL_ITERATIONS: int = 3
+MAX_TOOL_ITERATIONS: int = 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,6 +334,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             tool_results=final_state.get("tool_results", []),
             entities_enriched=final_state.get("entities_enriched", []),
             subgraph_id=final_state.get("subgraph_id"),
+            subgraph_task=final_state.get("subgraph_task"),
             relationships_extracted=final_state.get("relationships_extracted", False),
         )
 
@@ -415,7 +416,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 start_dt = datetime(end_dt.year - 4, 1, 1)
             form_type = "10-K"
             price_interval = "yearly"
-            periods = list(range(start_dt.year, end_dt.year + 1))
+            today = datetime.now()
+            last_complete_year = today.year - 1 if today.month < 12 else today.year
+            periods = list(
+                range(start_dt.year, min(end_dt.year, last_complete_year) + 1)
+            )
         else:
             default_start = end_dt - timedelta(days=2 * 365)
             start_dt = state.start_date if state.start_date else default_start
@@ -488,6 +493,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 ticker,
             )
         else:
+            thresh = max(1, int(len(financial_df.index) * 0.3))
+            financial_df = financial_df.dropna(axis=1, thresh=thresh)
+
             logger.info(
                 "[data_prep] Ready: %d concepts × %d periods for %s",
                 len(financial_df.index),

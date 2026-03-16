@@ -70,6 +70,7 @@ class BaseAgentOutput(BaseModel, ABC):
         ),
     )
     subgraph_id: Optional[str] = Field(default=None, exclude=True)
+    subgraph_task: Optional[Any] = Field(default=None, exclude=True)
     relationships_extracted: bool = Field(default=False)
 
     @abstractmethod

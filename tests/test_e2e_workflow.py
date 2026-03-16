@@ -18,7 +18,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
     agent = OrchestratorAgent()
     messages = [
         HumanMessage(
-            content="check the news for the recent Apple stock price and summarize the findings with cited sources, also check its fcf cagr for the past 5 years too"
+            content="i am interested in buying microsfot, can you tell me more about the company's profitability? check any recent news data on it too"
         )
     ]
 
@@ -56,7 +56,9 @@ async def test_full_orchestrator_pipeline_live() -> None:
     assert len(output.summary) > 0
 
     logging.info(f"Agent summary output: {output.summary}")
-    logging.info(f"Agent cited sources: {output.sources}")
+    if output.fundamental_data is not None and not output.fundamental_data.empty:
+        logging.info(f"Agent fundamental data: {output.fundamental_data}")
+    # logging.info(f"Agent cited sources: {output.sources}")
 
 
 @pytest.mark.asyncio

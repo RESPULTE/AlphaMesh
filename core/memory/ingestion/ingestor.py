@@ -411,7 +411,7 @@ class DualStoreIngestor:
                     lambda: self._neo4j_adapter.merge_relationship(
                         source_entity.id,
                         target_entity.id,
-                        "RELATED_TO",
+                        rel_type,
                         {
                             "relationship_type": rel_type,
                             "source_chunk_id": result.chunk_id,
@@ -511,12 +511,6 @@ class DualStoreIngestor:
             await self._upsert_with_retry(
                 lambda: self._neo4j_adapter.merge_relationship(
                     resolved_source, resolved_target, relation_type, props
-                ),
-                None,
-            )
-            await self._upsert_with_retry(
-                lambda: self._neo4j_adapter.merge_relationship(
-                    resolved_source, resolved_target, "RELATED_TO", props
                 ),
                 None,
             )

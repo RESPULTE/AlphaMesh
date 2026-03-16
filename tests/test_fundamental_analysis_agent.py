@@ -68,8 +68,8 @@ from core.agents.financial_tools import (
 from core.agents.fundamental_analysis_agent import (
     FundamentalAnalysisAgent,
     FundamentalAnalysisOutput,
+    IterativeToolPlan,
     ToolCallSpec,
-    ToolPlan,
     _AgentState,
     _format_value,
 )
@@ -1192,10 +1192,10 @@ class TestDataPrepNode:
             await agent._data_prep_node(state)
 
 
-class TestToolPlannerNode:
+class TestIterativeToolPlannerNode:
 
-    def _make_plan(self, calls: list) -> ToolPlan:
-        return ToolPlan(
+    def _make_plan(self, calls: list) -> IterativeToolPlan:
+        return IterativeToolPlan(
             calls=calls,
             data_summary="Test plan with CAGR tool.",
         )
@@ -1250,7 +1250,7 @@ class TestToolPlannerNode:
 class TestToolExecutorNode:
 
     async def test_happy_path_cagr_tool(self, sample_df):
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(
                     tool_name="cagr",
@@ -1269,7 +1269,7 @@ class TestToolExecutorNode:
         assert "Revenues_CAGR" in result["financial_data"].index
 
     async def test_unknown_tool_name_records_failure(self, sample_df):
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(
                     tool_name="nonexistent_tool",
@@ -1287,7 +1287,7 @@ class TestToolExecutorNode:
         assert "not found" in result["tool_results"][0].error.lower()
 
     async def test_invalid_parameters_records_failure(self, sample_df):
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(
                     tool_name="cagr",
@@ -1304,7 +1304,7 @@ class TestToolExecutorNode:
         assert result["tool_results"][0].success is False
 
     async def test_empty_financial_data_records_failure(self):
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(
                     tool_name="cagr",
@@ -1331,7 +1331,7 @@ class TestToolExecutorNode:
         CAGR adds a row 'Revenues_CAGR'; the second tool (custom_formula)
         must see that row in the DataFrame.
         """
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(
                     tool_name="cagr",
@@ -1361,7 +1361,7 @@ class TestToolExecutorNode:
         assert "rev_times_two" in result["financial_data"].index
 
     async def test_all_tools_fail_still_returns_original_df(self, sample_df):
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(tool_name="nonexistent_1", parameters={}, reasoning=""),
                 ToolCallSpec(tool_name="nonexistent_2", parameters={}, reasoning=""),
@@ -1614,7 +1614,7 @@ class TestFullAgentPipeline:
 
     async def test_run_returns_fundamental_analysis_output(self, full_agent):
         agent, sample_df = full_agent
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(
                     tool_name="cagr",
@@ -1663,7 +1663,7 @@ class TestFullAgentPipeline:
     async def test_run_with_raw_data_only_no_tools(self, full_agent):
         """Planner returning empty calls list → no tools run, raw data returned."""
         agent, _ = full_agent
-        empty_plan = ToolPlan(calls=[], data_summary="Raw data only.")
+        empty_plan = IterativeToolPlan(calls=[], data_summary="Raw data only.")
         mock_llm = MagicMock()
         mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=empty_plan
@@ -1710,7 +1710,7 @@ class TestFullAgentPipeline:
         agent._graph = agent._build_graph()
 
         mock_llm = MagicMock()
-        empty_plan = ToolPlan(calls=[], data_summary="No data.")
+        empty_plan = IterativeToolPlan(calls=[], data_summary="No data.")
         mock_llm.with_structured_output.return_value.ainvoke = AsyncMock(
             return_value=empty_plan
         )
@@ -1736,7 +1736,7 @@ class TestFullAgentPipeline:
     async def test_run_with_dcf_and_cagr_tools(self, sample_df_with_fcf):
         """Multi-tool plan: CAGR first, then DCF."""
         agent = _make_full_mock_agent(sample_df_with_fcf)
-        plan = ToolPlan(
+        plan = IterativeToolPlan(
             calls=[
                 ToolCallSpec(
                     tool_name="cagr",

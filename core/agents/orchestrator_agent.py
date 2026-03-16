@@ -563,7 +563,6 @@ class OrchestratorAgent:
 
         valid_names = [n for n in plan.target_agents if n in self._agents]
         tasks = [self._agents[name].run(shared_input) for name in valid_names]
-
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         outputs: Dict[str, BaseAgentOutput] = {}
@@ -580,6 +579,14 @@ class OrchestratorAgent:
             logger.warning(
                 "_execute_node: all agents failed — synthesiser will have empty context"
             )
+
+        subgraph_tasks = [
+            getattr(out, "subgraph_task", None) for out in outputs.values()
+        ]
+        await asyncio.gather(
+            *[t for t in subgraph_tasks if t is not None],
+            return_exceptions=True,
+        )
 
         return {"agent_outputs": outputs}
 
@@ -664,38 +671,21 @@ class OrchestratorAgent:
         # ── Graph write-back (async, non-blocking) ────────────────
         if multi_agent and state.conversation_id:
             try:
-                store = service_manager.get_subgraph_store()
                 builder = InMemorySubgraphBuilder(
                     embedding_func=service_manager.get_embedding_func(),
                     fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
                     semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
                 )
-                merged_graph = nx.DiGraph()
-
-                for output in state.agent_outputs.values():
-                    subgraph_id = getattr(output, "subgraph_id", None)
-                    if not subgraph_id:
-                        continue
-                    try:
-                        graph = await store.load(subgraph_id)
-                        if graph is not None:
-                            merged_graph = nx.compose(merged_graph, graph)
-                    except Exception:
-                        logger.exception("Failed to load subgraph %s", subgraph_id)
-
+                cross_graph = nx.DiGraph()
                 if cross_relationships:
-                    try:
-                        cross_graph = await builder.build(
-                            cross_relationships, source_agent="orchestrator"
-                        )
-                        merged_graph = nx.compose(merged_graph, cross_graph)
-                    except Exception:
-                        logger.exception("Failed to build cross-domain subgraph")
+                    cross_graph = await builder.build(
+                        cross_relationships, source_agent="orchestrator"
+                    )
 
-                if merged_graph.number_of_edges() > 0:
+                if cross_graph.number_of_edges() > 0:
                     _safe_create_task(
                         service_manager.get_ingestor()._upsert_graph_to_neo4j(
-                            merged_graph, state.conversation_id
+                            cross_graph, state.conversation_id
                         )
                     )
             except Exception:

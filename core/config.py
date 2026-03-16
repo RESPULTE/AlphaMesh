@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     CHROMA_PORT: int = 8000
     CHROMA_COLLECTION_NEWS: str = "news_chunks"
     CHROMA_COLLECTION_ENTITIES: str = "entity_nodes"
-    CHROMA_PATH: str = "./chroma_db"
+    CHROMA_PATH: str = "./data/chroma_db"
     CHROMA_NAME: Optional[str] = None
 
     # Chunking Configuration
