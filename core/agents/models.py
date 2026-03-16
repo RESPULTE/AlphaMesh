@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.memory.graph.models import ChunkExtractionResult, EntityNode
 from core.memory.retrieval.models import RetrievedChunk
@@ -32,8 +32,12 @@ class BaseAgentInput(BaseModel):
     end_date: Optional[datetime] = Field(
         default=None, description="End date (format: YYYY-MM-DD)."
     )
-    # ── Fundamental agent granularity ────────────────────────────────────────
-    granularity: Literal["yearly", "quarterly"] = Field(
+
+    # ── Internal / excluded from serialisation ────────────────────────────────
+    memory_task: Optional[Any] = Field(default=None, exclude=True)
+    conversation_id: Optional[str] = Field(default=None, exclude=True)
+
+    granularity: Optional[Literal["yearly", "quarterly"]] = Field(
         default="yearly",
         description=(
             "Data granularity for the fundamental agent. "
@@ -42,9 +46,11 @@ class BaseAgentInput(BaseModel):
             "when the user explicitly asks for quarterly trends or TTM figures."
         ),
     )
-    # ── Internal / excluded from serialisation ────────────────────────────────
-    memory_task: Optional[Any] = Field(default=None, exclude=True)
-    conversation_id: Optional[str] = Field(default=None, exclude=True)
+
+    @field_validator("granularity", mode="before")
+    @classmethod
+    def _default_granularity(cls, v: Any) -> str:
+        return v if v in ("yearly", "quarterly") else "yearly"
 
 
 class BaseAgentOutput(BaseModel, ABC):

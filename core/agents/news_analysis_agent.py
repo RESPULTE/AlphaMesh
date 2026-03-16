@@ -240,28 +240,49 @@ class NewsAnalysisAgent(AbstractAgent):
             return {"chunk_ids": []}
 
         try:
-            chunk_ids, _ = await service_manager.get_ingestor().ingest_articles(
-                state.raw_articles
+            new_chunk_ids, existing_chunk_ids, _ = (
+                await service_manager.get_ingestor().ingest_articles(state.raw_articles)
             )
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
             raise
 
         retrieved_chunks: List[RetrievedChunk] = []
-        if chunk_ids:
-            query = state.query
+        query = state.query
+
+        if new_chunk_ids:
             docs_with_scores = await service_manager.get_chroma_adapter().query(
-                query_text=query, n_results=10, where={"chunk_id": {"$in": chunk_ids}}
+                query_text=query,
+                n_results=10,
+                where={"chunk_id": {"$in": new_chunk_ids}},
             )
-            retrieved_chunks = [
+            retrieved_chunks += [
                 RetrievedChunk.from_document(
                     doc, score=score, source="vector", domain="new"
                 )
                 for doc, score in docs_with_scores
             ]
 
-        logger.info("Ingested articles into memory. #Chunk IDs: %s", len(chunk_ids))
-        return {"chunk_ids": chunk_ids, "retrieved_chunks": retrieved_chunks}
+        if existing_chunk_ids:
+            docs_with_scores = await service_manager.get_chroma_adapter().query(
+                query_text=query,
+                n_results=10,
+                where={"chunk_id": {"$in": existing_chunk_ids}},
+            )
+            retrieved_chunks += [
+                RetrievedChunk.from_document(
+                    doc, score=score, source="vector", domain="existing"
+                )
+                for doc, score in docs_with_scores
+            ]
+
+        all_chunk_ids = new_chunk_ids + existing_chunk_ids
+        logger.info(
+            "Ingested articles into memory. #New: %s, #Existing: %s",
+            len(new_chunk_ids),
+            len(existing_chunk_ids),
+        )
+        return {"chunk_ids": all_chunk_ids, "retrieved_chunks": retrieved_chunks}
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge memory retrieval results with freshly ingested chunks."""

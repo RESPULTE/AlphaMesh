@@ -2,13 +2,13 @@
 AlphaMesh — Streamlit Chat Front-End
 ======================================
 Design Philosophy: Claude.ai-inspired comfort
-  • Soft warm-ivory background, not pure white
-  • Rounded cards and bubbles
-  • DM Serif Display (headings) + DM Sans (body)
-  • Accent: warm amber/gold for AI, soft slate for user
-  • Subtle pulse animation while agent is running
-  • Citations: inline [N] badges with hover tooltip showing title + URL
-  • Tables: rendered via st.dataframe with custom styling
+• Soft warm-ivory background, not pure white
+• Rounded cards and bubbles
+• DM Serif Display (headings) + DM Sans (body)
+• Accent: warm amber/gold for AI, soft slate for user
+• Subtle pulse animation while agent is running
+• Citations: inline [N] badges with hover tooltip showing title + URL
+• Tables: rendered via st.dataframe with custom styling
 """
 
 from __future__ import annotations
@@ -36,6 +36,245 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+AGENT_CARD_CSS = """
+<style>
+/* ── Agent card grid ─────────────────────────────────────── */
+.agent-cards-row {
+    display: flex;
+    flex-direction: row;
+    gap: 14px;
+    align-items: flex-start;
+    margin-bottom: 16px;
+    flex-wrap: wrap;          /* wraps gracefully on narrow screens */
+}
+
+.agent-card {
+    flex: 1 1 0;              /* each card grows equally */
+    min-width: 220px;
+    background: var(--secondary-background-color, #1e1e2e);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 16px 18px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.agent-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-color, #cdd6f4);
+    opacity: 0.65;
+    margin-bottom: 4px;
+}
+
+.agent-card-body {
+    font-size: 0.9rem;
+    line-height: 1.65;
+    color: var(--text-color, #cdd6f4);
+    white-space: pre-wrap;
+}
+
+/* ── Synthesizer summary (horizontal, below agents) ─────── */
+.synth-card {
+    background: var(--secondary-background-color, #1e1e2e);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-left: 3px solid #89b4fa;   /* accent stripe */
+    border-radius: 12px;
+    padding: 14px 20px;
+    margin-top: 4px;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 14px;
+}
+
+.synth-card-icon {
+    font-size: 1.2rem;
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+.synth-card-content {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+}
+
+.synth-card-label {
+    font-size: 0.73rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #89b4fa;
+    opacity: 0.85;
+}
+
+.synth-card-body {
+    font-size: 0.9rem;
+    line-height: 1.6;
+    color: var(--text-color, #cdd6f4);
+}
+</style>
+"""
+
+_AGENT_DISPLAY: dict = {
+    "news_agent": {"icon": "📰", "label": "News Analysis"},
+    "fundamentals_agent": {"icon": "📊", "label": "Fundamentals"},
+}
+
+
+def _agent_display(name: str) -> tuple[str, str]:
+    """Return (icon, label) for an agent name."""
+    info = _AGENT_DISPLAY.get(name, {})
+    icon = info.get("icon", "🤖")
+    label = info.get("label", name.replace("_", " ").title())
+    return icon, label
+
+
+import html as _html
+
+import streamlit as st
+
+
+def render_agent_response_cards(
+    result, agent_analyses: dict, summary: str, sources
+) -> None:
+    """Render agent cards + synthesizer card from stored message data."""
+    st.markdown(AGENT_CARD_CSS, unsafe_allow_html=True)
+    multi_agent = bool(agent_analyses)
+
+    if multi_agent:
+        cards_html_parts = ['<div class="agent-cards-row">']
+        for agent_name, analysis_text in agent_analyses.items():
+            icon, label = _agent_display(agent_name)
+            safe_text = _html.escape(analysis_text or "No analysis returned.")
+            cards_html_parts.append(
+                f"""
+            <div class="agent-card">
+                <div class="agent-card-header">
+                    <span>{icon}</span>
+                    <span>{_html.escape(label)}</span>
+                </div>
+                <div class="agent-card-body">{safe_text}</div>
+            </div>"""
+            )
+        cards_html_parts.append("</div>")
+        st.markdown("".join(cards_html_parts), unsafe_allow_html=True)
+
+        safe_summary = (
+            _html.escape(summary) if summary else "<em>No synthesis generated.</em>"
+        )
+        st.markdown(
+            f"""
+        <div class="synth-card">
+            <div class="synth-card-icon">🔗</div>
+            <div class="synth-card-content">
+                <div class="synth-card-label">Synthesis</div>
+                <div class="synth-card-body">{safe_summary}</div>
+            </div>
+        </div>""",
+            unsafe_allow_html=True,
+        )
+
+
+def render_agent_response(response) -> None:
+    """
+    Render a FinalResponse in the new multi-card layout.
+
+    Layout rules
+    ─────────────
+    • If agent_analyses is populated (multi-agent run):
+        – One vertical card per agent, displayed side-by-side in a flex row.
+        – A short horizontal synthesizer summary card below all agent cards.
+    • If no agent_analyses (direct answer / single-agent with no extra analyses):
+        – Full-size synthesizer card only (normal size, no agent cards above).
+
+    Parameters
+    ──────────
+    response : FinalResponse
+        The object returned by OrchestratorAgent.run().
+    """
+    agent_analyses: dict = getattr(response, "agent_analyses", {}) or {}
+    summary: str = (response.summary or "").strip()
+    multi_agent = bool(agent_analyses)
+
+    # ── Inject CSS (idempotent — Streamlit deduplicates identical blocks) ──
+    st.markdown(AGENT_CARD_CSS, unsafe_allow_html=True)
+
+    if multi_agent:
+        # ── Build agent cards HTML ────────────────────────────────────────
+        cards_html_parts = ['<div class="agent-cards-row">']
+        for agent_name, analysis_text in agent_analyses.items():
+            icon, label = _agent_display(agent_name)
+            safe_text = _html.escape(analysis_text or "No analysis returned.")
+            cards_html_parts.append(
+                f"""
+            <div class="agent-card">
+                <div class="agent-card-header">
+                    <span>{icon}</span>
+                    <span>{_html.escape(label)}</span>
+                </div>
+                <div class="agent-card-body">{safe_text}</div>
+            </div>"""
+            )
+        cards_html_parts.append("</div>")
+        st.markdown("".join(cards_html_parts), unsafe_allow_html=True)
+
+        # ── Short horizontal synthesizer card ─────────────────────────────
+        safe_summary = (
+            _html.escape(summary) if summary else "<em>No synthesis generated.</em>"
+        )
+        st.markdown(
+            f"""
+        <div class="synth-card">
+            <div class="synth-card-icon">🔗</div>
+            <div class="synth-card-content">
+                <div class="synth-card-label">Synthesis</div>
+                <div class="synth-card-body">{safe_summary}</div>
+            </div>
+        </div>""",
+            unsafe_allow_html=True,
+        )
+
+    else:
+        # ── Single / direct-answer — full-size synthesizer card ───────────
+        safe_summary = (
+            _html.escape(summary) if summary else "<em>No response generated.</em>"
+        )
+        st.markdown(
+            f"""
+        <div class="synth-card" style="border-left-width:0; padding-left:20px;">
+            <div class="synth-card-icon">🔗</div>
+            <div class="synth-card-content">
+                <div class="synth-card-label">Analysis</div>
+                <div class="synth-card-body">{safe_summary}</div>
+            </div>
+        </div>""",
+            unsafe_allow_html=True,
+        )
+
+    # ── Fundamental data table (unchanged from before) ────────────────────
+    if getattr(response, "fundamental_data", None) is not None:
+        df = response.fundamental_data
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+
+    # ── Cited sources (unchanged from before) ─────────────────────────────
+    sources = getattr(response, "sources", []) or []
+    if sources:
+        with st.expander("📎 Sources", expanded=False):
+            for src in sources:
+                st.markdown(f"**[{src.source_id}]** [{src.title}]({src.url})")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Global CSS
@@ -191,9 +430,9 @@ st.markdown(
     .chat-bubble h1,
     .chat-bubble h2,
     .chat-bubble h3         { font-family: var(--font-display);
-                               color: var(--text-primary);
-                               margin: 14px 0 6px;
-                               line-height: 1.3; }
+                            color: var(--text-primary);
+                            margin: 14px 0 6px;
+                            line-height: 1.3; }
     .chat-bubble h1         { font-size: 18px; }
     .chat-bubble h2         { font-size: 16px; }
     .chat-bubble h3         { font-size: 14.5px; }
@@ -203,25 +442,25 @@ st.markdown(
     .chat-bubble ol         { margin: 6px 0 10px 20px; padding: 0; }
     .chat-bubble li         { margin-bottom: 4px; }
     .chat-bubble code       { font-family: 'Fira Code', monospace;
-                               font-size: 12.5px;
-                               background: var(--surface-2);
-                               border: 1px solid var(--border);
-                               border-radius: 4px;
-                               padding: 1px 5px; }
+                            font-size: 12.5px;
+                            background: var(--surface-2);
+                            border: 1px solid var(--border);
+                            border-radius: 4px;
+                            padding: 1px 5px; }
     .chat-bubble pre        { background: var(--surface-2);
-                               border: 1px solid var(--border);
-                               border-radius: var(--radius-sm);
-                               padding: 10px 14px;
-                               overflow-x: auto;
-                               margin: 8px 0; }
+                            border: 1px solid var(--border);
+                            border-radius: var(--radius-sm);
+                            padding: 10px 14px;
+                            overflow-x: auto;
+                            margin: 8px 0; }
     .chat-bubble pre code   { background: none; border: none; padding: 0; }
     .chat-bubble blockquote { border-left: 3px solid var(--accent);
-                               margin: 8px 0;
-                               padding: 4px 12px;
-                               color: var(--text-secondary); }
+                            margin: 8px 0;
+                            padding: 4px 12px;
+                            color: var(--text-secondary); }
     .chat-bubble hr         { border: none;
-                               border-top: 1px solid var(--border);
-                               margin: 12px 0; }
+                            border-top: 1px solid var(--border);
+                            margin: 12px 0; }
     .chat-bubble a          { color: var(--accent-dark); text-decoration: underline; }
 
     /* ── Citation badges ───────────────────────────────────────────── */
@@ -559,11 +798,11 @@ def _citation_badge(num: int, src) -> str:
 def _render_ai_content(text: str, sources) -> str:
     """
     Convert an AI response to display HTML:
-      1. Protect [N] citation markers from the markdown parser by replacing
-         them with unique placeholders.
-      2. Run the full text through the markdown library (bold, italic, headers,
-         lists, code blocks, blockquotes all get converted to HTML).
-      3. Restore citation markers as hoverable badge HTML.
+    1. Protect [N] citation markers from the markdown parser by replacing
+        them with unique placeholders.
+    2. Run the full text through the markdown library (bold, italic, headers,
+        lists, code blocks, blockquotes all get converted to HTML).
+    3. Restore citation markers as hoverable badge HTML.
     """
     src_map = {s.source_id: s for s in (sources or [])}
 
@@ -612,6 +851,7 @@ def _render_message(msg: dict):
     content = msg.get("content", "")
     sources = msg.get("sources", [])
     df: Optional[pd.DataFrame] = msg.get("df")
+    agent_analyses = msg.get("agent_analyses", {}) or {}
 
     is_user = role == "user"
     row_cls = "chat-row user" if is_user else "chat-row"
@@ -622,7 +862,7 @@ def _render_message(msg: dict):
     inner_html = (
         _render_user_content(content)
         if is_user
-        else _render_ai_content(content, sources)
+        else ("" if agent_analyses else _render_ai_content(content, sources))
     )
 
     # Sources footer (AI only)
@@ -648,6 +888,11 @@ def _render_message(msg: dict):
         f"</div>",
         unsafe_allow_html=True,
     )
+
+    if not is_user:
+        render_agent_response_cards(
+            result=None, agent_analyses=agent_analyses, summary=content, sources=sources
+        )
 
     # DataFrame below the bubble
     if df is not None and not df.empty:
@@ -720,13 +965,13 @@ def _run_agent_sync(query: str) -> FinalResponse:
 
 _THINKING_HTML = """
 <div class="chat-row">
-  <div class="chat-avatar avatar-ai">✦</div>
-  <div class="am-thinking">
+<div class="chat-avatar avatar-ai">✦</div>
+<div class="am-thinking">
     <div class="dots">
-      <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+    <div class="dot"></div><div class="dot"></div><div class="dot"></div>
     </div>
     {label}
-  </div>
+</div>
 </div>
 """
 
@@ -737,12 +982,12 @@ _THINKING_HTML = """
 st.markdown(
     """
     <div class="am-header">
-      <div class="am-logo">✦</div>
-      <div>
+    <div class="am-logo">✦</div>
+    <div>
         <div class="am-title">AlphaMesh</div>
         <div class="am-subtitle">Financial Intelligence · Multi-Agent Research</div>
-      </div>
-      <div class="am-badge">BETA</div>
+    </div>
+    <div class="am-badge">BETA</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -759,13 +1004,13 @@ if not st.session_state.messages:
     st.markdown(
         """
         <div class="am-empty">
-          <div class="am-empty-icon">✦</div>
-          <div class="am-empty-title">What would you like to explore?</div>
-          <div class="am-empty-sub">
+        <div class="am-empty-icon">✦</div>
+        <div class="am-empty-title">What would you like to explore?</div>
+        <div class="am-empty-sub">
             Ask me about stocks, earnings, news sentiment, valuations, or
             portfolio insights. I'll analyse multiple sources and synthesise
             a grounded answer for you.
-          </div>
+        </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -859,6 +1104,7 @@ if (
             "content": result.summary,
             "sources": result.sources or [],
             "df": result.fundamental_data,
+            "agent_analyses": result.agent_analyses or {},
         }
     )
 

@@ -104,6 +104,8 @@ class FinalResponse(BaseModel):
     summary: str = ""
     fundamental_data: Optional[pd.DataFrame] = None
     sources: List[CitedSource] = Field(default_factory=list)
+    # Per-agent raw analyses keyed by agent name, e.g. {"news_agent": "...", "fundamentals_agent": "..."}
+    agent_analyses: Dict[str, str] = Field(default_factory=dict)
 
 
 class UserInterestEntity(BaseModel):
@@ -378,6 +380,7 @@ class OrchestratorAgent:
                 summary=raw.get("summary") or "",
                 fundamental_data=raw.get("fundamental_data"),
                 sources=raw.get("sources") or [],
+                agent_analyses=raw.get("agent_analyses") or {},
             )
 
         # Last resort: attribute-based extraction
@@ -385,6 +388,7 @@ class OrchestratorAgent:
             summary=getattr(raw, "summary", "") or "",
             fundamental_data=getattr(raw, "fundamental_data", None),
             sources=getattr(raw, "sources", []) or [],
+            agent_analyses=getattr(raw, "agent_analyses", {}) or {},
         )
 
     def _build_synthesis_prompt(
@@ -695,10 +699,17 @@ class OrchestratorAgent:
         if state.user_email and state.plan:
             await self._write_user_signals(state, context_parts)
 
+        # Collect per-agent raw analyses for the UI
+        per_agent_analyses: Dict[str, str] = {
+            name: getattr(output, "analysis", "") or ""
+            for name, output in state.agent_outputs.items()
+        }
+
         return {
             "summary": user_response,
             "fundamental_data": fundamental_df,
             "sources": news_sources,
+            "agent_analyses": per_agent_analyses,
         }
 
     async def _write_user_signals(

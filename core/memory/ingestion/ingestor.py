@@ -68,8 +68,14 @@ class DualStoreIngestor:
 
     async def ingest_articles(
         self, articles: List[dict]
-    ) -> Tuple[List[str], List[RetrievedChunk]]:
-        """Ingest a batch of articles into both stores."""
+    ) -> Tuple[List[str], List[str], List[RetrievedChunk]]:
+        """Ingest a batch of articles into both stores.
+
+        Returns a 3-tuple of:
+        - new_chunk_ids:      IDs for articles ingested this call (domain="new")
+        - existing_chunk_ids: IDs for articles that were already in the store (domain="existing")
+        - involved_chunks:    RetrievedChunk objects for all of the above
+        """
         try:
             global_anchor_id = (
                 await self._nodeset_manager.get_global_financial_events_id()
@@ -104,18 +110,19 @@ class DualStoreIngestor:
                 await self._write_vector_chunks(chunks_to_ingest, global_anchor_id)
 
             new_chunk_ids = [chunk.chunk_id for chunk in chunks_to_ingest]
+            new_chunk_ids = [cid for cid in new_chunk_ids if cid]
             existing_chunk_ids = [chunk.chunk_id for chunk in existing_chunks_to_return]
             existing_chunk_ids = [cid for cid in existing_chunk_ids if cid]
-            chunk_ids = new_chunk_ids + existing_chunk_ids
+            all_chunk_ids = new_chunk_ids + existing_chunk_ids
 
             involved_chunks: List[RetrievedChunk] = []
-            if chunk_ids:
-                docs = await self._chroma_adapter.get_documents_by_ids(chunk_ids)
+            if all_chunk_ids:
+                docs = await self._chroma_adapter.get_documents_by_ids(all_chunk_ids)
                 involved_chunks = [
                     RetrievedChunk.from_document(doc, source="vector") for doc in docs
                 ]
-            # self._schedule_extraction(chunk_ids)
-            return (chunk_ids, involved_chunks)
+            # self._schedule_extraction(new_chunk_ids)
+            return (new_chunk_ids, existing_chunk_ids, involved_chunks)
             return (chunk_ids, involved_chunks)
         except Exception as exec:
             self._logger.exception("Failed to ingest articles. %s", str(exec))
