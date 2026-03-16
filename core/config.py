@@ -44,9 +44,9 @@ class Settings(BaseSettings):
 
     # Extraction Configuration
     EXTRACTION_BATCH_SIZE: int = 6
-    EXTRACTION_MAX_CONCURRENCY: int = 3
+    EXTRACTION_MAX_CONCURRENCY: int = 10
     EXTRACTION_ENABLED: bool = True
-    EXTRACTION_IMMEDIATE: bool = True
+    EXTRACTION_IMMEDIATE: bool = False
     EXTRACTION_LLM_RETRY_ATTEMPTS: int = 3
     EXTRACTION_NEO4J_RETRY_ATTEMPTS: int = 3
 

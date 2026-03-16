@@ -1,0 +1,31 @@
+# .streamlit/config.toml
+# Streamlit server + theme config.
+# Place this file at .streamlit/config.toml relative to your project root.
+# Note: The full visual theme is driven by ui/config.py via injected CSS.
+# This file only controls Streamlit-native chrome (toolbar, sidebar toggle, etc.)
+
+[server]
+port = 8501
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+# Base dark theme — overridden comprehensively by our injected CSS
+base = "dark"
+backgroundColor        = "#070C18"
+secondaryBackgroundColor = "#0D1525"
+textColor              = "#EDF2FF"
+primaryColor           = "#F5A623"
+font                   = "sans serif"
+
+[runner]
+# Prevent st.rerun() loops from hanging
+fastReruns = true
+
+[client]
+showErrorDetails = false
+toolbarMode = "minimal"
