@@ -6,21 +6,21 @@ Fundamental Analysis Agent — Iterative Tool-Calling LangGraph Architecture
 
 Graph
 ─────
-  START
+START
     │
     ▼
-  data_prep          — Concurrently: update EDGAR cache, fetch price data,
+data_prep          — Concurrently: update EDGAR cache, fetch price data,
     │                    load available concepts from DB.
     │                    Output: financial_data (DataFrame), available_concepts (List[str])
     ▼
-  tool_planner       — LLM produces an IterativeToolPlan:
+tool_planner       — LLM produces an IterativeToolPlan:
     │                    • A BATCH of parallel tool calls for *this* iteration.
     │                    • A flag indicating whether more iterations are needed.
     │                    • Explicit reasoning about derived metrics it must
     │                      compute before a downstream tool can run
     │                      (e.g. FCF = OperatingCF − CapEx before DCF).
     ▼
-  tool_executor      — Runs ALL calls in the current batch **in parallel**
+tool_executor      — Runs ALL calls in the current batch **in parallel**
     │                    (asyncio.gather). Merges added_rows into financial_data.
     │                    Persists new time-series rows back to SQLite.
     │                    Increments iteration_count.
@@ -29,35 +29,35 @@ Graph
     │
     └─── done (or limit reached) ──► analyst
     ▼
-  analyst            — LLM selects the *relevant* rows for the final table
+analyst            — LLM selects the *relevant* rows for the final table
     │                    and writes the analysis.
     │                    Runs memory graph relationship extraction.
     ▼
-  END
+END
 
 Key improvements
 ────────────────
-  • Iterative re-planning loop (max MAX_TOOL_ITERATIONS = 3):
-      The LLM detects missing derived metrics (e.g. FCF) and computes
-      them via custom_formula BEFORE running DCF, instead of incorrectly
-      substituting an available but wrong metric.
+• Iterative re-planning loop (max MAX_TOOL_ITERATIONS = 3):
+    The LLM detects missing derived metrics (e.g. FCF) and computes
+    them via custom_formula BEFORE running DCF, instead of incorrectly
+    substituting an available but wrong metric.
 
-  • Parallel execution per iteration:
-      All calls in a single IterativeToolPlan.calls batch are dispatched
-      with asyncio.gather — calls that are mutually independent run at the
-      same time. Sequential dependencies are handled across iterations.
+• Parallel execution per iteration:
+    All calls in a single IterativeToolPlan.calls batch are dispatched
+    with asyncio.gather — calls that are mutually independent run at the
+    same time. Sequential dependencies are handled across iterations.
 
-  • Derived-metric persistence:
-      Computed time-series rows (same date columns as financial_data) are
-      saved back to SQLite (statement_type='computed') so they survive
-      across sessions and are visible to subsequent planner iterations via
-      available_concepts.
+• Derived-metric persistence:
+    Computed time-series rows (same date columns as financial_data) are
+    saved back to SQLite (statement_type='computed') so they survive
+    across sessions and are visible to subsequent planner iterations via
+    available_concepts.
 
-  • LLM-selected relevant-data table:
-      The analyst uses a structured output call to pick only the rows that
-      are meaningful for the user's query. Component rows that reveal an
-      insight (e.g. falling EPS behind a rising PE) are included; unrelated
-      asset/liability rows are excluded.
+• LLM-selected relevant-data table:
+    The analyst uses a structured output call to pick only the rows that
+    are meaningful for the user's query. Component rows that reveal an
+    insight (e.g. falling EPS behind a rising PE) are included; unrelated
+    asset/liability rows are excluded.
 """
 
 from __future__ import annotations
@@ -366,13 +366,15 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     @staticmethod
     def _should_continue(state: _AgentState) -> str:
-        """Loop back to tool_planner if more iterations are needed and budget allows."""
+        if state.iteration_count >= MAX_TOOL_ITERATIONS:
+            logger.warning(
+                "[Router] Max iterations (%d) reached — forcing analyst.",
+                MAX_TOOL_ITERATIONS,
+            )
+            return "done"
+
         plan = state.tool_plan
-        if (
-            plan is not None
-            and plan.needs_more_iterations
-            and state.iteration_count < MAX_TOOL_ITERATIONS
-        ):
+        if plan and plan.needs_more_iterations:
             logger.info(
                 "[Router] Looping: iteration %d/%d. Reason: %s",
                 state.iteration_count,
@@ -381,11 +383,18 @@ class FundamentalAnalysisAgent(AbstractAgent):
             )
             return "continue"
 
-        if state.iteration_count >= MAX_TOOL_ITERATIONS:
-            logger.warning(
-                "[Router] Max iterations (%d) reached — forcing analyst.",
+        # Only retry on failure if the planner actually scheduled tools this round
+        # (avoids infinite loop when planner gives up but old failures persist)
+        last_iteration_had_calls = plan is not None and len(plan.calls) > 0
+        any_failed = any(not r.success for r in (state.tool_results or []))
+        if last_iteration_had_calls and any_failed:
+            logger.info(
+                "[Router] Tool failures detected — retrying. Iteration %d/%d",
+                state.iteration_count,
                 MAX_TOOL_ITERATIONS,
             )
+            return "continue"
+
         return "done"
 
     # ── Node: data_prep ───────────────────────────────────────────────────────
@@ -393,16 +402,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
     async def _data_prep_node(self, state: _AgentState) -> Dict:
         """
         Concurrently:
-          1. Ensures EDGAR data is cached for the requested periods.
-          2. Fetches price data from yfinance at matching granularity.
-          3. Loads financial data from local DB and normalises period dates.
+        1. Ensures EDGAR data is cached for the requested periods.
+        2. Fetches price data from yfinance at matching granularity.
+        3. Loads financial data from local DB and normalises period dates.
 
         Granularity:
-          yearly   (default) — 10-K filings, 5-year window.
-                               Normalises fiscal-year-end dates to YYYY-12-31
-                               to align with yfinance YE prices.
-          quarterly           — 10-Q filings, last 8 quarters.
-                               Normalises to quarter-end dates.
+        yearly   (default) — 10-K filings, 5-year window.
+                            Normalises fiscal-year-end dates to YYYY-12-31
+                            to align with yfinance YE prices.
+        quarterly           — 10-Q filings, last 8 quarters.
+                            Normalises to quarter-end dates.
         """
         ticker: str = state.ticker
         granularity: str = getattr(state, "granularity", "yearly")
@@ -606,10 +615,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
         """
         Executes ALL calls in the current iteration batch in PARALLEL via
         asyncio.gather. Then:
-          1. Merges added_rows back into financial_data.
-          2. Persists new time-series rows to SQLite.
-          3. Updates available_concepts with newly added row labels.
-          4. Increments iteration_count.
+        1. Merges added_rows back into financial_data.
+        2. Persists new time-series rows to SQLite.
+        3. Updates available_concepts with newly added row labels.
+        4. Increments iteration_count.
         """
         logger.info("[Node] tool_executor — iteration %d", state.iteration_count + 1)
 
@@ -705,10 +714,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
         updated_computed = list(
             set(state.computed_row_labels) | set(newly_added_labels)
         )
+        accumulated_results = list(state.tool_results) + batch_results
 
         return {
             "financial_data": df if not df.empty else state.financial_data,
-            "tool_results": batch_results,
+            "tool_results": accumulated_results,
             "iteration_count": state.iteration_count + 1,
             "available_concepts": updated_concepts,
             "computed_row_labels": updated_computed,
@@ -762,8 +772,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             async with aiosqlite.connect(self.db.db_name) as db:
                 await db.executemany(
                     """INSERT OR REPLACE INTO financials
-                       (company, period_date, form_type, statement_type, label, value)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (company, period_date, form_type, statement_type, label, value)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
                     records,
                 )
                 await db.commit()

@@ -682,6 +682,14 @@ class DebtSolvencyTool(FinancialTool):
                 )
 
         logger.info("[DebtSolvencyTool] Computed: %s", list(added_rows.keys()))
+        if not added_rows:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,  # ← change True → False so the planner sees a real failure
+                summary="\n".join(summaries)
+                or "No solvency ratios could be computed — check metric names.",
+            )
+
         return ToolResult(
             tool_name=self.name,
             success=True,
