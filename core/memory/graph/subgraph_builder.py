@@ -1,24 +1,37 @@
-"""Build and merge in-memory subgraphs with fuzzy/semantic deduplication."""
+"""
+core/memory/graph/subgraph_builder.py
+
+Build and merge in-memory subgraphs with fuzzy/semantic deduplication.
+
+Added in this revision
+──────────────────────
+schedule_subgraph_extraction() — a module-level async helper that
+encapsulates the fire-and-forget subgraph build/store pattern that was
+previously duplicated verbatim in NewsAnalysisAgent and
+FundamentalAnalysisAgent.  It lives here because this module already owns
+everything it needs: InMemorySubgraphBuilder, the SubgraphStore key
+convention, and the retry path for failed extractions.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
 from rapidfuzz import fuzz
 
+from core.config import settings
 from core.memory.graph.utils import canonical_entity_id
+from core.services import service_manager
 
 
 class InMemorySubgraphBuilder:
-    def __init__(
-        self, embedding_func, fuzzy_threshold: float, semantic_threshold: float
-    ) -> None:
-        self._embedding_func = embedding_func
-        self._fuzzy_threshold = fuzzy_threshold
-        self._semantic_threshold = semantic_threshold
+    def __init__(self) -> None:
+        self._embedding_func = service_manager.get_embedding_func()
+        self._fuzzy_threshold = settings.EXTRACTION_FUZZY_THRESHOLD
+        self._semantic_threshold = settings.EXTRACTION_SEMANTIC_THRESHOLD
         self._entity_name_cache: Dict[Tuple[str, str], str] = {}
 
     async def build(self, relationships: List[dict], source_agent: str) -> nx.DiGraph:
@@ -156,6 +169,113 @@ class InMemorySubgraphBuilder:
             graph.add_edge(from_id, to_id, **edge_attrs)
 
         return graph
+
+    async def schedule_subgraph_extraction(
+        self,
+        *,
+        agent_name: str,
+        conversation_id: str,
+        analysis_text: str,
+        relationships: List[dict],
+        relationships_extracted: bool,
+        llm: object,
+    ) -> Optional[str]:
+        """
+        Build and persist a relationship subgraph for one agent turn.
+
+        Encapsulates the fire-and-forget pattern shared by every agent that
+        produces relationship data (NewsAnalysisAgent, FundamentalAnalysisAgent).
+
+        Parameters
+        ----------
+        agent_name:
+            Calling agent's canonical name (e.g. ``"news_agent"``).
+            Used as the SubgraphStore key prefix and the ``source_agent``
+            label on every graph edge.
+        conversation_id:
+            Current conversation ID.  Returns None immediately if empty.
+        analysis_text:
+            The agent's written analysis.  Passed to ``retry_relationships_only``
+            when ``relationships_extracted`` is False for a second-pass LLM
+            extraction from the prose alone.
+        relationships:
+            Relationship dicts from ``extract_with_retry``.  May be empty when
+            first-pass extraction failed — the retry path handles that.
+        relationships_extracted:
+            True  → first-pass succeeded; build directly from ``relationships``.
+            False → first-pass failed; schedule ``retry_relationships_only``.
+        llm:
+            LLM instance for the retry path.  Callers supply their own so that
+            temperature / model choices stay with the agent, not this helper.
+
+        Returns
+        -------
+        The ``subgraph_id`` string scheduled for storage, or ``None`` when
+        extraction is disabled or ``conversation_id`` is absent.
+
+        Notes
+        -----
+        - Never raises.  All exceptions inside the background task are caught
+          and logged so a failed write never surfaces to the user.
+        - When ``settings.EXTRACTION_IMMEDIATE`` is True the task is awaited
+          inline (useful for tests and synchronous debugging).
+        """
+        # Deferred imports to avoid a circular dependency:
+        # relationship_extractor imports InMemorySubgraphBuilder from this
+        # module, so importing relationship_extractor at the top level here
+        # would create a cycle.
+        from core.config import settings
+        from core.logger import get_logger
+        from core.memory.graph.extraction_prompts import (
+            ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+        )
+        from core.memory.graph.relationship_extractor import retry_relationships_only
+        from core.memory.stores.subgraph_store import SubgraphStore
+        from core.services import service_manager
+
+        logger = get_logger(__name__)
+
+        if not settings.EXTRACTION_ENABLED or not conversation_id:
+            return None
+
+        store = service_manager.get_subgraph_store()
+        subgraph_id = SubgraphStore.make_key(agent_name, conversation_id)
+
+        async def _build_and_store() -> None:
+            try:
+                graph = await self.build(relationships, source_agent=agent_name)
+                await store.save(subgraph_id, graph)
+                logger.debug(
+                    "schedule_subgraph_extraction: saved '%s' (%d edges)",
+                    subgraph_id,
+                    graph.number_of_edges(),
+                )
+            except Exception:
+                logger.exception(
+                    "schedule_subgraph_extraction: _build_and_store failed for '%s'",
+                    subgraph_id,
+                )
+
+        if relationships_extracted:
+            task = asyncio.create_task(_build_and_store())
+        else:
+            task = asyncio.create_task(
+                retry_relationships_only(
+                    llm,
+                    analysis_text,
+                    agent_name,
+                    conversation_id,
+                    self,
+                    store,
+                    subgraph_id,
+                    ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+                )
+            )
+
+        if settings.EXTRACTION_IMMEDIATE:
+            await task
+
+        return subgraph_id
 
 
 async def merge_subgraphs(

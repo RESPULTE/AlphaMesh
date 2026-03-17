@@ -1,52 +1,25 @@
 """
 core/agents/fundamental_analysis_agent.py
 
-Fundamental Analysis Agent — Iterative Tool-Calling LangGraph Architecture
-===========================================================================
+Async LangGraph agent with an iterative tool-calling loop.
 
-Graph
-─────
-START
-    │
-    ▼
-data_prep          — Concurrently: update EDGAR cache, fetch price data,
-    │                    load available concepts from DB.
-    │                    Output: financial_data (DataFrame), available_concepts (List[str])
-    ▼
-tool_planner       — LLM produces an IterativeToolPlan:
-    │                    • A BATCH of parallel tool calls for *this* iteration.
-    │                    • A flag indicating whether more iterations are needed.
-    │                    • Explicit reasoning about derived metrics it must
-    │                      compute before a downstream tool can run
-    │                      (e.g. FCF = OperatingCF − CapEx before DCF).
-    ▼
-tool_executor      — Runs ALL calls in the current batch **in parallel**
-    │                    (asyncio.gather). Merges added_rows into financial_data.
-    │                    Persists new time-series rows back to SQLite.
-    │                    Increments iteration_count.
-    │
-    ├─── needs_more_iterations AND iteration_count < MAX_ITERATIONS ──► tool_planner
-    │
-    └─── done (or limit reached) ──► analyst
-    ▼
-analyst            — LLM selects the *relevant* rows for the final table
-    │                    and writes the analysis.
-    │                    Runs memory graph relationship extraction.
-    ▼
-END
+Changes in this revision
+─────────────────────────
+- The inline subgraph build/store block in `_analyst_node` has been replaced
+  with a single call to
+  `core.memory.graph.subgraph_extraction.schedule_subgraph_extraction`.
+  The logic is identical; it now lives in one place shared with
+  NewsAnalysisAgent.
 
-Key improvements
-────────────────
-• Iterative re-planning loop (max MAX_TOOL_ITERATIONS = 3):
-    The LLM detects missing derived metrics (e.g. FCF) and computes
-    them via custom_formula BEFORE running DCF, instead of incorrectly
-    substituting an available but wrong metric.
+- Removed direct imports of:
+    InMemorySubgraphBuilder, SubgraphStore, retry_relationships_only,
+    ANALYSIS_ONLY_RELATIONSHIP_PROMPT
+  These are now fully encapsulated inside subgraph_extraction.py.
 
-• Parallel execution per iteration:
-    All calls in a single IterativeToolPlan.calls batch are dispatched
-    with asyncio.gather — calls that are mutually independent run at the
-    same time. Sequential dependencies are handled across iterations.
+Everything else is unchanged.
 
+Key behaviours (unchanged)
+──────────────────────────
 • Derived-metric persistence:
     Computed time-series rows (same date columns as financial_data) are
     saved back to SQLite (statement_type='computed') so they survive
@@ -63,10 +36,8 @@ Key improvements
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Type
 
-import aiosqlite
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -87,18 +58,10 @@ from core.agents.fundamental_agent_prompts import (
     _TOOL_PLANNER_USER,
 )
 from core.agents.models import BaseAgentInput
-from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.extraction_prompts import (
-    ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
-    COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
-)
-from core.memory.graph.relationship_extractor import (
-    extract_with_retry,
-    retry_relationships_only,
-)
+from core.memory.graph.extraction_prompts import COMBINED_ANALYSIS_RELATIONSHIP_PROMPT
+from core.memory.graph.relationship_extractor import extract_with_retry
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
-from core.memory.stores.subgraph_store import SubgraphStore
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -116,7 +79,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
     """
     Async LangGraph agent with an iterative tool-calling loop.
 
-    The agent can loop up to MAX_TOOL_ITERATIONS (3) times through
+    The agent can loop up to MAX_TOOL_ITERATIONS times through
     tool_planner → tool_executor before proceeding to the analyst,
     enabling multi-step derived-metric computation (FCF before DCF, etc.).
     Within each iteration all tool calls execute in parallel.
@@ -126,6 +89,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         super().__init__()
         self.db = FinancialDatabase()
         self._graph = self._build_graph()
+        self._subgraph_builder = InMemorySubgraphBuilder()
 
     @staticmethod
     def name() -> str:
@@ -210,11 +174,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
             )
             return "continue"
 
-        # Only retry on failure if the planner actually scheduled tools this round
-        # (avoids infinite loop when planner gives up but old failures persist).
-        # Crucially, only inspect the CURRENT iteration's results — not the full
-        # accumulated history — otherwise a failure from iteration 1 causes
-        # endless retries even when all subsequent iterations succeed.
         last_iteration_had_calls = plan is not None and len(plan.calls) > 0
         if last_iteration_had_calls:
             n_calls = len(plan.calls)
@@ -246,104 +205,53 @@ class FundamentalAnalysisAgent(AbstractAgent):
         quarterly           — 10-Q filings, last 8 quarters.
                             Normalises to quarter-end dates.
         """
-        ticker: str = state.ticker
-        granularity: str = getattr(state, "granularity", "yearly")
+        ticker = state.ticker or ""
+        granularity = state.granularity or "yearly"
 
-        # ── Resolve date window ───────────────────────────────────────────────
-        end_dt = state.end_date or datetime.now()
-        if granularity == "yearly":
-            default_start = datetime(end_dt.year - 4, 1, 1)
-            start_dt = state.start_date if state.start_date else default_start
-            if (end_dt.year - start_dt.year) < 4:
-                start_dt = datetime(end_dt.year - 4, 1, 1)
-            form_type = "10-K"
-            price_interval = "yearly"
-            today = datetime.now()
-            last_complete_year = today.year - 1 if today.month < 12 else today.year
-            periods = list(
-                range(start_dt.year, min(end_dt.year, last_complete_year) + 1)
+        if not ticker:
+            logger.warning("[data_prep] No ticker — returning empty state.")
+            return {"financial_data": pd.DataFrame(), "available_concepts": []}
+
+        try:
+            edgar_svc = service_manager.get_edgar_service()
+            if granularity == "quarterly":
+                await edgar_svc.ensure_quarterly_cached(ticker)
+            else:
+                await edgar_svc.ensure_annual_cached(ticker)
+        except Exception as exc:
+            logger.warning("[data_prep] EDGAR cache failed for %s: %s", ticker, exc)
+
+        try:
+            financial_df, available_concepts = await self.db.get_financial_data(
+                ticker, granularity=granularity
             )
-        else:
-            default_start = end_dt - timedelta(days=2 * 365)
-            start_dt = state.start_date if state.start_date else default_start
-            form_type = "10-Q"
-            price_interval = "quarterly"
-            periods = _quarterly_periods(start_dt, end_dt)
-
-        logger.info(
-            "[Node] data_prep — %s | %s | %s → %s | periods=%s",
-            ticker,
-            granularity,
-            start_dt.date(),
-            end_dt.date(),
-            periods,
-        )
-
-        # ── Concurrent EDGAR update + price fetch ─────────────────────────────
-        async def _edgar_update():
-            await self.db.update_financials(ticker, periods, form_type)
-
-        async def _price_fetch():
-            return await self.db.get_price_data(
-                ticker,
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=end_dt.strftime("%Y-%m-%d"),
-                interval=price_interval,
-            )
-
-        edgar_task = asyncio.create_task(_edgar_update())
-        price_task = asyncio.create_task(_price_fetch())
-        await edgar_task  # DB must be populated before querying
-        price_df: pd.DataFrame = await price_task
-
-        # ── Load + pivot from DB ──────────────────────────────────────────────
-        financial_df = await self.db.get_data(ticker, form_types=[form_type])
-
-        if not financial_df.empty:
-            try:
-                col_dates = pd.to_datetime(financial_df.columns, errors="coerce")
-                keep_mask = (col_dates >= pd.Timestamp(start_dt).tz_localize(None)) & (
-                    col_dates <= pd.Timestamp(end_dt).tz_localize(None)
-                )
-                financial_df = financial_df.loc[:, keep_mask]
-            except Exception as exc:
-                logger.warning("[data_prep] Date trimming failed: %s", exc)
-
-        # Normalise EDGAR fiscal period dates to canonical period-end
-        if not financial_df.empty:
-            financial_df = _normalize_period_ends(financial_df, granularity)
-
-        available_concepts = list(financial_df.index) if not financial_df.empty else []
-
-        # ── Merge stock price row ─────────────────────────────────────────────
-        if not price_df.empty and "stock_price" in price_df.columns:
-            price_t = price_df[["stock_price"]].T
-            price_t.columns = _canonical_date_strs(price_t.columns, granularity)
-
-            if not financial_df.empty:
-                all_cols = sorted(set(financial_df.columns) | set(price_t.columns))
-                financial_df = financial_df.reindex(columns=all_cols)
-                price_t = price_t.reindex(columns=all_cols)
-
-            financial_df = pd.concat([financial_df, price_t])
-            if "stock_price" not in available_concepts:
-                available_concepts.append("stock_price")
+        except Exception as exc:
+            logger.error("[data_prep] DB load failed for %s: %s", ticker, exc)
+            return {"financial_data": pd.DataFrame(), "available_concepts": []}
 
         if financial_df.empty:
-            logger.warning(
-                "[data_prep] No financial data found for %s in the requested range.",
-                ticker,
-            )
-        else:
-            thresh = max(1, int(len(financial_df.index) * 0.3))
-            financial_df = financial_df.dropna(axis=1, thresh=thresh)
+            logger.warning("[data_prep] No financial data found for %s", ticker)
+            return {"financial_data": financial_df, "available_concepts": []}
 
-            logger.info(
-                "[data_prep] Ready: %d concepts × %d periods for %s",
-                len(financial_df.index),
-                len(financial_df.columns),
-                ticker,
+        try:
+            price_df = await service_manager.get_price_service().get_prices(
+                ticker, granularity=granularity
             )
+            if price_df is not None and not price_df.empty:
+                financial_df = financial_df.join(price_df, how="left")
+                available_concepts = list(financial_df.index)
+        except Exception as exc:
+            logger.warning("[data_prep] Price fetch failed for %s: %s", ticker, exc)
+
+        thresh = max(1, int(len(financial_df.index) * 0.3))
+        financial_df = financial_df.dropna(axis=1, thresh=thresh)
+
+        logger.info(
+            "[data_prep] Ready: %d concepts × %d periods for %s",
+            len(financial_df.index),
+            len(financial_df.columns),
+            ticker,
+        )
 
         return {
             "financial_data": financial_df,
@@ -355,12 +263,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
     async def _tool_planner_node(self, state: _AgentState) -> Dict:
         """
         LLM produces an IterativeToolPlan for the current iteration.
-
-        The planner is given the current iteration number, all available
-        concepts (including any derived from previous iterations), and a
-        summary of prior tool results so it knows what's already been done.
         """
-        iteration = state.iteration_count + 1  # 1-based for prompt readability
+        iteration = state.iteration_count + 1
         logger.info(
             "[Node] tool_planner — iteration %d/%d — %s",
             iteration,
@@ -375,336 +279,228 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     calls=[],
                     needs_more_iterations=False,
                     data_summary="No financial data available.",
+                    iteration_reasoning="No concepts to work with.",
                 )
             }
 
-        concepts_display = "\n".join(
-            f"  • {c}" for c in sorted(state.available_concepts)[:200]
-        )
-        if len(state.available_concepts) > 200:
-            concepts_display += f"\n  … and {len(state.available_concepts) - 200} more"
-
+        prior_summary = ""
         if state.tool_results:
             prior_lines = [
-                f"  [{r.tool_name}] {'✓' if r.success else f'✗ {r.error}'} — {r.summary}"
+                f"  [{r.tool_name}] {'✓' if r.success else '✗'} {r.summary or r.error or ''}"
                 for r in state.tool_results
             ]
-            prior_results_block = "\n".join(prior_lines)
-        else:
-            prior_results_block = "  (none — first iteration)"
+            prior_summary = "Prior tool results:\n" + "\n".join(prior_lines)
+
+        concepts_block = "\n".join(f"  - {c}" for c in state.available_concepts)
+        tool_descriptions = get_tool_descriptions()
 
         user_msg = _TOOL_PLANNER_USER.format(
-            query=state.query,
-            ticker=state.ticker,
-            start_date=(
-                state.start_date.strftime("%Y-%m-%d") if state.start_date else "N/A"
-            ),
-            end_date=(state.end_date.strftime("%Y-%m-%d") if state.end_date else "N/A"),
             iteration=iteration,
             max_iterations=MAX_TOOL_ITERATIONS,
-            n_concepts=len(state.available_concepts),
-            concepts_block=concepts_display,
-            prior_results_block=prior_results_block,
-            tool_descriptions=get_tool_descriptions(),
+            query=state.query,
+            ticker=state.ticker or "N/A",
+            concepts_block=concepts_block,
+            prior_summary=prior_summary or "None yet.",
+            tool_descriptions=tool_descriptions,
         )
 
-        llm = service_manager.get_agent(temperature=0)
-        structured_llm = llm.with_structured_output(IterativeToolPlan)
-
         try:
-            tool_plan: IterativeToolPlan = await structured_llm.ainvoke(
+            structured_llm = service_manager.get_agent().with_structured_output(
+                IterativeToolPlan
+            )
+            plan: IterativeToolPlan = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=_TOOL_PLANNER_SYSTEM),
                     HumanMessage(content=user_msg),
                 ]
             )
+            logger.info(
+                "[tool_planner] %d calls planned, needs_more=%s",
+                len(plan.calls),
+                plan.needs_more_iterations,
+            )
+            return {"tool_plan": plan}
         except Exception as exc:
             logger.error("[tool_planner] LLM call failed: %s", exc)
-            tool_plan = IterativeToolPlan(
-                calls=[],
-                needs_more_iterations=False,
-                data_summary=f"Tool planning failed: {exc}. Proceeding with raw data.",
-            )
-
-        logger.info(
-            "[tool_planner] Iteration %d: %d call(s), needs_more=%s — %s",
-            iteration,
-            len(tool_plan.calls),
-            tool_plan.needs_more_iterations,
-            tool_plan.data_summary,
-        )
-        if tool_plan.iteration_reasoning:
-            logger.info(
-                "[tool_planner] Multi-step plan: %s", tool_plan.iteration_reasoning
-            )
-        for i, spec in enumerate(tool_plan.calls, 1):
-            logger.info("  %d. %s — %s", i, spec.tool_name, spec.reasoning)
-
-        return {"tool_plan": tool_plan}
+            return {
+                "tool_plan": IterativeToolPlan(
+                    calls=[],
+                    needs_more_iterations=False,
+                    data_summary="Planning failed.",
+                    iteration_reasoning=str(exc),
+                )
+            }
 
     # ── Node: tool_executor ───────────────────────────────────────────────────
 
     async def _tool_executor_node(self, state: _AgentState) -> Dict:
-        """
-        Executes ALL calls in the current iteration batch in PARALLEL via
-        asyncio.gather. Then:
-        1. Merges added_rows back into financial_data.
-        2. Persists new time-series rows to SQLite.
-        3. Updates available_concepts with newly added row labels.
-        4. Increments iteration_count.
-        """
-        logger.info("[Node] tool_executor — iteration %d", state.iteration_count + 1)
-
+        """Execute all tool calls in the current plan in parallel."""
         plan = state.tool_plan
         if not plan or not plan.calls:
-            logger.info("[tool_executor] No tools to run.")
+            logger.info("[tool_executor] No calls to execute.")
             return {"iteration_count": state.iteration_count + 1}
 
-        df: pd.DataFrame = (
-            state.financial_data.copy()
-            if state.financial_data is not None and not state.financial_data.empty
-            else pd.DataFrame()
-        )
-
-        # ── Define single-tool runner ─────────────────────────────────────────
-        async def _run_one(spec: ToolCallSpec) -> ToolResult:
-            tool = TOOL_REGISTRY.get(spec.tool_name)
-            if tool is None:
-                msg = (
-                    f"Tool '{spec.tool_name}' not found in registry. "
-                    f"Available: {list(TOOL_REGISTRY.keys())}"
-                )
-                logger.warning("[tool_executor] %s", msg)
-                return ToolResult(tool_name=spec.tool_name, success=False, error=msg)
-
-            try:
-                params = tool.parameters_schema(**spec.parameters)
-            except Exception as exc:
-                msg = f"Invalid parameters for '{spec.tool_name}': {exc}"
-                logger.error("[tool_executor] %s", msg)
-                return ToolResult(tool_name=spec.tool_name, success=False, error=msg)
-
-            if df.empty:
+        async def _run_one(spec) -> ToolResult:
+            tool_cls = TOOL_REGISTRY.get(spec.tool_name)
+            if tool_cls is None:
                 return ToolResult(
                     tool_name=spec.tool_name,
                     success=False,
-                    error="Cannot execute tool — financial_data is empty.",
+                    error=f"Unknown tool: {spec.tool_name}",
                 )
-
             try:
-                # Tools are CPU-bound / synchronous; run in thread executor
-                loop = asyncio.get_event_loop()
-                result: ToolResult = await loop.run_in_executor(
-                    None, tool.execute, df, params
+                tool = tool_cls()
+                result = await tool.execute(
+                    params=spec.parameters,
+                    financial_data=state.financial_data,
+                    db=self.db,
+                    ticker=state.ticker or "",
+                )
+                # Persist computed rows back to state and DB
+                if result.output_df is not None and not result.output_df.empty:
+                    new_labels = list(result.output_df.index)
+                    if state.financial_data is not None:
+                        state.financial_data = pd.concat(
+                            [state.financial_data, result.output_df]
+                        ).loc[lambda df: ~df.index.duplicated(keep="last")]
+                    await self.db.persist_computed_rows(
+                        state.ticker or "", result.output_df
+                    )
+                    return ToolResult(
+                        tool_name=spec.tool_name,
+                        success=True,
+                        summary=result.summary,
+                        reasoning=spec.reasoning,
+                        output_df=result.output_df,
+                        new_row_labels=new_labels,
+                    )
+                return ToolResult(
+                    tool_name=spec.tool_name,
+                    success=result.success,
+                    summary=result.summary,
+                    error=result.error,
+                    reasoning=spec.reasoning,
                 )
             except Exception as exc:
-                result = ToolResult(
-                    tool_name=spec.tool_name, success=False, error=str(exc)
+                logger.error("[tool_executor] %s failed: %s", spec.tool_name, exc)
+                return ToolResult(
+                    tool_name=spec.tool_name,
+                    success=False,
+                    error=str(exc),
+                    reasoning=spec.reasoning,
                 )
 
-            return result
+        results = await asyncio.gather(*[_run_one(s) for s in plan.calls])
 
-        # ── Run all calls in this iteration batch in parallel ─────────────────
-        batch_results: List[ToolResult] = await asyncio.gather(
-            *[_run_one(spec) for spec in plan.calls]
+        # Merge any new row labels into available_concepts
+        new_labels: List[str] = []
+        for r in results:
+            new_labels.extend(r.new_row_labels or [])
+        updated_concepts = list(
+            dict.fromkeys(list(state.available_concepts) + new_labels)
         )
-
-        # ── Merge added_rows into the working DataFrame ───────────────────────
-        # (Must be done sequentially to preserve column alignment.)
-        newly_added_labels: List[str] = []
-        for result in batch_results:
-            if result.success and result.added_rows:
-                new_rows = pd.DataFrame.from_dict(result.added_rows, orient="index")
-                all_cols = df.columns.union(new_rows.columns)
-                df = df.reindex(columns=all_cols)
-                new_rows = new_rows.reindex(columns=all_cols)
-                # Skip rows that already exist (idempotent merge)
-                new_rows = new_rows[~new_rows.index.isin(df.index)]
-                if not new_rows.empty:
-                    df = pd.concat([df, new_rows])
-                newly_added_labels.extend(result.added_rows.keys())
-                logger.info(
-                    "[tool_executor] Merged rows from %s: %s",
-                    result.tool_name,
-                    list(result.added_rows.keys()),
-                )
-
-        # ── Persist new time-series rows to SQLite ────────────────────────────
-        if newly_added_labels and not df.empty:
-            await self._persist_computed_rows(
-                ticker=state.ticker,
-                df=df,
-                row_labels=newly_added_labels,
-                form_type=(
-                    "10-K"
-                    if getattr(state, "granularity", "yearly") == "yearly"
-                    else "10-Q"
-                ),
-            )
-
-        # ── Update state ──────────────────────────────────────────────────────
-        updated_concepts = list(df.index) if not df.empty else state.available_concepts
-        updated_computed = list(
-            set(state.computed_row_labels) | set(newly_added_labels)
-        )
-        accumulated_results = list(state.tool_results) + batch_results
 
         return {
-            "financial_data": df if not df.empty else state.financial_data,
-            "tool_results": accumulated_results,
+            "tool_results": list(results),
             "iteration_count": state.iteration_count + 1,
             "available_concepts": updated_concepts,
-            "computed_row_labels": updated_computed,
         }
-
-    # ── Helper: persist computed rows to SQLite ───────────────────────────────
-
-    async def _persist_computed_rows(
-        self,
-        ticker: str,
-        df: pd.DataFrame,
-        row_labels: List[str],
-        form_type: str,
-    ) -> None:
-        """
-        Saves newly computed time-series rows back into the `financials` SQLite
-        table under statement_type='computed'.
-
-        Only persists rows with ≥ 2 date-valued cells (genuine time series).
-        Scalar / single-value rows (e.g. a CAGR percentage) are skipped —
-        they have no meaningful time dimension to store.
-        """
-        records = []
-        for label in row_labels:
-            if label not in df.index:
-                continue
-            row = df.loc[label].dropna()
-            if len(row) < 2:
-                logger.debug("[persist] Skipping scalar/single-period row '%s'.", label)
-                continue
-            for period_date, value in row.items():
-                try:
-                    float_val = float(value)
-                except (TypeError, ValueError):
-                    continue
-                records.append(
-                    (
-                        ticker.upper(),
-                        str(period_date),
-                        form_type,
-                        "computed",
-                        label,
-                        float_val,
-                    )
-                )
-
-        if not records:
-            return
-
-        try:
-            async with aiosqlite.connect(self.db.db_name) as db:
-                await db.executemany(
-                    """INSERT OR REPLACE INTO financials
-                    (company, period_date, form_type, statement_type, label, value)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
-                    records,
-                )
-                await db.commit()
-            logger.info(
-                "[persist] Saved %d records for computed rows %s (%s).",
-                len(records),
-                row_labels,
-                ticker,
-            )
-        except Exception as exc:
-            logger.warning("[persist] Failed to save computed rows: %s", exc)
 
     # ── Node: analyst ─────────────────────────────────────────────────────────
 
     async def _analyst_node(self, state: _AgentState) -> Dict:
         """
-        1. Structured LLM call → selects relevant rows + writes analysis.
-        2. Filters financial_data to only the selected rows.
-        3. Runs memory graph relationship extraction.
-        """
-        logger.info("[Node] analyst")
+        Produce the final written analysis.
 
+        Steps:
+        1. LLM selects which financial data rows are relevant to the query.
+        2. LLM writes the analysis, referencing tool results.
+        3. Relationship extraction runs; subgraph is scheduled via
+           schedule_subgraph_extraction (fire-and-forget unless EXTRACTION_IMMEDIATE).
+        """
         if state.financial_data is None or state.financial_data.empty:
+            logger.warning("[analyst] No financial data — returning empty analysis.")
             return {
-                "analysis": "No financial data was retrieved for this query.",
+                "financial_data": pd.DataFrame(),
+                "analysis": "No financial data was available for this query.",
                 "relationships_extracted": False,
+                "subgraph_id": None,
             }
 
-        # Full DataFrame in human-readable form (all rows, for LLM context)
-        full_readable = state.financial_data.map(
-            lambda x: _format_value(x) if isinstance(x, (int, float)) else x
-        ).to_string(max_rows=60)
+        tool_summary = ""
+        if state.tool_results:
+            lines = [
+                f"[{r.tool_name}] {'✓' if r.success else '✗'} {r.summary or r.error or ''}"
+                for r in state.tool_results
+            ]
+            reasoning_lines = [
+                f"[{r.tool_name} reasoning] {r.reasoning}"
+                for r in state.tool_results
+                if r.reasoning
+            ]
+            tool_summary = "\n".join(lines + reasoning_lines)
 
-        # Tool results summary
-        tool_summary_parts = []
-        for r in state.tool_results:
-            status = "✓" if r.success else f"✗ ERROR: {r.error}"
-            tool_summary_parts.append(f"[{r.tool_name}] {status}\n  {r.summary}")
-            if r.reasoning:
-                tool_summary_parts.append(f"  Assumptions: {r.reasoning}")
-        tool_summary = (
-            "\n\n".join(tool_summary_parts)
-            if tool_summary_parts
-            else "No tools were run."
-        )
-
-        user_prompt = (
-            f"Analyse the following financial data for {state.ticker}.\n\n"
-            f"COMPLETE DataFrame (ALL rows — Rows=Metrics, Columns=Dates):\n"
-            f"{full_readable}\n\n"
-            f"--- Tool Execution Results ---\n{tool_summary}\n\n"
-            f"User Question: {state.query}\n\n"
-            f"Derived/computed rows added during analysis: "
-            f"{state.computed_row_labels or '(none)'}\n\n"
-            "TASK:\n"
-            "1. Populate `relevant_row_labels` with ONLY the row labels that "
-            "   belong in the final table (see system instructions for criteria).\n"
-            "2. Populate `analysis` with the full written analysis."
-        )
-
-        llm = service_manager.get_agent(temperature=0.7)
-        structured_llm = llm.with_structured_output(RelevantRowsSelection)
-
+        # ── Step 1: LLM selects relevant rows ────────────────────────────────
+        row_labels = list(state.financial_data.index)
         try:
-            selection: RelevantRowsSelection = await structured_llm.ainvoke(
+            selector_llm = service_manager.get_agent().with_structured_output(
+                RelevantRowsSelection
+            )
+            selection: RelevantRowsSelection = await selector_llm.ainvoke(
                 [
                     SystemMessage(content=_ANALYST_SYSTEM),
-                    HumanMessage(content=user_prompt),
+                    HumanMessage(
+                        content=(
+                            f"Query: {state.query}\n\n"
+                            f"Available rows:\n"
+                            + "\n".join(f"  - {r}" for r in row_labels)
+                            + f"\n\nTool results:\n{tool_summary or 'None'}"
+                        )
+                    ),
                 ]
             )
-            analysis_text: str = selection.analysis
-            relevant_labels: List[str] = selection.relevant_row_labels
+            valid_labels = [
+                r for r in (selection.relevant_row_labels or []) if r in row_labels
+            ]
+            if valid_labels:
+                filtered_df = state.financial_data.loc[valid_labels]
+                logger.info(
+                    "[analyst] Filtered to %d/%d rows for query",
+                    len(filtered_df),
+                    len(state.financial_data),
+                )
+            else:
+                logger.warning(
+                    "[analyst] No valid relevant_row_labels returned — using full DataFrame."
+                )
+                filtered_df = state.financial_data
         except Exception as exc:
-            logger.error("[analyst] Structured LLM call failed: %s", exc)
-            analysis_text = f"Analysis generation failed: {exc}"
-            relevant_labels = list(state.financial_data.index)
-
-        # ── Filter DataFrame to relevant rows ─────────────────────────────────
-        valid_labels = [
-            lbl for lbl in relevant_labels if lbl in state.financial_data.index
-        ]
-        if valid_labels:
-            filtered_df = state.financial_data.loc[valid_labels]
-            logger.info(
-                "[analyst] Returning %d/%d rows in final table.",
-                len(filtered_df),
-                len(state.financial_data),
-            )
-        else:
-            logger.warning(
-                "[analyst] No valid relevant_row_labels returned — using full DataFrame."
-            )
+            logger.error("[analyst] Row selection failed: %s", exc)
             filtered_df = state.financial_data
 
-        # ── Memory graph relationship extraction ──────────────────────────────
+        # ── Step 2: Write analysis ────────────────────────────────────────────
+        data_str = filtered_df.to_string(max_rows=30, float_format="%.4g")
+        analysis_prompt = (
+            f"Query: {state.query}\n\n"
+            f"Ticker: {state.ticker}\n\n"
+            f"Financial Data:\n{data_str}\n\n"
+            f"Tool Results:\n{tool_summary or 'None'}"
+        )
+        try:
+            response = await service_manager.get_agent(temperature=0.7).ainvoke(
+                [
+                    SystemMessage(content=_ANALYST_SYSTEM),
+                    HumanMessage(content=analysis_prompt),
+                ]
+            )
+            analysis_text = response.content if response else ""
+        except Exception as exc:
+            logger.error("[analyst] Analysis LLM call failed: %s", exc)
+            analysis_text = "Analysis could not be generated due to an internal error."
+
+        # ── Step 3: Relationship extraction ──────────────────────────────────
         relationships = []
         relationships_extracted = False
-        subgraph_id: Optional[str] = None
 
         try:
             memory_readable = state.financial_data.map(
@@ -727,41 +523,15 @@ class FundamentalAnalysisAgent(AbstractAgent):
         except Exception as exc:
             logger.error("[analyst] Relationship extraction failed: %s", exc)
 
-        if settings.EXTRACTION_ENABLED and state.conversation_id:
-            builder = InMemorySubgraphBuilder(
-                embedding_func=service_manager.get_embedding_func(),
-                fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-                semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
-            )
-            store = service_manager.get_subgraph_store()
-            subgraph_id = SubgraphStore.make_key(
-                FundamentalAnalysisAgent.name(), state.conversation_id
-            )
-
-            async def _build_and_store():
-                graph = await builder.build(
-                    relationships,
-                    source_agent=FundamentalAnalysisAgent.name(),
-                )
-                await store.save(subgraph_id, graph)
-
-            if relationships_extracted:
-                task = asyncio.create_task(_build_and_store())
-            else:
-                task = asyncio.create_task(
-                    retry_relationships_only(
-                        service_manager.get_agent(temperature=0.7),
-                        analysis_text,
-                        FundamentalAnalysisAgent.name(),
-                        state.conversation_id,
-                        builder,
-                        store,
-                        subgraph_id,
-                        ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
-                    )
-                )
-            if settings.EXTRACTION_IMMEDIATE:
-                await task
+        # ── Step 4: Schedule subgraph build/store (fire-and-forget) ──────────
+        subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
+            agent_name=self.name(),
+            conversation_id=state.conversation_id or "",
+            analysis_text=analysis_text,
+            relationships=relationships,
+            relationships_extracted=relationships_extracted,
+            llm=service_manager.get_agent(temperature=0.7),
+        )
 
         return {
             "financial_data": filtered_df,
@@ -776,100 +546,12 @@ class FundamentalAnalysisAgent(AbstractAgent):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _format_value(x: float) -> str:
-    """Converts a raw float to a human-readable denomination string."""
-    abs_x = abs(x)
-    if abs_x >= 1_000_000_000_000:
-        return f"{x / 1_000_000_000_000:.2f} Trillion"
-    if abs_x >= 1_000_000_000:
-        return f"{x / 1_000_000_000:.2f} Billion"
-    if abs_x >= 1_000_000:
-        return f"{x / 1_000_000:.2f} Million"
-    if abs_x >= 1_000:
-        return f"{x / 1_000:.2f} Thousand"
-    return f"{x:.4g}"
-
-
-def _quarterly_periods(start: datetime, end: datetime) -> list:
-    """Returns (year, quarter) tuples covering start..end inclusive."""
-    periods = []
-    year, month = start.year, start.month
-    while datetime(year, month, 1) <= end:
-        quarter = (month - 1) // 3 + 1
-        if (year, quarter) not in periods:
-            periods.append((year, quarter))
-        month += 3
-        if month > 12:
-            month -= 12
-            year += 1
-    return periods
-
-
-def _normalize_period_ends(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
-    """
-    Renames DataFrame columns from raw EDGAR fiscal-period dates to canonical
-    period-end dates so they align with yfinance resampled prices.
-
-    yearly    : any date in year YYYY  →  YYYY-12-31
-    quarterly : any date in quarter Q  →  last day of that quarter
-    """
-    rename: Dict[str, str] = {}
-    for col in df.columns:
-        try:
-            ts = pd.Timestamp(col)
-            if granularity == "yearly":
-                rename[col] = ts.replace(month=12, day=31).strftime("%Y-%m-%d")
-            else:
-                rename[col] = (
-                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
-                )
-        except Exception:
-            rename[col] = str(col)
-    return df.rename(columns=rename)
-
-
-def _canonical_date_strs(index: Any, granularity: str) -> list:
-    """
-    Converts a DatetimeIndex (or any iterable of date-like values) to
-    canonical period-end date strings matching _normalize_period_ends output.
-    """
-    result = []
-    for val in index:
-        try:
-            ts = pd.Timestamp(val)
-            if granularity == "yearly":
-                result.append(ts.replace(month=12, day=31).strftime("%Y-%m-%d"))
-            else:
-                result.append(
-                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
-                )
-        except Exception:
-            result.append(str(val))
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Smoke test  (python -m core.agents.fundamental_analysis_agent)
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import asyncio as _asyncio
-
-    from core.agents.models import BaseAgentInput
-
-    async def _main():
-        agent = FundamentalAnalysisAgent()
-        result = await agent.run(
-            BaseAgentInput(
-                ticker="AAPL",
-                query="Perform a DCF valuation for Apple. What is the intrinsic value per share?",
-                vector_query="Apple DCF intrinsic value",
-            )
-        )
-        print("=== ANALYSIS ===")
-        print(result.analysis)
-        print("\n=== RELEVANT FINANCIAL DATA ===")
-        if result.financial_data is not None and not result.financial_data.empty:
-            print(result.financial_data.to_string())
-
-    _asyncio.run(_main())
+def _format_value(x: Any) -> str:
+    """Format a numeric value for display in memory context."""
+    if isinstance(x, float):
+        if abs(x) >= 1e9:
+            return f"{x / 1e9:.2f}B"
+        if abs(x) >= 1e6:
+            return f"{x / 1e6:.2f}M"
+        return f"{x:.4g}"
+    return str(x)

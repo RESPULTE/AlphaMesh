@@ -55,13 +55,9 @@ from core.memory.graph.extraction_prompts import (
     ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
     COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
 )
-from core.memory.graph.relationship_extractor import (
-    extract_with_retry,
-    retry_relationships_only,
-)
+from core.memory.graph.relationship_extractor import extract_with_retry
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
-from core.memory.stores.subgraph_store import SubgraphStore
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -153,6 +149,7 @@ class NewsAnalysisAgent(AbstractAgent):
         super().__init__()
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
+        self._subgraph_builder = InMemorySubgraphBuilder()
 
     @staticmethod
     def name() -> str:
@@ -497,38 +494,14 @@ class NewsAnalysisAgent(AbstractAgent):
         ]
         # ── End citation filtering ─────────────────────────────────────────────
 
-        subgraph_id = None
-        if settings.EXTRACTION_ENABLED and state.conversation_id:
-            builder = InMemorySubgraphBuilder(
-                embedding_func=service_manager.get_embedding_func(),
-                fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-                semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
-            )
-            store = service_manager.get_subgraph_store()
-            subgraph_id = SubgraphStore.make_key(self.name(), state.conversation_id)
-
-            async def _build_and_store():
-                graph = await builder.build(relationships, source_agent=self.name())
-                await store.save(subgraph_id, graph)
-
-            if relationships_extracted:
-                task = asyncio.create_task(_build_and_store())
-            else:
-                task = asyncio.create_task(
-                    retry_relationships_only(
-                        self._llm,
-                        analysis_text,
-                        self.name(),
-                        state.conversation_id,
-                        builder,
-                        store,
-                        subgraph_id,
-                        ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
-                    )
-                )
-
-            if settings.EXTRACTION_IMMEDIATE:
-                await task
+        subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
+            agent_name=self.name(),
+            conversation_id=state.conversation_id or "",
+            analysis_text=analysis_text,
+            relationships=relationships,
+            relationships_extracted=relationships_extracted,
+            llm=self._llm,
+        )
 
         return {
             "analysis": analysis_text,
