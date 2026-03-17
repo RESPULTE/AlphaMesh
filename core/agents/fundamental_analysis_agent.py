@@ -384,16 +384,22 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return "continue"
 
         # Only retry on failure if the planner actually scheduled tools this round
-        # (avoids infinite loop when planner gives up but old failures persist)
+        # (avoids infinite loop when planner gives up but old failures persist).
+        # Crucially, only inspect the CURRENT iteration's results — not the full
+        # accumulated history — otherwise a failure from iteration 1 causes
+        # endless retries even when all subsequent iterations succeed.
         last_iteration_had_calls = plan is not None and len(plan.calls) > 0
-        any_failed = any(not r.success for r in (state.tool_results or []))
-        if last_iteration_had_calls and any_failed:
-            logger.info(
-                "[Router] Tool failures detected — retrying. Iteration %d/%d",
-                state.iteration_count,
-                MAX_TOOL_ITERATIONS,
-            )
-            return "continue"
+        if last_iteration_had_calls:
+            n_calls = len(plan.calls)
+            current_batch = (state.tool_results or [])[-n_calls:]
+            any_current_failed = any(not r.success for r in current_batch)
+            if any_current_failed:
+                logger.info(
+                    "[Router] Tool failures in current batch — retrying. Iteration %d/%d",
+                    state.iteration_count,
+                    MAX_TOOL_ITERATIONS,
+                )
+                return "continue"
 
         return "done"
 

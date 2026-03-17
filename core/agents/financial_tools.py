@@ -365,11 +365,20 @@ class CAGRTool(FinancialTool):
                 f"({start_val:,.0f} → {end_val:,.0f})"
             )
             logger.info("[CAGRTool] %s", summary)
+
+            # CAGR is a single summary scalar — place it only in the terminal
+            # (most recent) date column so the table doesn't show the same
+            # value repeated identically across every period.
+            last_col = sorted_row.index[-1]
+            added_row = {
+                col: cagr_val if col == last_col else float("nan") for col in df.columns
+            }
+
             return ToolResult(
                 tool_name=self.name,
                 success=True,
                 scalar_value=cagr_val,
-                added_rows={output_label: {col: cagr_val for col in df.columns}},
+                added_rows={output_label: added_row},
                 summary=summary,
             )
         except Exception as exc:

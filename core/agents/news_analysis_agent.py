@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re as _re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Type
@@ -376,6 +377,43 @@ class NewsAnalysisAgent(AbstractAgent):
         except Exception as exc:
             logger.error("Analysis generation failed: %s", exc)
             raise
+
+        # ── Filter sources to only those actually cited, and renumber ──────────────
+
+        # Collect cited source IDs in order of first appearance
+        _seen_ids: set[int] = set()
+        _cited_in_order: list[int] = []
+        for _m in _re.finditer(r"\[(\d+)\]", analysis_text):
+            _sid = int(_m.group(1))
+            if _sid not in _seen_ids:
+                _cited_in_order.append(_sid)
+                _seen_ids.add(_sid)
+
+        # Build old → new id remapping (first-cited source becomes [1], etc.)
+        _old_to_new: dict[int, int] = {
+            old_id: new_id for new_id, old_id in enumerate(_cited_in_order, start=1)
+        }
+
+        # Rewrite in-text citations to use the new consecutive numbering
+        def _remap(m: _re.Match) -> str:
+            sid = int(m.group(1))
+            return f"[{_old_to_new[sid]}]" if sid in _old_to_new else m.group(0)
+
+        analysis_text = _re.sub(r"\[(\d+)\]", _remap, analysis_text)
+
+        # Rebuild sources list — only cited articles, with updated source_id
+        _sources_by_old_id: dict[int, CitedSource] = {s.source_id: s for s in sources}
+        sources = [
+            CitedSource(
+                source_id=new_id,
+                title=_sources_by_old_id[old_id].title,
+                url=_sources_by_old_id[old_id].url,
+                page_content=_sources_by_old_id[old_id].page_content,
+            )
+            for old_id, new_id in _old_to_new.items()
+            if old_id in _sources_by_old_id
+        ]
+        # ── End citation filtering ─────────────────────────────────────────────────
 
         subgraph_id = None
         if settings.EXTRACTION_ENABLED and state.conversation_id:

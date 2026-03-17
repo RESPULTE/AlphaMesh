@@ -39,90 +39,265 @@ st.set_page_config(
 
 AGENT_CARD_CSS = """
 <style>
-/* ── Agent card grid ─────────────────────────────────────── */
-.agent-cards-row {
-    display: flex;
-    flex-direction: row;
-    gap: 14px;
-    align-items: flex-start;
-    margin-bottom: 16px;
-    flex-wrap: wrap;          /* wraps gracefully on narrow screens */
+/* ═══════════════════════════════════════════════════════════
+   Per-agent accent palette — driven by data-agent attribute
+   ═══════════════════════════════════════════════════════════ */
+.agent-card[data-agent="news_agent"] {
+    --ca: #c8954a; --ca-light: #fdf3e3; --ca-mid: #e8c48a;
+}
+.agent-card[data-agent="fundamentals_agent"] {
+    --ca: #5b8dd9; --ca-light: #eef3fb; --ca-mid: #a8c0e8;
+}
+.agent-card {
+    /* fallback for unknown agents */
+    --ca: #7e9e7e; --ca-light: #f0f5f0; --ca-mid: #b8d0b8;
 }
 
-.agent-card {
-    flex: 1 1 0;              /* each card grows equally */
-    min-width: 220px;
-    background: var(--secondary-background-color, #1e1e2e);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px;
-    padding: 16px 18px;
-    box-sizing: border-box;
+/* ── Vertical stack wrapper ──────────────────────────────── */
+.agent-cards-col {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 0;
+    margin-bottom: 12px;
+    position: relative;
 }
 
+/* Thin guide line running through the icon column */
+.agent-cards-col::before {
+    content: '';
+    position: absolute;
+    left: 19px;
+    top: 42px;
+    bottom: 42px;
+    width: 2px;
+    background: linear-gradient(
+        to bottom,
+        var(--border, #e8e4de) 0%,
+        var(--border, #e8e4de) 80%,
+        transparent 100%
+    );
+    pointer-events: none;
+    z-index: 0;
+}
+
+/* ── Individual agent card ───────────────────────────────── */
+.agent-card {
+    display: grid;
+    grid-template-columns: 40px 1fr;
+    grid-template-rows: auto auto auto;
+    column-gap: 14px;
+    background: var(--surface, #ffffff);
+    border: 1px solid var(--border, #e8e4de);
+    border-radius: 14px;
+    padding: 16px 18px 16px 14px;
+    margin-bottom: 10px;
+    box-sizing: border-box;
+    position: relative;
+    transition: box-shadow 0.2s, border-color 0.2s;
+    animation: acFadeIn 0.3s ease both;
+}
+.agent-card:nth-child(2) { animation-delay: 0.08s; }
+.agent-card:nth-child(3) { animation-delay: 0.16s; }
+.agent-card:hover {
+    border-color: var(--ca);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.06);
+}
+@keyframes acFadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Left accent stripe */
+.agent-card::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 12px; bottom: 12px;
+    width: 3px;
+    background: var(--ca);
+    border-radius: 0 3px 3px 0;
+}
+
+/* Icon bubble — column 1, spans all rows */
+.agent-card-icon-col {
+    grid-column: 1;
+    grid-row: 1 / 4;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 1px;
+    position: relative;
+    z-index: 1;
+}
+.agent-card-icon-bubble {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    background: var(--ca-light);
+    border: 2px solid var(--ca-mid);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px;
+    flex-shrink: 0;
+}
+
+/* Header row — column 2, row 1 */
 .agent-card-header {
+    grid-column: 2;
+    grid-row: 1;
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 0.78rem;
+    margin-bottom: 8px;
+}
+.agent-card-label {
+    font-size: 0.75rem;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-color, #cdd6f4);
-    opacity: 0.65;
-    margin-bottom: 4px;
+    letter-spacing: 0.07em;
+    color: var(--ca);
+}
+.agent-card-pill {
+    margin-left: auto;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    background: var(--ca-light);
+    color: var(--ca);
+    border: 1px solid var(--ca-mid);
+    border-radius: 20px;
+    padding: 1px 8px;
 }
 
+/* Body — column 2, row 2 */
 .agent-card-body {
-    font-size: 0.9rem;
-    line-height: 1.65;
-    color: var(--text-color, #cdd6f4);
-    white-space: pre-wrap;
+    grid-column: 2;
+    grid-row: 2;
+    font-size: 0.875rem;
+    line-height: 1.7;
+    color: var(--text-primary, #1a1814);
 }
+.agent-card-body p            { margin: 0 0 8px; }
+.agent-card-body p:last-child { margin-bottom: 0; }
+.agent-card-body ul,
+.agent-card-body ol           { margin: 4px 0 8px 16px; padding: 0; }
+.agent-card-body li           { margin-bottom: 3px; }
+.agent-card-body strong       { font-weight: 600; }
+.agent-card-body a            { color: var(--accent-dark, #9e6e2e); }
 
-/* ── Synthesizer summary (horizontal, below agents) ─────── */
-.synth-card {
-    background: var(--secondary-background-color, #1e1e2e);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-left: 3px solid #89b4fa;   /* accent stripe */
-    border-radius: 12px;
-    padding: 14px 20px;
-    margin-top: 4px;
+/* ── Collapsible reference list — column 2, row 3 ────────── */
+.agent-card-refs {
+    grid-column: 2;
+    grid-row: 3;
+    margin-top: 10px;
+    border-top: 1px solid var(--border, #e8e4de);
+    padding-top: 8px;
+}
+.agent-card-refs summary {
     display: flex;
-    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text-muted, #9e9890);
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    padding: 2px 0;
+    transition: color 0.15s;
+}
+.agent-card-refs summary::-webkit-details-marker { display: none; }
+.agent-card-refs summary:hover { color: var(--ca); }
+.agent-card-refs summary .refs-chevron {
+    display: inline-block;
+    font-size: 0.55rem;
+    transition: transform 0.2s;
+}
+.agent-card-refs[open] summary .refs-chevron { transform: rotate(90deg); }
+.agent-card-refs-list {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+.agent-card-ref-item {
+    display: flex;
     align-items: flex-start;
-    gap: 14px;
+    gap: 7px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-secondary, #6b6560);
 }
-
-.synth-card-icon {
-    font-size: 1.2rem;
-    flex-shrink: 0;
-    margin-top: 2px;
+.agent-card-ref-num {
+    min-width: 17px; height: 17px;
+    background: var(--ca-light);
+    color: var(--ca);
+    border: 1px solid var(--ca-mid);
+    font-weight: 700; font-size: 9.5px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; margin-top: 1px;
 }
+.agent-card-ref-link {
+    color: var(--text-secondary, #6b6560);
+    text-decoration: none;
+    transition: color 0.15s;
+}
+.agent-card-ref-link:hover { color: var(--ca); text-decoration: underline; }
 
+/* ── Synthesis card ──────────────────────────────────────── */
+.synth-card {
+    background: linear-gradient(135deg,
+        var(--surface, #ffffff) 0%,
+        var(--ai-bubble, #fdf8f2) 100%);
+    border: 1px solid var(--ai-border, #e8d9c0);
+    border-top: 2px solid var(--accent, #c8954a);
+    border-radius: 14px;
+    padding: 16px 20px;
+    margin-top: 4px;
+    display: grid;
+    grid-template-columns: 36px 1fr;
+    column-gap: 12px;
+    animation: acFadeIn 0.3s ease both;
+    animation-delay: 0.22s;
+}
+.synth-card-icon-col {
+    display: flex;
+    align-items: flex-start;
+    padding-top: 2px;
+}
+.synth-card-icon-bubble {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: var(--accent-light, #f5e6cc);
+    border: 2px solid var(--ai-border, #e8d9c0);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+}
 .synth-card-content {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    flex: 1;
+    gap: 6px;
 }
-
 .synth-card-label {
-    font-size: 0.73rem;
+    font-size: 0.72rem;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #89b4fa;
-    opacity: 0.85;
+    letter-spacing: 0.08em;
+    color: var(--accent, #c8954a);
 }
-
 .synth-card-body {
     font-size: 0.9rem;
-    line-height: 1.6;
-    color: var(--text-color, #cdd6f4);
+    line-height: 1.68;
+    color: var(--text-primary, #1a1814);
 }
+.synth-card-body p            { margin: 0 0 8px; }
+.synth-card-body p:last-child { margin-bottom: 0; }
+.synth-card-body strong       { font-weight: 600; }
+.synth-card-body ul,
+.synth-card-body ol           { margin: 4px 0 8px 16px; padding: 0; }
+.synth-card-body li           { margin-bottom: 3px; }
+.synth-card-body a            { color: var(--accent-dark, #9e6e2e); }
 </style>
 """
 
@@ -144,133 +319,172 @@ import html as _html
 
 import streamlit as st
 
+_PILL_LABELS: dict = {
+    "news_agent": "Sentiment",
+    "fundamentals_agent": "Quantitative",
+}
+
+
+def _refs_html(sources) -> str:
+    """Collapsed <details> reference list — folded by default, click to expand."""
+    if not sources:
+        return ""
+    items = "".join(
+        f'<div class="agent-card-ref-item">'
+        f'<span class="agent-card-ref-num">{s.source_id}</span>'
+        f'<a class="agent-card-ref-link" href="{s.url}" target="_blank">'
+        f"{_html.escape(s.title)}</a>"
+        f"</div>"
+        for s in sources
+    )
+    return (
+        f'<details class="agent-card-refs">'
+        f"<summary>"
+        f'<span class="refs-chevron">▶</span> References ({len(sources)})'
+        f"</summary>"
+        f'<div class="agent-card-refs-list">{items}</div>'
+        f"</details>"
+    )
+
 
 def render_agent_response_cards(
     result, agent_analyses: dict, summary: str, sources
 ) -> None:
-    """Render agent cards + synthesizer card from stored message data."""
+    """Render vertically stacked agent cards + synthesis card."""
     st.markdown(AGENT_CARD_CSS, unsafe_allow_html=True)
-    multi_agent = bool(agent_analyses)
 
-    if multi_agent:
-        cards_html_parts = ['<div class="agent-cards-row">']
-        for agent_name, analysis_text in agent_analyses.items():
-            icon, label = _agent_display(agent_name)
-            safe_text = _html.escape(analysis_text or "No analysis returned.")
-            cards_html_parts.append(
-                f"""
-            <div class="agent-card">
-                <div class="agent-card-header">
-                    <span>{icon}</span>
-                    <span>{_html.escape(label)}</span>
-                </div>
-                <div class="agent-card-body">{safe_text}</div>
-            </div>"""
-            )
-        cards_html_parts.append("</div>")
-        st.markdown("".join(cards_html_parts), unsafe_allow_html=True)
+    if not agent_analyses:
+        return
 
-        safe_summary = (
-            _html.escape(summary) if summary else "<em>No synthesis generated.</em>"
+    # ── Vertical stack of agent cards ────────────────────────────────────
+    parts = ['<div class="agent-cards-col">']
+    for agent_name, analysis_text in agent_analyses.items():
+        icon, label = _agent_display(agent_name)
+        rendered = _render_ai_content(analysis_text or "No analysis returned.", sources)
+        pill = _PILL_LABELS.get(agent_name, "Agent")
+        # References folded block only on news agent
+        refs = _refs_html(sources) if agent_name == "news_agent" else ""
+        parts.append(
+            f'<div class="agent-card" data-agent="{_html.escape(agent_name)}">'
+            f'  <div class="agent-card-icon-col">'
+            f'    <div class="agent-card-icon-bubble">{icon}</div>'
+            f"  </div>"
+            f'  <div class="agent-card-header">'
+            f'    <span class="agent-card-label">{_html.escape(label)}</span>'
+            f'    <span class="agent-card-pill">{_html.escape(pill)}</span>'
+            f"  </div>"
+            f'  <div class="agent-card-body">{rendered}</div>'
+            f"  {refs}"
+            f"</div>"
         )
-        st.markdown(
-            f"""
-        <div class="synth-card">
-            <div class="synth-card-icon">🔗</div>
-            <div class="synth-card-content">
-                <div class="synth-card-label">Synthesis</div>
-                <div class="synth-card-body">{safe_summary}</div>
-            </div>
-        </div>""",
-            unsafe_allow_html=True,
-        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+    # ── Synthesis card ────────────────────────────────────────────────────
+    safe_summary = (
+        _render_ai_content(summary, sources)
+        if summary
+        else "<em>No synthesis generated.</em>"
+    )
+    st.markdown(
+        f'<div class="synth-card">'
+        f'  <div class="synth-card-icon-col">'
+        f'    <div class="synth-card-icon-bubble">🔗</div>'
+        f"  </div>"
+        f'  <div class="synth-card-content">'
+        f'    <div class="synth-card-label">Synthesis</div>'
+        f'    <div class="synth-card-body">{safe_summary}</div>'
+        f"  </div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_agent_response(response) -> None:
     """
-    Render a FinalResponse in the new multi-card layout.
+    Render a FinalResponse in the vertical-stack card layout.
 
-    Layout rules
-    ─────────────
-    • If agent_analyses is populated (multi-agent run):
-        – One vertical card per agent, displayed side-by-side in a flex row.
-        – A short horizontal synthesizer summary card below all agent cards.
-    • If no agent_analyses (direct answer / single-agent with no extra analyses):
-        – Full-size synthesizer card only (normal size, no agent cards above).
-
-    Parameters
-    ──────────
-    response : FinalResponse
-        The object returned by OrchestratorAgent.run().
+    • Multi-agent: one card per agent stacked top-to-bottom, then a
+      synthesis card beneath.
+    • Single-agent / direct: synthesis card only.
     """
     agent_analyses: dict = getattr(response, "agent_analyses", {}) or {}
     summary: str = (response.summary or "").strip()
-    multi_agent = bool(agent_analyses)
+    sources = getattr(response, "sources", []) or []
 
-    # ── Inject CSS (idempotent — Streamlit deduplicates identical blocks) ──
     st.markdown(AGENT_CARD_CSS, unsafe_allow_html=True)
 
-    if multi_agent:
-        # ── Build agent cards HTML ────────────────────────────────────────
-        cards_html_parts = ['<div class="agent-cards-row">']
+    if agent_analyses:
+        parts = ['<div class="agent-cards-col">']
         for agent_name, analysis_text in agent_analyses.items():
             icon, label = _agent_display(agent_name)
-            safe_text = _html.escape(analysis_text or "No analysis returned.")
-            cards_html_parts.append(
-                f"""
-            <div class="agent-card">
-                <div class="agent-card-header">
-                    <span>{icon}</span>
-                    <span>{_html.escape(label)}</span>
-                </div>
-                <div class="agent-card-body">{safe_text}</div>
-            </div>"""
+            rendered = _render_ai_content(
+                analysis_text or "No analysis returned.", sources
             )
-        cards_html_parts.append("</div>")
-        st.markdown("".join(cards_html_parts), unsafe_allow_html=True)
+            pill = _PILL_LABELS.get(agent_name, "Agent")
+            refs = _refs_html(sources) if agent_name == "news_agent" else ""
+            parts.append(
+                f'<div class="agent-card" data-agent="{_html.escape(agent_name)}">'
+                f'  <div class="agent-card-icon-col">'
+                f'    <div class="agent-card-icon-bubble">{icon}</div>'
+                f"  </div>"
+                f'  <div class="agent-card-header">'
+                f'    <span class="agent-card-label">{_html.escape(label)}</span>'
+                f'    <span class="agent-card-pill">{_html.escape(pill)}</span>'
+                f"  </div>"
+                f'  <div class="agent-card-body">{rendered}</div>'
+                f"  {refs}"
+                f"</div>"
+            )
+        parts.append("</div>")
+        st.markdown("".join(parts), unsafe_allow_html=True)
 
-        # ── Short horizontal synthesizer card ─────────────────────────────
         safe_summary = (
-            _html.escape(summary) if summary else "<em>No synthesis generated.</em>"
+            _render_ai_content(summary, sources)
+            if summary
+            else "<em>No synthesis generated.</em>"
         )
         st.markdown(
-            f"""
-        <div class="synth-card">
-            <div class="synth-card-icon">🔗</div>
-            <div class="synth-card-content">
-                <div class="synth-card-label">Synthesis</div>
-                <div class="synth-card-body">{safe_summary}</div>
-            </div>
-        </div>""",
+            f'<div class="synth-card">'
+            f'  <div class="synth-card-icon-col">'
+            f'    <div class="synth-card-icon-bubble">🔗</div>'
+            f"  </div>"
+            f'  <div class="synth-card-content">'
+            f'    <div class="synth-card-label">Synthesis</div>'
+            f'    <div class="synth-card-body">{safe_summary}</div>'
+            f"  </div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
 
     else:
-        # ── Single / direct-answer — full-size synthesizer card ───────────
+        # Single / direct-answer — synthesis card only
         safe_summary = (
-            _html.escape(summary) if summary else "<em>No response generated.</em>"
+            _render_ai_content(summary, sources)
+            if summary
+            else "<em>No response generated.</em>"
         )
         st.markdown(
-            f"""
-        <div class="synth-card" style="border-left-width:0; padding-left:20px;">
-            <div class="synth-card-icon">🔗</div>
-            <div class="synth-card-content">
-                <div class="synth-card-label">Analysis</div>
-                <div class="synth-card-body">{safe_summary}</div>
-            </div>
-        </div>""",
+            f'<div class="synth-card">'
+            f'  <div class="synth-card-icon-col">'
+            f'    <div class="synth-card-icon-bubble">✦</div>'
+            f"  </div>"
+            f'  <div class="synth-card-content">'
+            f'    <div class="synth-card-label">Analysis</div>'
+            f'    <div class="synth-card-body">{safe_summary}</div>'
+            f"  </div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
 
-    # ── Fundamental data table (unchanged from before) ────────────────────
+    # Fundamental data table
     if getattr(response, "fundamental_data", None) is not None:
         df = response.fundamental_data
         if not df.empty:
             st.dataframe(df, use_container_width=True)
 
-    # ── Cited sources (unchanged from before) ─────────────────────────────
-    sources = getattr(response, "sources", []) or []
-    if sources:
+    # Sources expander — only for single-agent (multi-agent has refs in card)
+    if sources and not agent_analyses:
         with st.expander("📎 Sources", expanded=False):
             for src in sources:
                 st.markdown(f"**[{src.source_id}]** [{src.title}]({src.url})")
@@ -865,9 +1079,9 @@ def _render_message(msg: dict):
         else ("" if agent_analyses else _render_ai_content(content, sources))
     )
 
-    # Sources footer (AI only)
+    # Sources footer (AI only, suppressed when agent cards carry them)
     sources_html = ""
-    if sources and not is_user:
+    if sources and not is_user and not agent_analyses:
         items = "".join(
             f'<div class="source-item">'
             f'<span class="source-num">{s.source_id}</span>'
