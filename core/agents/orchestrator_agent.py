@@ -484,11 +484,7 @@ class OrchestratorAgent:
             plan.target_agents = [a for a in plan.target_agents if a in _AGENT_NAMES]
 
         memory_task = None
-        if (
-            plan.target_agents
-            and plan.rewritten_queries
-            and plan.rewritten_queries.active_domains
-        ):
+        if state.user_email and plan.needs_memory:
             try:
                 memory_task = _safe_create_task(
                     service_manager.get_retriever().comprehensive_retrieve(

@@ -1169,6 +1169,7 @@ def _run_agent_sync(query: str) -> FinalResponse:
             st.session_state.agent.run(
                 messages=lc_msgs,
                 conversation_id=st.session_state.conversation_id,
+                user_email="test@test.com",
             )
         )
     finally:
