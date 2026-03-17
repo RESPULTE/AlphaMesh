@@ -13,15 +13,31 @@ from core.memory.retrieval.models import RetrievedChunk
 class BaseAgentInput(BaseModel):
     """
     The unified input schema shared by the Orchestrator and all Sub-Agents.
+
+    Changes
+    -------
+    - `vector_query` removed: the orchestrator now rewrites the query per-agent
+      via `per_agent_queries` in `OrchestratorPlan` and sets `query` directly
+      to the agent-tailored string before dispatch.  There is no longer a
+      separate vector-retrieval string; each agent uses its `query` field for
+      both semantic understanding and vector retrieval.
+
+    - `memory_task` removed: the news analysis agent now self-manages its own
+      memory retrieval task internally (see `_rewrite_queries_node`).  No other
+      agent uses memory retrieval, so the field served no purpose elsewhere.
     """
 
     model_config = ConfigDict(extra="ignore")
 
-    query: str = Field(description="The original user query for context.")
-    vector_query: str = Field(
-        description="The query optimized for vector store retrieval (e.g., 'news about AAPL stock price drop')."
+    query: str = Field(
+        description=(
+            "The query for this agent, already rewritten by the orchestrator to be "
+            "optimal for this agent's job.  Used for both LLM context and vector retrieval."
+        )
     )
-    ticker: Optional[str] = Field(description="The stock ticker symbol (e.g., AAPL).")
+    ticker: Optional[str] = Field(
+        default=None, description="The stock ticker symbol (e.g., AAPL)."
+    )
     metrics: Optional[List[str]] = Field(
         default_factory=list,
         description="List of financial metrics to analyze (if applicable).",
@@ -34,7 +50,6 @@ class BaseAgentInput(BaseModel):
     )
 
     # ── Internal / excluded from serialisation ────────────────────────────────
-    memory_task: Optional[Any] = Field(default=None, exclude=True)
     conversation_id: Optional[str] = Field(default=None, exclude=True)
 
     granularity: Optional[Literal["yearly", "quarterly"]] = Field(
@@ -99,29 +114,36 @@ class CitedSource(BaseModel):
 
 
 class NewsAgentState(BaseModel):
-    """State container for the refactored news analysis agent."""
+    """State container for the news analysis agent."""
 
     model_config = ConfigDict(extra="ignore")
 
+    # ── Inputs set by the agent's run() method ────────────────────────────────
     query: str
     ticker: str
     start_date: datetime
     end_date: datetime
+    conversation_id: Optional[str] = Field(default=None)
+
+    # ── Internal pipeline state ───────────────────────────────────────────────
+    # memory_task is managed entirely inside the news agent; it is created in
+    # _rewrite_queries_node and awaited in _rendezvous_node.
+    memory_task: Optional[Any] = Field(default=None, exclude=True)
+
     raw_articles: List[dict] = Field(default_factory=list)
     chunk_ids: List[str] = Field(default_factory=list)
     retrieved_chunks: List[RetrievedChunk] = Field(default_factory=list)
     extraction_results: List[ChunkExtractionResult] = Field(default_factory=list)
-    conversation_id: Optional[str] = Field(default=None)
-    memory_task: Optional[Any] = Field(default=None, exclude=True)
-
     final_chunks: List[RetrievedChunk] = Field(default_factory=list)
+
+    # ── Output fields ─────────────────────────────────────────────────────────
     analysis: Optional[str] = None
     sources: List[CitedSource] = Field(default_factory=list)
     entities_enriched: List[EntityNode] = Field(default_factory=list)
 
 
 class NewsAgentOutput(BaseAgentOutput):
-    """Output schema for the refactored news analysis agent."""
+    """Output schema for the news analysis agent."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -131,14 +153,9 @@ class NewsAgentOutput(BaseAgentOutput):
 
     def get_llm_context_str(self) -> str:
         """Return analysis and sources formatted for LLM context."""
-        header = "### REPORT FROM news_agent\n"
         if not self.sources:
-            return f"{header}{self.analysis}"
-
+            return f"[news_agent]\n{self.analysis}"
         sources_block = "\n".join(
-            [
-                f"[{s.source_id}] {s.title}\n{getattr(s, 'url', '')}".strip()
-                for s in self.sources
-            ]
+            f"[{s.source_id}] {s.title} — {s.url}" for s in self.sources
         )
-        return f"{header}{self.analysis}\n\n### SOURCES\n{sources_block}"
+        return f"[news_agent]\n{self.analysis}\n\nSources:\n{sources_block}"

@@ -1,4 +1,29 @@
-"""News analysis agent with dual-store ingestion and chunk-level extraction."""
+"""
+core/agents/news_analysis_agent.py
+
+News analysis agent with dual-store ingestion and chunk-level extraction.
+
+Changes
+-------
+- Added `_rewrite_queries_node` as the first node in the LangGraph workflow.
+  This node makes a lightweight structured-output LLM call to expand the
+  orchestrator's already-tailored query into three domain-specific retrieval
+  strings (company / sector / market) and immediately fires the memory
+  retrieval as a background asyncio task stored on the state.
+  The task is awaited later in `_rendezvous_node`, exactly as before.
+
+- `run()` no longer reads `input_data.memory_task` — the news agent now
+  self-manages its memory retrieval lifecycle entirely.  BaseAgentInput no
+  longer carries a `memory_task` field.
+
+- `_fetch_news_node` and `_ingest_articles_node` run concurrently with the
+  memory retrieval task thanks to the background task created in
+  `_rewrite_queries_node`.
+
+Graph topology:
+  rewrite_queries → fetch_news → ingest_articles → rendezvous → analyse_news
+                 ↘ (memory_task fires in background) ↗
+"""
 
 from __future__ import annotations
 
@@ -20,7 +45,10 @@ from core.agents.models import (
     NewsAgentState,
 )
 from core.agents.news_fetcher import build_news_query, fetch_articles
-from core.agents.prompts import NEWS_ANALYSIS_USER_PROMPT
+from core.agents.prompts import (
+    NEWS_ANALYSIS_USER_PROMPT,
+    NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
+)
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import (
@@ -32,7 +60,7 @@ from core.memory.graph.relationship_extractor import (
     retry_relationships_only,
 )
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
-from core.memory.retrieval.models import RetrievedChunk
+from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.memory.stores.subgraph_store import SubgraphStore
 from core.services import service_manager
 
@@ -80,11 +108,10 @@ def _build_deduplicated_sources(
       - chunk_to_source_id: maps the original chunk index (0-based) to its
         canonical source_id so context blocks can reference the right number.
 
-    Multiple chunks from the same article get the same source_id. The
+    Multiple chunks from the same article get the same source_id.
     CitedSource.page_content accumulates all unique chunk texts for that
     article so the tooltip remains informative.
     """
-    # Ordered dict: (title, url) -> (source_id, accumulated_texts)
     article_map: Dict[Tuple[str, str], Tuple[int, List[str]]] = {}
     chunk_to_source_id: Dict[int, int] = {}
     next_id = 1
@@ -120,27 +147,28 @@ def _build_deduplicated_sources(
 
 
 class NewsAnalysisAgent(AbstractAgent):
-    """LangGraph-based news analysis agent."""
+    """LangGraph-based news analysis agent with self-managed memory retrieval."""
 
     def __init__(self) -> None:
-        """Initialize the agent and compile the graph."""
         super().__init__()
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
 
     @staticmethod
     def name() -> str:
-        """Return the agent name."""
         return "news_agent"
 
     @staticmethod
     def description() -> str:
-        """Return the agent description."""
-        return "Ingests news into dual stores, schedules background extraction, and synthesizes analysis."
+        return (
+            "Fetches and ingests recent news, retrieves relevant stored memory, "
+            "and synthesizes a grounded financial analysis with cited sources. "
+            "Best for: recent events, earnings, analyst ratings, macro news, "
+            "company announcements, sector developments."
+        )
 
     @staticmethod
     def get_output_schema_class() -> Type[BaseModel]:
-        """Return the output schema class."""
         return NewsAgentOutput
 
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
@@ -155,25 +183,31 @@ class NewsAnalysisAgent(AbstractAgent):
             ticker=input_data.ticker or "",
             start_date=start_date,
             end_date=end_date,
-            memory_task=input_data.memory_task,
             conversation_id=input_data.conversation_id,
         )
 
         state_payload = initial_state.model_dump()
-        state_payload["memory_task"] = input_data.memory_task
+        # memory_task is excluded from model_dump() (exclude=True) but must be
+        # carried in the state dict so LangGraph can thread it between nodes.
+        # It starts as None; _rewrite_queries_node sets it.
+        state_payload["memory_task"] = None
         final_state = await self._graph.ainvoke(state_payload)
         return NewsAgentOutput(**final_state)
+
+    # ── Graph construction ────────────────────────────────────────────────────
 
     def _build_graph(self):
         """Compile the linear LangGraph workflow."""
         workflow = StateGraph(NewsAgentState, output_schema=NewsAgentOutput)
 
+        workflow.add_node("rewrite_queries", self._rewrite_queries_node)
         workflow.add_node("fetch_news", self._fetch_news_node)
         workflow.add_node("ingest_articles", self._ingest_articles_node)
         workflow.add_node("rendezvous", self._rendezvous_node)
         workflow.add_node("analyse_news", self._analyse_news_node)
 
-        workflow.add_edge(START, "fetch_news")
+        workflow.add_edge(START, "rewrite_queries")
+        workflow.add_edge("rewrite_queries", "fetch_news")
         workflow.add_edge("fetch_news", "ingest_articles")
         workflow.add_edge("ingest_articles", "rendezvous")
         workflow.add_edge("rendezvous", "analyse_news")
@@ -181,26 +215,76 @@ class NewsAnalysisAgent(AbstractAgent):
 
         return workflow.compile()
 
+    # ── Node: rewrite_queries ─────────────────────────────────────────────────
+
+    async def _rewrite_queries_node(self, state: NewsAgentState) -> dict:
+        """
+        Expand the orchestrator's rewritten query into three domain-specific
+        memory retrieval strings (company / sector / market) and immediately
+        fire the memory retrieval as a background asyncio task.
+
+        The task is stored on `memory_task` and awaited later in
+        `_rendezvous_node`, which runs after news ingestion completes —
+        effectively making memory retrieval concurrent with news fetching.
+
+        Falls back gracefully: if the LLM call or task creation fails,
+        `memory_task` remains None and the rendezvous node skips memory.
+        """
+        rewritten_queries: RewrittenQueries | None = None
+        try:
+            structured_llm = self._llm.with_structured_output(RewrittenQueries)
+            rewritten_queries = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT),
+                    HumanMessage(content=state.query),
+                ]
+            )
+            logger.info(
+                "_rewrite_queries_node: domains=%s for query='%.80s'",
+                rewritten_queries.active_domains if rewritten_queries else [],
+                state.query,
+            )
+        except Exception:
+            logger.exception(
+                "_rewrite_queries_node: query rewrite LLM call failed — "
+                "memory retrieval will be skipped"
+            )
+
+        memory_task = None
+        if rewritten_queries and rewritten_queries.active_domains:
+            try:
+                svc = service_manager.get_memory_retrieval_service()
+
+                async def _retrieve() -> MemoryContext:
+                    return await svc.retrieve(rewritten_queries)
+
+                memory_task = asyncio.ensure_future(_retrieve())
+            except Exception:
+                logger.exception(
+                    "_rewrite_queries_node: failed to create memory retrieval task"
+                )
+
+        # memory_task is excluded from Pydantic serialisation but LangGraph
+        # carries it through the state dict; return it explicitly here.
+        return {"memory_task": memory_task}
+
+    # ── Node: fetch_news ──────────────────────────────────────────────────────
+
     async def _fetch_news_node(self, state: NewsAgentState) -> dict:
         """
         Fetch news articles from NewsAPI and enrich them with full content
         scraped by trafilatura.
 
-        Changes vs. the original node
-        ──────────────────────────────
         • build_news_query() constructs a boolean NewsAPI query that combines
           the ticker symbol with optional company name / keywords.
         • Results are filtered to a curated list of trusted financial domains.
         • trafilatura replaces the truncated NewsAPI `content` field (~200 chars)
-          with the full article body, which the downstream chunker/embedder can
-          use without losing context.
-        • Falls back gracefully to the NewsAPI snippet when scraping fails
-          (e.g. paywalled pages).
+          with the full article body.
+        • Falls back gracefully to the NewsAPI snippet when scraping fails.
         """
         now = datetime.now()
         api_limit_date = now - timedelta(days=28)
 
-        # Clamp dates to NewsAPI's allowed window
         start = state.start_date
         end = state.end_date
 
@@ -234,6 +318,8 @@ class NewsAnalysisAgent(AbstractAgent):
             end.date(),
         )
         return {"raw_articles": articles}
+
+    # ── Node: ingest_articles ─────────────────────────────────────────────────
 
     async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
         """Ingest articles into Neo4j and ChromaDB."""
@@ -285,12 +371,21 @@ class NewsAnalysisAgent(AbstractAgent):
         )
         return {"chunk_ids": all_chunk_ids, "retrieved_chunks": retrieved_chunks}
 
+    # ── Node: rendezvous ──────────────────────────────────────────────────────
+
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
-        """Merge memory retrieval results with freshly ingested chunks."""
-        memory_context = None
+        """
+        Await the memory retrieval task (fired in _rewrite_queries_node) and
+        merge its results with the freshly ingested article chunks.
+        """
+        memory_context: MemoryContext | None = None
         if state.memory_task is not None:
             try:
                 memory_context = await state.memory_task
+                logger.info(
+                    "_rendezvous_node: memory returned %d chunks",
+                    len(memory_context.chunks) if memory_context else 0,
+                )
             except Exception as exc:
                 logger.error("Memory retrieval task failed: %s", exc)
                 memory_context = None
@@ -305,103 +400,90 @@ class NewsAnalysisAgent(AbstractAgent):
         final_ranked = service_manager.get_reranker().rank(combined)
         return {"final_chunks": final_ranked}
 
+    # ── Node: analyse_news ────────────────────────────────────────────────────
+
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""
-        if not state.final_chunks:
-            return {"analysis": "No relevant news articles found.", "sources": []}
+        chunks = state.final_chunks
+        if not chunks:
+            logger.warning("_analyse_news_node: no chunks available")
+            return {
+                "analysis": "No relevant news data was found for this query.",
+                "sources": [],
+                "entities_enriched": [],
+            }
 
-        extracted_entities: List[object] = []
-        chunk_ids = [chunk.chunk_id for chunk in state.final_chunks if chunk.chunk_id]
-        if chunk_ids:
-            extracted_entities = (
-                await service_manager.get_ingestor().extract_entities_for_chunks(
-                    chunk_ids
-                )
-            )
-        if state.conversation_id:
-            _merge_cached_entities(state.conversation_id, extracted_entities)
-            cached_entities = _get_cached_entities(state.conversation_id)
-        else:
-            cached_entities = []
+        sources, chunk_to_source_id = _build_deduplicated_sources(chunks)
 
-        # ── Deduplicate chunks by article so chunks from the same article
-        #    share one source_id. The LLM sees e.g. [1] for all chunks of
-        #    article 1 rather than [1], [2], [3] all pointing at the same URL.
-        sources, chunk_to_source_id = _build_deduplicated_sources(state.final_chunks)
+        context_lines = []
+        for idx, chunk in enumerate(chunks):
+            sid = chunk_to_source_id.get(idx, "?")
+            context_lines.append(f"[{sid}] {chunk.text}")
+        context_block = "\n\n".join(context_lines)
 
-        # Build context blocks; each chunk is labelled with its canonical [N]
-        context_blocks = []
-        for chunk_idx, chunk in enumerate(state.final_chunks):
-            sid = chunk_to_source_id[chunk_idx]
-            label = "NEW" if chunk.domain == "new" else f"MEMORY:{chunk.domain}"
-            metadata = chunk.metadata or {}
-            title = (
-                metadata.get("article_title") or chunk.article_title or "Unknown Title"
-            )
-            context_blocks.append(
-                f"[Source {sid} | {label} | score={chunk.composite_score:.2f}] {title}\n"
-                f"{chunk.text}"
-            )
-        context = "\n\n".join(context_blocks)
-
-        system_prompt = COMBINED_ANALYSIS_RELATIONSHIP_PROMPT
-        known_entities_block = ""
+        conversation_id = state.conversation_id or ""
+        cached_entities = _get_cached_entities(conversation_id)
+        entities_section = ""
         if cached_entities:
-            known_entities_lines = [
-                f"{entity['entity_type']}: {entity['name']}"
-                for entity in cached_entities
+            entity_lines = [
+                f"  - {e['name']} ({e['entity_type']})" for e in cached_entities
             ]
-            known_entities_block = (
-                "Known entities (from extracted chunks):\n"
-                + "\n".join(known_entities_lines)
+            entities_section = (
+                "Known entities from prior turns:\n" + "\n".join(entity_lines) + "\n\n"
             )
 
-        entities_section = f"{known_entities_block}\n\n" if known_entities_block else ""
-        user_prompt = NEWS_ANALYSIS_USER_PROMPT.format(
-            query=state.query,
-            entities_section=entities_section,
-            context=context,
-        )
+        messages = [
+            SystemMessage(content=COMBINED_ANALYSIS_RELATIONSHIP_PROMPT),
+            HumanMessage(
+                content=NEWS_ANALYSIS_USER_PROMPT.format(
+                    query=state.query,
+                    entities_section=entities_section,
+                    context=context_block,
+                )
+            ),
+        ]
 
         try:
-            result = await extract_with_retry(
-                self._llm,
-                [
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=user_prompt),
-                ],
-            )
-            analysis_text = result.analysis
-            relationships = result.relationships
-            relationships_extracted = result.parse_success
+            response = await extract_with_retry(self._llm, messages)
+            analysis_text = response.analysis
+            relationships = response.relationships
+            relationships_extracted = response.parse_success
         except Exception as exc:
-            logger.error("Analysis generation failed: %s", exc)
-            raise
+            logger.error("_analyse_news_node: extraction failed: %s", exc)
+            # Fallback: plain LLM call without relationship extraction
+            fallback_response = await self._llm.ainvoke(
+                [
+                    SystemMessage(content=ANALYSIS_ONLY_RELATIONSHIP_PROMPT),
+                    HumanMessage(
+                        content=NEWS_ANALYSIS_USER_PROMPT.format(
+                            query=state.query,
+                            entities_section=entities_section,
+                            context=context_block,
+                        )
+                    ),
+                ]
+            )
+            analysis_text = fallback_response.content if fallback_response else ""
+            relationships = []
+            relationships_extracted = False
 
-        # ── Filter sources to only those actually cited, and renumber ──────────────
+        # ── Update entity cache ───────────────────────────────────────────────
+        if conversation_id and relationships:
+            _merge_cached_entities(conversation_id, relationships)
 
-        # Collect cited source IDs in order of first appearance
-        _seen_ids: set[int] = set()
-        _cited_in_order: list[int] = []
-        for _m in _re.finditer(r"\[(\d+)\]", analysis_text):
-            _sid = int(_m.group(1))
-            if _sid not in _seen_ids:
-                _cited_in_order.append(_sid)
-                _seen_ids.add(_sid)
-
-        # Build old → new id remapping (first-cited source becomes [1], etc.)
+        # ── Citation filtering: keep only sources cited in the analysis ───────
+        cited_ids = set(int(m) for m in _re.findall(r"\[(\d+)\]", analysis_text))
+        _cited_in_order = sorted(cited_ids)
         _old_to_new: dict[int, int] = {
             old_id: new_id for new_id, old_id in enumerate(_cited_in_order, start=1)
         }
 
-        # Rewrite in-text citations to use the new consecutive numbering
         def _remap(m: _re.Match) -> str:
             sid = int(m.group(1))
             return f"[{_old_to_new[sid]}]" if sid in _old_to_new else m.group(0)
 
         analysis_text = _re.sub(r"\[(\d+)\]", _remap, analysis_text)
 
-        # Rebuild sources list — only cited articles, with updated source_id
         _sources_by_old_id: dict[int, CitedSource] = {s.source_id: s for s in sources}
         sources = [
             CitedSource(
@@ -413,7 +495,7 @@ class NewsAnalysisAgent(AbstractAgent):
             for old_id, new_id in _old_to_new.items()
             if old_id in _sources_by_old_id
         ]
-        # ── End citation filtering ─────────────────────────────────────────────────
+        # ── End citation filtering ─────────────────────────────────────────────
 
         subgraph_id = None
         if settings.EXTRACTION_ENABLED and state.conversation_id:

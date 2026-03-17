@@ -3,47 +3,47 @@ core/agents/orchestrator_agent.py
 
 Hardened OrchestratorAgent.
 
-Changes vs previous revision
-─────────────────────────────
-8.  Single LLM call for synthesis.
-    The previous design made two LLM calls over identical context:
-      • _run_synthesis_chain  → cross-domain relationships + user response
-      • _write_user_signals   → user interest relationships (separate call)
+Changes in this revision
+─────────────────────────
+1.  Per-agent query rewriting (Change #1 from design doc).
+    OrchestratorPlan now carries `per_agent_queries: Dict[str, str]`.
+    The planner LLM populates a tailored retrieval string for every agent
+    it selects.  _execute_node reads this dict and builds a separate
+    BaseAgentInput per agent — each receiving only its own rewritten query
+    instead of the raw user string.  Falls back to `plan.query` for agents
+    not present in the dict.
 
-    Now _run_synthesis_chain parses THREE output blocks from one call:
+2.  Memory retrieval responsibility moved to NewsAnalysisAgent (Change #3).
+    `rewritten_queries` and `memory_task` are removed from OrchestratorPlan
+    and OrchestratorState.  The orchestrator no longer creates or passes a
+    memory retrieval task — the news agent self-manages this via its own
+    `_rewrite_queries_node`.  BaseAgentInput no longer carries `memory_task`
+    or `vector_query`.
+
+3.  Single LLM call for synthesis (unchanged from previous revision).
+    _run_synthesis_chain parses THREE output blocks from one call:
       <cross_domain_relationships> … </cross_domain_relationships>
       <user_interest_relationships> … </user_interest_relationships>
       <response> … </response>
 
-    The third block is only present when signals are detected (the prompt
-    is built by build_writeback_system_prompt() accordingly).
-
-9.  _write_user_signals removed from OrchestratorAgent entirely.
-    All graph-write logic for user signals now lives in:
-        core/memory/user_signal_writeback.write_user_signals()
-    The orchestrator builds a UserSignalPayload and fires it as a
-    background task — it has no further involvement.
-
-10. _run_synthesis_chain now returns SynthesisResult (a dataclass) instead
-    of a raw string so callers get typed access to all three parsed blocks.
-
-11. InterestEdge / UserInterestMapping Pydantic models removed — they were
-    only needed for the old structured-output LLM call.  Interest edges are
-    now parsed as plain dicts from the <user_interest_relationships> XML block
-    and converted to memory.user_signal_writeback.InterestEdge dataclasses.
+4.  All graph-write logic for user signals delegated to
+    core/memory/user_signal_writeback.write_user_signals() (unchanged).
 """
 
 import asyncio
 import json
 import re
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, ConfigDict, Field
+from orchestrator_models import (
+    FinalResponse,
+    OrchestratorPlan,
+    OrchestratorState,
+    SynthesisResult,
+)
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
@@ -51,17 +51,13 @@ from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.agents.prompts import (
     ORCHESTRATOR_PLANNER_SYSTEM_PROMPT,
-    QUERY_REWRITE_SYSTEM_PROMPT,
     SYNTHESISER_SINGLE_AGENT_PROMPT,
     SYNTHESISER_USER_CONTEXT_SECTION,
     build_writeback_system_prompt,
 )
 from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.models import RelationshipType
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
-from core.memory.retrieval.models import RewrittenQueries
-from core.memory.user_context_service import UserContext
 from core.memory.user_signal_writeback import (
     DetectedEntity,
     InterestEdge,
@@ -89,107 +85,6 @@ AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pydantic models — plan / state / response
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-class UserInterestEntity(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    entity_name: str
-    entity_type: str
-
-
-class InvestmentSignalDetection(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    status: Literal["Bought", "Interested", "Sold", "Avoids"]
-    target_entities: List[UserInterestEntity] = Field(default_factory=list)
-
-
-class LearningSignalDetection(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    status: Literal["Interested", "Understood", "Confused", "Not Interested"]
-    target_entities: List[UserInterestEntity] = Field(default_factory=list)
-
-
-class OrchestratorPlan(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    final_answer: Optional[str] = Field(
-        default=None,
-        description=(
-            "Set ONLY when the question can be answered directly without any agent, "
-            "memory, or financial data."
-        ),
-    )
-    needs_memory: bool = Field(default=False)
-    target_agents: List[str] = Field(default_factory=list)
-    target_entities: List[str] = Field(default_factory=list)
-    rewritten_queries: Optional[RewrittenQueries] = Field(default=None)
-    detected_investment_signals: List[InvestmentSignalDetection] = Field(
-        default_factory=list
-    )
-    detected_learning_signals: List[LearningSignalDetection] = Field(
-        default_factory=list
-    )
-
-
-class OrchestratorState(BaseModel):
-    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
-
-    messages: List[BaseMessage] = Field(default_factory=list)
-    plan: Optional[OrchestratorPlan] = None
-    agent_outputs: Dict[str, BaseAgentOutput] = Field(default_factory=dict)
-    final_response: Optional["FinalResponse"] = None
-
-    conversation_id: Optional[str] = None
-    user_email: Optional[str] = None
-    user_context: Optional[UserContext] = None
-    user_context_block: str = ""
-    user_context_loaded: bool = False
-    memory_task: Optional[Any] = Field(default=None, exclude=True)
-
-    summary: str = ""
-    fundamental_data: Optional[pd.DataFrame] = None
-    sources: List[CitedSource] = Field(default_factory=list)
-
-
-class FinalResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
-
-    summary: str = ""
-    fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)
-    sources: List[CitedSource] = Field(default_factory=list)
-    agent_analyses: Dict[str, str] = Field(default_factory=dict)
-
-
-class CrossDomainRelationship(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    from_name: str
-    from_type: Literal["Company", "FinancialEvent", "FinancialConcept", "Sector"]
-    relation: RelationshipType
-    to_name: str
-    to_type: Literal["Company", "FinancialEvent", "FinancialConcept", "Sector"]
-    confidence: Literal["high", "low"]
-    reason: str
-    source_agent_from: Literal["news_agent", "fundamentals_agent"]
-    source_agent_to: Literal["news_agent", "fundamentals_agent"]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SynthesisResult — returned by _run_synthesis_chain
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class SynthesisResult:
-    """Typed container for all blocks parsed from a single synthesis LLM call."""
-
-    user_response: str
-    cross_relationships: List[dict] = field(default_factory=list)
-    interest_edges: List[dict] = field(default_factory=list)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -200,19 +95,18 @@ def _safe_create_task(coro) -> Optional[asyncio.Task]:
         loop = asyncio.get_running_loop()
         return loop.create_task(coro)
     except RuntimeError:
-        logger.warning("No running event loop — background task skipped.")
+        logger.warning("_safe_create_task: no running event loop — task skipped.")
         return None
 
 
 def _extract_last_human_message(messages: List[BaseMessage]) -> str:
     for msg in reversed(messages):
-        if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human":
+        if isinstance(msg, HumanMessage):
             return msg.content or ""
-    return messages[-1].content if messages else ""
+    return ""
 
 
 def _safe_json(text: str) -> List[dict]:
-    """Parse a JSON array string; return [] on any error."""
     try:
         result = json.loads(text.strip())
         return result if isinstance(result, list) else []
@@ -490,7 +384,7 @@ class OrchestratorAgent:
     # ── Nodes ─────────────────────────────────────────────────────
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        """Ask the LLM planner which agents to activate."""
+        """Ask the LLM planner which agents to activate and rewrite the query per agent."""
         available_agents_desc = "\n".join(
             f"  {agent.name()}: {agent.description()}" for agent in AVAILABLE_AGENTS
         )
@@ -500,7 +394,6 @@ class OrchestratorAgent:
                     "system",
                     ORCHESTRATOR_PLANNER_SYSTEM_PROMPT.format(
                         available_agents_desc=available_agents_desc,
-                        query_rewrite_system_prompt=QUERY_REWRITE_SYSTEM_PROMPT,
                     ),
                 ),
                 MessagesPlaceholder(variable_name="history"),
@@ -511,9 +404,10 @@ class OrchestratorAgent:
             chain = prompt | structured_llm
             plan: OrchestratorPlan = await chain.ainvoke({"history": state.messages})
             logger.info(
-                "_plan_node: agents=%s needs_memory=%s final_answer=%s",
+                "_plan_node: agents=%s needs_memory=%s per_agent_queries=%s final_answer=%s",
                 plan.target_agents,
                 plan.needs_memory,
+                list(plan.per_agent_queries.keys()),
                 plan.final_answer is not None,
             )
             return {"plan": plan}
@@ -547,32 +441,48 @@ class OrchestratorAgent:
             return {"user_context_loaded": True}
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        """Run selected agents in parallel."""
+        """
+        Run selected agents in parallel, each receiving a query rewritten
+        specifically for its job description.
+
+        Because OrchestratorPlan inherits BaseAgentInput, `plan` already IS a
+        valid agent input carrying all shared fields (ticker, dates, metrics,
+        granularity).  We simply call model_copy(update={"query": agent_query})
+        to produce a per-agent BaseAgentInput with only the query swapped out —
+        no dict-filtering or manual field reconstruction needed.
+        """
         plan = state.plan
         if not plan or not plan.target_agents:
             logger.warning("_execute_node: no agents to run")
             return {"agent_outputs": {}}
 
-        try:
-            shared_input = BaseAgentInput(
-                **{
-                    k: v
-                    for k, v in plan.model_dump().items()
-                    if k in BaseAgentInput.model_fields
-                },
-                memory_task=state.memory_task,
-                conversation_id=state.conversation_id,
+        valid_names = [n for n in plan.target_agents if n in self._agents]
+
+        tasks = []
+        for name in valid_names:
+            # Use the agent-specific rewritten query; fall back to plan.query
+            agent_query = plan.per_agent_queries.get(name) or plan.query
+            logger.info(
+                "_execute_node: dispatching '%s' with query='%.120s'",
+                name,
+                agent_query,
             )
-        except Exception:
-            logger.exception("_execute_node: failed to build BaseAgentInput")
+            # plan IS a BaseAgentInput — copy it, overriding only query and
+            # injecting the runtime-only conversation_id (excluded from serialisation).
+            agent_input: BaseAgentInput = plan.model_copy(
+                update={"query": agent_query, "conversation_id": state.conversation_id}
+            )
+            tasks.append((name, self._agents[name].run(agent_input)))
+
+        if not tasks:
+            logger.warning("_execute_node: no valid agent tasks built")
             return {"agent_outputs": {}}
 
-        valid_names = [n for n in plan.target_agents if n in self._agents]
-        tasks = [self._agents[name].run(shared_input) for name in valid_names]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        names, coros = zip(*tasks)
+        results = await asyncio.gather(*coros, return_exceptions=True)
 
         outputs: Dict[str, BaseAgentOutput] = {}
-        for name, res in zip(valid_names, results):
+        for name, res in zip(names, results):
             if isinstance(res, Exception):
                 logger.error(
                     "_execute_node: agent '%s' failed — %s", name, res, exc_info=res
@@ -693,7 +603,6 @@ class OrchestratorAgent:
             payload = _build_signal_payload(
                 state, synthesis_result.interest_edges, user_message
             )
-            # Fire-and-forget — never blocks the response
             _safe_create_task(write_user_signals(payload))
 
         per_agent_analyses: Dict[str, str] = {
