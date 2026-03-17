@@ -1,51 +1,46 @@
 """
+core/agents/orchestrator_agent.py
+
 Hardened OrchestratorAgent.
 
-Drop-in replacement for core/agents/orchestrator_agent.py.
+Changes vs previous revision
+─────────────────────────────
+8.  Single LLM call for synthesis.
+    The previous design made two LLM calls over identical context:
+      • _run_synthesis_chain  → cross-domain relationships + user response
+      • _write_user_signals   → user interest relationships (separate call)
 
-Changes vs original
-───────────────────
-1.  FinalResponse.summary has a default="" so LangGraph's output_schema
-    projection never crashes on the final_answer → END path.
+    Now _run_synthesis_chain parses THREE output blocks from one call:
+      <cross_domain_relationships> … </cross_domain_relationships>
+      <user_interest_relationships> … </user_interest_relationships>
+      <response> … </response>
 
-2.  _direct_answer_node replaces the bare END route for final_answer.
-    It writes summary into state before the graph exits, so the
-    output_schema projection always has a valid FinalResponse.
+    The third block is only present when signals are detected (the prompt
+    is built by build_writeback_system_prompt() accordingly).
 
-3.  _router guards against state.plan being None.
+9.  _write_user_signals removed from OrchestratorAgent entirely.
+    All graph-write logic for user signals now lives in:
+        core/memory/user_signal_writeback.write_user_signals()
+    The orchestrator builds a UserSignalPayload and fires it as a
+    background task — it has no further involvement.
 
-4.  _plan_node wraps the LLM call in try/except; on failure it falls
-    back to a safe OrchestratorPlan that routes straight to the
-    synthesiser with empty context rather than crashing the graph.
+10. _run_synthesis_chain now returns SynthesisResult (a dataclass) instead
+    of a raw string so callers get typed access to all three parsed blocks.
 
-5.  _execute_node:
-    - logs every agent failure instead of silently discarding it
-    - guards against plan.target_agents containing unknown agent names
-    - adds conversation_id to shared_input (matches newer prompts)
-
-6.  _synthesize_node:
-    - handles empty agent_outputs gracefully (all agents failed)
-    - wraps LLM call in try/except with a sensible fallback message
-    - FIXED signal iteration bug: InvestmentSignalDetection /
-      LearningSignalDetection carry a `target_entities` list — the old
-      code incorrectly read `signal.entity_name` which doesn't exist at
-      the signal level
-    - asyncio.create_task is guarded so it never fires outside a
-      running event loop
-
-7.  run() robustly unwraps the LangGraph result regardless of whether
-    it comes back as a FinalResponse, a plain dict, or None.
+11. InterestEdge / UserInterestMapping Pydantic models removed — they were
+    only needed for the old structured-output LLM call.  Interest edges are
+    now parsed as plain dicts from the <user_interest_relationships> XML block
+    and converted to memory.user_signal_writeback.InterestEdge dataclasses.
 """
 
 import asyncio
 import json
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal, Optional, Type
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional
 
-import networkx as nx
 import pandas as pd
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
@@ -59,86 +54,75 @@ from core.agents.prompts import (
     QUERY_REWRITE_SYSTEM_PROMPT,
     SYNTHESISER_SINGLE_AGENT_PROMPT,
     SYNTHESISER_USER_CONTEXT_SECTION,
-    SYNTHESISER_WRITEBACK_SYSTEM_PROMPT,
+    build_writeback_system_prompt,
 )
 from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.models import (
-    RelationshipType,
-    UserInvestmentInterestNode,
-    UserLearningInterestNode,
-)
+from core.memory.graph.models import RelationshipType
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
 from core.memory.retrieval.models import RewrittenQueries
 from core.memory.user_context_service import UserContext
+from core.memory.user_signal_writeback import (
+    DetectedEntity,
+    InterestEdge,
+    InvestmentSignal,
+    LearningSignal,
+    UserSignalPayload,
+    write_user_signals,
+)
 from core.services import service_manager
 
 logger = get_logger(__name__)
 
+# ── Regex patterns ─────────────────────────────────────────────────────────────
 _RESPONSE_RE = re.compile(r"<response>(.*?)</response>", re.DOTALL | re.IGNORECASE)
 _CROSS_RE = re.compile(
     r"<cross_domain_relationships>(.*?)</cross_domain_relationships>",
     re.DOTALL | re.IGNORECASE,
 )
+_INTEREST_RE = re.compile(
+    r"<user_interest_relationships>(.*?)</user_interest_relationships>",
+    re.DOTALL | re.IGNORECASE,
+)
 
-AVAILABLE_AGENTS: List[Type[AbstractAgent]] = [
-    FundamentalAnalysisAgent,
-    NewsAnalysisAgent,
-]
-
-_AGENT_NAMES: frozenset = frozenset(a.name() for a in AVAILABLE_AGENTS)
+AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data models
+# Pydantic models — plan / state / response
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-class FinalResponse(BaseModel):
-    """Structured output returned to the UI."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    # FIX 1: default="" so the output_schema projection never fails when
-    # LangGraph exits via the final_answer → END path with no summary written.
-    summary: str = ""
-    fundamental_data: Optional[pd.DataFrame] = None
-    sources: List[CitedSource] = Field(default_factory=list)
-    # Per-agent raw analyses keyed by agent name, e.g. {"news_agent": "...", "fundamentals_agent": "..."}
-    agent_analyses: Dict[str, str] = Field(default_factory=dict)
 
 
 class UserInterestEntity(BaseModel):
     model_config = ConfigDict(extra="ignore")
     entity_name: str
-    entity_type: Literal["Company", "FinancialConcept", "FinancialEvent", "Sector"]
+    entity_type: str
 
 
 class InvestmentSignalDetection(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    target_entities: List[UserInterestEntity] = Field(default_factory=list)
     status: Literal["Bought", "Interested", "Sold", "Avoids"]
+    target_entities: List[UserInterestEntity] = Field(default_factory=list)
 
 
 class LearningSignalDetection(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    target_entities: List[UserInterestEntity] = Field(default_factory=list)
     status: Literal["Interested", "Understood", "Confused", "Not Interested"]
+    target_entities: List[UserInterestEntity] = Field(default_factory=list)
 
 
-class OrchestratorPlan(BaseAgentInput):
+class OrchestratorPlan(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    target_agents: List[str] = Field(default_factory=list)
-    final_answer: Optional[str] = Field(default=None)
-    needs_memory: bool = Field(
-        default=False,
+    final_answer: Optional[str] = Field(
+        default=None,
         description=(
-            "Set True when the user's question requires their personal investment or "
-            "learning context to answer well (e.g. questions about their portfolio, "
-            "holdings, watchlist, personalised recommendations, or interests)."
+            "Set ONLY when the question can be answered directly without any agent, "
+            "memory, or financial data."
         ),
     )
+    needs_memory: bool = Field(default=False)
+    target_agents: List[str] = Field(default_factory=list)
     target_entities: List[str] = Field(default_factory=list)
     rewritten_queries: Optional[RewrittenQueries] = Field(default=None)
     detected_investment_signals: List[InvestmentSignalDetection] = Field(
@@ -155,7 +139,7 @@ class OrchestratorState(BaseModel):
     messages: List[BaseMessage] = Field(default_factory=list)
     plan: Optional[OrchestratorPlan] = None
     agent_outputs: Dict[str, BaseAgentOutput] = Field(default_factory=dict)
-    final_response: Optional[FinalResponse] = None
+    final_response: Optional["FinalResponse"] = None
 
     conversation_id: Optional[str] = None
     user_email: Optional[str] = None
@@ -164,11 +148,18 @@ class OrchestratorState(BaseModel):
     user_context_loaded: bool = False
     memory_task: Optional[Any] = Field(default=None, exclude=True)
 
-    # FIX 2: summary lives in state so the direct-answer node can write it
-    # before the graph exits, making output_schema projection safe.
     summary: str = ""
     fundamental_data: Optional[pd.DataFrame] = None
     sources: List[CitedSource] = Field(default_factory=list)
+
+
+class FinalResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
+
+    summary: str = ""
+    fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)
+    sources: List[CitedSource] = Field(default_factory=list)
+    agent_analyses: Dict[str, str] = Field(default_factory=dict)
 
 
 class CrossDomainRelationship(BaseModel):
@@ -184,30 +175,18 @@ class CrossDomainRelationship(BaseModel):
     source_agent_to: Literal["news_agent", "fundamentals_agent"]
 
 
-class MultiSynthesizedResponse(BaseModel):
-    cross_domain_relationships: List[CrossDomainRelationship]
-    response: str = Field(description="The final user-facing analysis response.")
+# ──────────────────────────────────────────────────────────────────────────────
+# SynthesisResult — returned by _run_synthesis_chain
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-class SingleSynthesizedResponse(BaseModel):
-    response: str = Field(description="The final user-facing analysis response.")
+@dataclass
+class SynthesisResult:
+    """Typed container for all blocks parsed from a single synthesis LLM call."""
 
-
-class InterestEdge(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    entity_name: str
-    entity_type: Literal["Company", "FinancialConcept", "FinancialEvent", "Sector"]
-    user_signal_type: Literal["investment", "learning"]
-    target_entity_name: str
-    relationship: Literal["THREATENS", "SUPPORTS", "CLARIFIES", "CONFUSES_FURTHER"]
-    reason: str
-    confidence: Literal["high", "low"]
-
-
-class UserInterestMapping(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    investment_threats: List[InterestEdge] = Field(default_factory=list)
-    learning_helpers: List[InterestEdge] = Field(default_factory=list)
+    user_response: str
+    cross_relationships: List[dict] = field(default_factory=list)
+    interest_edges: List[dict] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -226,11 +205,71 @@ def _safe_create_task(coro) -> Optional[asyncio.Task]:
 
 
 def _extract_last_human_message(messages: List[BaseMessage]) -> str:
-    """Return the content of the most recent HumanMessage, or '' if none."""
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage) or getattr(msg, "type", "") == "human":
             return msg.content or ""
     return messages[-1].content if messages else ""
+
+
+def _safe_json(text: str) -> List[dict]:
+    """Parse a JSON array string; return [] on any error."""
+    try:
+        result = json.loads(text.strip())
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+def _build_signal_payload(
+    state: OrchestratorState,
+    interest_edges: List[dict],
+    user_message: str,
+) -> UserSignalPayload:
+    """
+    Convert OrchestratorState signal lists + parsed interest edge dicts into
+    the plain UserSignalPayload the memory module expects.
+    """
+    investment_signals = [
+        InvestmentSignal(
+            status=s.status,
+            target_entities=[
+                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
+                for e in s.target_entities
+            ],
+        )
+        for s in (state.plan.detected_investment_signals or [])
+    ]
+    learning_signals = [
+        LearningSignal(
+            status=s.status,
+            target_entities=[
+                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
+                for e in s.target_entities
+            ],
+        )
+        for s in (state.plan.detected_learning_signals or [])
+    ]
+    edges = [
+        InterestEdge(
+            entity_name=e.get("entity_name", ""),
+            entity_type=e.get("entity_type", ""),
+            user_signal_type=e.get("user_signal_type", "investment"),
+            target_entity_name=e.get("target_entity_name", ""),
+            relationship=e.get("relationship", "RELATED_TO"),
+            reason=e.get("reason", ""),
+            confidence=e.get("confidence", "low"),
+        )
+        for e in interest_edges
+        if e.get("entity_name") and e.get("target_entity_name")
+    ]
+    return UserSignalPayload(
+        user_email=state.user_email or "",
+        conversation_id=state.conversation_id or "",
+        user_message=user_message,
+        investment_signals=investment_signals,
+        learning_signals=learning_signals,
+        interest_edges=edges,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -264,31 +303,18 @@ class OrchestratorAgent:
     # ── Graph wiring ──────────────────────────────────────────────
 
     def _router(self, state: OrchestratorState) -> str:
-        """
-        Three-way split after the planner:
-
-        1. final_answer set          ? direct_answer
-        2. needs_memory = True       ? load_context
-        3. agents needed, no memory  ? execute_agents
-        4. no agents, no memory      ? synthesiser
-        """
         if state.plan is None:
-            logger.warning("_router: plan is None � falling back to synthesiser")
+            logger.warning("_router: plan is None — falling back to synthesiser")
             return "synthesiser"
-
         if state.plan.final_answer is not None:
             return "direct_answer"
-
         if state.plan.needs_memory:
             return "load_context"
-
         if state.plan.target_agents:
             return "execute_agents"
-
         return "synthesiser"
 
     def _post_context_router(self, state: OrchestratorState) -> str:
-        """Called after load_context. Decides whether agents are needed."""
         if state.plan and state.plan.target_agents:
             return "execute_agents"
         return "synthesiser"
@@ -314,7 +340,6 @@ class OrchestratorAgent:
                 "synthesiser": "synthesiser",
             },
         )
-
         workflow.add_conditional_edges(
             "load_context",
             self._post_context_router,
@@ -338,14 +363,6 @@ class OrchestratorAgent:
         conversation_id: Optional[str] = None,
         user_email: Optional[str] = None,
     ) -> FinalResponse:
-        """
-        Run the orchestrator graph and always return a FinalResponse.
-        Handles all three shapes LangGraph can return:
-          • FinalResponse instance  (output_schema projection succeeded)
-          • dict                    (raw state dict)
-          • None                    (should no longer happen with direct_answer node,
-                                     but guarded defensively)
-        """
         initial_state = OrchestratorState(
             messages=messages,
             conversation_id=conversation_id,
@@ -354,27 +371,22 @@ class OrchestratorAgent:
             user_context_block="USER CONTEXT: None",
             user_context_loaded=False,
         )
-
         try:
             raw = await self._graph.ainvoke(initial_state)
         except Exception:
             logger.exception("Graph invocation failed")
             return FinalResponse(
-                summary="I encountered an internal error. Please try again.",
+                summary="I encountered an internal error. Please try again."
             )
 
-        # FIX 1 + 7: normalise all possible return shapes
         return self._coerce_final_response(raw)
 
     @staticmethod
     def _coerce_final_response(raw: Any) -> FinalResponse:
-        """Convert whatever LangGraph returned into a safe FinalResponse."""
         if raw is None:
             return FinalResponse(summary="")
-
         if isinstance(raw, FinalResponse):
             return raw
-
         if isinstance(raw, dict):
             return FinalResponse(
                 summary=raw.get("summary") or "",
@@ -382,8 +394,6 @@ class OrchestratorAgent:
                 sources=raw.get("sources") or [],
                 agent_analyses=raw.get("agent_analyses") or {},
             )
-
-        # Last resort: attribute-based extraction
         return FinalResponse(
             summary=getattr(raw, "summary", "") or "",
             fundamental_data=getattr(raw, "fundamental_data", None),
@@ -391,16 +401,31 @@ class OrchestratorAgent:
             agent_analyses=getattr(raw, "agent_analyses", {}) or {},
         )
 
+    # ── Prompt builders ───────────────────────────────────────────
+
     def _build_synthesis_prompt(
-        self, user_context_section: str, multi_agent: bool
+        self,
+        user_context_section: str,
+        multi_agent: bool,
+        investment_signals: Optional[List] = None,
+        learning_signals: Optional[List] = None,
     ) -> ChatPromptTemplate:
+        """
+        Build the synthesis ChatPromptTemplate.
+
+        For multi-agent runs the system prompt is assembled by
+        build_writeback_system_prompt() which conditionally injects the
+        user-interest-relationships block when signals are present —
+        eliminating the need for a second LLM call.
+        """
         if multi_agent:
             system_prompt = (
                 user_context_section
-                + SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
+                + "\n\n"
+                + build_writeback_system_prompt(investment_signals, learning_signals)
                 + "\n\nAgent Findings:\n{context}"
             )
-            human_prompt = "Produce cross-domain relationships and final analysis."
+            human_prompt = "Produce cross-domain relationships, user interest relationships (if applicable), and final analysis."
         else:
             system_prompt = (
                 user_context_section
@@ -417,13 +442,14 @@ class OrchestratorAgent:
             ]
         )
 
-    async def _run_synthesis_chain(
+    async def _invoke_synthesis_llm(
         self,
         prompt: ChatPromptTemplate,
         state: OrchestratorState,
         context_parts: List[str],
         portfolio_block: str,
     ) -> str:
+        """Invoke the synthesis LLM chain and return raw string output."""
         chain = prompt | self._llm
         response = await chain.ainvoke(
             {
@@ -435,89 +461,75 @@ class OrchestratorAgent:
         )
         return response.content if response else ""
 
+    def _parse_synthesis_output(self, raw: str, multi_agent: bool) -> SynthesisResult:
+        """
+        Parse all XML output blocks from a raw synthesis LLM response into a
+        typed SynthesisResult.  Never raises — returns empty lists on parse failure.
+        """
+        cross_relationships: List[dict] = []
+        interest_edges: List[dict] = []
+
+        if multi_agent:
+            cross_match = _CROSS_RE.search(raw)
+            if cross_match:
+                cross_relationships = _safe_json(cross_match.group(1))
+
+            interest_match = _INTEREST_RE.search(raw)
+            if interest_match:
+                interest_edges = _safe_json(interest_match.group(1))
+
+        resp_match = _RESPONSE_RE.search(raw)
+        user_response = resp_match.group(1).strip() if resp_match else raw.strip()
+
+        return SynthesisResult(
+            user_response=user_response,
+            cross_relationships=cross_relationships,
+            interest_edges=interest_edges,
+        )
+
     # ── Nodes ─────────────────────────────────────────────────────
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        """
-        Ask the LLM planner which agents to activate.
-        FIX 4: Wrapped in try/except — any LLM failure produces a safe
-        fallback plan instead of crashing the graph.
-        """
-        now = datetime.now()
-        available_agents_desc = ", ".join(
-            f"{a.name()}: {a.description()}" for a in AVAILABLE_AGENTS
+        """Ask the LLM planner which agents to activate."""
+        available_agents_desc = "\n".join(
+            f"  {agent.name()}: {agent.description()}" for agent in AVAILABLE_AGENTS
         )
-        system_prompt = ORCHESTRATOR_PLANNER_SYSTEM_PROMPT.format(
-            available_agents_desc=available_agents_desc,
-            query_rewrite_system_prompt=QUERY_REWRITE_SYSTEM_PROMPT,
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    ORCHESTRATOR_PLANNER_SYSTEM_PROMPT.format(
+                        available_agents_desc=available_agents_desc,
+                        query_rewrite_system_prompt=QUERY_REWRITE_SYSTEM_PROMPT,
+                    ),
+                ),
+                MessagesPlaceholder(variable_name="history"),
+            ]
         )
-
         try:
-            planner_llm = self._llm.with_structured_output(OrchestratorPlan)
-            plan: OrchestratorPlan = await planner_llm.ainvoke(
-                [SystemMessage(content=system_prompt)] + state.messages
+            structured_llm = self._llm.with_structured_output(OrchestratorPlan)
+            chain = prompt | structured_llm
+            plan: OrchestratorPlan = await chain.ainvoke({"history": state.messages})
+            logger.info(
+                "_plan_node: agents=%s needs_memory=%s final_answer=%s",
+                plan.target_agents,
+                plan.needs_memory,
+                plan.final_answer is not None,
             )
+            return {"plan": plan}
         except Exception:
-            logger.exception("_plan_node: LLM planner failed — using fallback plan")
-            # Safe fallback: route to synthesiser with no agents, no rewrite
-            last_query = _extract_last_human_message(state.messages)
-            plan = OrchestratorPlan(
-                query=last_query,
-                vector_query=last_query,
-                ticker=None,
-                start_date=now - timedelta(days=365),
-                end_date=now,
-                target_agents=[],
-                final_answer=None,
-            )
-
-        # Default date guards
-        if plan.end_date is None:
-            plan.end_date = now
-        if plan.start_date is None:
-            plan.start_date = plan.end_date - timedelta(days=365)
-
-        # Filter target_agents to only known agents (prevents KeyError downstream)
-        unknown = [a for a in plan.target_agents if a not in _AGENT_NAMES]
-        if unknown:
-            logger.warning("_plan_node: unknown agents in plan %s — removed", unknown)
-            plan.target_agents = [a for a in plan.target_agents if a in _AGENT_NAMES]
-
-        memory_task = None
-        if state.user_email and plan.needs_memory:
-            try:
-                memory_task = _safe_create_task(
-                    service_manager.get_retriever().comprehensive_retrieve(
-                        plan.rewritten_queries
-                    )
-                )
-            except Exception:
-                logger.exception("_plan_node: memory retrieval task creation failed")
-
-        return {"plan": plan, "memory_task": memory_task}
+            logger.exception("_plan_node: LLM call failed — using safe fallback plan")
+            return {"plan": OrchestratorPlan()}
 
     async def _direct_answer_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        """
-        FIX 2: Handles the final_answer path by writing summary into state
-        before the graph exits. Previously routed bare to END which left
-        summary unpopulated and caused the output_schema projection to crash.
-        """
         answer = (state.plan.final_answer or "").strip() if state.plan else ""
-        logger.info(
-            "_direct_answer_node: returning direct answer (%d chars)", len(answer)
-        )
+        logger.info("_direct_answer_node: %d chars", len(answer))
         return {"summary": answer, "sources": [], "fundamental_data": None}
 
     async def _load_context_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        """
-        Load user context from UserContextService (cache-first, cold-start hits Neo4j).
-        Only reached when the planner set needs_memory=True.
-        On failure, continues with empty context so the rest of the graph still runs.
-        """
         if not state.user_email:
-            logger.warning("_load_context_node: no user_email in state, skipping")
+            logger.warning("_load_context_node: no user_email, skipping")
             return {"user_context_loaded": True}
-
         try:
             svc = service_manager.get_user_context_service()
             user_context = await svc.load_for_user(state.user_email)
@@ -531,22 +543,16 @@ class OrchestratorAgent:
                 "user_context_loaded": True,
             }
         except Exception:
-            logger.exception(
-                "_load_context_node: failed to load context for %s", state.user_email
-            )
+            logger.exception("_load_context_node: failed for %s", state.user_email)
             return {"user_context_loaded": True}
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        """
-        Run selected agents in parallel.
-        FIX 5: Logs individual agent failures; guards against unknown agents.
-        """
+        """Run selected agents in parallel."""
         plan = state.plan
         if not plan or not plan.target_agents:
             logger.warning("_execute_node: no agents to run")
             return {"agent_outputs": {}}
 
-        # Build shared input — use model_dump but exclude memory_task (not serialisable)
         try:
             shared_input = BaseAgentInput(
                 **{
@@ -573,19 +579,16 @@ class OrchestratorAgent:
                 )
             else:
                 outputs[name] = res
-                logger.info("_execute_node: agent '%s' completed successfully", name)
+                logger.info("_execute_node: agent '%s' completed", name)
 
         if not outputs:
-            logger.warning(
-                "_execute_node: all agents failed — synthesiser will have empty context"
-            )
+            logger.warning("_execute_node: all agents failed")
 
         subgraph_tasks = [
             getattr(out, "subgraph_task", None) for out in outputs.values()
         ]
         await asyncio.gather(
-            *[t for t in subgraph_tasks if t is not None],
-            return_exceptions=True,
+            *[t for t in subgraph_tasks if t is not None], return_exceptions=True
         )
 
         return {"agent_outputs": outputs}
@@ -594,16 +597,14 @@ class OrchestratorAgent:
         """
         Synthesise agent outputs into a final response.
 
-        FIX 5: Handles empty agent_outputs gracefully.
-        FIX 5: Wraps LLM call in try/except with a sensible fallback.
-        FIX 6: Corrects signal entity iteration (was reading signal.entity_name
-               which doesn't exist — entities live in signal.target_entities).
-        FIX 7: asyncio.create_task guarded via _safe_create_task.
+        Single LLM call produces up to three output blocks:
+          <cross_domain_relationships>  → written to knowledge graph
+          <user_interest_relationships> → delegated to memory.user_signal_writeback
+          <response>                    → returned to the user
         """
         context_parts: List[str] = []
         fundamental_df = None
         news_sources: List[CitedSource] = []
-        all_enriched_entities = []
 
         for name, output in state.agent_outputs.items():
             try:
@@ -616,51 +617,45 @@ class OrchestratorAgent:
                 fundamental_df = getattr(output, "financial_data", None)
             if name == "news_agent":
                 news_sources = getattr(output, "sources", []) or []
-            all_enriched_entities.extend(getattr(output, "entities_enriched", []))
 
         portfolio = self.get_portfolio(settings.PORTFOLIO_JSON_PATH)
         portfolio_block = json.dumps(portfolio, indent=2) if portfolio else "[]"
         multi_agent = len(state.agent_outputs) > 1
+
         user_context_section = SYNTHESISER_USER_CONTEXT_SECTION.format(
             user_context=state.user_context_block
         )
 
-        user_response = ""
-        cross_relationships: List[dict] = []
+        investment_signals = (
+            (state.plan.detected_investment_signals or []) if state.plan else []
+        )
+        learning_signals = (
+            (state.plan.detected_learning_signals or []) if state.plan else []
+        )
 
-        # ── LLM synthesis ─────────────────────────────────────────
+        user_response = ""
+        synthesis_result = SynthesisResult(user_response="")
+
+        # ── LLM synthesis (single call) ───────────────────────────
         if not context_parts and not state.user_context_block and not portfolio_block:
-            # All agents failed or no agents ran — produce a safe fallback
-            logger.warning(
-                "_synthesize_node: no context from agents, skipping LLM synthesis"
-            )
+            logger.warning("_synthesize_node: no context from agents, using fallback")
             user_response = (
                 "I wasn't able to retrieve data for your query at this time. "
                 "Please try again or rephrase your question."
             )
         else:
             try:
-                prompt = self._build_synthesis_prompt(user_context_section, multi_agent)
-                raw = await self._run_synthesis_chain(
-                    prompt,
-                    state,
-                    context_parts,
-                    portfolio_block,
+                prompt = self._build_synthesis_prompt(
+                    user_context_section,
+                    multi_agent,
+                    investment_signals=investment_signals if multi_agent else None,
+                    learning_signals=learning_signals if multi_agent else None,
                 )
-
-                if multi_agent:
-                    match = _CROSS_RE.search(raw)
-                    if match:
-                        try:
-                            cross_relationships = json.loads(match.group(1).strip())
-                        except json.JSONDecodeError:
-                            cross_relationships = []
-
-                resp_match = _RESPONSE_RE.search(raw)
-                user_response = (
-                    resp_match.group(1).strip() if resp_match else raw.strip()
+                raw = await self._invoke_synthesis_llm(
+                    prompt, state, context_parts, portfolio_block
                 )
-
+                synthesis_result = self._parse_synthesis_output(raw, multi_agent)
+                user_response = synthesis_result.user_response
             except Exception:
                 logger.exception("_synthesize_node: LLM synthesis failed")
                 user_response = (
@@ -668,20 +663,21 @@ class OrchestratorAgent:
                     "The raw data was retrieved but could not be summarised."
                 )
 
-        # ── Graph write-back (async, non-blocking) ────────────────
-        if multi_agent and state.conversation_id:
+        # ── Cross-domain graph write-back (async, non-blocking) ───
+        if (
+            multi_agent
+            and state.conversation_id
+            and synthesis_result.cross_relationships
+        ):
             try:
                 builder = InMemorySubgraphBuilder(
                     embedding_func=service_manager.get_embedding_func(),
                     fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
                     semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
                 )
-                cross_graph = nx.DiGraph()
-                if cross_relationships:
-                    cross_graph = await builder.build(
-                        cross_relationships, source_agent="orchestrator"
-                    )
-
+                cross_graph = await builder.build(
+                    synthesis_result.cross_relationships, source_agent="orchestrator"
+                )
                 if cross_graph.number_of_edges() > 0:
                     _safe_create_task(
                         service_manager.get_ingestor()._upsert_graph_to_neo4j(
@@ -689,13 +685,17 @@ class OrchestratorAgent:
                         )
                     )
             except Exception:
-                logger.exception("_synthesize_node: graph write-back setup failed")
+                logger.exception("_synthesize_node: cross-graph write-back failed")
 
-        # ── User interest signal write-back ───────────────────────
-        if state.user_email and state.plan:
-            await self._write_user_signals(state, context_parts)
+        # ── User signal write-back (delegated to memory module) ───
+        if state.user_email and state.plan and state.conversation_id:
+            user_message = _extract_last_human_message(state.messages)
+            payload = _build_signal_payload(
+                state, synthesis_result.interest_edges, user_message
+            )
+            # Fire-and-forget — never blocks the response
+            _safe_create_task(write_user_signals(payload))
 
-        # Collect per-agent raw analyses for the UI
         per_agent_analyses: Dict[str, str] = {
             name: getattr(output, "analysis", "") or ""
             for name, output in state.agent_outputs.items()
@@ -707,206 +707,3 @@ class OrchestratorAgent:
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,
         }
-
-    async def _write_user_signals(
-        self,
-        state: OrchestratorState,
-        context_parts: List[str],
-    ) -> None:
-        """
-        Persist investment and learning interest signals to the user graph.
-
-        FIX 6 (signal iteration): InvestmentSignalDetection has
-        `target_entities: List[UserInterestEntity]` not `entity_name` /
-        `entity_type` at the top level. We iterate target_entities correctly.
-        """
-        user_message = _extract_last_human_message(state.messages)
-        ingestor = service_manager.get_ingestor()
-        user_context_service = service_manager.get_user_context_service()
-        entity_cache: Dict[str, Any] = {}
-        wrote_any = False
-
-        # ── Investment signals ────────────────────────────────────
-        for signal in state.plan.detected_investment_signals or []:
-            for entity in signal.target_entities or []:  # ← FIX: was signal.entity_name
-                try:
-                    resolved_id = await ingestor.resolve_entity_id(
-                        entity.entity_name,
-                        entity.entity_type,
-                        entity_cache=entity_cache,
-                    )
-                    if not resolved_id:
-                        continue
-                    node = UserInvestmentInterestNode(
-                        id="",
-                        user_email=state.user_email,
-                        status=signal.status,
-                        reason=user_message,
-                        confidence="high",
-                        updated_at=datetime.now(timezone.utc),
-                        target_entity_ids=[resolved_id],
-                    )
-                    user_context_service.schedule_upsert_fire_and_forget(
-                        node, state.user_email
-                    )
-                    wrote_any = True
-                except Exception:
-                    logger.exception(
-                        "_write_user_signals: investment signal failed for '%s'",
-                        entity.entity_name,
-                    )
-
-        # ── Learning signals ──────────────────────────────────────
-        for signal in state.plan.detected_learning_signals or []:
-            for entity in signal.target_entities or []:  # ← FIX: was signal.entity_name
-                try:
-                    resolved_id = await ingestor.resolve_entity_id(
-                        entity.entity_name,
-                        entity.entity_type,
-                        entity_cache=entity_cache,
-                    )
-                    if not resolved_id:
-                        continue
-                    node = UserLearningInterestNode(
-                        id="",
-                        user_email=state.user_email,
-                        status=signal.status,
-                        reason=user_message,
-                        updated_at=datetime.now(timezone.utc),
-                        target_entity_ids=[resolved_id],
-                    )
-                    user_context_service.schedule_upsert_fire_and_forget(
-                        node, state.user_email
-                    )
-                    wrote_any = True
-                except Exception:
-                    logger.exception(
-                        "_write_user_signals: learning signal failed for '%s'",
-                        entity.entity_name,
-                    )
-
-        # ── User interest subgraph ────────────────────────────────
-        detected_investment = state.plan.detected_investment_signals or []
-        detected_learning = state.plan.detected_learning_signals or []
-
-        if not (detected_investment or detected_learning) or not state.conversation_id:
-            return
-
-        try:
-            user_prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        "You are a financial relationship extractor. Given the user context and "
-                        "agent analyses, extract only relationships that connect entities to the "
-                        "user's investment or learning signals. Return only the structured fields "
-                        "required by the schema.",
-                    ),
-                    (
-                        "human",
-                        "USER CONTEXT:\n{user_context}\n\n"
-                        "DETECTED INVESTMENT SIGNALS:\n{investment_signals}\n\n"
-                        "DETECTED LEARNING SIGNALS:\n{learning_signals}\n\n"
-                        "AGENT FINDINGS:\n{context}\n",
-                    ),
-                ]
-            )
-            structured_llm = self._llm.with_structured_output(UserInterestMapping)
-            mapping: UserInterestMapping = await (user_prompt | structured_llm).ainvoke(
-                {
-                    "user_context": state.user_context_block,
-                    "investment_signals": detected_investment,
-                    "learning_signals": detected_learning,
-                    "context": "\n\n".join(context_parts),
-                }
-            )
-        except Exception:
-            logger.exception("_write_user_signals: UserInterestMapping LLM call failed")
-            return
-
-        edges = (mapping.investment_threats or []) + (mapping.learning_helpers or [])
-        if not edges:
-            return
-
-        # Build a type-lookup from all signal target_entities
-        target_type_lookup: Dict[str, str] = {}
-        for signal in detected_investment + detected_learning:
-            for entity in signal.target_entities or []:
-                if entity.entity_name and entity.entity_type:
-                    target_type_lookup[entity.entity_name.lower()] = entity.entity_type
-
-        rels = []
-        for edge in edges:
-            target_type = target_type_lookup.get(edge.target_entity_name.lower())
-            if not target_type:
-                continue
-            rels.append(
-                {
-                    "from_name": edge.entity_name,
-                    "from_type": edge.entity_type,
-                    "relation": edge.relationship,
-                    "to_name": edge.target_entity_name,
-                    "to_type": target_type,
-                    "confidence": edge.confidence,
-                    "reason": edge.reason,
-                    "extra_props": {"derived_for_user_email": state.user_email},
-                }
-            )
-
-        if not rels:
-            return
-
-        try:
-            builder = InMemorySubgraphBuilder(
-                embedding_func=service_manager.get_embedding_func(),
-                fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-                semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
-            )
-            interest_graph = await builder.build(rels, source_agent="orchestrator")
-            _safe_create_task(
-                service_manager.get_ingestor()._upsert_graph_to_neo4j(
-                    interest_graph, state.conversation_id
-                )
-            )
-        except Exception:
-            logger.exception(
-                "_write_user_signals: interest subgraph build/upsert failed"
-            )
-            return
-
-        # Update last_analysis_summary on user interest targets
-        try:
-            user_graph = service_manager.get_neo4j_adapter()
-            entity_cache2: Dict[str, Any] = {}
-
-            def _first_sentence(text: str) -> str:
-                text = (text or "").strip()
-                sentence = text.split(".")[0].strip()
-                return f"{sentence}." if sentence else ""
-
-            for edge in edges:
-                target_type = target_type_lookup.get(edge.target_entity_name.lower())
-                if not target_type:
-                    continue
-                try:
-                    target_id = await ingestor.resolve_entity_id(
-                        edge.target_entity_name,
-                        target_type,
-                        entity_cache=entity_cache2,
-                    )
-                    if not target_id:
-                        continue
-                    summary = _first_sentence(edge.reason)
-                    if summary:
-                        await user_graph.update_targets_last_analysis_summary(
-                            state.user_email, target_id, summary
-                        )
-                except Exception:
-                    logger.exception(
-                        "_write_user_signals: summary update failed for '%s'",
-                        edge.target_entity_name,
-                    )
-        except Exception:
-            logger.exception(
-                "_write_user_signals: last_analysis_summary update loop failed"
-            )
