@@ -42,8 +42,8 @@ AVAILABLE AGENTS:
 Populate `target_agents` with the agent names whose job descriptions match the query. Leave empty if no agent is needed (e.g. the synthesiser can answer from user context alone).
 
 -- DECISION 4: Rewrite the query per agent --
-For every agent name in `target_agents`, populate `per_agent_queries[<agent_name>]` with a concise,
-keyword-dense retrieval string that is specifically tailored to that agent's job description and
+For every agent name in `target_agents`, populate `per_agent_queries[<agent_name>]` with a descriptive,
+string that aims to infer what the user might be trying to say. infer the full form of the short forms used by the user to. The rewritten prompt should be specifically tailored to that agent's job description and
 retrieval strategy.  The downstream agent will receive ONLY this rewritten string as its query —
 the original user message will not be passed through.
 

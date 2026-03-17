@@ -38,17 +38,17 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
-from orchestrator_models import (
-    FinalResponse,
-    OrchestratorPlan,
-    OrchestratorState,
-    SynthesisResult,
-)
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
 from core.agents.news_analysis_agent import NewsAnalysisAgent
+from core.agents.orchestrator_models import (
+    FinalResponse,
+    OrchestratorPlan,
+    OrchestratorState,
+    SynthesisResult,
+)
 from core.agents.prompts import (
     ORCHESTRATOR_PLANNER_SYSTEM_PROMPT,
     SYNTHESISER_SINGLE_AGENT_PROMPT,

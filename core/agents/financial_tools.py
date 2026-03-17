@@ -870,6 +870,135 @@ class CustomFormulaTool(FinancialTool):
             return ToolResult(tool_name=self.name, success=False, error=str(exc))
 
 
+# ── Period-over-Period Change ─────────────────────────────────────────────────
+
+
+class PeriodOverPeriodParams(BaseModel):
+    metrics: List[str] = Field(
+        description=(
+            "One or more exact row labels to compute period-over-period changes for "
+            "(e.g. ['Revenues', 'NetIncomeLoss', 'gross_margin']). "
+            "Accepts both raw EDGAR concepts and previously derived rows."
+        )
+    )
+    absolute_change: bool = Field(
+        default=True,
+        description=(
+            "If True, add a '<metric>_change' row with the raw numeric difference "
+            "between each period and the prior one."
+        ),
+    )
+    pct_change: bool = Field(
+        default=True,
+        description=(
+            "If True, add a '<metric>_pct_change' row with the percentage change "
+            "(expressed as a decimal, e.g. 0.12 = +12%) between consecutive periods."
+        ),
+    )
+
+
+class PeriodOverPeriodTool(FinancialTool):
+    name = "period_over_period"
+    description = (
+        "Computes period-over-period absolute change and/or percentage change for one or "
+        "more metrics across all available periods (works for both annual and quarterly data). "
+        "Produces '<metric>_change' rows (raw difference) and '<metric>_pct_change' rows "
+        "(decimal percentage) which the analyst can reference directly. "
+        "Use this whenever the user asks about growth, acceleration, deceleration, "
+        "improvement, deterioration, or trend direction for any financial line item."
+    )
+    parameters_schema = PeriodOverPeriodParams
+
+    def execute(  # type: ignore[override]
+        self, df: pd.DataFrame, params: PeriodOverPeriodParams
+    ) -> ToolResult:
+        if not params.absolute_change and not params.pct_change:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error="At least one of absolute_change or pct_change must be True.",
+            )
+
+        missing = [m for m in params.metrics if m not in df.index]
+        if missing:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error=f"Metrics not found in DataFrame: {missing}. "
+                f"Available (first 10): {list(df.index[:10])}",
+            )
+
+        # Sort columns chronologically so diff() moves forward in time
+        try:
+            sorted_cols = sorted(df.columns, key=lambda c: pd.Timestamp(c))
+        except Exception:
+            sorted_cols = list(df.columns)
+
+        added_rows: Dict[str, Dict[str, float]] = {}
+        summaries: List[str] = []
+
+        for metric in params.metrics:
+            series = df.loc[metric, sorted_cols]
+            numeric = pd.to_numeric(series, errors="coerce")
+
+            if params.absolute_change:
+                abs_diff = numeric.diff()  # NaN for the first period — intentional
+                row_label = f"{metric}_change"
+                added_rows[row_label] = {
+                    col: val for col, val in abs_diff.items() if pd.notna(val)
+                }
+                if added_rows[row_label]:
+                    latest_col = sorted_cols[-1]
+                    latest_val = abs_diff.get(latest_col)
+                    if pd.notna(latest_val):
+                        direction = "▲" if latest_val >= 0 else "▼"
+                        summaries.append(
+                            f"{metric} absolute change "
+                            f"(latest {str(latest_col)[:7]}): "
+                            f"{direction} {latest_val:+,.2f}"
+                        )
+
+            if params.pct_change:
+                pct = numeric.pct_change()  # NaN for first period — intentional
+                row_label = f"{metric}_pct_change"
+                added_rows[row_label] = {
+                    col: val
+                    for col, val in pct.items()
+                    if pd.notna(val) and not np.isinf(val)
+                }
+                if added_rows[row_label]:
+                    latest_col = sorted_cols[-1]
+                    latest_val = pct.get(latest_col)
+                    if pd.notna(latest_val) and not np.isinf(latest_val):
+                        direction = "▲" if latest_val >= 0 else "▼"
+                        summaries.append(
+                            f"{metric} % change "
+                            f"(latest {str(latest_col)[:7]}): "
+                            f"{direction} {latest_val:+.1%}"
+                        )
+
+        # Drop any empty rows (metric had no valid consecutive pairs)
+        added_rows = {k: v for k, v in added_rows.items() if v}
+
+        if not added_rows:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error=(
+                    "No period-over-period values could be computed. "
+                    "The DataFrame may have fewer than 2 periods or all values are NaN."
+                ),
+            )
+
+        logger.info("[PeriodOverPeriodTool] Computed rows: %s", list(added_rows.keys()))
+        return ToolResult(
+            tool_name=self.name,
+            success=True,
+            added_rows=added_rows,
+            summary="\n".join(summaries),
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Tool Registry
 # ─────────────────────────────────────────────────────────────────────────────
@@ -881,6 +1010,7 @@ TOOL_REGISTRY: Dict[str, FinancialTool] = {
     DebtSolvencyTool.name: DebtSolvencyTool(),
     LiquidityTool.name: LiquidityTool(),
     CustomFormulaTool.name: CustomFormulaTool(),
+    PeriodOverPeriodTool.name: PeriodOverPeriodTool(),
 }
 
 

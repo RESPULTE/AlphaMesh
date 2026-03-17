@@ -18,7 +18,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
     agent = OrchestratorAgent()
     messages = [
         HumanMessage(
-            content="i am interested in buying microsfot, can you tell me more about the company's profitability? check any recent news data on it too"
+            content="can you tell me more about APPLE's price to free cash flow ratio changes year over year for the past 5 years?"
         )
     ]
 

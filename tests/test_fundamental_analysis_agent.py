@@ -65,11 +65,11 @@ from core.agents.financial_tools import (
     get_tool_descriptions,
     set_adapter,
 )
+from core.agents.fundamental_agent_models import BaseAgentInput, ToolCallSpec
 from core.agents.fundamental_analysis_agent import (
     FundamentalAnalysisAgent,
     FundamentalAnalysisOutput,
     IterativeToolPlan,
-    ToolCallSpec,
     _AgentState,
     _format_value,
 )

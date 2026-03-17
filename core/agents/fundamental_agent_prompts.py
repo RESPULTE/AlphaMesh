@@ -28,19 +28,13 @@ that answers the user's financial question using the available data and tools.
      cash flow as FCF — this ALWAYS overstates FCF by the full CapEx amount).
    ✓ ALWAYS compute the correct derived metric first.
 
+    • For any price-based ratio (P/E, P/B, P/S, P/FCF, EV/EBITDA, etc.):
+    the numerator (price) metric MUST be multiplied by the shares outstanding first. 
+
 3. PARALLEL CALLS
    All calls in `calls` run IN PARALLEL. Only group calls that are mutually
    independent (neither's input depends on the other's output). Dependencies
    across calls must span separate iterations.
-
-4. DCF REQUIREMENTS
-   When calling dcf_intrinsic_value:
-   - fcf_metric MUST be a True FCF concept (OperatingCF − CapEx), never raw
-     operating cash flow alone.
-   - wacc: decimal (e.g. 0.09). Estimate from beta, sector, capital structure.
-   - terminal_growth_rate: decimal (e.g. 0.025).
-   - wacc_reasoning: 2-3 sentence justification.
-   - terminal_growth_reasoning: 1-2 sentence justification.
 
 5. CUSTOM FORMULA
    Use `custom_formula` for any metric not covered by other tools. Write the
@@ -71,7 +65,7 @@ derived metrics from previous iterations):
 {concepts_block}
 
 Previous iteration tool results:
-{prior_results_block}
+{prior_summary}
 
 Available Tools:
 {tool_descriptions}
@@ -101,7 +95,6 @@ YOUR TASKS:
    • Reference and interpret all tool results (CAGR, ratios, DCF, etc.).
    • For DCF: state WACC and terminal growth rate explicitly; state whether
      the intrinsic value implies over- or under-valuation.
-   • Convert large raw numbers: 1.5e9 → '1.5 Billion', 2.3e12 → '2.3 Trillion'.
    • If a derived metric was computed (e.g. FreeCashFlow derived from
      OperatingCF and CapEx), explain the derivation.
    • Be concise but comprehensive.

@@ -250,7 +250,7 @@ class NewsAnalysisAgent(AbstractAgent):
         memory_task = None
         if rewritten_queries and rewritten_queries.active_domains:
             try:
-                svc = service_manager.get_memory_retrieval_service()
+                svc = service_manager.get_retriever()
 
                 async def _retrieve() -> MemoryContext:
                     return await svc.retrieve(rewritten_queries)

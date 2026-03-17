@@ -36,6 +36,7 @@ Key behaviours (unchanged)
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Type
 
 import pandas as pd
@@ -50,6 +51,7 @@ from core.agents.fundamental_agent_models import (
     FundamentalAnalysisOutput,
     IterativeToolPlan,
     RelevantRowsSelection,
+    ToolCallSpec,
     _AgentState,
 )
 from core.agents.fundamental_agent_prompts import (
@@ -73,6 +75,78 @@ MAX_TOOL_ITERATIONS: int = 5
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  Agent
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _format_value(x: float) -> str:
+    """Converts a raw float to a human-readable denomination string."""
+    abs_x = abs(x)
+    if abs_x >= 1_000_000_000_000:
+        return f"{x / 1_000_000_000_000:.2f} Trillion"
+    if abs_x >= 1_000_000_000:
+        return f"{x / 1_000_000_000:.2f} Billion"
+    if abs_x >= 1_000_000:
+        return f"{x / 1_000_000:.2f} Million"
+    if abs_x >= 1_000:
+        return f"{x / 1_000:.2f} Thousand"
+    return f"{x:.4g}"
+
+
+def _quarterly_periods(start: datetime, end: datetime) -> list:
+    """Returns (year, quarter) tuples covering start..end inclusive."""
+    periods = []
+    year, month = start.year, start.month
+    while datetime(year, month, 1) <= end:
+        quarter = (month - 1) // 3 + 1
+        if (year, quarter) not in periods:
+            periods.append((year, quarter))
+        month += 3
+        if month > 12:
+            month -= 12
+            year += 1
+    return periods
+
+
+def _normalize_period_ends(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    """
+    Renames DataFrame columns from raw EDGAR fiscal-period dates to canonical
+    period-end dates so they align with yfinance resampled prices.
+
+    yearly    : any date in year YYYY  →  YYYY-12-31
+    quarterly : any date in quarter Q  →  last day of that quarter
+    """
+    rename: Dict[str, str] = {}
+    for col in df.columns:
+        try:
+            ts = pd.Timestamp(col)
+            if granularity == "yearly":
+                rename[col] = ts.replace(month=12, day=31).strftime("%Y-%m-%d")
+            else:
+                rename[col] = (
+                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
+                )
+        except Exception:
+            rename[col] = str(col)
+    return df.rename(columns=rename)
+
+
+def _canonical_date_strs(index: Any, granularity: str) -> list:
+    """
+    Converts a DatetimeIndex (or any iterable of date-like values) to
+    canonical period-end date strings matching _normalize_period_ends output.
+    """
+    result = []
+    for val in index:
+        try:
+            ts = pd.Timestamp(val)
+            if granularity == "yearly":
+                result.append(ts.replace(month=12, day=31).strftime("%Y-%m-%d"))
+            else:
+                result.append(
+                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
+                )
+        except Exception:
+            result.append(str(val))
+    return result
 
 
 class FundamentalAnalysisAgent(AbstractAgent):
@@ -193,55 +267,106 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def _data_prep_node(self, state: _AgentState) -> Dict:
         """
-        Concurrently:
-        1. Ensures EDGAR data is cached for the requested periods.
-        2. Fetches price data from yfinance at matching granularity.
-        3. Loads financial data from local DB and normalises period dates.
+        Concurrently fetches/caches EDGAR filings and yfinance price data via
+        self.db (FinancialDatabase), then loads and normalises the result.
 
         Granularity:
-        yearly   (default) — 10-K filings, 5-year window.
-                            Normalises fiscal-year-end dates to YYYY-12-31
-                            to align with yfinance YE prices.
-        quarterly           — 10-Q filings, last 8 quarters.
-                            Normalises to quarter-end dates.
+        yearly   (default) — 10-K filings, 5-year window, prices resampled yearly.
+        quarterly           — 10-Q filings, last 8 quarters, prices resampled quarterly.
         """
-        ticker = state.ticker or ""
-        granularity = state.granularity or "yearly"
+        ticker: str = state.ticker
+        granularity: str = getattr(state, "granularity", "yearly")
 
         if not ticker:
             logger.warning("[data_prep] No ticker — returning empty state.")
             return {"financial_data": pd.DataFrame(), "available_concepts": []}
 
-        try:
-            edgar_svc = service_manager.get_edgar_service()
-            if granularity == "quarterly":
-                await edgar_svc.ensure_quarterly_cached(ticker)
-            else:
-                await edgar_svc.ensure_annual_cached(ticker)
-        except Exception as exc:
-            logger.warning("[data_prep] EDGAR cache failed for %s: %s", ticker, exc)
-
-        try:
-            financial_df, available_concepts = await self.db.get_financial_data(
-                ticker, granularity=granularity
+        # ── Resolve date window and filing parameters ─────────────────────────
+        end_dt = state.end_date or datetime.now()
+        if granularity == "yearly":
+            default_start = datetime(end_dt.year - 4, 1, 1)
+            start_dt = state.start_date if state.start_date else default_start
+            if (end_dt.year - start_dt.year) < 4:
+                start_dt = datetime(end_dt.year - 4, 1, 1)
+            form_type = "10-K"
+            price_interval = "yearly"
+            today = datetime.now()
+            last_complete_year = today.year - 1 if today.month < 12 else today.year
+            periods = list(
+                range(start_dt.year, min(end_dt.year, last_complete_year) + 1)
             )
-        except Exception as exc:
-            logger.error("[data_prep] DB load failed for %s: %s", ticker, exc)
-            return {"financial_data": pd.DataFrame(), "available_concepts": []}
+        else:
+            default_start = end_dt - timedelta(days=2 * 365)
+            start_dt = state.start_date if state.start_date else default_start
+            form_type = "10-Q"
+            price_interval = "quarterly"
+            periods = _quarterly_periods(start_dt, end_dt)
+
+        logger.info(
+            "[Node] data_prep — %s | %s | %s → %s | periods=%s",
+            ticker,
+            granularity,
+            start_dt.date(),
+            end_dt.date(),
+            periods,
+        )
+
+        # ── Concurrent EDGAR update + price fetch via self.db ─────────────────
+        async def _edgar_update():
+            await self.db.update_financials(ticker, periods, form_type)
+
+        async def _price_fetch():
+            return await self.db.get_price_data(
+                ticker,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                interval=price_interval,
+            )
+
+        edgar_task = asyncio.create_task(_edgar_update())
+        price_task = asyncio.create_task(_price_fetch())
+        await edgar_task  # DB must be populated before querying
+        price_df: pd.DataFrame = await price_task
+
+        # ── Load + pivot from DB ──────────────────────────────────────────────
+        financial_df = await self.db.get_data(ticker, form_types=[form_type])
+
+        if not financial_df.empty:
+            try:
+                col_dates = pd.to_datetime(financial_df.columns, errors="coerce")
+                keep_mask = (col_dates >= pd.Timestamp(start_dt).tz_localize(None)) & (
+                    col_dates <= pd.Timestamp(end_dt).tz_localize(None)
+                )
+                financial_df = financial_df.loc[:, keep_mask]
+            except Exception as exc:
+                logger.warning("[data_prep] Date trimming failed: %s", exc)
+
+        # Normalise EDGAR fiscal period dates to canonical period-end
+        if not financial_df.empty:
+            financial_df = _normalize_period_ends(financial_df, granularity)
+
+        available_concepts = list(financial_df.index) if not financial_df.empty else []
+
+        # ── Merge stock price row ─────────────────────────────────────────────
+        if not price_df.empty and "stock_price" in price_df.columns:
+            price_t = price_df[["stock_price"]].T
+            price_t.columns = _canonical_date_strs(price_t.columns, granularity)
+
+            if not financial_df.empty:
+                all_cols = sorted(set(financial_df.columns) | set(price_t.columns))
+                financial_df = financial_df.reindex(columns=all_cols)
+                price_t = price_t.reindex(columns=all_cols)
+
+            financial_df = pd.concat([financial_df, price_t])
+            if "stock_price" not in available_concepts:
+                available_concepts.append("stock_price")
 
         if financial_df.empty:
-            logger.warning("[data_prep] No financial data found for %s", ticker)
-            return {"financial_data": financial_df, "available_concepts": []}
-
-        try:
-            price_df = await service_manager.get_price_service().get_prices(
-                ticker, granularity=granularity
+            logger.warning(
+                "[data_prep] No financial data found for %s in the requested range.",
+                ticker,
             )
-            if price_df is not None and not price_df.empty:
-                financial_df = financial_df.join(price_df, how="left")
-                available_concepts = list(financial_df.index)
-        except Exception as exc:
-            logger.warning("[data_prep] Price fetch failed for %s: %s", ticker, exc)
+            return {"financial_data": pd.DataFrame(), "available_concepts": []}
 
         thresh = max(1, int(len(financial_df.index) * 0.3))
         financial_df = financial_df.dropna(axis=1, thresh=thresh)
@@ -296,7 +421,12 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         user_msg = _TOOL_PLANNER_USER.format(
             iteration=iteration,
+            start_date=(
+                state.start_date.strftime("%Y-%m-%d") if state.start_date else "N/A"
+            ),
+            end_date=state.end_date.strftime("%Y-%m-%d") if state.end_date else "N/A",
             max_iterations=MAX_TOOL_ITERATIONS,
+            n_concepts=len(state.available_concepts),
             query=state.query,
             ticker=state.ticker or "N/A",
             concepts_block=concepts_block,
@@ -340,71 +470,112 @@ class FundamentalAnalysisAgent(AbstractAgent):
             logger.info("[tool_executor] No calls to execute.")
             return {"iteration_count": state.iteration_count + 1}
 
-        async def _run_one(spec) -> ToolResult:
-            tool_cls = TOOL_REGISTRY.get(spec.tool_name)
-            if tool_cls is None:
+        df = (
+            state.financial_data if state.financial_data is not None else pd.DataFrame()
+        )
+
+        async def _run_one(spec: ToolCallSpec) -> ToolResult:
+            tool = TOOL_REGISTRY.get(spec.tool_name)
+            if tool is None:
                 return ToolResult(
                     tool_name=spec.tool_name,
                     success=False,
                     error=f"Unknown tool: {spec.tool_name}",
                 )
             try:
-                tool = tool_cls()
-                result = await tool.execute(
-                    params=spec.parameters,
-                    financial_data=state.financial_data,
-                    db=self.db,
-                    ticker=state.ticker or "",
-                )
-                # Persist computed rows back to state and DB
-                if result.output_df is not None and not result.output_df.empty:
-                    new_labels = list(result.output_df.index)
-                    if state.financial_data is not None:
-                        state.financial_data = pd.concat(
-                            [state.financial_data, result.output_df]
-                        ).loc[lambda df: ~df.index.duplicated(keep="last")]
-                    await self.db.persist_computed_rows(
-                        state.ticker or "", result.output_df
-                    )
-                    return ToolResult(
-                        tool_name=spec.tool_name,
-                        success=True,
-                        summary=result.summary,
-                        reasoning=spec.reasoning,
-                        output_df=result.output_df,
-                        new_row_labels=new_labels,
-                    )
-                return ToolResult(
-                    tool_name=spec.tool_name,
-                    success=result.success,
-                    summary=result.summary,
-                    error=result.error,
-                    reasoning=spec.reasoning,
+                return tool.execute(
+                    df=df, params=tool.parameters_schema(**spec.parameters)
                 )
             except Exception as exc:
                 logger.error("[tool_executor] %s failed: %s", spec.tool_name, exc)
                 return ToolResult(
-                    tool_name=spec.tool_name,
-                    success=False,
-                    error=str(exc),
-                    reasoning=spec.reasoning,
+                    tool_name=spec.tool_name, success=False, error=str(exc)
                 )
 
-        results = await asyncio.gather(*[_run_one(s) for s in plan.calls])
+        batch_results: List[ToolResult] = await asyncio.gather(
+            *[_run_one(s) for s in plan.calls]
+        )
 
-        # Merge any new row labels into available_concepts
-        new_labels: List[str] = []
-        for r in results:
-            new_labels.extend(r.new_row_labels or [])
-        updated_concepts = list(
-            dict.fromkeys(list(state.available_concepts) + new_labels)
+        # ── Merge added_rows back into the DataFrame ──────────────────────────
+        newly_added_labels: List[str] = []
+        for result in batch_results:
+            if result.success and result.added_rows:
+                new_rows = pd.DataFrame.from_dict(result.added_rows, orient="index")
+                all_cols = df.columns.union(new_rows.columns)
+                df = df.reindex(columns=all_cols)
+                new_rows = new_rows.reindex(columns=all_cols)
+                new_rows = new_rows[~new_rows.index.isin(df.index)]
+                if not new_rows.empty:
+                    df = pd.concat([df, new_rows])
+                newly_added_labels.extend(result.added_rows.keys())
+                logger.info(
+                    "[tool_executor] Merged rows from %s: %s",
+                    result.tool_name,
+                    list(result.added_rows.keys()),
+                )
+
+        # ── Persist new time-series rows to SQLite ────────────────────────────
+        if newly_added_labels and not df.empty:
+            await self._persist_computed_rows(
+                ticker=state.ticker,
+                df=df,
+                row_labels=newly_added_labels,
+                form_type=(
+                    "10-K"
+                    if getattr(state, "granularity", "yearly") == "yearly"
+                    else "10-Q"
+                ),
+            )
+
+        updated_concepts = list(df.index) if not df.empty else state.available_concepts
+        updated_computed = list(
+            set(state.computed_row_labels) | set(newly_added_labels)
         )
 
         return {
-            "tool_results": list(results),
+            "financial_data": df if not df.empty else state.financial_data,
+            "tool_results": list(state.tool_results) + batch_results,
             "iteration_count": state.iteration_count + 1,
             "available_concepts": updated_concepts,
+            "computed_row_labels": updated_computed,
         }
+
+    async def _persist_computed_rows(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        row_labels: List[str],
+        form_type: str,
+    ) -> None:
+        """
+        Saves newly computed time-series rows back into the financials SQLite
+        table under statement_type='computed'.  Scalar/single-period rows are
+        skipped as they have no meaningful time dimension to store.
+        """
+        records = []
+        for label in row_labels:
+            if label not in df.index:
+                continue
+            row = df.loc[label].dropna()
+            if len(row) < 2:
+                logger.debug("[persist] Skipping scalar/single-period row '%s'.", label)
+                continue
+            for date_col, value in row.items():
+                records.append(
+                    {
+                        "company": ticker.upper(),
+                        "period_date": str(date_col),
+                        "form_type": form_type,
+                        "statement_type": "computed",
+                        "label": label,
+                        "value": float(value),
+                    }
+                )
+        if records:
+            await self.db._bulk_insert(pd.DataFrame(records))
+            logger.info(
+                "[persist] Saved %d computed rows for %s.", len(records), ticker
+            )
 
     # ── Node: analyst ─────────────────────────────────────────────────────────
 
@@ -539,19 +710,3 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "relationships_extracted": relationships_extracted,
             "subgraph_id": subgraph_id,
         }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _format_value(x: Any) -> str:
-    """Format a numeric value for display in memory context."""
-    if isinstance(x, float):
-        if abs(x) >= 1e9:
-            return f"{x / 1e9:.2f}B"
-        if abs(x) >= 1e6:
-            return f"{x / 1e6:.2f}M"
-        return f"{x:.4g}"
-    return str(x)
