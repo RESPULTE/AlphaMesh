@@ -59,8 +59,7 @@ from core.memory.graph.extraction_prompts import (
     ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
     COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
 )
-from core.memory.graph.relationship_extractor import extract_with_retry
-from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
+from core.memory.graph.utils import extract_with_retry
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
@@ -217,7 +216,6 @@ class NewsAnalysisAgent(AbstractAgent):
         super().__init__()
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
-        self._subgraph_builder = InMemorySubgraphBuilder()
         self._ingestor = service_manager.get_ingestor()
 
     @staticmethod
@@ -394,12 +392,16 @@ class NewsAnalysisAgent(AbstractAgent):
     async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
         """
         Ingest articles into Neo4j and ChromaDB, then retrieve the most
-        relevant chunks for the current query.
+        relevant chunks for the current query via scored similarity search.
 
-        The two Chroma similarity queries (new chunks and existing chunks) are
-        fired in parallel via asyncio.gather — they share neither inputs nor
-        outputs and each involves an embedding round-trip, so parallelising
-        them saves one full query latency.
+        ingest_articles() returns involved_chunks in memory (no round-trip),
+        but those chunks carry no relevance scores. Two parallel ChromaDB
+        similarity queries are still needed to score new and existing chunks
+        against the query before reranking. The in-memory return value is
+        intentionally ignored for this reason.
+
+        The two queries are fired in parallel — they are independent and each
+        involves an embedding round-trip.
         """
         if not state.raw_articles:
             return {"chunk_ids": [], "retrieved_chunks": []}
@@ -414,12 +416,12 @@ class NewsAnalysisAgent(AbstractAgent):
 
         query = state.query
 
-        async def _query(chunk_ids: List[int], domain: str) -> List[RetrievedChunk]:
+        async def _query(chunk_ids: List[str], domain: str) -> List[RetrievedChunk]:
             if not chunk_ids:
                 return []
             docs_with_scores = await service_manager.get_chroma_adapter().query(
                 query_text=query,
-                n_results=10,
+                n_results=settings.RETRIEVER_SEED_TOP_K,
                 where={"chunk_id": {"$in": chunk_ids}},
             )
             return [
@@ -430,25 +432,27 @@ class NewsAnalysisAgent(AbstractAgent):
             ]
 
         new_chunks, existing_chunks = await asyncio.gather(
-            _query(new_chunk_ids, "new"), _query(existing_chunk_ids, "existing")
+            _query(new_chunk_ids, "new"),
+            _query(existing_chunk_ids, "existing"),
         )
         retrieved_chunks = new_chunks + existing_chunks
 
-        all_chunk_ids = new_chunk_ids + existing_chunk_ids
         logger.info(
             "Ingested articles into memory. #New: %s, #Existing: %s",
             len(new_chunk_ids),
             len(existing_chunk_ids),
         )
-        return {"chunk_ids": all_chunk_ids, "retrieved_chunks": retrieved_chunks}
+        # chunk_ids retained in state for schema compatibility but no longer
+        # consumed downstream — entity extraction uses final_ranked IDs in
+        # _rendezvous_node instead.
+        return {
+            "chunk_ids": new_chunk_ids + existing_chunk_ids,
+            "retrieved_chunks": retrieved_chunks,
+        }
 
     # ── Node: rendezvous ──────────────────────────────────────────────────────
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
-        """
-        Await the memory retrieval task (fired in _rewrite_queries_node) and
-        merge its results with the freshly ingested article chunks.
-        """
         memory_context: MemoryContext | None = None
         if state.memory_task is not None:
             try:
@@ -459,16 +463,25 @@ class NewsAnalysisAgent(AbstractAgent):
                 )
             except Exception as exc:
                 logger.error("Memory retrieval task failed: %s", exc)
-                memory_context = None
 
         final_chunks = list(state.retrieved_chunks)
-
         if memory_context is not None:
             final_chunks = final_chunks + memory_context.chunks
 
         final_ranked = service_manager.get_reranker().rank(final_chunks)
 
-        await self._ingestor.extract_entities_for_chunks(final_ranked)
+        # Extract entities only from the reranked set — chunks that actually
+        # contributed to this query. Fire-and-forget: extraction enriches the
+        # graph for future retrieval but does not affect the current analysis.
+        # Memory chunks already marked EXTRACTED are skipped by the idempotency
+        # guard inside extract_entities_for_chunks at no cost.
+        pending_chunk_ids = [chunk.chunk_id for chunk in final_ranked if chunk.chunk_id]
+        if pending_chunk_ids:
+            task = asyncio.create_task(
+                self._ingestor.extract_entities_for_chunks(pending_chunk_ids)
+            )
+            if settings.EXTRACTION_IMMEDIATE:
+                await task
 
         return {"final_chunks": final_ranked}
 
@@ -569,13 +582,14 @@ class NewsAnalysisAgent(AbstractAgent):
         ]
         # ── End citation filtering ─────────────────────────────────────────────
 
-        subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
+        subgraph_svc = service_manager.get_subgraph_service()
+        subgraph_id = await subgraph_svc.schedule(
             agent_name=self.name(),
             conversation_id=state.conversation_id or "",
             analysis_text=analysis_text,
-            relationships=relationships,
-            relationships_extracted=relationships_extracted,
             llm=self._llm,
+            system_prompt=ANALYSIS_ONLY_RELATIONSHIP_PROMPT,  # agent owns this choice
+            relationships=response.relationships if response.parse_success else None,
         )
 
         return {

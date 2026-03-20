@@ -22,6 +22,7 @@ class ServiceManager:
         self._memory_retrieval_service = None
         self._user_context_service = None
         self._subgraph_store = None
+        self._subgraph_service = None
 
     def get_agent(self, temperature=0.0):
         """Initializes and returns the language model instance."""
@@ -221,6 +222,18 @@ class ServiceManager:
                 print(f"Error initializing SubgraphStore: {e}")
                 raise
         return self._subgraph_store
+
+    def get_subgraph_service(self):
+        from core.memory.graph.subgraph_service import SubgraphExtractionService
+
+        if self._subgraph_service is None:
+            self._subgraph_service = SubgraphExtractionService(
+                ingestor=self.get_ingestor(),
+                embedding_func=self.get_embedding_func(),
+                fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
+                semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
+            )
+        return self._subgraph_service
 
 
 service_manager = ServiceManager()

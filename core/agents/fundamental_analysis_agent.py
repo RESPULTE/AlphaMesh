@@ -64,7 +64,6 @@ from core.agents.fundamental_agent_prompts import (
 )
 from core.agents.models import BaseAgentInput
 from core.logger import get_logger
-from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -110,7 +109,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
         super().__init__()
         self.db = FinancialDatabase()
         self._graph = self._build_graph()
-        self._subgraph_builder = InMemorySubgraphBuilder()
 
     @staticmethod
     def name() -> str:
@@ -634,15 +632,14 @@ class FundamentalAnalysisAgent(AbstractAgent):
             analysis_text = "Analysis could not be generated due to an internal error."
 
         # ── Schedule background relationship extraction ───────────────────────
-        subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
+        subgraph_id = await service_manager.get_subgraph_service().schedule(
             agent_name=self.name(),
             conversation_id=state.conversation_id or "",
             analysis_text=analysis_text,
-            relationships=[],
-            relationships_extracted=False,
             llm=service_manager.get_agent(temperature=0.7),
+            system_prompt="",  # can now be different
+            relationships=None,  # always needs extraction
         )
-
         return {
             "financial_data": filtered_df,
             "analysis": analysis_text,

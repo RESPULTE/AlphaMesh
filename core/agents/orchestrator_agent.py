@@ -33,9 +33,6 @@ Changes in this revision
     messages is passed instead of `state.messages`, preventing unbounded token
     growth as conversations grow.
 
-4.  InMemorySubgraphBuilder instantiated without arguments.
-    The constructor reads embedding_func and thresholds from service_manager /
-    settings internally; passing them as keyword args was a pre-existing bug.
 """
 
 import asyncio
@@ -66,7 +63,6 @@ from core.agents.prompts import (
 from core.agents.utils import _safe_create_task
 from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
 from core.memory.user_signal_writeback import (
     DetectedEntity,
     InterestEdge,
@@ -187,7 +183,6 @@ class OrchestratorAgent:
             agent.name(): agent() for agent in AVAILABLE_AGENTS
         }
         self._graph = self._build_graph()
-        self._subgraph_builder = InMemorySubgraphBuilder()
 
     # ── Static helpers ────────────────────────────────────────────
 
@@ -579,13 +574,13 @@ class OrchestratorAgent:
             and state.conversation_id
             and synthesis_result.cross_relationships
         ):
-            subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
+            subgraph_id = await service_manager.get_subgraph_service().schedule(
                 agent_name=self.name(),
                 conversation_id=state.conversation_id or "",
                 analysis_text=analysis_text,
-                relationships=[],
-                relationships_extracted=False,
                 llm=service_manager.get_agent(temperature=0.7),
+                system_prompt="",  # orchestrator-specific
+                relationships=synthesis_result.cross_relationships or None,
             )
 
         # ── User signal write-back (delegated to memory module) ───

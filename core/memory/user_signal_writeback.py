@@ -21,21 +21,26 @@ Public surface
 
           2. Builds a user-scoped interest subgraph from pre-extracted
              interest edges (produced by the synthesis LLM call — see
-             SynthesisResult.interest_edges) and upserts it to Neo4j.
+             SynthesisResult.interest_edges) and persists it to Neo4j via
+             SubgraphExtractionService.
 
           3. Updates last_analysis_summary on each target entity.
 
 Design notes
 ------------
-- No LLM calls here.  The interest edges are extracted once, inside
-  _run_synthesis_chain (the synthesis prompt now includes a third output
-  block).  This module is pure write logic.
+- No LLM calls here. The interest edges are extracted once, inside
+  _run_synthesis_chain (the synthesis prompt includes a third output block).
+  This module is pure write logic.
 
-- All exceptions are caught and logged.  This function NEVER raises —
+- SubgraphExtractionService is used directly (build_graph + persist_graph)
+  rather than through schedule() because the relationships are already
+  extracted — there is no LLM call to defer. _upsert_interest_subgraph is
+  itself already called from a background coroutine, so nesting another
+  fire-and-forget task inside it would cause failures to be silently
+  swallowed. We await both operations directly.
+
+- All exceptions are caught and logged. This function NEVER raises —
   a failure here must never surface to the user.
-
-- _safe_create_task is duplicated from orchestrator_agent.py deliberately
-  so this module has no import dependency on agents.
 """
 
 from __future__ import annotations
@@ -45,21 +50,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-
-from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.models import (
     UserInvestmentInterestNode,
     UserLearningInterestNode,
 )
-from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
 from core.services import service_manager
 
 logger = get_logger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Payload dataclass — decouples this module from OrchestratorState
+# Payload dataclasses — decouples this module from OrchestratorState
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -103,7 +105,7 @@ class InterestEdge:
 @dataclass
 class UserSignalPayload:
     """
-    Everything write_user_signals needs.  Built by the orchestrator from
+    Everything write_user_signals needs. Built by the orchestrator from
     OrchestratorState + SynthesisResult and passed in as a plain value object.
     """
 
@@ -134,6 +136,20 @@ def _first_sentence(text: str) -> str:
     text = (text or "").strip()
     sentence = text.split(".")[0].strip()
     return f"{sentence}." if sentence else ""
+
+
+def _build_target_type_lookup(payload: UserSignalPayload) -> Dict[str, str]:
+    """
+    Index entity_type by lowercased entity_name across all signal target lists.
+    Used by both _upsert_interest_subgraph and _update_analysis_summaries to
+    resolve the type of a target entity given only its name.
+    """
+    lookup: Dict[str, str] = {}
+    for signal in payload.investment_signals + payload.learning_signals:
+        for entity in signal.target_entities:
+            if entity.entity_name and entity.entity_type:
+                lookup[entity.entity_name.lower()] = entity.entity_type
+    return lookup
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -208,7 +224,7 @@ async def _upsert_interest_nodes(payload: UserSignalPayload) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 2 — build and upsert the user-scoped interest subgraph
+# Step 2 — build and persist the user-scoped interest subgraph
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -216,21 +232,28 @@ async def _upsert_interest_subgraph(payload: UserSignalPayload) -> None:
     """
     Convert interest edges (from the synthesis LLM) into a Neo4j subgraph
     tagged with derived_for_user_email.
+
+    Uses SubgraphExtractionService.build_graph() + persist_graph() directly
+    rather than schedule(), because:
+      - The relationships are already extracted; no LLM call is needed.
+      - This coroutine is itself executing inside a background task
+        (write_user_signals is fire-and-forget from the orchestrator).
+        Nesting another task via schedule() would cause any exception in the
+        inner task to bypass the exception handlers in write_user_signals.
     """
     if not payload.interest_edges:
         return
 
-    # Build type lookup from all signal entities so we can resolve target types
-    target_type_lookup: Dict[str, str] = {}
-    for signal in payload.investment_signals + payload.learning_signals:
-        for entity in signal.target_entities:
-            if entity.entity_name and entity.entity_type:
-                target_type_lookup[entity.entity_name.lower()] = entity.entity_type
+    target_type_lookup = _build_target_type_lookup(payload)
 
     rels = []
     for edge in payload.interest_edges:
         target_type = target_type_lookup.get(edge.target_entity_name.lower())
         if not target_type:
+            logger.debug(
+                "_upsert_interest_subgraph: skipping edge — unknown type for '%s'",
+                edge.target_entity_name,
+            )
             continue
         rels.append(
             {
@@ -249,19 +272,24 @@ async def _upsert_interest_subgraph(payload: UserSignalPayload) -> None:
         return
 
     try:
-        builder = InMemorySubgraphBuilder(
-            embedding_func=service_manager.get_embedding_func(),
-            fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-            semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
+        subgraph_svc = service_manager.get_subgraph_service()
+        interest_graph = await subgraph_svc.build_graph(
+            rels, source_agent="orchestrator"
         )
-        interest_graph = await builder.build(rels, source_agent="orchestrator")
-        _safe_create_task(
-            service_manager.get_ingestor()._upsert_graph_to_neo4j(
-                interest_graph, payload.conversation_id
-            )
+        await subgraph_svc.persist_graph(
+            interest_graph, conversation_id=payload.conversation_id
+        )
+        logger.info(
+            "_upsert_interest_subgraph: persisted %d edges for user '%s'",
+            interest_graph.number_of_edges(),
+            payload.user_email,
         )
     except Exception:
-        logger.exception("user_signal_writeback: interest subgraph upsert failed")
+        logger.exception(
+            "user_signal_writeback: interest subgraph build/persist failed "
+            "for user '%s'",
+            payload.user_email,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -277,15 +305,11 @@ async def _update_analysis_summaries(payload: UserSignalPayload) -> None:
     if not payload.interest_edges:
         return
 
-    target_type_lookup: Dict[str, str] = {}
-    for signal in payload.investment_signals + payload.learning_signals:
-        for entity in signal.target_entities:
-            if entity.entity_name and entity.entity_type:
-                target_type_lookup[entity.entity_name.lower()] = entity.entity_type
+    target_type_lookup = _build_target_type_lookup(payload)
 
     try:
         ingestor = service_manager.get_ingestor()
-        user_graph = service_manager.get_neo4j_adapter()
+        neo4j = service_manager.get_neo4j_adapter()
         entity_cache: Dict[str, Any] = {}
 
         for edge in payload.interest_edges:
@@ -302,7 +326,7 @@ async def _update_analysis_summaries(payload: UserSignalPayload) -> None:
                     continue
                 summary = _first_sentence(edge.reason)
                 if summary:
-                    await user_graph.update_targets_last_analysis_summary(
+                    await neo4j.update_targets_last_analysis_summary(
                         payload.user_email, target_id, summary
                     )
             except Exception:
@@ -325,7 +349,7 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
 
     Steps (all exceptions caught internally — never raises):
       1. Upsert UserInvestmentInterestNode / UserLearningInterestNode records.
-      2. Build and upsert the user-scoped interest subgraph.
+      2. Build and persist the user-scoped interest subgraph.
       3. Update last_analysis_summary on each targeted entity.
 
     Intended to be called fire-and-forget from the orchestrator:
@@ -334,7 +358,7 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
     """
     if not payload.user_email or not payload.conversation_id:
         logger.warning(
-            "write_user_signals: missing user_email or conversation_id, skipping"
+            "write_user_signals: missing user_email or conversation_id — skipping"
         )
         return
 

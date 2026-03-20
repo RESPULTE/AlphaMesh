@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from core.memory.graph.models import ChunkExtractionResult, EntityNode
+from core.memory.graph.models import EntityNode
 from core.memory.retrieval.models import RetrievedChunk
 
 
@@ -14,17 +14,6 @@ class BaseAgentInput(BaseModel):
     """
     The unified input schema shared by the Orchestrator and all Sub-Agents.
 
-    Changes
-    -------
-    - `vector_query` removed: the orchestrator now rewrites the query per-agent
-      via `per_agent_queries` in `OrchestratorPlan` and sets `query` directly
-      to the agent-tailored string before dispatch.  There is no longer a
-      separate vector-retrieval string; each agent uses its `query` field for
-      both semantic understanding and vector retrieval.
-
-    - `memory_task` removed: the news analysis agent now self-manages its own
-      memory retrieval task internally (see `_rewrite_queries_node`).  No other
-      agent uses memory retrieval, so the field served no purpose elsewhere.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -90,15 +79,14 @@ class BaseAgentOutput(BaseModel, ABC):
             "Populated by each agent's final node before returning."
         ),
     )
+    # subgraph_task removed: SubgraphExtractionService.schedule() manages its
+    # own background task internally and returns only the subgraph_id string.
     subgraph_id: Optional[str] = Field(default=None, exclude=True)
-    subgraph_task: Optional[Any] = Field(default=None, exclude=True)
     relationships_extracted: bool = Field(default=False)
 
     @abstractmethod
     def get_llm_context_str(self) -> str:
-        """
-        Formats the output's data into a string suitable for an LLM context.
-        """
+        """Formats the output into a string suitable for LLM context."""
         raise NotImplementedError
 
 
@@ -121,19 +109,20 @@ class NewsAgentState(BaseModel):
     # ── Inputs set by the agent's run() method ────────────────────────────────
     query: str
     ticker: str
-    start_date: datetime
-    end_date: datetime
+    # date (not datetime): _constrain_date_range returns date objects.
+    # These are used only as ISO strings in fetch_articles.
+    start_date: date
+    end_date: date
     conversation_id: Optional[str] = Field(default=None)
 
     # ── Internal pipeline state ───────────────────────────────────────────────
-    # memory_task is managed entirely inside the news agent; it is created in
-    # _rewrite_queries_node and awaited in _rendezvous_node.
+    # memory_task is created in _rewrite_queries_node and awaited in
+    # _rendezvous_node. Excluded from Pydantic serialisation; carried through
+    # the LangGraph state dict directly.
     memory_task: Optional[Any] = Field(default=None, exclude=True)
 
     raw_articles: List[dict] = Field(default_factory=list)
-    chunk_ids: List[str] = Field(default_factory=list)
     retrieved_chunks: List[RetrievedChunk] = Field(default_factory=list)
-    extraction_results: List[ChunkExtractionResult] = Field(default_factory=list)
     final_chunks: List[RetrievedChunk] = Field(default_factory=list)
 
     # ── Output fields ─────────────────────────────────────────────────────────
