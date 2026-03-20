@@ -1,33 +1,41 @@
 """
 core/agents/orchestrator_agent.py
 
-Hardened OrchestratorAgent.
+Hardened OrchestratorAgent — refactored for lower latency.
 
 Changes in this revision
 ─────────────────────────
-1.  Per-agent query rewriting (Change #1 from design doc).
-    OrchestratorPlan now carries `per_agent_queries: Dict[str, str]`.
-    The planner LLM populates a tailored retrieval string for every agent
-    it selects.  _execute_node reads this dict and builds a separate
-    BaseAgentInput per agent — each receiving only its own rewritten query
-    instead of the raw user string.  Falls back to `plan.query` for agents
-    not present in the dict.
+1.  `load_context` node removed entirely.
+    User context is now pre-loaded externally (on session start) and held in
+    the UserContextService in-memory cache.  `run()` reads it synchronously
+    via `svc.get_formatted_context()` — a pure dict lookup with no I/O — and
+    writes the result into initial state before the graph is invoked.
 
-2.  Memory retrieval responsibility moved to NewsAnalysisAgent (Change #3).
-    `rewritten_queries` and `memory_task` are removed from OrchestratorPlan
-    and OrchestratorState.  The orchestrator no longer creates or passes a
-    memory retrieval task — the news agent self-manages this via its own
-    `_rewrite_queries_node`.  BaseAgentInput no longer carries `memory_task`
-    or `vector_query`.
+    This eliminates a sequential Neo4j round-trip that previously sat on the
+    critical path whenever `needs_memory=True`, blocking agent dispatch for
+    the duration of the database read.
 
-3.  Single LLM call for synthesis (unchanged from previous revision).
-    _run_synthesis_chain parses THREE output blocks from one call:
-      <cross_domain_relationships> … </cross_domain_relationships>
-      <user_interest_relationships> … </user_interest_relationships>
-      <response> … </response>
+    Graph topology simplified from:
+      planner → [direct_answer | load_context | execute_agents | synthesiser]
+    to:
+      planner → [direct_answer | execute_agents | synthesiser]
 
-4.  All graph-write logic for user signals delegated to
-    core/memory/user_signal_writeback.write_user_signals() (unchanged).
+2.  Planner receives only the latest human message.
+    Routing and per-agent query rewriting require only the current user
+    intent — not the full conversation transcript.  The ChatPromptTemplate /
+    MessagesPlaceholder wrapper in _plan_node is replaced with a direct
+    [SystemMessage, HumanMessage] pair, keeping the token load on this
+    latency-critical call constant regardless of conversation length.
+
+3.  Synthesiser receives a bounded history window (_SYNTHESIS_HISTORY_WINDOW).
+    The synthesis LLM needs enough context to write a coherent, personalised
+    response but not the entire transcript.  A fixed window of the most recent
+    messages is passed instead of `state.messages`, preventing unbounded token
+    growth as conversations grow.
+
+4.  InMemorySubgraphBuilder instantiated without arguments.
+    The constructor reads embedding_func and thresholds from service_manager /
+    settings internally; passing them as keyword args was a pre-existing bug.
 """
 
 import asyncio
@@ -35,7 +43,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
 
@@ -83,9 +91,13 @@ _INTEREST_RE = re.compile(
 
 AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
 
+# Number of most-recent messages passed to the synthesis LLM.
+# The planner receives only the single latest human message (see _plan_node).
+_SYNTHESIS_HISTORY_WINDOW: int = 6
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Module-level helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -100,10 +112,16 @@ def _safe_create_task(coro) -> Optional[asyncio.Task]:
 
 
 def _extract_last_human_message(messages: List[BaseMessage]) -> str:
+    """Return the content of the most recent HumanMessage, or '' if none exists."""
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             return msg.content or ""
     return ""
+
+
+def _last_n_messages(messages: List[BaseMessage], n: int) -> List[BaseMessage]:
+    """Return the last *n* messages; returns the full list when len ≤ n."""
+    return messages[-n:] if len(messages) > n else list(messages)
 
 
 def _safe_json(text: str) -> List[dict]:
@@ -178,7 +196,6 @@ class OrchestratorAgent:
             agent.name(): agent() for agent in AVAILABLE_AGENTS
         }
         self._graph = self._build_graph()
-        self._builder = InMemorySubgraphBuilder()
 
     # ── Static helpers ────────────────────────────────────────────
 
@@ -203,14 +220,7 @@ class OrchestratorAgent:
             return "synthesiser"
         if state.plan.final_answer is not None:
             return "direct_answer"
-        if state.plan.needs_memory:
-            return "load_context"
         if state.plan.target_agents:
-            return "execute_agents"
-        return "synthesiser"
-
-    def _post_context_router(self, state: OrchestratorState) -> str:
-        if state.plan and state.plan.target_agents:
             return "execute_agents"
         return "synthesiser"
 
@@ -218,32 +228,20 @@ class OrchestratorAgent:
         workflow = StateGraph(OrchestratorState, output_schema=FinalResponse)
 
         workflow.add_node("planner", self._plan_node)
-        workflow.add_node("load_context", self._load_context_node)
         workflow.add_node("direct_answer", self._direct_answer_node)
         workflow.add_node("execute_agents", self._execute_node)
         workflow.add_node("synthesiser", self._synthesize_node)
 
         workflow.add_edge(START, "planner")
-
         workflow.add_conditional_edges(
             "planner",
             self._router,
             {
                 "direct_answer": "direct_answer",
-                "load_context": "load_context",
                 "execute_agents": "execute_agents",
                 "synthesiser": "synthesiser",
             },
         )
-        workflow.add_conditional_edges(
-            "load_context",
-            self._post_context_router,
-            {
-                "execute_agents": "execute_agents",
-                "synthesiser": "synthesiser",
-            },
-        )
-
         workflow.add_edge("direct_answer", END)
         workflow.add_edge("execute_agents", "synthesiser")
         workflow.add_edge("synthesiser", END)
@@ -258,13 +256,31 @@ class OrchestratorAgent:
         conversation_id: Optional[str] = None,
         user_email: Optional[str] = None,
     ) -> FinalResponse:
+        """
+        Entry point for one conversation turn.
+
+        User context is read synchronously from the UserContextService
+        in-memory cache (O(1), no I/O) before the graph starts.  The cache
+        is populated externally on session start; if it is cold the service
+        returns "USER CONTEXT: None", which is a safe default.
+        """
+        user_context_block = "USER CONTEXT: None"
+        if user_email:
+            try:
+                svc = service_manager.get_user_context_service()
+                user_context_block = (
+                    svc.get_formatted_context(user_email) or "USER CONTEXT: None"
+                )
+            except Exception:
+                logger.exception(
+                    "run: failed to read user context from cache for %s", user_email
+                )
+
         initial_state = OrchestratorState(
             messages=messages,
             conversation_id=conversation_id,
             user_email=user_email,
-            user_context=None,
-            user_context_block="USER CONTEXT: None",
-            user_context_loaded=False,
+            user_context_block=user_context_block,
         )
         try:
             raw = await self._graph.ainvoke(initial_state)
@@ -343,12 +359,13 @@ class OrchestratorAgent:
         state: OrchestratorState,
         context_parts: List[str],
         portfolio_block: str,
+        history: List[BaseMessage],
     ) -> str:
         """Invoke the synthesis LLM chain and return raw string output."""
         chain = prompt | self._llm
         response = await chain.ainvoke(
             {
-                "history": state.messages,
+                "history": history,
                 "context": "\n\n".join(context_parts),
                 "user_context": state.user_context_block,
                 "portfolio": portfolio_block,
@@ -385,27 +402,34 @@ class OrchestratorAgent:
     # ── Nodes ─────────────────────────────────────────────────────
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        """Ask the LLM planner which agents to activate and rewrite the query per agent."""
+        """
+        Route the conversation and rewrite the query per target agent.
+
+        Only the latest human message is sent to the planner LLM — routing
+        and query rewriting require only the current user intent, not the full
+        transcript.  This keeps the token load on this latency-critical call
+        constant regardless of conversation length.
+        """
         available_agents_desc = "\n".join(
             f"  {agent.name()}: {agent.description()}" for agent in AVAILABLE_AGENTS
         )
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    ORCHESTRATOR_PLANNER_SYSTEM_PROMPT.format(
-                        available_agents_desc=available_agents_desc,
-                    ),
-                ),
-                MessagesPlaceholder(variable_name="history"),
-            ]
+        system_content = ORCHESTRATOR_PLANNER_SYSTEM_PROMPT.format(
+            available_agents_desc=available_agents_desc,
         )
+        latest_human = _extract_last_human_message(state.messages)
+
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
-            chain = prompt | structured_llm
-            plan: OrchestratorPlan = await chain.ainvoke({"history": state.messages})
+            plan: OrchestratorPlan = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=system_content),
+                    HumanMessage(content=latest_human),
+                ]
+            )
             logger.info(
-                "_plan_node: agents=%s needs_memory=%s per_agent_queries=%s final_answer=%s start_date=%s end_date=%s ticker=%s metrics=%s granularity=%s",
+                "_plan_node: agents=%s needs_memory=%s per_agent_queries=%s "
+                "final_answer=%s start_date=%s end_date=%s ticker=%s "
+                "metrics=%s granularity=%s",
                 plan.target_agents,
                 plan.needs_memory,
                 list(plan.per_agent_queries.keys()),
@@ -425,26 +449,6 @@ class OrchestratorAgent:
         answer = (state.plan.final_answer or "").strip() if state.plan else ""
         logger.info("_direct_answer_node: %d chars", len(answer))
         return {"summary": answer, "sources": [], "fundamental_data": None}
-
-    async def _load_context_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        if not state.user_email:
-            logger.warning("_load_context_node: no user_email, skipping")
-            return {"user_context_loaded": True}
-        try:
-            svc = service_manager.get_user_context_service()
-            user_context = await svc.load_for_user(state.user_email)
-            user_context_block = (
-                svc.get_formatted_context(state.user_email) or "USER CONTEXT: None"
-            )
-            logger.info("_load_context_node: context loaded for %s", state.user_email)
-            return {
-                "user_context": user_context,
-                "user_context_block": user_context_block,
-                "user_context_loaded": True,
-            }
-        except Exception:
-            logger.exception("_load_context_node: failed for %s", state.user_email)
-            return {"user_context_loaded": True}
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
         """
@@ -466,15 +470,12 @@ class OrchestratorAgent:
 
         tasks = []
         for name in valid_names:
-            # Use the agent-specific rewritten query; fall back to plan.query
             agent_query = plan.per_agent_queries.get(name) or plan.query
             logger.info(
                 "_execute_node: dispatching '%s' with query='%.120s'",
                 name,
                 agent_query,
             )
-            # plan IS a BaseAgentInput — copy it, overriding only query and
-            # injecting the runtime-only conversation_id (excluded from serialisation).
             agent_input: BaseAgentInput = plan.model_copy(
                 update={"query": agent_query, "conversation_id": state.conversation_id}
             )
@@ -500,18 +501,15 @@ class OrchestratorAgent:
         if not outputs:
             logger.warning("_execute_node: all agents failed")
 
-        subgraph_tasks = [
-            getattr(out, "subgraph_task", None) for out in outputs.values()
-        ]
-        await asyncio.gather(
-            *[t for t in subgraph_tasks if t is not None], return_exceptions=True
-        )
-
         return {"agent_outputs": outputs}
 
     async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
         """
         Synthesise agent outputs into a final response.
+
+        The synthesis LLM receives a bounded window of the most recent messages
+        (`_SYNTHESIS_HISTORY_WINDOW`) rather than the full history, keeping
+        token load constant as conversations grow.
 
         Single LLM call produces up to three output blocks:
           <cross_domain_relationships>  → written to knowledge graph
@@ -541,7 +539,6 @@ class OrchestratorAgent:
         user_context_section = SYNTHESISER_USER_CONTEXT_SECTION.format(
             user_context=state.user_context_block
         )
-
         investment_signals = (
             (state.plan.detected_investment_signals or []) if state.plan else []
         )
@@ -549,10 +546,12 @@ class OrchestratorAgent:
             (state.plan.detected_learning_signals or []) if state.plan else []
         )
 
+        # Bounded window — prevents unbounded token growth on long conversations.
+        history_window = _last_n_messages(state.messages, _SYNTHESIS_HISTORY_WINDOW)
+
         user_response = ""
         synthesis_result = SynthesisResult(user_response="")
 
-        # ── LLM synthesis (single call) ───────────────────────────
         if not context_parts and not state.user_context_block and not portfolio_block:
             logger.warning("_synthesize_node: no context from agents, using fallback")
             user_response = (
@@ -568,7 +567,7 @@ class OrchestratorAgent:
                     learning_signals=learning_signals if multi_agent else None,
                 )
                 raw = await self._invoke_synthesis_llm(
-                    prompt, state, context_parts, portfolio_block
+                    prompt, state, context_parts, portfolio_block, history_window
                 )
                 synthesis_result = self._parse_synthesis_output(raw, multi_agent)
                 user_response = synthesis_result.user_response
@@ -586,7 +585,8 @@ class OrchestratorAgent:
             and synthesis_result.cross_relationships
         ):
             try:
-                cross_graph = await self._builder.build(
+                builder = InMemorySubgraphBuilder()
+                cross_graph = await builder.build(
                     synthesis_result.cross_relationships, source_agent="orchestrator"
                 )
                 if cross_graph.number_of_edges() > 0:
@@ -595,10 +595,8 @@ class OrchestratorAgent:
                             cross_graph, state.conversation_id
                         )
                     )
-            except Exception as e:
-                logger.exception(
-                    "_synthesize_node: cross-graph write-back failed: %s", e
-                )
+            except Exception:
+                logger.exception("_synthesize_node: cross-graph write-back failed")
 
         # ── User signal write-back (delegated to memory module) ───
         if state.user_email and state.plan and state.conversation_id:

@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
 from core.memory.graph.models import RelationshipType
-from core.memory.user_context_service import UserContext
 
 
 class UserInterestEntity(BaseModel):
@@ -82,6 +81,15 @@ class OrchestratorPlan(BaseAgentInput):
 
 
 class OrchestratorState(BaseModel):
+    """
+    LangGraph state for the orchestrator pipeline.
+
+    `user_context_block` is populated once — synchronously from the
+    UserContextService in-memory cache — at the start of `run()`, before the
+    graph is invoked.  There is no `load_context` node: context loading is
+    handled externally (on session start) and the cache read is O(1).
+    """
+
     model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
 
     messages: List[BaseMessage] = Field(default_factory=list)
@@ -91,12 +99,12 @@ class OrchestratorState(BaseModel):
 
     conversation_id: Optional[str] = None
     user_email: Optional[str] = None
-    user_context: Optional[UserContext] = None
+
+    # Populated synchronously in run() from the UserContextService cache.
     user_context_block: str = ""
-    user_context_loaded: bool = False
 
     summary: str = ""
-    fundamental_data: Optional[pd.DataFrame] = None
+    fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)
     sources: List[CitedSource] = Field(default_factory=list)
 
 
