@@ -388,8 +388,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
     async def _tool_planner_node(self, state: _AgentState) -> Dict:
         """
         LLM produces an IterativeToolPlan for the current iteration.
+
+        The planner receives:
+        - The current iteration number and remaining budget.
+        - All available concepts, with [computed] annotations on derived rows so
+        the LLM can immediately see what was already produced in prior iterations
+        and avoid re-deriving it.
+        - A summary of every prior tool result so the LLM can see success/failure
+        and build on completed work.
         """
-        iteration = state.iteration_count + 1
+        iteration = state.iteration_count + 1  # 1-based for prompt readability
         logger.info(
             "[Node] tool_planner — iteration %d/%d — %s",
             iteration,
@@ -404,62 +412,80 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     calls=[],
                     needs_more_iterations=False,
                     data_summary="No financial data available.",
-                    iteration_reasoning="No concepts to work with.",
+                    iteration_reasoning="",
                 )
             }
 
-        prior_summary = ""
-        if state.tool_results:
-            prior_lines = [
-                f"  [{r.tool_name}] {'✓' if r.success else '✗'} {r.summary or r.error or ''}"
-                for r in state.tool_results
-            ]
-            prior_summary = "Prior tool results:\n" + "\n".join(prior_lines)
+        # ── Concepts block: annotate computed rows so the LLM doesn't re-derive them ──
+        computed_set = set(state.computed_row_labels or [])
+        concept_lines = [
+            f"  • {c}{' [computed]' if c in computed_set else ''}"
+            for c in sorted(state.available_concepts)[:200]
+        ]
+        if len(state.available_concepts) > 200:
+            concept_lines.append(f"  … and {len(state.available_concepts) - 200} more")
+        concepts_block = "\n".join(concept_lines)
 
-        concepts_block = "\n".join(f"  - {c}" for c in state.available_concepts)
-        tool_descriptions = get_tool_descriptions()
+        # ── Prior results block ────────────────────────────────────────────────────
+        if state.tool_results:
+            prior_results_block = "\n".join(
+                f"  [{r.tool_name}] {'✓' if r.success else f'✗ {r.error}'} — {r.summary}"
+                for r in state.tool_results
+            )
+        else:
+            prior_results_block = "  (none — first iteration)"
 
         user_msg = _TOOL_PLANNER_USER.format(
-            iteration=iteration,
+            query=state.query,
+            ticker=state.ticker or "N/A",
             start_date=(
                 state.start_date.strftime("%Y-%m-%d") if state.start_date else "N/A"
             ),
             end_date=state.end_date.strftime("%Y-%m-%d") if state.end_date else "N/A",
+            iteration=iteration,
             max_iterations=MAX_TOOL_ITERATIONS,
             n_concepts=len(state.available_concepts),
-            query=state.query,
-            ticker=state.ticker or "N/A",
             concepts_block=concepts_block,
-            prior_summary=prior_summary or "None yet.",
-            tool_descriptions=tool_descriptions,
+            prior_summary=prior_results_block,
+            tool_descriptions=get_tool_descriptions(),
         )
 
+        structured_llm = service_manager.get_agent(
+            temperature=0
+        ).with_structured_output(IterativeToolPlan)
         try:
-            structured_llm = service_manager.get_agent().with_structured_output(
-                IterativeToolPlan
-            )
-            plan: IterativeToolPlan = await structured_llm.ainvoke(
+            tool_plan: IterativeToolPlan = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=_TOOL_PLANNER_SYSTEM),
                     HumanMessage(content=user_msg),
                 ]
             )
-            logger.info(
-                "[tool_planner] %d calls planned, needs_more=%s",
-                len(plan.calls),
-                plan.needs_more_iterations,
-            )
-            return {"tool_plan": plan}
         except Exception as exc:
             logger.error("[tool_planner] LLM call failed: %s", exc)
             return {
                 "tool_plan": IterativeToolPlan(
                     calls=[],
                     needs_more_iterations=False,
-                    data_summary="Planning failed.",
-                    iteration_reasoning=str(exc),
+                    data_summary=f"Tool planning failed: {exc}. Proceeding with raw data.",
+                    iteration_reasoning="",
                 )
             }
+
+        logger.info(
+            "[tool_planner] Iteration %d: %d call(s), needs_more=%s — %s",
+            iteration,
+            len(tool_plan.calls),
+            tool_plan.needs_more_iterations,
+            tool_plan.data_summary,
+        )
+        if tool_plan.iteration_reasoning:
+            logger.info(
+                "[tool_planner] Multi-step plan: %s", tool_plan.iteration_reasoning
+            )
+        for i, spec in enumerate(tool_plan.calls, 1):
+            logger.info("  %d. %s — %s", i, spec.tool_name, spec.reasoning)
+
+        return {"tool_plan": tool_plan}
 
     # ── Node: tool_executor ───────────────────────────────────────────────────
 

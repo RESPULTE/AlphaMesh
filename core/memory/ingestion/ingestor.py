@@ -105,6 +105,9 @@ class DualStoreIngestor:
                 chunks_to_ingest.extend(chunk_records)
 
             if documents_to_ingest:
+                # Phase order is preserved: documents → chunks → vectors.
+                # Within each phase, all items are mutually independent and
+                # written in parallel.
                 await self._write_document_nodes(documents_to_ingest, global_anchor_id)
                 await self._write_chunk_nodes(chunks_to_ingest, global_anchor_id)
                 await self._write_vector_chunks(chunks_to_ingest, global_anchor_id)
@@ -121,9 +124,7 @@ class DualStoreIngestor:
                 involved_chunks = [
                     RetrievedChunk.from_document(doc, source="vector") for doc in docs
                 ]
-            # self._schedule_extraction(new_chunk_ids)
             return (new_chunk_ids, existing_chunk_ids, involved_chunks)
-            return (chunk_ids, involved_chunks)
         except Exception as exec:
             self._logger.exception("Failed to ingest articles. %s", str(exec))
             raise
@@ -131,22 +132,25 @@ class DualStoreIngestor:
     async def _write_document_nodes(
         self, docs: List[DocumentMetadata], global_anchor_id: str
     ) -> None:
-        """Write document nodes and anchor them to the global node."""
+        """Write document nodes and anchor them to the global nodeset — in parallel."""
         ingested_at = datetime.now(timezone.utc)
+
+        async def _write_one(doc: DocumentMetadata) -> None:
+            node = DocumentNode(
+                id=doc.document_id,
+                title=doc.title,
+                source_url=doc.source_url,
+                published_at=doc.published_at,
+                ingested_at=ingested_at,
+                nodeset_ids=[global_anchor_id],
+            )
+            await self._neo4j_adapter.merge_document_node(node)
+            await self._nodeset_manager.assign_to_node(
+                doc.document_id, "Document", global_anchor_id
+            )
+
         try:
-            for doc in docs:
-                node = DocumentNode(
-                    id=doc.document_id,
-                    title=doc.title,
-                    source_url=doc.source_url,
-                    published_at=doc.published_at,
-                    ingested_at=ingested_at,
-                    nodeset_ids=[global_anchor_id],
-                )
-                await self._neo4j_adapter.merge_document_node(node)
-                await self._nodeset_manager.assign_to_node(
-                    doc.document_id, "Document", global_anchor_id
-                )
+            await asyncio.gather(*[_write_one(doc) for doc in docs])
         except Exception:
             self._logger.exception("Failed to write document nodes.")
             raise
@@ -154,16 +158,19 @@ class DualStoreIngestor:
     async def _write_chunk_nodes(
         self, chunks: List[RetrievedChunk], global_anchor_id: str
     ) -> None:
-        """Write chunk nodes to Neo4j."""
+        """Write chunk nodes to Neo4j — in parallel."""
+
+        async def _write_one(chunk: RetrievedChunk) -> None:
+            node = chunk.model_copy(
+                update={
+                    "nodeset_ids": [global_anchor_id],
+                    "extraction_status": "PENDING",
+                }
+            )
+            await self._neo4j_adapter.merge_chunk_node(node)
+
         try:
-            for chunk in chunks:
-                node = chunk.model_copy(
-                    update={
-                        "nodeset_ids": [global_anchor_id],
-                        "extraction_status": "PENDING",
-                    }
-                )
-                await self._neo4j_adapter.merge_chunk_node(node)
+            await asyncio.gather(*[_write_one(chunk) for chunk in chunks])
         except Exception:
             self._logger.exception("Failed to write chunk nodes.")
             raise

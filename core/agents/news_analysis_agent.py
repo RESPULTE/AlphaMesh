@@ -20,6 +20,10 @@ Changes
   memory retrieval task thanks to the background task created in
   `_rewrite_queries_node`.
 
+- `_ingest_articles_node` now fires both Chroma retrieval queries (new chunks
+  and existing chunks) in parallel via asyncio.gather, eliminating a
+  sequential round-trip.
+
 Graph topology:
   rewrite_queries → fetch_news → ingest_articles → rendezvous → analyse_news
                  ↘ (memory_task fires in background) ↗
@@ -319,9 +323,17 @@ class NewsAnalysisAgent(AbstractAgent):
     # ── Node: ingest_articles ─────────────────────────────────────────────────
 
     async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
-        """Ingest articles into Neo4j and ChromaDB."""
+        """
+        Ingest articles into Neo4j and ChromaDB, then retrieve the most
+        relevant chunks for the current query.
+
+        The two Chroma similarity queries (new chunks and existing chunks) are
+        fired in parallel via asyncio.gather — they share neither inputs nor
+        outputs and each involves an embedding round-trip, so parallelising
+        them saves one full query latency.
+        """
         if not state.raw_articles:
-            return {"chunk_ids": []}
+            return {"chunk_ids": [], "retrieved_chunks": []}
 
         try:
             new_chunk_ids, existing_chunk_ids, _ = (
@@ -331,34 +343,42 @@ class NewsAnalysisAgent(AbstractAgent):
             logger.error("Ingestion failed: %s", exc)
             raise
 
-        retrieved_chunks: List[RetrievedChunk] = []
         query = state.query
 
-        if new_chunk_ids:
+        async def _query_new() -> List[RetrievedChunk]:
+            if not new_chunk_ids:
+                return []
             docs_with_scores = await service_manager.get_chroma_adapter().query(
                 query_text=query,
                 n_results=10,
                 where={"chunk_id": {"$in": new_chunk_ids}},
             )
-            retrieved_chunks += [
+            return [
                 RetrievedChunk.from_document(
                     doc, score=score, source="vector", domain="new"
                 )
                 for doc, score in docs_with_scores
             ]
 
-        if existing_chunk_ids:
+        async def _query_existing() -> List[RetrievedChunk]:
+            if not existing_chunk_ids:
+                return []
             docs_with_scores = await service_manager.get_chroma_adapter().query(
                 query_text=query,
                 n_results=10,
                 where={"chunk_id": {"$in": existing_chunk_ids}},
             )
-            retrieved_chunks += [
+            return [
                 RetrievedChunk.from_document(
                     doc, score=score, source="vector", domain="existing"
                 )
                 for doc, score in docs_with_scores
             ]
+
+        new_chunks, existing_chunks = await asyncio.gather(
+            _query_new(), _query_existing()
+        )
+        retrieved_chunks = new_chunks + existing_chunks
 
         all_chunk_ids = new_chunk_ids + existing_chunk_ids
         logger.info(
