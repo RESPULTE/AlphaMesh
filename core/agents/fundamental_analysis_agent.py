@@ -1,36 +1,34 @@
 """
 core/agents/fundamental_analysis_agent.py
 
-Async LangGraph agent with an iterative tool-calling loop.
+Async LangGraph agent — refactored for lower latency.
 
 Changes in this revision
-─────────────────────────
-- The inline subgraph build/store block in `_analyst_node` has been replaced
-  with a single call to
-  `core.memory.graph.subgraph_extraction.schedule_subgraph_extraction`.
-  The logic is identical; it now lives in one place shared with
-  NewsAnalysisAgent.
+────────────────────────
+1. db.initialize() guarded by _initialized flag on FinancialDatabase
+   (no-op after the first call; keeps the call in run() for API compatibility
+   but eliminates the repeated SQLite round-trip in practice).
 
-- Removed direct imports of:
-    InMemorySubgraphBuilder, SubgraphStore, retry_relationships_only,
-    ANALYSIS_ONLY_RELATIONSHIP_PROMPT
-  These are now fully encapsulated inside subgraph_extraction.py.
+2. Iterative planner → single upfront multi-batch plan (Option D hybrid).
+   IterativeToolPlan now carries `batches: List[ToolCallBatch]`.  The planner
+   LLM emits the FULL ordered dependency chain in one call.  The executor
+   steps through batches sequentially without re-invoking the LLM.
+   The LLM planner is only called again if a tool failure occurs mid-execution
+   (fallback recovery path), at which point `replanning_due_to_failure=True`
+   is signalled to the planner for context.
+
+   Old worst-case: 3 LLM planner calls + 3 executor passes = 6+ LLM calls.
+   New worst-case: 1 LLM planner call + N executor passes (no LLM between
+   passes) + 1 analyst call = 2 LLM calls for the happy path.
+
+3. Relationship extraction removed from the _analyst_node critical path.
+   The blocking extract_with_retry call (1–4s, potentially retried) is gone.
+   schedule_subgraph_extraction is called with relationships=[] and
+   relationships_extracted=False, which routes to the background
+   retry_relationships_only path using analysis_text as input.
+   The background task runs entirely after the node returns.
 
 Everything else is unchanged.
-
-Key behaviours (unchanged)
-──────────────────────────
-• Derived-metric persistence:
-    Computed time-series rows (same date columns as financial_data) are
-    saved back to SQLite (statement_type='computed') so they survive
-    across sessions and are visible to subsequent planner iterations via
-    available_concepts.
-
-• LLM-selected relevant-data table:
-    The analyst uses a structured output call to pick only the rows that
-    are meaningful for the user's query. Component rows that reveal an
-    insight (e.g. falling EPS behind a rising PE) are included; unrelated
-    asset/liability rows are excluded.
 """
 
 from __future__ import annotations
@@ -51,6 +49,7 @@ from core.agents.fundamental_agent_models import (
     FundamentalAnalysisOutput,
     IterativeToolPlan,
     RelevantRowsSelection,
+    ToolCallBatch,
     ToolCallSpec,
     _AgentState,
 )
@@ -61,19 +60,17 @@ from core.agents.fundamental_agent_prompts import (
 )
 from core.agents.models import BaseAgentInput
 from core.logger import get_logger
-from core.memory.graph.extraction_prompts import COMBINED_ANALYSIS_RELATIONSHIP_PROMPT
-from core.memory.graph.relationship_extractor import extract_with_retry
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
 from core.services import service_manager
 
 logger = get_logger(__name__)
 
-# ── Iteration ceiling ─────────────────────────────────────────────────────────
+# ── Iteration ceiling (guards the fallback re-planning loop only) ─────────────
 MAX_TOOL_ITERATIONS: int = 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  Agent
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -107,13 +104,6 @@ def _quarterly_periods(start: datetime, end: datetime) -> list:
 
 
 def _normalize_period_ends(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
-    """
-    Renames DataFrame columns from raw EDGAR fiscal-period dates to canonical
-    period-end dates so they align with yfinance resampled prices.
-
-    yearly    : any date in year YYYY  →  YYYY-12-31
-    quarterly : any date in quarter Q  →  last day of that quarter
-    """
     rename: Dict[str, str] = {}
     for col in df.columns:
         try:
@@ -130,10 +120,6 @@ def _normalize_period_ends(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
 
 
 def _canonical_date_strs(index: Any, granularity: str) -> list:
-    """
-    Converts a DatetimeIndex (or any iterable of date-like values) to
-    canonical period-end date strings matching _normalize_period_ends output.
-    """
     result = []
     for val in index:
         try:
@@ -149,14 +135,18 @@ def _canonical_date_strs(index: Any, granularity: str) -> list:
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class FundamentalAnalysisAgent(AbstractAgent):
     """
-    Async LangGraph agent with an iterative tool-calling loop.
+    Async LangGraph agent with a pre-planned multi-batch tool execution pipeline.
 
-    The agent can loop up to MAX_TOOL_ITERATIONS times through
-    tool_planner → tool_executor before proceeding to the analyst,
-    enabling multi-step derived-metric computation (FCF before DCF, etc.).
-    Within each iteration all tool calls execute in parallel.
+    The planner LLM emits the complete ordered dependency chain in ONE call.
+    The executor steps through batches without re-planning between them.
+    The planner is only re-invoked on tool failure (fallback recovery).
     """
 
     def __init__(self) -> None:
@@ -173,8 +163,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
     def description() -> str:
         return (
             "Fetches standardised EDGAR financial statements and computes "
-            "quantitative metrics (CAGR, DCF, ratios) via an iterative, "
-            "parallel tool-calling pipeline. Returns enriched financial data "
+            "quantitative metrics (CAGR, DCF, ratios) via a pre-planned, "
+            "parallel tool execution pipeline. Returns enriched financial data "
             "and a written analysis."
         )
 
@@ -186,6 +176,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
         logger.info("[Agent: %s] Started for %s", self.name(), input_data.ticker)
+
+        # Fix #1: db.initialize() is now guarded by _initialized flag on
+        # FinancialDatabase — this is a no-op after the first call.
         await self.db.initialize()
 
         final_state: Dict = await self._graph.ainvoke(
@@ -217,11 +210,15 @@ class FundamentalAnalysisAgent(AbstractAgent):
         workflow.add_edge("data_prep", "tool_planner")
         workflow.add_edge("tool_planner", "tool_executor")
 
-        # ── Iterative loop: executor → planner or analyst ─────────────────────
+        # ── Routing: advance batch, re-plan on failure, or proceed to analyst ─
         workflow.add_conditional_edges(
             "tool_executor",
             self._should_continue,
-            {"continue": "tool_planner", "done": "analyst"},
+            {
+                "next_batch": "tool_executor",  # advance to next batch, no LLM
+                "replan": "tool_planner",  # failure fallback — LLM re-plan
+                "done": "analyst",
+            },
         )
 
         workflow.add_edge("analyst", END)
@@ -231,6 +228,20 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     @staticmethod
     def _should_continue(state: _AgentState) -> str:
+        """
+        Three-way routing after each tool_executor pass:
+
+        1. Hard ceiling: force analyst if we've hit MAX_TOOL_ITERATIONS.
+           (Prevents runaway loops even in the re-planning fallback path.)
+
+        2. Failure in the current batch AND budget remaining → replan.
+           The planner is only re-invoked when something actually went wrong.
+
+        3. More pre-planned batches remain AND no failure → next_batch.
+           The executor advances directly without touching the LLM.
+
+        4. No more batches and no failure → done (analyst).
+        """
         if state.iteration_count >= MAX_TOOL_ITERATIONS:
             logger.warning(
                 "[Router] Max iterations (%d) reached — forcing analyst.",
@@ -239,27 +250,37 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return "done"
 
         plan = state.tool_plan
-        if plan and plan.needs_more_iterations:
-            logger.info(
-                "[Router] Looping: iteration %d/%d. Reason: %s",
-                state.iteration_count,
-                MAX_TOOL_ITERATIONS,
-                plan.iteration_reasoning or "(no reason given)",
-            )
-            return "continue"
 
-        last_iteration_had_calls = plan is not None and len(plan.calls) > 0
-        if last_iteration_had_calls:
-            n_calls = len(plan.calls)
-            current_batch = (state.tool_results or [])[-n_calls:]
-            any_current_failed = any(not r.success for r in current_batch)
-            if any_current_failed:
+        # ── Check for failures in the batch that just ran ─────────────────────
+        # We inspect only the slice of tool_results that corresponds to the
+        # current batch, not the full accumulated history, to avoid a stale
+        # failure from a previous batch triggering a re-plan.
+        current_batch_had_calls = (
+            plan is not None
+            and plan.get_batch(state.current_batch_index - 1) is not None
+            and len(plan.get_batch(state.current_batch_index - 1).calls) > 0
+        )
+        if current_batch_had_calls:
+            batch = plan.get_batch(state.current_batch_index - 1)
+            n_calls = len(batch.calls)
+            current_results = (state.tool_results or [])[-n_calls:]
+            if any(not r.success for r in current_results):
                 logger.info(
-                    "[Router] Tool failures in current batch — retrying. Iteration %d/%d",
+                    "[Router] Failure in batch %d — re-planning. Iteration %d/%d",
+                    state.current_batch_index - 1,
                     state.iteration_count,
                     MAX_TOOL_ITERATIONS,
                 )
-                return "continue"
+                return "replan"
+
+        # ── Advance to next pre-planned batch if available ────────────────────
+        if plan is not None and state.current_batch_index < plan.batch_count():
+            logger.info(
+                "[Router] Advancing to batch %d/%d (no LLM call).",
+                state.current_batch_index,
+                plan.batch_count(),
+            )
+            return "next_batch"
 
         return "done"
 
@@ -267,8 +288,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def _data_prep_node(self, state: _AgentState) -> Dict:
         """
-        Concurrently fetches/caches EDGAR filings and yfinance price data via
-        self.db (FinancialDatabase), then loads and normalises the result.
+        Concurrently fetches/caches EDGAR filings and yfinance price data,
+        then loads and normalises the result.
 
         Granularity:
         yearly   (default) — 10-K filings, 5-year window, prices resampled yearly.
@@ -281,7 +302,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
             logger.warning("[data_prep] No ticker — returning empty state.")
             return {"financial_data": pd.DataFrame(), "available_concepts": []}
 
-        # ── Resolve date window and filing parameters ─────────────────────────
         end_dt = state.end_date or datetime.now()
         if granularity == "yearly":
             default_start = datetime(end_dt.year - 4, 1, 1)
@@ -311,7 +331,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
             periods,
         )
 
-        # ── Concurrent EDGAR update + price fetch via self.db ─────────────────
         async def _edgar_update():
             await self.db.update_financials(ticker, periods, form_type)
 
@@ -325,10 +344,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         edgar_task = asyncio.create_task(_edgar_update())
         price_task = asyncio.create_task(_price_fetch())
-        await edgar_task  # DB must be populated before querying
+        await edgar_task
         price_df: pd.DataFrame = await price_task
 
-        # ── Load + pivot from DB ──────────────────────────────────────────────
         financial_df = await self.db.get_data(ticker, form_types=[form_type])
 
         if not financial_df.empty:
@@ -341,13 +359,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
             except Exception as exc:
                 logger.warning("[data_prep] Date trimming failed: %s", exc)
 
-        # Normalise EDGAR fiscal period dates to canonical period-end
         if not financial_df.empty:
             financial_df = _normalize_period_ends(financial_df, granularity)
 
         available_concepts = list(financial_df.index) if not financial_df.empty else []
 
-        # ── Merge stock price row ─────────────────────────────────────────────
         if not price_df.empty and "stock_price" in price_df.columns:
             price_t = price_df[["stock_price"]].T
             price_t.columns = _canonical_date_strs(price_t.columns, granularity)
@@ -387,36 +403,30 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def _tool_planner_node(self, state: _AgentState) -> Dict:
         """
-        LLM produces an IterativeToolPlan for the current iteration.
+        Single LLM call that produces the complete ordered batch plan.
 
-        The planner receives:
-        - The current iteration number and remaining budget.
-        - All available concepts, with [computed] annotations on derived rows so
-        the LLM can immediately see what was already produced in prior iterations
-        and avoid re-deriving it.
-        - A summary of every prior tool result so the LLM can see success/failure
-        and build on completed work.
+        Called once at the start of the execution pipeline.  Only called
+        again if a tool failure triggers the fallback re-planning path
+        (replanning_due_to_failure=True on state in that case).
         """
-        iteration = state.iteration_count + 1  # 1-based for prompt readability
         logger.info(
-            "[Node] tool_planner — iteration %d/%d — %s",
-            iteration,
-            MAX_TOOL_ITERATIONS,
+            "[Node] tool_planner — %s%s",
             state.query,
+            " [RE-PLANNING after failure]" if state.replanning_due_to_failure else "",
         )
 
         if not state.available_concepts:
             logger.warning("[tool_planner] No concepts — skipping planning.")
             return {
                 "tool_plan": IterativeToolPlan(
-                    calls=[],
-                    needs_more_iterations=False,
+                    batches=[],
                     data_summary="No financial data available.",
-                    iteration_reasoning="",
-                )
+                ),
+                "current_batch_index": 0,
+                "replanning_due_to_failure": False,
             }
 
-        # ── Concepts block: annotate computed rows so the LLM doesn't re-derive them ──
+        # ── Concepts block ─────────────────────────────────────────────────────
         computed_set = set(state.computed_row_labels or [])
         concept_lines = [
             f"  • {c}{' [computed]' if c in computed_set else ''}"
@@ -426,14 +436,24 @@ class FundamentalAnalysisAgent(AbstractAgent):
             concept_lines.append(f"  … and {len(state.available_concepts) - 200} more")
         concepts_block = "\n".join(concept_lines)
 
-        # ── Prior results block ────────────────────────────────────────────────────
+        # ── Prior results block ────────────────────────────────────────────────
         if state.tool_results:
             prior_results_block = "\n".join(
                 f"  [{r.tool_name}] {'✓' if r.success else f'✗ {r.error}'} — {r.summary}"
                 for r in state.tool_results
             )
         else:
-            prior_results_block = "  (none — first iteration)"
+            prior_results_block = "  (none)"
+
+        # ── Replanning note for failure context ───────────────────────────────
+        replanning_note = ""
+        if state.replanning_due_to_failure:
+            replanning_note = (
+                "NOTE: You are RE-PLANNING because one or more tools failed "
+                "in the previous batch (see results above). "
+                "Emit only the REMAINING work — do not re-emit calls that "
+                "already succeeded."
+            )
 
         user_msg = _TOOL_PLANNER_USER.format(
             query=state.query,
@@ -442,8 +462,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 state.start_date.strftime("%Y-%m-%d") if state.start_date else "N/A"
             ),
             end_date=state.end_date.strftime("%Y-%m-%d") if state.end_date else "N/A",
-            iteration=iteration,
-            max_iterations=MAX_TOOL_ITERATIONS,
+            replanning_note=replanning_note,
             n_concepts=len(state.available_concepts),
             concepts_block=concepts_block,
             prior_summary=prior_results_block,
@@ -453,6 +472,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         structured_llm = service_manager.get_agent(
             temperature=0
         ).with_structured_output(IterativeToolPlan)
+
         try:
             tool_plan: IterativeToolPlan = await structured_llm.ainvoke(
                 [
@@ -464,37 +484,75 @@ class FundamentalAnalysisAgent(AbstractAgent):
             logger.error("[tool_planner] LLM call failed: %s", exc)
             return {
                 "tool_plan": IterativeToolPlan(
-                    calls=[],
-                    needs_more_iterations=False,
+                    batches=[],
                     data_summary=f"Tool planning failed: {exc}. Proceeding with raw data.",
-                    iteration_reasoning="",
-                )
+                ),
+                "current_batch_index": 0,
+                "replanning_due_to_failure": False,
             }
 
         logger.info(
-            "[tool_planner] Iteration %d: %d call(s), needs_more=%s — %s",
-            iteration,
-            len(tool_plan.calls),
-            tool_plan.needs_more_iterations,
+            "[tool_planner] Plan: %d batch(es) — %s",
+            tool_plan.batch_count(),
             tool_plan.data_summary,
         )
-        if tool_plan.iteration_reasoning:
+        for i, batch in enumerate(tool_plan.batches):
             logger.info(
-                "[tool_planner] Multi-step plan: %s", tool_plan.iteration_reasoning
+                "  Batch %d (%d call(s)): %s",
+                i,
+                len(batch.calls),
+                batch.batch_reasoning or "(no reasoning)",
             )
-        for i, spec in enumerate(tool_plan.calls, 1):
-            logger.info("  %d. %s — %s", i, spec.tool_name, spec.reasoning)
+            for j, spec in enumerate(batch.calls, 1):
+                logger.info("    %d. %s — %s", j, spec.tool_name, spec.reasoning)
 
-        return {"tool_plan": tool_plan}
+        return {
+            "tool_plan": tool_plan,
+            "current_batch_index": 0,  # always reset on a new plan
+            "replanning_due_to_failure": False,
+        }
 
     # ── Node: tool_executor ───────────────────────────────────────────────────
 
     async def _tool_executor_node(self, state: _AgentState) -> Dict:
-        """Execute all tool calls in the current plan in parallel."""
+        """
+        Execute the current batch (state.current_batch_index) in parallel.
+
+        After execution:
+        - Merges added_rows into financial_data.
+        - Persists computed time-series rows to SQLite.
+        - Advances current_batch_index by 1.
+        - Increments iteration_count (for the MAX guard).
+
+        The router then decides: advance to next batch, re-plan, or go to analyst.
+        """
         plan = state.tool_plan
-        if not plan or not plan.calls:
-            logger.info("[tool_executor] No calls to execute.")
-            return {"iteration_count": state.iteration_count + 1}
+        batch_index = state.current_batch_index
+
+        if plan is None or plan.is_empty():
+            logger.info("[tool_executor] No plan or empty plan — skipping.")
+            return {
+                "iteration_count": state.iteration_count + 1,
+                "current_batch_index": batch_index + 1,
+            }
+
+        batch: ToolCallBatch | None = plan.get_batch(batch_index)
+        if batch is None or not batch.calls:
+            logger.info(
+                "[tool_executor] Batch %d is empty or out of range — skipping.",
+                batch_index,
+            )
+            return {
+                "iteration_count": state.iteration_count + 1,
+                "current_batch_index": batch_index + 1,
+            }
+
+        logger.info(
+            "[Node] tool_executor — batch %d/%d (%d call(s))",
+            batch_index,
+            plan.batch_count() - 1,
+            len(batch.calls),
+        )
 
         df = (
             state.financial_data if state.financial_data is not None else pd.DataFrame()
@@ -519,7 +577,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 )
 
         batch_results: List[ToolResult] = await asyncio.gather(
-            *[_run_one(s) for s in plan.calls]
+            *[_run_one(s) for s in batch.calls]
         )
 
         # ── Merge added_rows back into the DataFrame ──────────────────────────
@@ -562,6 +620,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "financial_data": df if not df.empty else state.financial_data,
             "tool_results": list(state.tool_results) + batch_results,
             "iteration_count": state.iteration_count + 1,
+            "current_batch_index": batch_index + 1,
             "available_concepts": updated_concepts,
             "computed_row_labels": updated_computed,
         }
@@ -573,11 +632,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         row_labels: List[str],
         form_type: str,
     ) -> None:
-        """
-        Saves newly computed time-series rows back into the financials SQLite
-        table under statement_type='computed'.  Scalar/single-period rows are
-        skipped as they have no meaningful time dimension to store.
-        """
+        """Saves newly computed time-series rows to SQLite under statement_type='computed'."""
         records = []
         for label in row_labels:
             if label not in df.index:
@@ -607,13 +662,14 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def _analyst_node(self, state: _AgentState) -> Dict:
         """
-        Produce the final written analysis.
+        Produce the final written analysis and schedule background relationship
+        extraction.
 
-        Steps:
-        1. LLM selects which financial data rows are relevant to the query.
-        2. LLM writes the analysis, referencing tool results.
-        3. Relationship extraction runs; subgraph is scheduled via
-           schedule_subgraph_extraction (fire-and-forget unless EXTRACTION_IMMEDIATE).
+        Fix #3: extract_with_retry (blocking LLM call) is removed from this
+        node entirely.  schedule_subgraph_extraction is called with
+        relationships=[] / relationships_extracted=False, which routes to the
+        retry_relationships_only background path using analysis_text.
+        The user-facing response is unaffected.
         """
         if state.financial_data is None or state.financial_data.empty:
             logger.warning("[analyst] No financial data — returning empty analysis.")
@@ -695,44 +751,23 @@ class FundamentalAnalysisAgent(AbstractAgent):
             logger.error("[analyst] Analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
 
-        # ── Step 3: Relationship extraction ──────────────────────────────────
-        relationships = []
-        relationships_extracted = False
-
-        try:
-            memory_readable = state.financial_data.map(
-                lambda x: _format_value(x) if isinstance(x, (int, float)) else x
-            ).to_string(max_rows=30)
-            memory_content = (
-                f"Financial data for {state.ticker}:\n{memory_readable}\n\n"
-                f"Tool results:\n{tool_summary}\n\n"
-                f"Analysis:\n{analysis_text}"
-            )
-            result = await extract_with_retry(
-                service_manager.get_agent(temperature=0.7),
-                [
-                    SystemMessage(content=COMBINED_ANALYSIS_RELATIONSHIP_PROMPT),
-                    HumanMessage(content=memory_content),
-                ],
-            )
-            relationships = result.relationships
-            relationships_extracted = result.parse_success
-        except Exception as exc:
-            logger.error("[analyst] Relationship extraction failed: %s", exc)
-
-        # ── Step 4: Schedule subgraph build/store (fire-and-forget) ──────────
+        # ── Step 3: Schedule background relationship extraction ───────────────
+        # Fix #3: No blocking extract_with_retry call here.
+        # We schedule with relationships=[] / relationships_extracted=False,
+        # which routes to the retry_relationships_only background path that
+        # extracts relationships from analysis_text asynchronously.
         subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
             agent_name=self.name(),
             conversation_id=state.conversation_id or "",
             analysis_text=analysis_text,
-            relationships=relationships,
-            relationships_extracted=relationships_extracted,
+            relationships=[],
+            relationships_extracted=False,
             llm=service_manager.get_agent(temperature=0.7),
         )
 
         return {
             "financial_data": filtered_df,
             "analysis": analysis_text,
-            "relationships_extracted": relationships_extracted,
+            "relationships_extracted": False,
             "subgraph_id": subgraph_id,
         }

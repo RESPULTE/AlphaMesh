@@ -69,12 +69,15 @@ class DualStoreRetriever:
 
     async def _vector_seed_node(self, state: RetrieverState) -> dict:
         query = state["query"]
-        results = await self._chroma_adapter.query(
-            query_text=query,
-            n_results=self._seed_top_k,
-            search_type="similarity",
-        )
-
+        try:
+            results = await self._chroma_adapter.query(
+                query_text=query,
+                n_results=self._seed_top_k,
+                search_type="similarity",
+            )
+        except Exception as exc:
+            self._logger.error("Vector seed query failed: %s", exc)
+            results = []
         retrieved: List[RetrievedChunk] = []
         visited_chunk_ids: List[str] = []
 
@@ -315,3 +318,6 @@ class DualStoreRetriever:
             seen.add(item)
             updated.append(item)
         return updated
+
+
+

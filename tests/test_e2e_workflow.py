@@ -16,11 +16,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
     logging.basicConfig(level=logging.INFO)
 
     agent = OrchestratorAgent()
-    messages = [
-        HumanMessage(
-            content="can you tell me more about APPLE's price to free cash flow ratio changes year over year for the past 5 years?"
-        )
-    ]
+    messages = [HumanMessage(content="recent news of apple?")]
 
     try:
         output = await agent.run(

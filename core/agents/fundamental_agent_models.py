@@ -25,51 +25,86 @@ class ToolCallSpec(BaseModel):
         description=(
             "Parameter dict matching the tool's parameters_schema exactly. "
             "All metric fields MUST reference concept names present in the "
-            "'Available Concepts' list, OR row labels added in previous iterations."
+            "'Available Concepts' list, OR row labels added in previous batches."
         )
     )
     reasoning: str = Field(description="One-sentence justification for this tool call.")
 
 
-class IterativeToolPlan(BaseModel):
+class ToolCallBatch(BaseModel):
     """
-    Plan for ONE iteration, produced by the planner LLM.
+    A single parallel-safe batch of tool calls within a multi-step plan.
 
-    All calls in `calls` are executed **in parallel** within this iteration.
-    If call B depends on the output of call A, A must be in this iteration
-    and B deferred to the next (set needs_more_iterations=True).
+    All calls in this batch are mutually independent and execute in parallel.
+    If call B requires output from call A, they must be in separate batches
+    with A's batch appearing first in the list.
     """
 
     calls: List[ToolCallSpec] = Field(
         description=(
-            "Batch of tool calls to execute IN PARALLEL this iteration. "
-            "Only include mutually independent calls here — calls whose inputs "
-            "depend on outputs of other calls in this batch must wait for the "
-            "next iteration. "
+            "Tool calls to execute IN PARALLEL within this batch. "
+            "All calls must be mutually independent — no call may depend on "
+            "the output of another call in the same batch."
+        )
+    )
+    batch_reasoning: str = Field(
+        default="",
+        description=(
+            "Why these calls are grouped together, and what derived output "
+            "this batch produces that the next batch will consume (if any)."
+        ),
+    )
+
+
+class IterativeToolPlan(BaseModel):
+    """
+    A fully pre-planned, ordered sequence of tool execution batches.
+
+    The executor steps through `batches` sequentially without re-invoking
+    the LLM planner between steps — each batch runs only after the previous
+    batch completes successfully.  The LLM planner is only re-invoked if a
+    tool failure occurs mid-execution (fallback recovery path).
+
+    Design principles
+    -----------------
+    • All dependency chains must be expressed upfront as ordered batches.
+      Example (FCF → DCF):
+        batch[0]: custom_formula to derive FreeCashFlow
+        batch[1]: dcf_intrinsic_value using FreeCashFlow from batch[0]
+
+    • Calls within a batch run in parallel (asyncio.gather).
+    • Calls across batches run sequentially (batch N+1 sees batch N's results).
+
+    Replaces the old schema where a single `calls` list + `needs_more_iterations`
+    flag drove repeated LLM re-planning between each batch.
+    """
+
+    batches: List[ToolCallBatch] = Field(
+        description=(
+            "Ordered list of execution batches. "
+            "Batch 0 executes first; batch N may depend on results from batch N-1. "
             "Return an empty list if the user only wants raw data."
         )
     )
-    needs_more_iterations: bool = Field(
-        description=(
-            "True if another planning + execution iteration is required after "
-            "this batch completes (e.g. a derived metric must be computed before "
-            "a downstream analysis tool can run). False when this is the final batch."
-        )
-    )
-    iteration_reasoning: str = Field(
-        default="",
-        description=(
-            "Required when needs_more_iterations=True. Explain: what this "
-            "iteration computes, what derived metric is being staged, and what "
-            "the NEXT iteration will do with the newly created metric."
-        ),
-    )
     data_summary: str = Field(
         description=(
-            "1-2 sentence summary of what data is available and what this "
-            "iteration will compute."
+            "1-2 sentence summary of what data is available and what the full "
+            "plan will compute across all batches."
         )
     )
+
+    # ── Convenience helpers used by the executor ──────────────────────────────
+
+    def batch_count(self) -> int:
+        return len(self.batches)
+
+    def get_batch(self, index: int) -> Optional[ToolCallBatch]:
+        if 0 <= index < len(self.batches):
+            return self.batches[index]
+        return None
+
+    def is_empty(self) -> bool:
+        return len(self.batches) == 0 or all(len(b.calls) == 0 for b in self.batches)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,19 +197,28 @@ class _AgentState(BaseAgentInput):
     available_concepts: List[str] = Field(default_factory=list)
     financial_data: Optional[pd.DataFrame] = None
 
-    # Populated / updated by tool_planner each iteration
+    # Populated by tool_planner; carries the full pre-planned batch list
     tool_plan: Optional[IterativeToolPlan] = None
 
-    # Incremented by tool_executor after each batch
+    # Index into tool_plan.batches — incremented by tool_executor each pass.
+    # When current_batch_index == len(tool_plan.batches), execution is done.
+    current_batch_index: int = Field(default=0)
+
+    # Incremented by tool_executor after each batch (used for MAX guard only)
     iteration_count: int = Field(default=0)
 
-    # Accumulated across all iterations
+    # Accumulated across all batches (Annotated with operator.add so LangGraph
+    # merges lists rather than replacing them on each state update)
     tool_results: Annotated[List[ToolResult], operator.add] = Field(
         default_factory=list
     )
 
     # Labels of rows that were computed (not fetched from EDGAR)
     computed_row_labels: List[str] = Field(default_factory=list)
+
+    # Set True when a failure triggers re-planning so the planner prompt
+    # can acknowledge the context
+    replanning_due_to_failure: bool = Field(default=False)
 
     # Populated by analyst
     analysis: str = Field(default="")

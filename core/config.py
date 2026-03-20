@@ -18,11 +18,12 @@ class Settings(BaseSettings):
 
     # LLM and Embedding Configuration
     GOOGLE_API_KEY: Optional[str] = Field(default=None, validation_alias="LLM_API_KEY")
-    LLM_MODEL: str = Field(default="gemini-2.5-flash-lite")
+    LLM_MODEL: str
+
     EMBEDDING_API_KEY: Optional[str] = Field(
         default=None, validation_alias="EMBEDDING_API_KEY"
     )
-    EMBEDDING_MODEL: str = Field(default="gemini-embedding-001")
+    EMBEDDING_MODEL: str
 
     # Neo4j Configuration
     NEO4J_URI: str
@@ -51,9 +52,7 @@ class Settings(BaseSettings):
     EXTRACTION_NEO4J_RETRY_ATTEMPTS: int = 3
 
     # Subgraph store
-    REDIS_URL: str = (
-        "redis://default:iKcTNrBuxIxVawVtMQN54jwhrNFj7ApB@redis-16593.c334.asia-southeast2-1.gce.cloud.redislabs.com:16593"
-    )
+    REDIS_URL: str = ""
     SUBGRAPH_TTL_SECONDS: int = 3600
 
     # In-memory dedup thresholds

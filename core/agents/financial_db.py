@@ -68,9 +68,18 @@ class FinancialDatabase:
 
     def __init__(self, db_name: str = DB_PATH):
         self.db_name = db_name
+        self._initialized: bool = False
 
     async def initialize(self) -> None:
-        """Creates the table and indexes if they do not already exist."""
+        """Creates the table and indexes if they do not already exist.
+
+        Guarded by _initialized: after the first successful call this method
+        returns immediately without opening a connection.  This eliminates the
+        per-invocation SQLite round-trip that previously occurred on every
+        FundamentalAnalysisAgent.run() call.
+        """
+        if self._initialized:
+            return
         async with aiosqlite.connect(self.db_name) as db:
             await db.execute(
                 """
@@ -91,6 +100,7 @@ class FinancialDatabase:
             )
             await db.commit()
             logger.info("[DB] Initialized.")
+        self._initialized = True
 
     # ─────────────────────────────────────────────────────────────────────────
     # 1.  CORE DATA FETCHING AND PROCESSING

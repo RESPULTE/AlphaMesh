@@ -257,9 +257,17 @@ class NewsAnalysisAgent(AbstractAgent):
                 svc = service_manager.get_retriever()
 
                 async def _retrieve() -> MemoryContext:
-                    return await svc.retrieve(rewritten_queries)
+                    try:
+                        return await svc.comprehensive_retrieve(rewritten_queries)
+                    except Exception as exc:
+                        logger.error(
+                            "_rewrite_queries_node: memory retrieval failed: %s", exc
+                        )
+                        return MemoryContext(
+                            chunks=[], rewritten_queries=rewritten_queries
+                        )
 
-                memory_task = asyncio.ensure_future(_retrieve())
+                memory_task = asyncio.create_task(_retrieve())
             except Exception:
                 logger.exception(
                     "_rewrite_queries_node: failed to create memory retrieval task"
@@ -529,3 +537,4 @@ class NewsAnalysisAgent(AbstractAgent):
             "subgraph_id": subgraph_id,
             "relationships_extracted": relationships_extracted,
         }
+

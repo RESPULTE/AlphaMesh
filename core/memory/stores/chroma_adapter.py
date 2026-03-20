@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -187,6 +188,15 @@ class ChromaDBAdapter:
         vectorstore = await self._get_vectorstore()
 
         try:
+            if query_embedding is None and query_text is not None:
+                query_embedding = await self._embed_query_with_retry(query_text)
+                if query_embedding is None:
+                    self._logger.warning(
+                        "ChromaDB query skipped: embedding failed after retries."
+                    )
+                    return []
+                query_text = None
+
             if search_type == "mmr":
                 if query_embedding is not None:
                     mmr_docs = await asyncio.to_thread(
@@ -261,6 +271,34 @@ class ChromaDBAdapter:
         except Exception:
             self._logger.exception("Failed to query ChromaDB.")
             raise
+
+    async def _embed_query_with_retry(self, query_text: str) -> Optional[List[float]]:
+        """Embed query text with retry/backoff to handle transient provider errors."""
+        if not self._embedding_function:
+            return None
+        cleaned = (query_text or "").strip()
+        if not cleaned:
+            return None
+
+        max_attempts = 3
+        base_delay = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await asyncio.to_thread(
+                    self._embedding_function.embed_query, cleaned
+                )
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    self._logger.error(
+                        "Embedding query failed after %d attempts: %s",
+                        max_attempts,
+                        exc,
+                    )
+                    return None
+                delay = base_delay * (2 ** (attempt - 1))
+                jitter = random.uniform(0, 0.2)
+                await asyncio.sleep(delay + jitter)
+        return None
 
     async def get_by_ids(self, ids: List[str]) -> dict:
         """Fetch documents by their IDs."""
@@ -353,3 +391,5 @@ class ChromaDBAdapter:
         except Exception as exec:
             self._logger.exception("Failed to check ChromaDB for source URL.: %s", exec)
             raise
+
+
