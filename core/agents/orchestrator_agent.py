@@ -63,6 +63,7 @@ from core.agents.prompts import (
     SYNTHESISER_USER_CONTEXT_SECTION,
     build_writeback_system_prompt,
 )
+from core.agents.utils import _safe_create_task
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
@@ -99,16 +100,6 @@ _SYNTHESIS_HISTORY_WINDOW: int = 6
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-def _safe_create_task(coro) -> Optional[asyncio.Task]:
-    """Create an asyncio task only when a running loop exists."""
-    try:
-        loop = asyncio.get_running_loop()
-        return loop.create_task(coro)
-    except RuntimeError:
-        logger.warning("_safe_create_task: no running event loop — task skipped.")
-        return None
 
 
 def _extract_last_human_message(messages: List[BaseMessage]) -> str:
@@ -196,8 +187,12 @@ class OrchestratorAgent:
             agent.name(): agent() for agent in AVAILABLE_AGENTS
         }
         self._graph = self._build_graph()
+        self._subgraph_builder = InMemorySubgraphBuilder()
 
     # ── Static helpers ────────────────────────────────────────────
+
+    def name(self) -> str:
+        return "Orchestrator Agent"
 
     @staticmethod
     def get_portfolio(path: str) -> List[dict]:
@@ -391,10 +386,10 @@ class OrchestratorAgent:
                 interest_edges = _safe_json(interest_match.group(1))
 
         resp_match = _RESPONSE_RE.search(raw)
-        user_response = resp_match.group(1).strip() if resp_match else raw.strip()
+        analysis_text = resp_match.group(1).strip() if resp_match else raw.strip()
 
         return SynthesisResult(
-            user_response=user_response,
+            analysis_text=analysis_text,
             cross_relationships=cross_relationships,
             interest_edges=interest_edges,
         )
@@ -549,12 +544,12 @@ class OrchestratorAgent:
         # Bounded window — prevents unbounded token growth on long conversations.
         history_window = _last_n_messages(state.messages, _SYNTHESIS_HISTORY_WINDOW)
 
-        user_response = ""
-        synthesis_result = SynthesisResult(user_response="")
+        analysis_text = ""
+        synthesis_result = SynthesisResult(analysis_text="")
 
         if not context_parts and not state.user_context_block and not portfolio_block:
             logger.warning("_synthesize_node: no context from agents, using fallback")
-            user_response = (
+            analysis_text = (
                 "I wasn't able to retrieve data for your query at this time. "
                 "Please try again or rephrase your question."
             )
@@ -570,10 +565,10 @@ class OrchestratorAgent:
                     prompt, state, context_parts, portfolio_block, history_window
                 )
                 synthesis_result = self._parse_synthesis_output(raw, multi_agent)
-                user_response = synthesis_result.user_response
+                analysis_text = synthesis_result.analysis_text
             except Exception:
                 logger.exception("_synthesize_node: LLM synthesis failed")
-                user_response = (
+                analysis_text = (
                     "I encountered an error while synthesising the analysis. "
                     "The raw data was retrieved but could not be summarised."
                 )
@@ -584,19 +579,14 @@ class OrchestratorAgent:
             and state.conversation_id
             and synthesis_result.cross_relationships
         ):
-            try:
-                builder = InMemorySubgraphBuilder()
-                cross_graph = await builder.build(
-                    synthesis_result.cross_relationships, source_agent="orchestrator"
-                )
-                if cross_graph.number_of_edges() > 0:
-                    _safe_create_task(
-                        service_manager.get_ingestor()._upsert_graph_to_neo4j(
-                            cross_graph, state.conversation_id
-                        )
-                    )
-            except Exception:
-                logger.exception("_synthesize_node: cross-graph write-back failed")
+            subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
+                agent_name=self.name(),
+                conversation_id=state.conversation_id or "",
+                analysis_text=analysis_text,
+                relationships=[],
+                relationships_extracted=False,
+                llm=service_manager.get_agent(temperature=0.7),
+            )
 
         # ── User signal write-back (delegated to memory module) ───
         if state.user_email and state.plan and state.conversation_id:
@@ -612,7 +602,7 @@ class OrchestratorAgent:
         }
 
         return {
-            "summary": user_response,
+            "summary": analysis_text,
             "fundamental_data": fundamental_df,
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,

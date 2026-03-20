@@ -218,6 +218,7 @@ class NewsAnalysisAgent(AbstractAgent):
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
         self._subgraph_builder = InMemorySubgraphBuilder()
+        self._ingestor = service_manager.get_ingestor()
 
     @staticmethod
     def name() -> str:
@@ -413,38 +414,23 @@ class NewsAnalysisAgent(AbstractAgent):
 
         query = state.query
 
-        async def _query_new() -> List[RetrievedChunk]:
-            if not new_chunk_ids:
+        async def _query(chunk_ids: List[int], domain: str) -> List[RetrievedChunk]:
+            if not chunk_ids:
                 return []
             docs_with_scores = await service_manager.get_chroma_adapter().query(
                 query_text=query,
                 n_results=10,
-                where={"chunk_id": {"$in": new_chunk_ids}},
+                where={"chunk_id": {"$in": chunk_ids}},
             )
             return [
                 RetrievedChunk.from_document(
-                    doc, score=score, source="vector", domain="new"
-                )
-                for doc, score in docs_with_scores
-            ]
-
-        async def _query_existing() -> List[RetrievedChunk]:
-            if not existing_chunk_ids:
-                return []
-            docs_with_scores = await service_manager.get_chroma_adapter().query(
-                query_text=query,
-                n_results=10,
-                where={"chunk_id": {"$in": existing_chunk_ids}},
-            )
-            return [
-                RetrievedChunk.from_document(
-                    doc, score=score, source="vector", domain="existing"
+                    doc, score=score, source="vector", domain=domain
                 )
                 for doc, score in docs_with_scores
             ]
 
         new_chunks, existing_chunks = await asyncio.gather(
-            _query_new(), _query_existing()
+            _query(new_chunk_ids, "new"), _query(existing_chunk_ids, "existing")
         )
         retrieved_chunks = new_chunks + existing_chunks
 
@@ -475,14 +461,15 @@ class NewsAnalysisAgent(AbstractAgent):
                 logger.error("Memory retrieval task failed: %s", exc)
                 memory_context = None
 
-        new_chunks = list(state.retrieved_chunks)
+        final_chunks = list(state.retrieved_chunks)
 
-        if memory_context is None:
-            final_ranked = service_manager.get_reranker().rank(new_chunks)
-            return {"final_chunks": final_ranked}
+        if memory_context is not None:
+            final_chunks = final_chunks + memory_context.chunks
 
-        combined = new_chunks + memory_context.chunks
-        final_ranked = service_manager.get_reranker().rank(combined)
+        final_ranked = service_manager.get_reranker().rank(final_chunks)
+
+        await self._ingestor.extract_entities_for_chunks(final_ranked)
+
         return {"final_chunks": final_ranked}
 
     # ── Node: analyse_news ────────────────────────────────────────────────────

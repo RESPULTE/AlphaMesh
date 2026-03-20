@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -11,10 +10,11 @@ from typing import List, Optional, Tuple
 from langchain_core.messages import BaseMessage
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
 
+from core.agents.utils import _safe_create_task
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.subgraph_builder import InMemorySubgraphBuilder
-from core.memory.stores.subgraph_store import SubgraphStore
+from core.memory.ingestion.ingestor import DualStoreIngestor
 
 logger = get_logger(__name__)
 
@@ -52,6 +52,7 @@ def parse_xml_blocks(raw: str) -> Tuple[str, Optional[List[dict]]]:
         return analysis_text, None
     return analysis_text, relationships
 
+
 def parse_relationships_block(raw: str) -> Optional[List[dict]]:
     rel_match = _REL_RE.search(raw or "")
     if not rel_match:
@@ -66,7 +67,6 @@ def parse_relationships_block(raw: str) -> Optional[List[dict]]:
     if not isinstance(relationships, list):
         return None
     return relationships
-
 
 
 async def extract_with_retry(
@@ -97,14 +97,43 @@ async def extract_with_retry(
     return ExtractionResult(analysis="", relationships=[], parse_success=False)
 
 
-async def retry_relationships_only(
-    llm,
-    analysis_text: str,
+async def build_and_store(
+    *,
     agent_name: str,
     conversation_id: str,
     builder: InMemorySubgraphBuilder,
-    store: SubgraphStore,
-    key: str,
+    relationships: list[dict],
+    ingestor: DualStoreIngestor,
+    subgraph_id: str = None,
+) -> None:
+
+    try:
+        graph = await builder.build(relationships, source_agent=agent_name)
+        if graph.number_of_edges() > 0:
+            await _safe_create_task(
+                ingestor._upsert_graph_to_neo4j(graph, conversation_id)
+            )
+        logger.debug(
+            "schedule_subgraph_extraction: saved '%s' (%d edges)",
+            subgraph_id,
+            graph.number_of_edges(),
+        )
+    except Exception:
+        logger.exception(
+            "schedule_subgraph_extraction: _build_and_store failed for '%s'",
+            subgraph_id,
+        )
+
+
+async def retry_relationships_only(
+    *,
+    subgraph_id: str,
+    llm,
+    ingestor: DualStoreIngestor,
+    builder: InMemorySubgraphBuilder,
+    analysis_text: str,
+    agent_name: str,
+    conversation_id: str,
     prompt: str,
 ) -> None:
     if not analysis_text.strip():
@@ -115,15 +144,24 @@ async def retry_relationships_only(
         relationships = parse_relationships_block(response.content)
         if relationships is None:
             logger.warning(
-                "Retry relationships parse failed for %s:%s", agent_name, conversation_id
+                "Retry relationships parse failed for %s:%s",
+                agent_name,
+                conversation_id,
             )
             return
-        graph = await builder.build(relationships, source_agent=agent_name)
-        await store.save(key, graph)
+
+        await build_and_store(
+            agent_name=agent_name,
+            conversation_id=conversation_id,
+            builder=builder,
+            relationships=relationships,
+            subgraph_id=subgraph_id,
+            ingestor=ingestor,
+        )
     except Exception:
         logger.exception(
-            "Retry relationships extraction failed for %s:%s", agent_name, conversation_id
+            "Retry relationships extraction failed for %s:%s",
+            agent_name,
+            conversation_id,
         )
         return
-
-

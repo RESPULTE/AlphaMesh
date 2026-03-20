@@ -34,7 +34,6 @@ Everything else is unchanged.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Type
 
 import pandas as pd
@@ -43,6 +42,12 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from core.agents.base_agent import AbstractAgent
+from core.agents.data_prep import (
+    _fetch_raw_data,
+    _merge_price_rows,
+    _resolve_date_range,
+    _trim_and_normalise,
+)
 from core.agents.financial_db import FinancialDatabase
 from core.agents.financial_tools import TOOL_REGISTRY, ToolResult, get_tool_descriptions
 from core.agents.fundamental_agent_models import (
@@ -85,53 +90,6 @@ def _format_value(x: float) -> str:
     if abs_x >= 1_000:
         return f"{x / 1_000:.2f} Thousand"
     return f"{x:.4g}"
-
-
-def _quarterly_periods(start: datetime, end: datetime) -> list:
-    """Returns (year, quarter) tuples covering start..end inclusive."""
-    periods = []
-    year, month = start.year, start.month
-    while datetime(year, month, 1) <= end:
-        quarter = (month - 1) // 3 + 1
-        if (year, quarter) not in periods:
-            periods.append((year, quarter))
-        month += 3
-        if month > 12:
-            month -= 12
-            year += 1
-    return periods
-
-
-def _normalize_period_ends(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
-    rename: Dict[str, str] = {}
-    for col in df.columns:
-        try:
-            ts = pd.Timestamp(col)
-            if granularity == "yearly":
-                rename[col] = ts.replace(month=12, day=31).strftime("%Y-%m-%d")
-            else:
-                rename[col] = (
-                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
-                )
-        except Exception:
-            rename[col] = str(col)
-    return df.rename(columns=rename)
-
-
-def _canonical_date_strs(index: Any, granularity: str) -> list:
-    result = []
-    for val in index:
-        try:
-            ts = pd.Timestamp(val)
-            if granularity == "yearly":
-                result.append(ts.replace(month=12, day=31).strftime("%Y-%m-%d"))
-            else:
-                result.append(
-                    ts.to_period("Q").end_time.normalize().strftime("%Y-%m-%d")
-                )
-        except Exception:
-            result.append(str(val))
-    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -287,99 +245,51 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def _data_prep_node(self, state: _AgentState) -> Dict:
         """
-        Concurrently fetches/caches EDGAR filings and yfinance price data,
-        then loads and normalises the result.
+        Fetch and prepare financial data for the tool planner.
 
-        Granularity:
-        yearly   (default) — 10-K filings, 5-year window, prices resampled yearly.
-        quarterly           — 10-Q filings, last 8 quarters, prices resampled quarterly.
+        Step 1  _resolve_date_range  — compute dates, periods, form type
+        Step 2  _fetch_raw_data      — EDGAR + yfinance concurrently
+        Step 3  _trim_and_normalise  — clip to requested window, normalise col names
+        Step 4  _merge_price_rows    — append stock price series
+        Step 5  quality gate         — drop sparse columns, return
         """
         ticker: str = state.ticker
-        granularity: str = getattr(state, "granularity", "yearly")
+        granularity: str = getattr(state, "granularity", "yearly") or "yearly"
 
         if not ticker:
             logger.warning("[data_prep] No ticker — returning empty state.")
             return {"financial_data": pd.DataFrame(), "available_concepts": []}
 
-        end_dt = state.end_date or datetime.now()
-        if granularity == "yearly":
-            default_start = datetime(end_dt.year - 4, 1, 1)
-            start_dt = state.start_date if state.start_date else default_start
-            if (end_dt.year - start_dt.year) < 4:
-                start_dt = datetime(end_dt.year - 4, 1, 1)
-            form_type = "10-K"
-            price_interval = "yearly"
-            today = datetime.now()
-            last_complete_year = today.year - 1 if today.month < 12 else today.year
-            periods = list(
-                range(start_dt.year, min(end_dt.year, last_complete_year) + 1)
-            )
-        else:
-            default_start = end_dt - timedelta(days=2 * 365)
-            start_dt = state.start_date if state.start_date else default_start
-            form_type = "10-Q"
-            price_interval = "quarterly"
-            periods = _quarterly_periods(start_dt, end_dt)
+        # ── Step 1: dates / periods ───────────────────────────────────────────────
+        cfg = _resolve_date_range(state)
+        # Attach granularity so _trim_and_normalise can reach it via cfg
+        cfg.__dict__["granularity"] = granularity
 
         logger.info(
-            "[Node] data_prep — %s | %s | %s → %s | periods=%s",
+            "[data_prep] %s | %s | %s → %s | periods=%s",
             ticker,
             granularity,
-            start_dt.date(),
-            end_dt.date(),
-            periods,
+            cfg.start_dt.date(),
+            cfg.end_dt.date(),
+            cfg.periods,
         )
 
-        async def _edgar_update():
-            await self.db.update_financials(ticker, periods, form_type)
+        # ── Step 2: concurrent fetch ──────────────────────────────────────────────
+        financial_df, price_df = await _fetch_raw_data(self.db, ticker, cfg)
 
-        async def _price_fetch():
-            return await self.db.get_price_data(
-                ticker,
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=end_dt.strftime("%Y-%m-%d"),
-                interval=price_interval,
-            )
-
-        edgar_task = asyncio.create_task(_edgar_update())
-        price_task = asyncio.create_task(_price_fetch())
-        await edgar_task
-        price_df: pd.DataFrame = await price_task
-
-        financial_df = await self.db.get_data(ticker, form_types=[form_type])
-
-        if not financial_df.empty:
-            try:
-                col_dates = pd.to_datetime(financial_df.columns, errors="coerce")
-                keep_mask = (col_dates >= pd.Timestamp(start_dt).tz_localize(None)) & (
-                    col_dates <= pd.Timestamp(end_dt).tz_localize(None)
-                )
-                financial_df = financial_df.loc[:, keep_mask]
-            except Exception as exc:
-                logger.warning("[data_prep] Date trimming failed: %s", exc)
-
-        if not financial_df.empty:
-            financial_df = _normalize_period_ends(financial_df, granularity)
-
+        # ── Step 3: trim + normalise ──────────────────────────────────────────────
+        financial_df = _trim_and_normalise(financial_df, cfg)
         available_concepts = list(financial_df.index) if not financial_df.empty else []
 
-        if not price_df.empty and "stock_price" in price_df.columns:
-            price_t = price_df[["stock_price"]].T
-            price_t.columns = _canonical_date_strs(price_t.columns, granularity)
+        # ── Step 4: merge price rows ──────────────────────────────────────────────
+        financial_df, available_concepts = _merge_price_rows(
+            financial_df, price_df, cfg, available_concepts
+        )
 
-            if not financial_df.empty:
-                all_cols = sorted(set(financial_df.columns) | set(price_t.columns))
-                financial_df = financial_df.reindex(columns=all_cols)
-                price_t = price_t.reindex(columns=all_cols)
-
-            financial_df = pd.concat([financial_df, price_t])
-            if "stock_price" not in available_concepts:
-                available_concepts.append("stock_price")
-
+        # ── Step 5: quality gate ──────────────────────────────────────────────────
         if financial_df.empty:
             logger.warning(
-                "[data_prep] No financial data found for %s in the requested range.",
-                ticker,
+                "[data_prep] No financial data for %s in requested range.", ticker
             )
             return {"financial_data": pd.DataFrame(), "available_concepts": []}
 

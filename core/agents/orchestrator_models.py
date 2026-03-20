@@ -139,6 +139,6 @@ class CrossDomainRelationship(BaseModel):
 class SynthesisResult:
     """Typed container for all blocks parsed from a single synthesis LLM call."""
 
-    user_response: str
+    analysis_text: str
     cross_relationships: List[dict] = field(default_factory=list)
     interest_edges: List[dict] = field(default_factory=list)

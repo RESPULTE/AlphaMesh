@@ -23,8 +23,11 @@ import numpy as np
 from rapidfuzz import fuzz
 
 from core.config import settings
+from core.logger import get_logger
 from core.memory.graph.utils import canonical_entity_id
 from core.services import service_manager
+
+logger = get_logger(__name__)
 
 
 class InMemorySubgraphBuilder:
@@ -34,7 +37,14 @@ class InMemorySubgraphBuilder:
         self._semantic_threshold = settings.EXTRACTION_SEMANTIC_THRESHOLD
         self._entity_name_cache: Dict[Tuple[str, str], str] = {}
 
+        self._ingestor = service_manager.get_ingestor()
+
     async def build(self, relationships: List[dict], source_agent: str) -> nx.DiGraph:
+        logger.info("InMemorySubgraphBuilder.build: Starting subgraph build")
+        logger.info(
+            f"Received {len(relationships)} from {source_agent} for building subgraph"
+        )
+
         graph = nx.DiGraph()
         if not relationships:
             return graph
@@ -229,50 +239,47 @@ class InMemorySubgraphBuilder:
         from core.memory.graph.extraction_prompts import (
             ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
         )
-        from core.memory.graph.relationship_extractor import retry_relationships_only
+        from core.memory.graph.relationship_extractor import (
+            build_and_store,
+            retry_relationships_only,
+        )
         from core.memory.stores.subgraph_store import SubgraphStore
-        from core.services import service_manager
 
         logger = get_logger(__name__)
 
         if not settings.EXTRACTION_ENABLED or not conversation_id:
             return None
 
-        store = service_manager.get_subgraph_store()
         subgraph_id = SubgraphStore.make_key(agent_name, conversation_id)
-
-        async def _build_and_store() -> None:
-            try:
-                graph = await self.build(relationships, source_agent=agent_name)
-                await store.save(subgraph_id, graph)
-                logger.debug(
-                    "schedule_subgraph_extraction: saved '%s' (%d edges)",
-                    subgraph_id,
-                    graph.number_of_edges(),
-                )
-            except Exception:
-                logger.exception(
-                    "schedule_subgraph_extraction: _build_and_store failed for '%s'",
-                    subgraph_id,
-                )
-
         if relationships_extracted:
-            task = asyncio.create_task(_build_and_store())
+            task = asyncio.create_task(
+                build_and_store(
+                    agent_name=agent_name,
+                    conversation_id=conversation_id,
+                    relationships=relationships,
+                    builder=self,
+                    ingestor=self._ingestor,
+                )
+            )
         else:
             task = asyncio.create_task(
                 retry_relationships_only(
-                    llm,
-                    analysis_text,
-                    agent_name,
-                    conversation_id,
-                    self,
-                    store,
-                    subgraph_id,
-                    ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+                    subgraph_id=subgraph_id,
+                    llm=llm,
+                    ingestor=self._ingestor,
+                    builder=self,
+                    analysis_text=analysis_text,
+                    agent_name=agent_name,
+                    conversation_id=conversation_id,
+                    prompt=ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
                 )
             )
 
         if settings.EXTRACTION_IMMEDIATE:
+            logger.info(
+                "schedule_subgraph_extraction: awaiting task for '%s' (immediate mode)",
+                subgraph_id,
+            )
             await task
 
         return subgraph_id
