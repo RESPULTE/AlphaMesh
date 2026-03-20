@@ -77,12 +77,14 @@ class DetectedEntity:
 class InvestmentSignal:
     status: str  # "Bought" | "Interested" | "Sold" | "Avoids"
     target_entities: List[DetectedEntity] = field(default_factory=list)
+    confidence: float = 0.5  # float from planner, 0.0–1.0
 
 
 @dataclass
 class LearningSignal:
-    status: str  # "Interested" | "Understood" | "Confused" | …
+    status: str
     target_entities: List[DetectedEntity] = field(default_factory=list)
+    confidence: float = 0.5  # carried for symmetry; not stored on LearningInterestNode
 
 
 @dataclass
@@ -158,11 +160,6 @@ def _build_target_type_lookup(payload: UserSignalPayload) -> Dict[str, str]:
 
 
 async def _upsert_interest_nodes(payload: UserSignalPayload) -> None:
-    """
-    Persist UserInvestmentInterestNode / UserLearningInterestNode records.
-    Each signal entity is resolved to a graph entity ID first; if resolution
-    fails the entry is skipped silently.
-    """
     ingestor = service_manager.get_ingestor()
     user_context_service = service_manager.get_user_context_service()
     entity_cache: Dict[str, Any] = {}
@@ -182,7 +179,7 @@ async def _upsert_interest_nodes(payload: UserSignalPayload) -> None:
                     user_email=payload.user_email,
                     status=signal.status,
                     reason=payload.user_message,
-                    confidence="high",
+                    confidence=signal.confidence,  # float stored directly
                     updated_at=datetime.now(timezone.utc),
                     target_entity_ids=[resolved_id],
                 )
@@ -211,6 +208,7 @@ async def _upsert_interest_nodes(payload: UserSignalPayload) -> None:
                     status=signal.status,
                     reason=payload.user_message,
                     updated_at=datetime.now(timezone.utc),
+                    confidence=signal.confidence,
                     target_entity_ids=[resolved_id],
                 )
                 user_context_service.schedule_upsert_fire_and_forget(
@@ -356,6 +354,14 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
 
         _safe_create_task(write_user_signals(payload))
     """
+    logger.info(
+        "write_user_signals: started for user '%s' with %d investment signals, "
+        "%d learning signals, and %d interest edges",
+        payload.user_email,
+        len(payload.investment_signals),
+        len(payload.learning_signals),
+        len(payload.interest_edges),
+    )
     if not payload.user_email or not payload.conversation_id:
         logger.warning(
             "write_user_signals: missing user_email or conversation_id — skipping"
@@ -376,3 +382,56 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
         await _update_analysis_summaries(payload)
     except Exception:
         logger.exception("write_user_signals: _update_analysis_summaries failed")
+
+
+def build_signal_payload(
+    detected_investment_signals: List[InvestmentSignal],
+    detected_learning_signals: List[LearningSignal],
+    interest_edges: List[dict],
+    user_message: str,
+    user_email: Optional[str],
+    conversation_id: Optional[str],
+) -> UserSignalPayload:
+    investment_signals = [
+        InvestmentSignal(
+            status=s.status,
+            confidence=getattr(s, "confidence", 0.5),
+            target_entities=[
+                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
+                for e in s.target_entities
+            ],
+        )
+        for s in (detected_investment_signals or [])
+    ]
+    learning_signals = [
+        LearningSignal(
+            status=s.status,
+            confidence=getattr(s, "confidence", 0.5),
+            target_entities=[
+                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
+                for e in s.target_entities
+            ],
+        )
+        for s in (detected_learning_signals or [])
+    ]
+    edges = [
+        InterestEdge(
+            entity_name=e.get("entity_name", ""),
+            entity_type=e.get("entity_type", ""),
+            user_signal_type=e.get("user_signal_type", "investment"),
+            target_entity_name=e.get("target_entity_name", ""),
+            relationship=e.get("relationship", "RELATED_TO"),
+            reason=e.get("reason", ""),
+            confidence=e.get("confidence", "low"),
+        )
+        for e in interest_edges
+        if e.get("entity_name") and e.get("target_entity_name")
+    ]
+    return UserSignalPayload(
+        user_email=user_email or "",
+        conversation_id=conversation_id or "",
+        user_message=user_message,
+        investment_signals=investment_signals,
+        learning_signals=learning_signals,
+        interest_edges=edges,
+    )

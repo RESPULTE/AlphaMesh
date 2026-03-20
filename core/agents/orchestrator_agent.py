@@ -63,14 +63,7 @@ from core.agents.prompts import (
 from core.agents.utils import _safe_create_task
 from core.config import settings
 from core.logger import get_logger
-from core.memory.user_signal_writeback import (
-    DetectedEntity,
-    InterestEdge,
-    InvestmentSignal,
-    LearningSignal,
-    UserSignalPayload,
-    write_user_signals,
-)
+from core.memory.user_signal_writeback import build_signal_payload, write_user_signals
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -117,58 +110,6 @@ def _safe_json(text: str) -> List[dict]:
         return result if isinstance(result, list) else []
     except (json.JSONDecodeError, ValueError):
         return []
-
-
-def _build_signal_payload(
-    state: OrchestratorState,
-    interest_edges: List[dict],
-    user_message: str,
-) -> UserSignalPayload:
-    """
-    Convert OrchestratorState signal lists + parsed interest edge dicts into
-    the plain UserSignalPayload the memory module expects.
-    """
-    investment_signals = [
-        InvestmentSignal(
-            status=s.status,
-            target_entities=[
-                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
-                for e in s.target_entities
-            ],
-        )
-        for s in (state.plan.detected_investment_signals or [])
-    ]
-    learning_signals = [
-        LearningSignal(
-            status=s.status,
-            target_entities=[
-                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
-                for e in s.target_entities
-            ],
-        )
-        for s in (state.plan.detected_learning_signals or [])
-    ]
-    edges = [
-        InterestEdge(
-            entity_name=e.get("entity_name", ""),
-            entity_type=e.get("entity_type", ""),
-            user_signal_type=e.get("user_signal_type", "investment"),
-            target_entity_name=e.get("target_entity_name", ""),
-            relationship=e.get("relationship", "RELATED_TO"),
-            reason=e.get("reason", ""),
-            confidence=e.get("confidence", "low"),
-        )
-        for e in interest_edges
-        if e.get("entity_name") and e.get("target_entity_name")
-    ]
-    return UserSignalPayload(
-        user_email=state.user_email or "",
-        conversation_id=state.conversation_id or "",
-        user_message=user_message,
-        investment_signals=investment_signals,
-        learning_signals=learning_signals,
-        interest_edges=edges,
-    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -419,7 +360,7 @@ class OrchestratorAgent:
             logger.info(
                 "_plan_node: agents=%s needs_memory=%s per_agent_queries=%s "
                 "final_answer=%s start_date=%s end_date=%s ticker=%s "
-                "metrics=%s granularity=%s",
+                "metrics=%s granularity=%s investment_signals=%s learning_signals=%s",
                 plan.target_agents,
                 plan.needs_memory,
                 list(plan.per_agent_queries.keys()),
@@ -429,6 +370,8 @@ class OrchestratorAgent:
                 plan.ticker,
                 plan.metrics,
                 plan.granularity,
+                plan.detected_investment_signals,
+                plan.detected_learning_signals,
             )
             return {"plan": plan}
         except Exception:
@@ -529,12 +472,6 @@ class OrchestratorAgent:
         user_context_section = SYNTHESISER_USER_CONTEXT_SECTION.format(
             user_context=state.user_context_block
         )
-        investment_signals = (
-            (state.plan.detected_investment_signals or []) if state.plan else []
-        )
-        learning_signals = (
-            (state.plan.detected_learning_signals or []) if state.plan else []
-        )
 
         # Bounded window — prevents unbounded token growth on long conversations.
         history_window = _last_n_messages(state.messages, _SYNTHESIS_HISTORY_WINDOW)
@@ -550,6 +487,12 @@ class OrchestratorAgent:
             )
         else:
             try:
+                investment_signals = (
+                    (state.plan.detected_investment_signals or []) if state.plan else []
+                )
+                learning_signals = (
+                    (state.plan.detected_learning_signals or []) if state.plan else []
+                )
                 prompt = self._build_synthesis_prompt(
                     user_context_section,
                     multi_agent,
@@ -586,10 +529,19 @@ class OrchestratorAgent:
         # ── User signal write-back (delegated to memory module) ───
         if state.user_email and state.plan and state.conversation_id:
             user_message = _extract_last_human_message(state.messages)
-            payload = _build_signal_payload(
-                state, synthesis_result.interest_edges, user_message
+            payload = build_signal_payload(
+                user_email=state.user_email,
+                conversation_id=state.conversation_id,
+                user_message=user_message,
+                detected_investment_signals=state.plan.detected_investment_signals
+                or [],
+                detected_learning_signals=state.plan.detected_learning_signals or [],
+                interest_edges=synthesis_result.interest_edges or [],
             )
-            _safe_create_task(write_user_signals(payload))
+
+            task = _safe_create_task(write_user_signals(payload))
+            if settings.EXTRACTION_IMMEDIATE:
+                await task
 
         per_agent_analyses: Dict[str, str] = {
             name: getattr(output, "analysis", "") or ""

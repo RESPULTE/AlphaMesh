@@ -12,19 +12,56 @@ from core.memory.graph.models import RelationshipType
 class UserInterestEntity(BaseModel):
     model_config = ConfigDict(extra="ignore")
     entity_name: str
-    entity_type: str
+    entity_type: Literal[
+        "Company",
+        "FinancialEvent",
+        "FinancialConcept",
+        "Sector",
+    ]
 
 
 class InvestmentSignalDetection(BaseModel):
     model_config = ConfigDict(extra="ignore")
     status: Literal["Bought", "Interested", "Sold", "Avoids"]
     target_entities: List[UserInterestEntity] = Field(default_factory=list)
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Inference certainty (0.0–1.0). "
+            "1.0 = explicit stance verb; 0.7–0.9 = strong implicit; "
+            "0.4–0.6 = inferred; omit signal entirely if below 0.4."
+        ),
+    )
 
 
 class LearningSignalDetection(BaseModel):
     model_config = ConfigDict(extra="ignore")
     status: Literal["Interested", "Understood", "Confused", "Not Interested"]
     target_entities: List[UserInterestEntity] = Field(default_factory=list)
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Inference certainty (0.0–1.0). "
+            "1.0 = explicit learning request; 0.7–0.9 = strong implicit; "
+            "0.4–0.6 = inferred; omit signal entirely if below 0.4."
+        ),
+    )
+
+
+class LearningSignalDetection(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    status: Literal["Interested", "Understood", "Confused", "Not Interested"]
+    target_entities: List[UserInterestEntity] = Field(default_factory=list)
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="LLM confidence in this signal (0.0–1.0). Omit signals below 0.4.",
+    )
 
 
 class OrchestratorPlan(BaseAgentInput):

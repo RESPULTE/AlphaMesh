@@ -132,7 +132,7 @@ class UserInvestmentInterestNode(BaseModel):
     user_email: str
     status: Literal["Bought", "Interested", "Sold", "Avoids"]
     reason: str
-    confidence: Literal["high", "low"] = "low"
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     updated_at: datetime
     target_entity_ids: List[str] = Field(default_factory=list)
 
@@ -146,6 +146,7 @@ class UserLearningInterestNode(BaseModel):
     user_email: str
     status: Literal["Interested", "Understood", "Confused", "Not Interested"]
     reason: str
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     updated_at: datetime
     target_entity_ids: List[str] = Field(default_factory=list)
 

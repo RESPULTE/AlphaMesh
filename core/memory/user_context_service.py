@@ -35,6 +35,7 @@ class InterestCacheEntry:
     node: Union[UserInvestmentInterestNode, UserLearningInterestNode]
     target_names: List[str]
     cached_at: datetime
+    confidence: float = 0.5  # float throughout; no binary mapping
 
 
 class UserContext(BaseModel):
@@ -84,13 +85,19 @@ class UserContextService:
     def _rank_and_cap(
         self, entries: List[InterestCacheEntry]
     ) -> List[InterestCacheEntry]:
-        """Sort by cached_at DESC, then updated_at DESC, then truncate."""
-        entries.sort(
-            key=lambda e: (
-                -(e.cached_at.timestamp() if e.cached_at else 0),
-                -(e.node.updated_at.timestamp() if e.node.updated_at else 0),
-            )
-        )
+        """
+        Composite score: 60% signal confidence + 40% recency (30-day linear decay).
+        High-confidence recent signals surface first.
+        """
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        def _score(e: InterestCacheEntry) -> float:
+            recency_ts = e.cached_at.timestamp() if e.cached_at else 0.0
+            age_days = max(0.0, (now_ts - recency_ts) / 86400.0)
+            recency_score = max(0.0, 1.0 - age_days / 30.0)
+            return 0.6 * e.confidence + 0.4 * recency_score
+
+        entries.sort(key=_score, reverse=True)
         return entries[:CACHE_MAX_INTERESTS]
 
     def _build_user_context(self, entries: List[InterestCacheEntry]) -> UserContext:
@@ -127,17 +134,34 @@ class UserContextService:
             target_ids = [t.get("id") for t in targets or [] if t and t.get("id")]
             names = [t.get("name") for t in targets or [] if t and t.get("name")]
             target_names_lookup[props.get("id", "")] = names
+
+            # Read confidence as float; guard against legacy "high"/"low" strings
+            raw_conf = props.get("confidence", 0.5)
+            if isinstance(raw_conf, str):
+                confidence_float = 0.8 if raw_conf == "high" else 0.4
+            else:
+                try:
+                    confidence_float = float(raw_conf)
+                except (TypeError, ValueError):
+                    confidence_float = 0.5
+
             node = UserInvestmentInterestNode(
                 id=str(props.get("id") or ""),
                 user_email=str(props.get("user_email") or normalized),
                 status=str(props.get("status") or ""),
                 reason=str(props.get("reason") or ""),
-                confidence=str(props.get("confidence") or "low"),
+                confidence=confidence_float,
                 updated_at=self._parse_dt(props.get("updated_at")),
                 target_entity_ids=target_ids,
             )
             entries.append(
-                InterestCacheEntry("investment", node, names, cached_at=now)
+                InterestCacheEntry(
+                    "investment",
+                    node,
+                    names,
+                    cached_at=now,
+                    confidence=confidence_float,
+                )
             )
 
         for row in learning_rows or []:
@@ -155,7 +179,12 @@ class UserContextService:
                 updated_at=self._parse_dt(props.get("updated_at")),
                 target_entity_ids=target_ids,
             )
-            entries.append(InterestCacheEntry("learning", node, names, cached_at=now))
+            # LearningInterestNode has no confidence field in schema; default 0.5
+            entries.append(
+                InterestCacheEntry(
+                    "learning", node, names, cached_at=now, confidence=0.5
+                )
+            )
 
         entries = self._rank_and_cap(entries)
         self._cache[normalized] = {
@@ -239,7 +268,6 @@ class UserContextService:
             _, nodeset_id = await self._nodeset_manager.get_or_create_user_nodeset(
                 normalized
             )
-
             node_type = interest_node.__class__.__name__
 
             interest_node.id = self._deterministic_id(
@@ -259,11 +287,14 @@ class UserContextService:
                 if isinstance(interest_node, UserInvestmentInterestNode)
                 else "learning"
             )
+            confidence_float = float(getattr(interest_node, "confidence", 0.5))
+
             new_entry = InterestCacheEntry(
                 kind=kind,
                 node=interest_node,
                 target_names=[],
                 cached_at=now,
+                confidence=confidence_float,
             )
             cached = self._cache.get(normalized)
             if cached and "entries" in cached:
