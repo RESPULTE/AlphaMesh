@@ -404,11 +404,16 @@ class OrchestratorAgent:
             chain = prompt | structured_llm
             plan: OrchestratorPlan = await chain.ainvoke({"history": state.messages})
             logger.info(
-                "_plan_node: agents=%s needs_memory=%s per_agent_queries=%s final_answer=%s",
+                "_plan_node: agents=%s needs_memory=%s per_agent_queries=%s final_answer=%s start_date=%s end_date=%s ticker=%s metrics=%s granularity=%s",
                 plan.target_agents,
                 plan.needs_memory,
                 list(plan.per_agent_queries.keys()),
                 plan.final_answer is not None,
+                plan.start_date,
+                plan.end_date,
+                plan.ticker,
+                plan.metrics,
+                plan.granularity,
             )
             return {"plan": plan}
         except Exception:

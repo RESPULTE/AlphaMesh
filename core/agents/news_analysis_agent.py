@@ -69,6 +69,70 @@ _ENTITY_CACHE: Dict[str, Dict[str, dict]] = {}
 _ENTITY_CACHE_TS: Dict[str, float] = {}
 
 
+def _get_default_date_range(
+    start_date: datetime | None,
+    end_date: datetime | None,
+    default_days_back: int = 30,
+) -> Tuple[datetime, datetime]:
+    """
+    Fill in missing start/end dates with sensible defaults.
+
+    Args:
+        start_date: Requested start date (or None for default)
+        end_date: Requested end date (or None for default)
+        default_days_back: How many days back to default start_date (default: 1 month)
+
+    Returns:
+        Tuple of (start_date, end_date) with defaults applied
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    if end_date is None:
+        end_date = now_utc
+    if start_date is None:
+        start_date = now_utc - timedelta(days=default_days_back)
+
+    return start_date, end_date
+
+
+def _constrain_date_range(
+    start_date: datetime,
+    end_date: datetime,
+    api_limit_days: int = 28,
+) -> Tuple[datetime, datetime]:
+    """
+    Constrain date range to valid API query bounds.
+
+    - end_date cannot be in the future (capped at now)
+    - start_date cannot exceed the API limit window (default 28 days)
+
+    Args:
+        start_date: Requested start date
+        end_date: Requested end date
+        api_limit_days: Maximum number of days in the past for API queries
+
+    Returns:
+        Tuple of (constrained_start, constrained_end) as date objects in YYYY-MM-DD format
+    """
+    # Use consistent timezone awareness for comparison
+    if start_date.tzinfo or end_date.tzinfo:
+        now = datetime.now(timezone.utc).date()
+    else:
+        now = datetime.now().date()
+
+    api_limit_date = now - timedelta(days=api_limit_days)
+
+    start_date_only = start_date.date()
+    end_date_only = end_date.date()
+
+    if end_date_only > now:
+        end_date_only = now
+    if start_date_only < api_limit_date:
+        start_date_only = api_limit_date
+
+    return start_date_only, end_date_only
+
+
 def _get_cached_entities(conversation_id: str) -> List[dict]:
     if not conversation_id:
         return []
@@ -174,10 +238,10 @@ class NewsAnalysisAgent(AbstractAgent):
 
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
-        start_date = input_data.start_date or (
-            datetime.now(timezone.utc) - timedelta(days=7)
+        start_date, end_date = _get_default_date_range(
+            input_data.start_date, input_data.end_date
         )
-        end_date = input_data.end_date or datetime.now(timezone.utc)
+        start_date, end_date = _constrain_date_range(start_date, end_date)
 
         initial_state = NewsAgentState(
             query=input_data.query,
@@ -291,16 +355,12 @@ class NewsAnalysisAgent(AbstractAgent):
           with the full article body.
         • Falls back gracefully to the NewsAPI snippet when scraping fails.
         """
-        now = datetime.now()
-        api_limit_date = now - timedelta(days=28)
-
-        start = state.start_date
-        end = state.end_date
-
-        if end > now:
-            end = now
-        if start < api_limit_date:
-            start = api_limit_date
+        logger.info(
+            "_fetch_news_node: fetching news for ticker='%s' (%s → %s)",
+            state.ticker,
+            state.start_date,
+            state.end_date,
+        )
 
         q = build_news_query(ticker=state.ticker)
         logger.info("NewsAPI query: %s", q)
@@ -308,8 +368,8 @@ class NewsAnalysisAgent(AbstractAgent):
         try:
             articles = await fetch_articles(
                 q=q,
-                from_date=start.date().isoformat(),
-                to_date=end.date().isoformat(),
+                from_date=state.start_date.isoformat(),
+                to_date=state.end_date.isoformat(),
                 language="en",
                 sort_by="relevancy",
                 page=1,
@@ -323,8 +383,8 @@ class NewsAnalysisAgent(AbstractAgent):
             "Fetched %d articles for ticker '%s' (%s → %s).",
             len(articles),
             state.ticker,
-            start.date(),
-            end.date(),
+            state.start_date,
+            state.end_date,
         )
         return {"raw_articles": articles}
 
@@ -537,4 +597,3 @@ class NewsAnalysisAgent(AbstractAgent):
             "subgraph_id": subgraph_id,
             "relationships_extracted": relationships_extracted,
         }
-
