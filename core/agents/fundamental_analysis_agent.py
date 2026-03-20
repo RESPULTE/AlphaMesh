@@ -48,7 +48,6 @@ from core.agents.financial_tools import TOOL_REGISTRY, ToolResult, get_tool_desc
 from core.agents.fundamental_agent_models import (
     FundamentalAnalysisOutput,
     IterativeToolPlan,
-    RelevantRowsSelection,
     ToolCallBatch,
     ToolCallSpec,
     _AgentState,
@@ -467,6 +466,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             concepts_block=concepts_block,
             prior_summary=prior_results_block,
             tool_descriptions=get_tool_descriptions(),
+            iteration=state.iteration_count + 1,
+            max_iterations=MAX_TOOL_ITERATIONS,
         )
 
         structured_llm = service_manager.get_agent(
@@ -617,7 +618,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         )
 
         return {
-            "financial_data": df if not df.empty else state.financial_data,
+            "financial_data": df,
             "tool_results": list(state.tool_results) + batch_results,
             "iteration_count": state.iteration_count + 1,
             "current_batch_index": batch_index + 1,
@@ -662,14 +663,15 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     async def _analyst_node(self, state: _AgentState) -> Dict:
         """
-        Produce the final written analysis and schedule background relationship
-        extraction.
+        Produce the final written analysis.
 
-        Fix #3: extract_with_retry (blocking LLM call) is removed from this
-        node entirely.  schedule_subgraph_extraction is called with
-        relationships=[] / relationships_extracted=False, which routes to the
-        retry_relationships_only background path using analysis_text.
-        The user-facing response is unaffected.
+        Row selection is fully deterministic — no LLM call is made for it.
+        The relevant rows are derived from:
+        • IterativeToolPlan.selected_row_labels  (no-tools path)
+        • ToolCallSpec.parameters values         (tool input rows)
+        • ToolResult.added_rows keys             (tool output rows)
+
+        A single LLM call then writes the analysis against those rows.
         """
         if state.financial_data is None or state.financial_data.empty:
             logger.warning("[analyst] No financial data — returning empty analysis.")
@@ -693,45 +695,15 @@ class FundamentalAnalysisAgent(AbstractAgent):
             ]
             tool_summary = "\n".join(lines + reasoning_lines)
 
-        # ── Step 1: LLM selects relevant rows ────────────────────────────────
-        row_labels = list(state.financial_data.index)
-        try:
-            selector_llm = service_manager.get_agent().with_structured_output(
-                RelevantRowsSelection
-            )
-            selection: RelevantRowsSelection = await selector_llm.ainvoke(
-                [
-                    SystemMessage(content=_ANALYST_SYSTEM),
-                    HumanMessage(
-                        content=(
-                            f"Query: {state.query}\n\n"
-                            f"Available rows:\n"
-                            + "\n".join(f"  - {r}" for r in row_labels)
-                            + f"\n\nTool results:\n{tool_summary or 'None'}"
-                        )
-                    ),
-                ]
-            )
-            valid_labels = [
-                r for r in (selection.relevant_row_labels or []) if r in row_labels
-            ]
-            if valid_labels:
-                filtered_df = state.financial_data.loc[valid_labels]
-                logger.info(
-                    "[analyst] Filtered to %d/%d rows for query",
-                    len(filtered_df),
-                    len(state.financial_data),
-                )
-            else:
-                logger.warning(
-                    "[analyst] No valid relevant_row_labels returned — using full DataFrame."
-                )
-                filtered_df = state.financial_data
-        except Exception as exc:
-            logger.error("[analyst] Row selection failed: %s", exc)
-            filtered_df = state.financial_data
+        # ── Deterministic row selection (no LLM) ─────────────────────────────
+        filtered_df = self._extract_relevant_rows(state, state.financial_data)
+        logger.info(
+            "[analyst] Selected %d/%d rows deterministically for query.",
+            len(filtered_df),
+            len(state.financial_data),
+        )
 
-        # ── Step 2: Write analysis ────────────────────────────────────────────
+        # ── Write analysis ────────────────────────────────────────────────────
         data_str = filtered_df.to_string(max_rows=30, float_format="%.4g")
         analysis_prompt = (
             f"Query: {state.query}\n\n"
@@ -751,11 +723,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             logger.error("[analyst] Analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
 
-        # ── Step 3: Schedule background relationship extraction ───────────────
-        # Fix #3: No blocking extract_with_retry call here.
-        # We schedule with relationships=[] / relationships_extracted=False,
-        # which routes to the retry_relationships_only background path that
-        # extracts relationships from analysis_text asynchronously.
+        # ── Schedule background relationship extraction ───────────────────────
         subgraph_id = await self._subgraph_builder.schedule_subgraph_extraction(
             agent_name=self.name(),
             conversation_id=state.conversation_id or "",
@@ -771,3 +739,59 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "relationships_extracted": False,
             "subgraph_id": subgraph_id,
         }
+
+    def _extract_relevant_rows(
+        self,
+        state: _AgentState,
+        financial_data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Deterministically select the DataFrame rows relevant to this analysis.
+
+        Sources (in priority order):
+        1. No-tools path  — selected_row_labels from IterativeToolPlan.
+        2. Input rows     — every string / list-of-strings value inside each
+                            ToolCallSpec.parameters that matches an index label.
+        3. Output rows    — added_rows keys from every successful ToolResult.
+
+        Preserves the original DataFrame row ordering.
+        """
+        labels: set[str] = set()
+        available_index: list[str] = list(financial_data.index)
+        available_set: set[str] = set(available_index)
+
+        plan = state.tool_plan
+        if plan is not None:
+            # No-tools path: planner explicitly nominated the rows to analyse.
+            for label in plan.selected_row_labels or []:
+                if label in available_set:
+                    labels.add(label)
+
+            # Input rows: scan all parameter values in every ToolCallSpec.
+            for batch in plan.batches:
+                for spec in batch.calls:
+                    for v in spec.parameters.values():
+                        if isinstance(v, str) and v in available_set:
+                            labels.add(v)
+                        elif isinstance(v, list):
+                            for item in v:
+                                if isinstance(item, str) and item in available_set:
+                                    labels.add(item)
+
+        # Output rows: every row that a tool wrote back into the DataFrame.
+        for result in state.tool_results or []:
+            if result.success and result.added_rows:
+                for row_label in result.added_rows:
+                    if row_label in available_set:
+                        labels.add(row_label)
+
+        if not labels:
+            logger.warning(
+                "[analyst] _extract_relevant_rows: no labels resolved — "
+                "falling back to full DataFrame."
+            )
+            return financial_data
+
+        # Preserve original index ordering.
+        ordered = [lbl for lbl in available_index if lbl in labels]
+        return financial_data.loc[ordered]

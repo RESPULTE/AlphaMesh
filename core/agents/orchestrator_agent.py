@@ -178,6 +178,7 @@ class OrchestratorAgent:
             agent.name(): agent() for agent in AVAILABLE_AGENTS
         }
         self._graph = self._build_graph()
+        self._builder = InMemorySubgraphBuilder()
 
     # ── Static helpers ────────────────────────────────────────────
 
@@ -585,12 +586,7 @@ class OrchestratorAgent:
             and synthesis_result.cross_relationships
         ):
             try:
-                builder = InMemorySubgraphBuilder(
-                    embedding_func=service_manager.get_embedding_func(),
-                    fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-                    semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
-                )
-                cross_graph = await builder.build(
+                cross_graph = await self._builder.build(
                     synthesis_result.cross_relationships, source_agent="orchestrator"
                 )
                 if cross_graph.number_of_edges() > 0:
@@ -599,8 +595,10 @@ class OrchestratorAgent:
                             cross_graph, state.conversation_id
                         )
                     )
-            except Exception:
-                logger.exception("_synthesize_node: cross-graph write-back failed")
+            except Exception as e:
+                logger.exception(
+                    "_synthesize_node: cross-graph write-back failed: %s", e
+                )
 
         # ── User signal write-back (delegated to memory module) ───
         if state.user_email and state.plan and state.conversation_id:

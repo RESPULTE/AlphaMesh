@@ -83,7 +83,7 @@ class IterativeToolPlan(BaseModel):
         description=(
             "Ordered list of execution batches. "
             "Batch 0 executes first; batch N may depend on results from batch N-1. "
-            "Return an empty list if the user only wants raw data."
+            "Return an empty list if the user only wants raw data or no tools are needed."
         )
     )
     data_summary: str = Field(
@@ -91,6 +91,16 @@ class IterativeToolPlan(BaseModel):
             "1-2 sentence summary of what data is available and what the full "
             "plan will compute across all batches."
         )
+    )
+    selected_row_labels: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact row label strings (from Available Concepts) that the analyst "
+            "should include in the analysis. "
+            "REQUIRED when batches=[] — list every row needed to answer the query. "
+            "When batches is non-empty this field is ignored; row selection is "
+            "derived automatically from the tool parameters and their outputs."
+        ),
     )
 
     # ── Convenience helpers used by the executor ──────────────────────────────
@@ -105,37 +115,6 @@ class IterativeToolPlan(BaseModel):
 
     def is_empty(self) -> bool:
         return len(self.batches) == 0 or all(len(b.calls) == 0 for b in self.batches)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  Analyst structured output (row selection + written analysis)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class RelevantRowsSelection(BaseModel):
-    """Structured output from the analyst node."""
-
-    relevant_row_labels: List[str] = Field(
-        description=(
-            "Exact row label strings (DataFrame index values) to include in the "
-            "final financial data table. Include: (a) rows that directly answer "
-            "the query, (b) component rows whose values reveal an insight (e.g. "
-            "if PE is rising because EPS is falling, include both PE and EPS), "
-            "(c) essential context rows used in any calculation. "
-            "Exclude rows completely unrelated to the analysis."
-        )
-    )
-    analysis: str = Field(
-        description=(
-            "Full natural-language financial analysis. Reference all tool results. "
-            "Highlight key trends, risks, and insights. Convert large raw numbers "
-            "to human-readable form (1.5e9 → '1.5 Billion'). "
-            "For DCF: state WACC and terminal growth rate assumptions explicitly "
-            "and whether intrinsic value implies the stock is over- or under-valued. "
-            "If a derived metric was computed mid-analysis (e.g. FCF computed from "
-            "OperatingCF and CapEx), explain how it was derived."
-        )
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

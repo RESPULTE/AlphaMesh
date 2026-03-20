@@ -65,9 +65,16 @@ Example — FCF derivation before DCF:
    expression using EXACT Available Concept names (spaces → underscores in the
    expression variable names).
 
-5. EMPTY PLAN
-   If the user only wants raw statements, return batches=[] and a clear
-   data_summary.
+5. EMPTY PLAN / RAW DATA QUERY
+   If the user only wants raw statements or no tool computations are required,
+   return batches=[] and populate `selected_row_labels` with the EXACT row
+   label strings (from "Available Concepts") needed to answer the query.
+   The analyst will receive only these rows — choose them carefully.
+   Example: a revenue trend query with no calculations →
+     batches=[]
+     selected_row_labels=["Revenues", "NetIncomeLoss", "GrossProfit", "stock_price"]
+   When batches is non-empty, leave selected_row_labels empty — relevant rows
+   are derived automatically from your tool parameters and their outputs.
 
 6. TOOL SELECTION GUARD
    Do NOT include a tool call whose required inputs are absent and cannot be
@@ -83,45 +90,35 @@ _TOOL_PLANNER_USER = """\
 User Query: {query}
 Ticker: {ticker}
 Date Range: {start_date} to {end_date}
-{replanning_note}
+Current Iteration: {iteration} of {max_iterations}
 
 Available Concepts ({n_concepts} total — includes raw EDGAR data AND any \
-derived metrics from previous batches):
+derived metrics from previous iterations):
 {concepts_block}
 
-Previous tool results (across all batches executed so far):
+Previous iteration tool results:
 {prior_summary}
 
 Available Tools:
 {tool_descriptions}
 
-Produce the complete IterativeToolPlan with ALL ordered batches needed to \
-answer the query.
+Produce the IterativeToolPlan for iteration {iteration}.
 """
+
 
 _ANALYST_SYSTEM = """\
 You are a senior equity research analyst.
 
-You receive the COMPLETE financial DataFrame (all rows), tool execution results,
-and the user's original question.
+You receive a pre-selected financial DataFrame (rows = the metrics directly
+relevant to this query), tool execution results, and the user's original question.
 
-YOUR TASKS:
-1. SELECT relevant rows for the final table:
-   Include rows that:
-   (a) Directly answer the query.
-   (b) Are components used in a calculation that reveal an insight (e.g.
-       PE rising because EPS is FALLING while price is flat →
-        include PE, EPS, and stock price).
-   (c) Provide essential analytical context.
-   EXCLUDE rows that are completely unrelated (e.g. unrelated balance
-   sheet accounts not referenced anywhere in the analysis).
-
-2. WRITE the analysis:
-   • Highlight key trends, risks, and positives.
-   • Reference and interpret all tool results (CAGR, ratios, DCF, etc.).
-   • For DCF: state WACC and terminal growth rate explicitly; state whether
-     the intrinsic value implies over- or under-valuation.
-   • If a derived metric was computed (e.g. FreeCashFlow derived from
-     OperatingCF and CapEx), explain the derivation.
-   • Be concise but comprehensive.
+Write a comprehensive, evidence-based analysis:
+- Highlight key trends, risks, and positives across the available periods.
+- Reference and interpret every tool result (CAGR, ratios, DCF, etc.).
+- For DCF: state the WACC and terminal growth rate assumptions explicitly
+  and whether the intrinsic value implies the stock is over- or under-valued.
+- If a derived metric was computed mid-analysis (e.g. FreeCashFlow derived
+  from OperatingCF and CapEx), explain how it was derived.
+- Convert raw large numbers to human-readable form (1.5e9 → '1.5 Billion').
+- Be concise but comprehensive.
 """
