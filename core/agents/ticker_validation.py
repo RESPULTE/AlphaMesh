@@ -29,8 +29,6 @@ from typing import Dict, List, Optional
 import yfinance as yf
 
 from core.logger import get_logger
-from core.memory.graph.models import EntityNode
-from core.memory.graph.utils import canonical_entity_id
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
@@ -239,97 +237,143 @@ class TickerValidator:
 
     async def _upsert_company_taxonomy(self, info: TickerInfo) -> None:
         """
-        For a newly discovered company, upsert:
-          1. Industry entity node (if info.industry is populated)
-          2. Company entity node
-          3. BELONGS_TO edges: Company → Industry → Sector (or Company → Sector directly)
+        For a newly discovered company, build the full Market→Sector→Industry→Company
+        taxonomy chain as a relationship list and route it through
+        SubgraphExtractionService.schedule(bypass_guards=True).
 
-        Sector and Market nodes are assumed to already exist (bootstrapped at
-        startup via NodeSetManager.initialize_default_nodesets).
+        This ensures:
+        - Fuzzy + semantic entity deduplication runs before any write.
+        - All writes go through _resolve_entity → _persist_entity (Neo4j + Chroma).
+        - BELONGS_TO edges correctly connect to the pre-existing Sector/Market
+            nodes bootstrapped at startup.
+        - No direct Neo4j/Chroma calls from this layer.
 
-        All exceptions are caught here so a taxonomy failure never surfaces
-        to the user or blocks other background tasks.
+        All exceptions are caught so a taxonomy failure never surfaces to the user.
         """
         try:
-            # ── Industry node ─────────────────────────────────────────────────
-            industry_id: Optional[str] = None
-            if info.industry:
-                industry_id = canonical_entity_id(info.industry, "Industry")
-                industry_exists = await self._neo4j.entity_exists(industry_id)
-                if not industry_exists:
-                    industry_node = EntityNode(
-                        id=industry_id,
-                        name=info.industry,
-                        entity_type="Industry",
-                        description=f"Industry segment: {info.industry}.",
-                    )
-                    await self._neo4j.merge_entity_node(industry_node)
-                    if self._chroma is not None:
-                        await self._chroma.upsert_entity_embedding(
-                            entity_id=industry_id,
-                            name=info.industry,
-                            description=industry_node.description,
-                            entity_type="Industry",
-                        )
-                    # Industry → Sector BELONGS_TO edge
-                    if info.sector:
-                        sector_id = canonical_entity_id(info.sector, "Sector")
-                        await self._neo4j.merge_relationship(
-                            industry_id,
-                            sector_id,
-                            "BELONGS_TO",
-                            {
-                                "relationship_type": "BELONGS_TO",
-                                "source_agent": "taxonomy_bootstrap",
-                            },
-                        )
-                    self._logger.info("Upserted Industry entity: %s", info.industry)
+            from core.memory.graph.models import ALL_MAIN_SECTORS
+            from core.services import service_manager
 
-            # ── Company node ──────────────────────────────────────────────────
-            company_id = canonical_entity_id(info.long_name, "Company")
-            company_exists = await self._neo4j.entity_exists(company_id)
-            if not company_exists:
-                company_node = EntityNode(
-                    id=company_id,
-                    name=info.long_name,
-                    entity_type="Company",
-                    description=info.description,
-                    ticker=info.ticker,
+            market_props: dict = {
+                "description": (
+                    "Global equity market — top-level anchor node for the sector taxonomy."
                 )
-                await self._neo4j.merge_entity_node(company_node)
-                if self._chroma is not None:
-                    await self._chroma.upsert_entity_embedding(
-                        entity_id=company_id,
-                        name=info.long_name,
-                        description=info.description,
-                        entity_type="Company",
-                    )
+            }
+            sector_props: dict = {
+                "description": ALL_MAIN_SECTORS.get(info.sector, info.sector)
+            }
+            industry_props: dict = {
+                "description": f"Industry segment: {info.industry}."
+            }
+            company_props: dict = {
+                "description": info.description,
+                "ticker": info.ticker,
+            }
 
-                # Company → Industry or directly → Sector BELONGS_TO edge
-                if industry_id:
-                    await self._neo4j.merge_relationship(
-                        company_id,
-                        industry_id,
-                        "BELONGS_TO",
+            relationships: List[dict] = []
+
+            # ── Sector → Market ───────────────────────────────────────────────────
+            if info.sector:
+                relationships.append(
+                    {
+                        "from_name": info.sector,
+                        "from_type": "Sector",
+                        "relation": "BELONGS_TO",
+                        "to_name": "Market",
+                        "to_type": "Market",
+                        "confidence": "high",
+                        "reason": f"{info.sector} sector belongs to the global market taxonomy.",
+                        "from_node_props": sector_props,
+                        "to_node_props": market_props,
+                    }
+                )
+
+            # ── Industry → Sector ─────────────────────────────────────────────────
+            if info.industry and info.sector:
+                relationships.append(
+                    {
+                        "from_name": info.industry,
+                        "from_type": "Industry",
+                        "relation": "BELONGS_TO",
+                        "to_name": info.sector,
+                        "to_type": "Sector",
+                        "confidence": "high",
+                        "reason": (
+                            f"{info.industry} is an industry segment "
+                            f"within the {info.sector} sector."
+                        ),
+                        "from_node_props": industry_props,
+                        "to_node_props": sector_props,
+                    }
+                )
+
+            # ── Company → Industry (preferred) or Company → Sector (fallback) ────
+            if info.long_name:
+                if info.industry:
+                    relationships.append(
                         {
-                            "relationship_type": "BELONGS_TO",
-                            "source_agent": "taxonomy_bootstrap",
-                        },
+                            "from_name": info.long_name,
+                            "from_type": "Company",
+                            "relation": "BELONGS_TO",
+                            "to_name": info.industry,
+                            "to_type": "Industry",
+                            "confidence": "high",
+                            "reason": (
+                                f"{info.long_name} ({info.ticker}) operates in "
+                                f"the {info.industry} industry."
+                            ),
+                            "from_node_props": company_props,
+                            "to_node_props": industry_props,
+                        }
                     )
                 elif info.sector:
-                    sector_id = canonical_entity_id(info.sector, "Sector")
-                    await self._neo4j.merge_relationship(
-                        company_id,
-                        sector_id,
-                        "BELONGS_TO",
+                    relationships.append(
                         {
-                            "relationship_type": "BELONGS_TO",
-                            "source_agent": "taxonomy_bootstrap",
-                        },
+                            "from_name": info.long_name,
+                            "from_type": "Company",
+                            "relation": "BELONGS_TO",
+                            "to_name": info.sector,
+                            "to_type": "Sector",
+                            "confidence": "high",
+                            "reason": (
+                                f"{info.long_name} ({info.ticker}) operates in "
+                                f"the {info.sector} sector."
+                            ),
+                            "from_node_props": company_props,
+                            "to_node_props": sector_props,
+                        }
                     )
-                self._logger.info(
-                    "Upserted Company entity: %s (%s)", info.long_name, info.ticker
+
+            if not relationships:
+                self._logger.warning(
+                    "_upsert_company_taxonomy: no relationships built for '%s' "
+                    "(sector=%s, industry=%s)",
+                    info.ticker,
+                    info.sector,
+                    info.industry,
                 )
+                return
+
+            await service_manager.get_subgraph_service().schedule(
+                agent_name="taxonomy_bootstrap",
+                conversation_id="taxonomy_bootstrap",
+                analysis_text="",
+                llm=None,  # relationships are pre-supplied — no LLM call needed
+                system_prompt="",
+                relationships=relationships,
+                bypass_guards=True,
+            )
+
+            self._logger.info(
+                "_upsert_company_taxonomy: scheduled %d BELONGS_TO edge(s) "
+                "for '%s' (%s → %s → %s → Market)",
+                len(relationships),
+                info.ticker,
+                info.long_name,
+                info.industry or "(no industry)",
+                info.sector or "(no sector)",
+            )
+
         except Exception:
             self._logger.exception(
                 "_upsert_company_taxonomy failed for ticker '%s'", info.ticker

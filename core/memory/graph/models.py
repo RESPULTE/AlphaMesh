@@ -71,6 +71,20 @@ RelationshipType = Literal[
     "BELONGS_TO",
 ]
 
+_RELATIONSHIP_WEIGHTS: dict[str, float] = {
+    "AFFECTS": 1.0,
+    "CAUSED_BY": 0.95,
+    "BOOSTS": 0.85,
+    "DRAGS": 0.85,
+    "CORRELATED_WITH": 0.70,
+    "EXPOSES_TO": 0.65,
+    "MITIGATES": 0.55,
+    "COMPETES_WITH": 0.45,
+    "ACQUIRED_BY": 0.40,
+    "RELATED_TO": 0.10,  # generic fallback — lowest priority
+    "BELONGS_TO": 0.20,  # intermediate priority between RELATED_TO and specific causal/affective relationships
+}
+
 # ── _ENTITY_TYPE_WEIGHTS: add Industry and Market ────────────────────────────
 _ENTITY_TYPE_WEIGHTS: dict[str, float] = {
     "Company": 1.0,

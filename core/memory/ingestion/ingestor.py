@@ -164,12 +164,13 @@ class DualStoreIngestor:
         Persist a relationship subgraph to Neo4j.
 
         Entity resolution and edge writes are parallelised:
-          Phase 1 — resolve all unique entity IDs concurrently.
-          Phase 2 — write all relationship edges concurrently.
+        Phase 1 — resolve all unique entity IDs concurrently.
+        Phase 2 — write all relationship edges concurrently.
 
-        The entity_cache is shared across both phases.  Concurrent writes to
-        the cache dict are safe because CPython dict operations are atomic and
-        all coroutines run on a single event-loop thread.
+        node_props carried on each nx node (set by build_graph from the
+        `from_node_props`/`to_node_props` fields in the relationship dicts)
+        are forwarded to _resolve_entity as `raw`, so yfinance-sourced
+        attributes (ticker, description) survive the full dedup pipeline.
         """
         if graph is None or graph.number_of_edges() == 0:
             return
@@ -184,20 +185,29 @@ class DualStoreIngestor:
                     conversation_id,
                 )
 
-        # ── Phase 1: resolve all unique entities concurrently ─────────────
+        # ── Phase 1: resolve all unique entities concurrently ─────────────────
         entity_cache: Dict[Tuple[str, str], str] = {}
 
-        unique_entities: Dict[Tuple[str, str], None] = {}
+        # Build a deduped map of (name, type) → node_props so that if the same
+        # entity appears under multiple node_ids, its enriched props are preserved.
+        unique_entities: Dict[Tuple[str, str], dict] = {}
         for node_id in graph.nodes:
             node_data = graph.nodes[node_id]
             name = normalize_entity_name(node_data.get("name"))
             etype = normalize_entity_type(node_data.get("entity_type"))
             if name and etype:
-                unique_entities[(name, etype)] = None
+                existing_props = unique_entities.get((name, etype), {})
+                incoming_props = node_data.get("node_props") or {}
+                # Keep whichever props dict is richer (non-empty wins over empty)
+                unique_entities[(name, etype)] = (
+                    incoming_props if incoming_props else existing_props
+                )
 
-        async def _resolve_safe(name: str, etype: str) -> None:
+        async def _resolve_safe(name: str, etype: str, node_props: dict) -> None:
             try:
-                await self._resolve_entity(name, etype, entity_cache)
+                await self._resolve_entity(
+                    name, etype, entity_cache, raw=node_props or None
+                )
             except Exception:
                 self._logger.exception(
                     "_upsert_graph_to_neo4j: entity resolution failed for '%s' (%s)",
@@ -206,10 +216,13 @@ class DualStoreIngestor:
                 )
 
         await asyncio.gather(
-            *[_resolve_safe(name, etype) for name, etype in unique_entities]
+            *[
+                _resolve_safe(name, etype, props)
+                for (name, etype), props in unique_entities.items()
+            ]
         )
 
-        # ── Phase 2: write all edges concurrently ─────────────────────────
+        # ── Phase 2: write all edges concurrently ─────────────────────────────
         async def _write_edge(source_id: str, target_id: str, attrs: dict) -> None:
             source_node = graph.nodes.get(source_id, {})
             target_node = graph.nodes.get(target_id, {})
@@ -578,14 +591,29 @@ class DualStoreIngestor:
             return None
 
         entity_id = canonical_entity_id(name, entity_type)
+
+        # Support both dict (from node_props, e.g. taxonomy enrichment) and
+        # object (from raw entity, e.g. user signal writeback).
+        if isinstance(raw, dict):
+            _description = raw.get("description")
+            _ticker = raw.get("ticker") or None
+            _nodeset_ids = list(raw.get("nodeset_ids") or [])
+        elif raw is not None:
+            _description = getattr(raw, "description", None)
+            _ticker = getattr(raw, "ticker", None)
+            _nodeset_ids = list(getattr(raw, "nodeset_ids", []) or [])
+        else:
+            _description = None
+            _ticker = None
+            _nodeset_ids = []
+
         node = EntityNode(
             id=entity_id,
             name=name,
             entity_type=entity_type,
-            description=normalize_entity_description(
-                getattr(raw, "description", None) if raw else None, name
-            ),
-            nodeset_ids=list(getattr(raw, "nodeset_ids", []) or []) if raw else [],
+            description=normalize_entity_description(_description, name),
+            ticker=_ticker,
+            nodeset_ids=_nodeset_ids,
         )
 
         existing_id = await self._find_existing_entity(node)
@@ -594,9 +622,11 @@ class DualStoreIngestor:
             return existing_id
 
         await self._persist_entity(node)
-        if raw is not None:
+        # Only assign nodesets when there are actual IDs to assign —
+        # taxonomy entities (Company, Industry, Sector, Market) carry no nodeset_ids.
+        if _nodeset_ids:
             await self._nodeset_manager.assign_to_node(
-                node.id, node.entity_type, node.nodeset_ids or []
+                node.id, node.entity_type, _nodeset_ids[0]
             )
 
         entity_cache[key] = node.id

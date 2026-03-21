@@ -143,6 +143,12 @@ class SubgraphExtractionService:
         """
         Deduplicate entity names (fuzzy then semantic) and build an nx.DiGraph.
         No LLM calls, no I/O.  Idempotent — safe to call multiple times.
+
+        Each relationship dict may carry optional `from_node_props` / `to_node_props`
+        dicts with extra entity attributes (e.g. ticker, description sourced from
+        yfinance).  These are attached as `node_props` on the nx node and forwarded
+        to _resolve_entity during persistence, so canonical attributes survive the
+        full dedup pipeline.
         """
         graph = nx.DiGraph()
         if not relationships:
@@ -235,15 +241,34 @@ class SubgraphExtractionService:
             from_id = canonical_entity_id(from_name, from_type)
             to_id = canonical_entity_id(to_name, to_type)
 
-            graph.add_node(
-                from_id,
-                name=from_name,
-                entity_type=from_type,
-                source_agent=source_agent,
-            )
-            graph.add_node(
-                to_id, name=to_name, entity_type=to_type, source_agent=source_agent
-            )
+            from_node_props = rel.get("from_node_props") or {}
+            to_node_props = rel.get("to_node_props") or {}
+
+            # Add nodes — preserve existing non-empty node_props on subsequent
+            # encounters of the same entity (e.g. Sector appears as both `to` in
+            # Industry→Sector and `from` in Sector→Market; props from either pass
+            # should not clobber each other).
+            if from_id not in graph:
+                graph.add_node(
+                    from_id,
+                    name=from_name,
+                    entity_type=from_type,
+                    source_agent=source_agent,
+                    node_props=from_node_props,
+                )
+            elif from_node_props and not graph.nodes[from_id].get("node_props"):
+                graph.nodes[from_id]["node_props"] = from_node_props
+
+            if to_id not in graph:
+                graph.add_node(
+                    to_id,
+                    name=to_name,
+                    entity_type=to_type,
+                    source_agent=source_agent,
+                    node_props=to_node_props,
+                )
+            elif to_node_props and not graph.nodes[to_id].get("node_props"):
+                graph.nodes[to_id]["node_props"] = to_node_props
 
             edge_attrs = {
                 "relation_type": str(rel.get("relation", "RELATED_TO")).strip(),
@@ -286,22 +311,26 @@ class SubgraphExtractionService:
         analysis_text: str,
         llm,
         system_prompt: str,
-        # Pass pre-extracted relationships when the agent already ran its own
-        # LLM call (e.g. NewsAnalysisAgent's combined analysis+extraction pass).
-        # Pass None to have this service run extraction from analysis_text.
         relationships: Optional[List[dict]] = None,
+        bypass_guards: bool = False,
     ) -> Optional[str]:
         """
         Schedule relationship extraction + graph persistence as a background task.
 
         Two paths:
-          relationships is not None → skip LLM call, build + persist directly.
-          relationships is None     → extract from analysis_text, build + persist.
+        relationships is not None → skip LLM call, build + persist directly.
+        relationships is None     → extract from analysis_text, build + persist.
+
+        bypass_guards=True skips the EXTRACTION_ENABLED and conversation_id checks.
+        Use this for system-internal upserts (taxonomy bootstrap, ticker enrichment)
+        that must always run regardless of user-facing extraction settings.
 
         Returns the subgraph_id (a SubgraphStore key) or None when disabled
         or conversation_id is absent.
         """
-        if not settings.EXTRACTION_ENABLED or not conversation_id:
+        if not bypass_guards and (
+            not settings.EXTRACTION_ENABLED or not conversation_id
+        ):
             return None
 
         from core.memory.stores.subgraph_store import SubgraphStore
@@ -332,7 +361,7 @@ class SubgraphExtractionService:
 
         task = asyncio.create_task(_run())
 
-        if settings.EXTRACTION_IMMEDIATE:
+        if settings.EXTRACTION_IMMEDIATE or bypass_guards:
             await task
 
         return subgraph_id
