@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from typing import Dict, Optional
 
 from core.logger import get_logger
-from core.memory.graph.models import ALL_MAIN_SECTORS, GLOBAL_ENTITY_NODESETS
-from core.memory.graph.utils import canonical_nodeset_id
+from core.memory.graph.models import (
+    ALL_MAIN_SECTORS,
+    GLOBAL_ENTITY_NODESETS,
+    EntityNode,
+)
+from core.memory.graph.utils import canonical_entity_id, canonical_nodeset_id
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 
@@ -25,15 +30,38 @@ def get_user_nodeset_name(user_email: str) -> str:
     return f"USER_{hash_user_email(user_email)}"
 
 
-class NodeSetManager:
-    """Manages NodeSet creation, lookup, and assignment."""
+# Canonical description for the global Market anchor entity.
+_MARKET_DESCRIPTION = (
+    "Global equity market — top-level anchor node for the sector taxonomy. "
+    "All sectors belong to this node."
+)
 
-    def __init__(self, neo4j_adapter: Neo4jAdapter) -> None:
-        """Initialize the manager with a Neo4j adapter."""
+
+class NodeSetManager:
+    """Manages NodeSet creation, lookup, assignment, and canonical entity taxonomy bootstrap."""
+
+    def __init__(
+        self,
+        neo4j_adapter: Neo4jAdapter,
+        entity_chroma_adapter=None,  # Optional ChromaDBAdapter for entity embeddings
+    ) -> None:
+        """
+        Initialize the manager.
+
+        Args:
+            neo4j_adapter: Adapter for all Neo4j operations.
+            entity_chroma_adapter: Optional Chroma adapter for the entity
+                embeddings collection. When provided, Market and Sector entity
+                nodes are embedded at bootstrap so they participate in semantic
+                retrieval. Pass None to skip embedding (e.g. in unit tests).
+        """
         self._neo4j_adapter = neo4j_adapter
+        self._entity_chroma_adapter = entity_chroma_adapter
         self._registry: Dict[str, str] = {}
         self._initialized = False
         self._logger = get_logger(__name__)
+
+    # ── Registry bootstrap ────────────────────────────────────────────────────
 
     async def _ensure_initialized(self) -> None:
         """Synchronize in-memory registry with existing NodeSets."""
@@ -52,6 +80,8 @@ class NodeSetManager:
         except Exception:
             self._logger.exception("Failed to initialize NodeSet registry.")
             raise
+
+    # ── NodeSet CRUD ──────────────────────────────────────────────────────────
 
     async def get_or_create(self, name: str, description: str = "") -> str:
         """Get an existing NodeSet ID or create it deterministically."""
@@ -107,22 +137,126 @@ class NodeSetManager:
         nodeset_id = await self.get_or_create(nodeset_name)
         return nodeset_name, nodeset_id
 
+    # ── Canonical taxonomy bootstrap ─────────────────────────────────────────
+
+    async def _upsert_entity_with_embedding(self, node: EntityNode) -> None:
+        """
+        Upsert a single entity node to Neo4j and, if the Chroma adapter is
+        available, embed it into the entity vector store.
+        """
+        await self._neo4j_adapter.merge_entity_node(node)
+        if self._entity_chroma_adapter is not None:
+            await self._entity_chroma_adapter.upsert_entity_embedding(
+                entity_id=node.id,
+                name=node.name,
+                description=node.description,
+                entity_type=node.entity_type,
+            )
+
+    async def _bootstrap_market_entity(self) -> str:
+        """
+        Ensure the global Market entity node exists in both stores.
+        Returns the canonical Market entity ID.
+        """
+        market_id = canonical_entity_id("Market", "Market")
+        market_exists = await self._neo4j_adapter.entity_exists(market_id)
+        if not market_exists:
+            market_node = EntityNode(
+                id=market_id,
+                name="Market",
+                entity_type="Market",
+                description=_MARKET_DESCRIPTION,
+            )
+            await self._upsert_entity_with_embedding(market_node)
+            self._logger.info("Bootstrapped Market entity node.")
+        return market_id
+
+    async def _bootstrap_sector_entities(self, market_id: str) -> None:
+        """
+        Ensure all canonical Sector entity nodes exist in both stores and
+        have a BELONGS_TO edge pointing to the Market entity.
+
+        Runs all existence checks concurrently, then creates missing sectors.
+        """
+        # Collect which sectors are missing — batch the existence checks.
+        sector_ids = {
+            name: canonical_entity_id(name, "Sector") for name in ALL_MAIN_SECTORS
+        }
+
+        existence_results = await asyncio.gather(
+            *[self._neo4j_adapter.entity_exists(sid) for sid in sector_ids.values()],
+            return_exceptions=True,
+        )
+
+        missing_sectors = [
+            name
+            for (name, _sid), exists in zip(sector_ids.items(), existence_results)
+            if not isinstance(exists, Exception) and not exists
+        ]
+
+        if not missing_sectors:
+            return
+
+        self._logger.info(
+            "Bootstrapping %d missing Sector entity nodes: %s",
+            len(missing_sectors),
+            missing_sectors,
+        )
+
+        async def _create_sector(name: str) -> None:
+            sector_id = sector_ids[name]
+            description = ALL_MAIN_SECTORS[name]
+            sector_node = EntityNode(
+                id=sector_id,
+                name=name,
+                entity_type="Sector",
+                description=description,
+            )
+            await self._upsert_entity_with_embedding(sector_node)
+            # Sector → Market taxonomy edge
+            await self._neo4j_adapter.merge_relationship(
+                sector_id,
+                market_id,
+                "BELONGS_TO",
+                {
+                    "relationship_type": "BELONGS_TO",
+                    "source_agent": "taxonomy_bootstrap",
+                },
+            )
+            self._logger.debug("Bootstrapped Sector entity: %s", name)
+
+        await asyncio.gather(*[_create_sector(name) for name in missing_sectors])
+        self._logger.info("Sector entity bootstrap complete.")
+
+    # ── Public initializer (called at application startup) ───────────────────
+
     async def initialize_default_nodesets(self) -> None:
         """
-        Batch initialize the global nodesets and all main sector nodesets.
-        This adapts the archived Cognee logic to the current Neo4j adapter cleanly.
-        """
-        self._logger.info("Initializing default global and sector nodesets...")
+        Idempotent startup routine that:
+          1. Creates global anchor NodeSets (existing behaviour).
+          2. Creates per-sector NodeSets (existing behaviour).
+          3. Bootstraps the Market entity node in Neo4j + Chroma.
+          4. Bootstraps all 11 Sector entity nodes in Neo4j + Chroma,
+             each linked to Market via a BELONGS_TO edge.
 
-        # 1. Global anchor nodesets
+        Safe to call multiple times — all operations are idempotent.
+        """
+        self._logger.info(
+            "Initializing default nodesets and canonical entity taxonomy..."
+        )
+
+        # ── 1. Global anchor nodesets ─────────────────────────────────────────
         for name, description in GLOBAL_ENTITY_NODESETS.items():
             await self.get_or_create(name, description)
 
-        # Ensure the specific financial events node exists for backward compatibility
         await self.get_global_financial_events_id()
 
-        # 2. The 12 primary sectors
+        # ── 2. Sector nodesets (membership containers, separate from entities) ─
         for sector_name, description in ALL_MAIN_SECTORS.items():
             await self.get_or_create(sector_name, description)
+
+        # ── 3 & 4. Market + Sector entity nodes (taxonomy graph) ──────────────
+        market_id = await self._bootstrap_market_entity()
+        await self._bootstrap_sector_entities(market_id)
 
         self._logger.info("Default nodeset initialization complete.")

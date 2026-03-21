@@ -74,7 +74,11 @@ Each signal MUST include a `confidence` score (0.0–1.0):
 
 ══ FIELD RULES ══
 `query`                    — original or lightly cleaned user query.
-`ticker`                   — primary ticker from message or inferred from conversation history.
+`tickers`                  — list of ALL ticker symbols identified in the message or inferred
+                             from conversation history. Up to 3 entries. Always use uppercase
+                             ticker symbols (e.g. ["AAPL", "MSFT"]). Populate this instead of
+                             the legacy `ticker` field.
+`ticker`                   — leave null; the orchestrator derives it from tickers[0].
 `start_date` / `end_date`  — only when the user explicitly specifies a time range; else null.
 """
 

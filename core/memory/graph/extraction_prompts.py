@@ -8,7 +8,10 @@ CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     "You are an information extraction system. Extract entities and relationships from each "
     "news chunk provided. Only use information explicitly stated in each chunk. "
     "Do not infer relationships across multiple articles or chunks. "
-    "Allowed entity types: Company, FinancialEvent, FinancialConcept, Sector. Each entity must include a short, single-sentence description drawn only from the chunk text. "
+    "Allowed entity types: Company, FinancialEvent, FinancialConcept. "
+    "Sector, Industry and Market entities are managed by the taxonomy pipeline and must NOT "
+    "be extracted from text. Each entity must include a short, single-sentence description "
+    "drawn only from the chunk text. "
     "Return a JSON object matching the BatchExtractionResult schema. "
     "Each entity must include a temporary local_id used by relationships; "
     "relationships must reference entities by local_id. "
@@ -23,7 +26,8 @@ CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     '          "local_id": "<str>",\n'
     '          "id": "<uuid or placeholder>",\n'
     '          "name": "<str>",\n'
-    '          "entity_type": "<Company|FinancialEvent|FinancialConcept|Sector>",\n          "description": "<short summary from chunk text>",\n'
+    '          "entity_type": "<Company|FinancialEvent|FinancialConcept>",\n'
+    '          "description": "<short summary from chunk text>",\n'
     '          "aliases": ["<str>", "..."],\n'
     '          "nodeset_ids": ["<str>", "..."]\n'
     "        }}\n"
@@ -32,7 +36,7 @@ CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     "        {{\n"
     '          "source_entity_local_id": "<str>",\n'
     '          "target_entity_local_id": "<str>",\n'
-    '          "relationship_type": "<one of: AFFECTS|CAUSED_BY|INCREASES|DECREASES|CORRELATED_WITH|EXPOSES_TO|MITIGATES|COMPETES_WITH|ACQUIRED_BY|REPORTED_BY|RELATED_TO>",\\n'
+    '          "relationship_type": "<one of: AFFECTS|CAUSED_BY|INCREASES|DECREASES|CORRELATED_WITH|EXPOSES_TO|MITIGATES|COMPETES_WITH|ACQUIRED_BY|REPORTED_BY|RELATED_TO>",\n'
     '          "confidence": <float>\n'
     "        }}\n"
     "      ]\n"

@@ -248,6 +248,7 @@ class NewsAnalysisAgent(AbstractAgent):
             start_date=start_date,
             end_date=end_date,
             conversation_id=input_data.conversation_id,
+            company_context=input_data.company_context,
         )
 
         state_payload = initial_state.model_dump()
@@ -517,12 +518,18 @@ class NewsAnalysisAgent(AbstractAgent):
                 "Known entities from prior turns:\n" + "\n".join(entity_lines) + "\n\n"
             )
 
+        company_context_section = (
+            f"Company Context:\n{state.company_context}\n\n"
+            if state.company_context
+            else ""
+        )
+
         messages = [
             SystemMessage(content=COMBINED_ANALYSIS_RELATIONSHIP_PROMPT),
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
                     query=state.query,
-                    entities_section=entities_section,
+                    entities_section=company_context_section + entities_section,
                     context=context_block,
                 )
             ),

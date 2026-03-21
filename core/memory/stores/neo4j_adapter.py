@@ -143,15 +143,45 @@ class Neo4jAdapter:
         )
 
     async def merge_entity_node(self, node: EntityNode) -> None:
-        """Merge an entity node with a dynamic label."""
+        """
+        Merge an entity node with a dynamic label.
+
+        ON CREATE: all properties are written in full.
+        ON MATCH:  only mutable metadata (aliases, nodeset_ids, ticker) is updated.
+                name and description are intentionally preserved to protect
+                canonical values sourced from yfinance for Company, Sector,
+                Industry and Market entities.
+        """
         if node.entity_type not in ALLOWED_ENTITY_TYPES:
             raise ValueError(f"Unsupported entity_type: {node.entity_type}")
 
+        props = {k: v for k, v in node.model_dump().items() if k != "local_id"}
+
         cypher = (
-            "MERGE (e:Entity {id: $id}) " "SET e += $props " f"SET e:{node.entity_type}"
+            f"MERGE (e:Entity {{id: $id}}) "
+            "ON CREATE SET e += $props "
+            "ON MATCH SET "
+            "  e.aliases = CASE WHEN $props.aliases IS NOT NULL AND size($props.aliases) > 0 "
+            "               THEN $props.aliases ELSE e.aliases END, "
+            "  e.nodeset_ids = CASE WHEN $props.nodeset_ids IS NOT NULL AND size($props.nodeset_ids) > 0 "
+            "                   THEN $props.nodeset_ids ELSE e.nodeset_ids END, "
+            "  e.ticker = CASE WHEN $props.ticker IS NOT NULL THEN $props.ticker ELSE e.ticker END "
+            f"SET e:{node.entity_type}"
         )
-        props = node.model_dump()
         await self._execute_write(cypher, {"id": node.id, "props": props})
+
+    async def entity_exists_by_ticker(self, ticker: str) -> Optional[str]:
+        """
+        Return the entity ID if a Company entity with this ticker already exists
+        in the graph, otherwise None.
+        """
+        cypher = (
+            "MATCH (e:Entity:Company) "
+            "WHERE e.ticker = $ticker "
+            "RETURN e.id AS id LIMIT 1"
+        )
+        records = await self._execute_read(cypher, {"ticker": ticker.upper()})
+        return records[0]["id"] if records else None
 
     async def merge_relationship(
         self, source_id: str, target_id: str, rel_type: str, props: Dict[str, object]

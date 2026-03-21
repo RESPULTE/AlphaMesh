@@ -51,6 +51,8 @@ class BaseAgentInput(BaseModel):
         ),
     )
 
+    company_context: Optional[str] = Field(default=None)
+
     @field_validator("granularity", mode="before")
     @classmethod
     def _default_granularity(cls, v: Any) -> str:

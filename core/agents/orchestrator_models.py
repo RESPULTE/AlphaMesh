@@ -87,6 +87,20 @@ class OrchestratorPlan(BaseAgentInput):
 
     # ── Orchestrator-only fields ──────────────────────────────────────────────
 
+    ticker: Optional[str] = Field(
+        default=None,
+        description="Derived from tickers[0]; do not populate directly.",
+    )
+
+    # Authoritative list of all tickers identified in the query (up to 3).
+    tickers: List[str] = Field(
+        default_factory=list,
+        description=(
+            "All ticker symbols identified in the query, up to 3. "
+            "Always populate this list instead of the legacy `ticker` field."
+        ),
+    )
+
     final_answer: Optional[str] = Field(
         default=None,
         description=(
@@ -139,6 +153,10 @@ class OrchestratorState(BaseModel):
 
     # Populated synchronously in run() from the UserContextService cache.
     user_context_block: str = ""
+
+    # Keyed by ticker symbol; values are formatted context blocks from yfinance.
+    # Built by _validate_and_enrich_node and read by _execute_node.
+    company_context_blocks: Dict[str, str] = Field(default_factory=dict)
 
     summary: str = ""
     fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)

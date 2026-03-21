@@ -60,7 +60,14 @@ from core.agents.prompts import (
     SYNTHESISER_USER_CONTEXT_SECTION,
     build_writeback_system_prompt,
 )
-from core.agents.utils import _safe_create_task
+from core.agents.utils import (
+    _build_clarification_message,
+    _build_combined_company_context,
+    _extract_last_human_message,
+    _last_n_messages,
+    _safe_create_task,
+    _safe_json,
+)
 from core.config import settings
 from core.logger import get_logger
 from core.memory.user_signal_writeback import build_signal_payload, write_user_signals
@@ -89,27 +96,6 @@ _SYNTHESIS_HISTORY_WINDOW: int = 6
 # ──────────────────────────────────────────────────────────────────────────────
 # Module-level helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-def _extract_last_human_message(messages: List[BaseMessage]) -> str:
-    """Return the content of the most recent HumanMessage, or '' if none exists."""
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            return msg.content or ""
-    return ""
-
-
-def _last_n_messages(messages: List[BaseMessage], n: int) -> List[BaseMessage]:
-    """Return the last *n* messages; returns the full list when len ≤ n."""
-    return messages[-n:] if len(messages) > n else list(messages)
-
-
-def _safe_json(text: str) -> List[dict]:
-    try:
-        result = json.loads(text.strip())
-        return result if isinstance(result, list) else []
-    except (json.JSONDecodeError, ValueError):
-        return []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,12 +132,25 @@ class OrchestratorAgent:
     # ── Graph wiring ──────────────────────────────────────────────
 
     def _router(self, state: OrchestratorState) -> str:
+        """Route from planner: trivial answers skip validation entirely."""
         if state.plan is None:
             logger.warning("_router: plan is None — falling back to synthesiser")
             return "synthesiser"
         if state.plan.final_answer is not None:
             return "direct_answer"
         if state.plan.target_agents:
+            # Always validate tickers before dispatching to agents
+            return "validate_and_enrich"
+        return "synthesiser"
+
+    def _enrichment_router(self, state: OrchestratorState) -> str:
+        """
+        Route from validate_and_enrich.
+        final_answer being set means the validation step needs user clarification.
+        """
+        if state.plan and state.plan.final_answer is not None:
+            return "direct_answer"
+        if state.plan and state.plan.target_agents:
             return "execute_agents"
         return "synthesiser"
 
@@ -160,6 +159,7 @@ class OrchestratorAgent:
 
         workflow.add_node("planner", self._plan_node)
         workflow.add_node("direct_answer", self._direct_answer_node)
+        workflow.add_node("validate_and_enrich", self._validate_and_enrich_node)
         workflow.add_node("execute_agents", self._execute_node)
         workflow.add_node("synthesiser", self._synthesize_node)
 
@@ -167,6 +167,16 @@ class OrchestratorAgent:
         workflow.add_conditional_edges(
             "planner",
             self._router,
+            {
+                "direct_answer": "direct_answer",
+                "validate_and_enrich": "validate_and_enrich",
+                "synthesiser": "synthesiser",
+            },
+        )
+        # After enrichment: either clarify (direct_answer) or run agents
+        workflow.add_conditional_edges(
+            "validate_and_enrich",
+            self._enrichment_router,
             {
                 "direct_answer": "direct_answer",
                 "execute_agents": "execute_agents",
@@ -383,16 +393,76 @@ class OrchestratorAgent:
         logger.info("_direct_answer_node: %d chars", len(answer))
         return {"summary": answer, "sources": [], "fundamental_data": None}
 
+    async def _validate_and_enrich_node(
+        self, state: OrchestratorState
+    ) -> Dict[str, Any]:
+        """
+        Validate tickers emitted by the planner, enrich new companies from
+        yfinance, and build company_context_blocks for downstream agents.
+
+        Three outcomes:
+        1. All tickers valid equities → populate company_context_blocks, proceed.
+        2. Any ticker needs confirmation → set plan.final_answer with a
+            clarification message; _enrichment_router routes to direct_answer.
+        3. No tickers in plan → pass through with empty context blocks.
+
+        Taxonomy upsert (new Company/Industry nodes) runs as a background task
+        and never blocks this node's return.
+        """
+        from core.agents.ticker_validation import TickerInfo
+
+        plan = state.plan
+        tickers: List[str] = getattr(plan, "tickers", []) if plan else []
+
+        if not tickers:
+            return {"company_context_blocks": {}}
+
+        try:
+            validator = service_manager.get_ticker_validator()
+            results: Dict[str, TickerInfo] = await validator.validate_and_enrich(
+                tickers
+            )
+        except Exception:
+            logger.exception(
+                "_validate_and_enrich_node: validation failed — "
+                "proceeding without company context"
+            )
+            return {"company_context_blocks": {}}
+
+        # ── Check for tickers needing user confirmation ───────────────────────────
+        needing_confirmation = {
+            t: info for t, info in results.items() if info.needs_confirmation
+        }
+        if needing_confirmation:
+            clarification = _build_clarification_message(needing_confirmation)
+            updated_plan = plan.model_copy(update={"final_answer": clarification})
+            logger.info(
+                "_validate_and_enrich_node: %d ticker(s) need confirmation: %s",
+                len(needing_confirmation),
+                list(needing_confirmation.keys()),
+            )
+            return {"plan": updated_plan, "company_context_blocks": {}}
+
+        # ── Build context blocks for all valid equities ───────────────────────────
+        company_context_blocks: Dict[str, str] = {}
+        for t, info in results.items():
+            if info.is_valid and info.is_equity:
+                block = info.to_context_block()
+                if block:
+                    company_context_blocks[t] = block
+
+        logger.info(
+            "_validate_and_enrich_node: enriched %d/%d ticker(s): %s",
+            len(company_context_blocks),
+            len(tickers),
+            list(company_context_blocks.keys()),
+        )
+        return {"company_context_blocks": company_context_blocks}
+
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
         """
         Run selected agents in parallel, each receiving a query rewritten
-        specifically for its job description.
-
-        Because OrchestratorPlan inherits BaseAgentInput, `plan` already IS a
-        valid agent input carrying all shared fields (ticker, dates, metrics,
-        granularity).  We simply call model_copy(update={"query": agent_query})
-        to produce a per-agent BaseAgentInput with only the query swapped out —
-        no dict-filtering or manual field reconstruction needed.
+        specifically for its job description and combined company context.
         """
         plan = state.plan
         if not plan or not plan.target_agents:
@@ -401,16 +471,30 @@ class OrchestratorAgent:
 
         valid_names = [n for n in plan.target_agents if n in self._agents]
 
+        # Derive the primary ticker from the tickers list (Option A)
+        primary_ticker = plan.tickers[0] if plan.tickers else None
+
+        # Build a single combined context string covering all queried companies
+        combined_context = _build_combined_company_context(
+            plan.tickers, state.company_context_blocks
+        )
+
         tasks = []
         for name in valid_names:
             agent_query = plan.per_agent_queries.get(name) or plan.query
             logger.info(
-                "_execute_node: dispatching '%s' with query='%.120s'",
+                "_execute_node: dispatching '%s' | ticker=%s | query='%.120s'",
                 name,
+                primary_ticker,
                 agent_query,
             )
             agent_input: BaseAgentInput = plan.model_copy(
-                update={"query": agent_query, "conversation_id": state.conversation_id}
+                update={
+                    "query": agent_query,
+                    "ticker": primary_ticker,
+                    "conversation_id": state.conversation_id,
+                    "company_context": combined_context,
+                }
             )
             tasks.append((name, self._agents[name].run(agent_input)))
 

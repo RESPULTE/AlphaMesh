@@ -613,9 +613,13 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         # ── Write analysis ────────────────────────────────────────────────────
         data_str = filtered_df.to_string(max_rows=30, float_format="%.4g")
+        company_context_section = (
+            f"\n{state.company_context}\n" if state.company_context else ""
+        )
         analysis_prompt = (
             f"Query: {state.query}\n\n"
-            f"Ticker: {state.ticker}\n\n"
+            f"Ticker: {state.ticker}\n"
+            f"{company_context_section}\n"
             f"Financial Data:\n{data_str}\n\n"
             f"Tool Results:\n{tool_summary or 'None'}"
         )
