@@ -23,6 +23,7 @@ class ServiceManager:
         self._user_context_service = None
         self._subgraph_store = None
         self._subgraph_service = None
+        self._ticker_validator = None
 
     def get_agent(self, temperature=0.0):
         """Initializes and returns the language model instance."""
@@ -134,7 +135,10 @@ class ServiceManager:
 
         if self._nodeset_manager is None:
             try:
-                self._nodeset_manager = NodeSetManager(self.get_neo4j_adapter())
+                self._nodeset_manager = NodeSetManager(
+                    neo4j_adapter=self.get_neo4j_adapter(),
+                    entity_chroma_adapter=self.get_entity_chroma_adapter(),
+                )
             except Exception as e:
                 print(f"Error initializing NodeSetManager: {e}")
                 raise
@@ -234,6 +238,28 @@ class ServiceManager:
                 semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
             )
         return self._subgraph_service
+
+    def get_ticker_validator(self):
+        from core.agents.ticker_validation import TickerValidator
+
+        if self._ticker_validator is None:
+            try:
+                self._ticker_validator = TickerValidator(
+                    neo4j_adapter=self.get_neo4j_adapter(),
+                    entity_chroma_adapter=self.get_entity_chroma_adapter(),
+                )
+            except Exception as e:
+                print(f"Error initializing TickerValidator: {e}")
+                raise
+        return self._ticker_validator
+
+    async def startup(self) -> None:
+        """
+        Run once at application startup before serving any requests.
+        Bootstraps the Market + Sector entity taxonomy in both stores
+        and initializes all default NodeSets.
+        """
+        await self.get_nodeset_manager().initialize_default_nodesets()
 
 
 service_manager = ServiceManager()
