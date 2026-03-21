@@ -131,6 +131,7 @@ class NewsAgentState(BaseModel):
     analysis: Optional[str] = None
     sources: List[CitedSource] = Field(default_factory=list)
     entities_enriched: List[EntityNode] = Field(default_factory=list)
+    company_context: Optional[str] = Field(default=None)
 
 
 class NewsAgentOutput(BaseAgentOutput):

@@ -31,6 +31,8 @@ import yfinance as yf
 from core.logger import get_logger
 from core.memory.graph.models import EntityNode
 from core.memory.graph.utils import canonical_entity_id
+from core.memory.stores.chroma_adapter import ChromaDBAdapter
+from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 logger = get_logger(__name__)
 
@@ -90,7 +92,9 @@ class TickerValidator:
     (Company → Industry → Sector) as a non-blocking background task.
     """
 
-    def __init__(self, neo4j_adapter, entity_chroma_adapter) -> None:
+    def __init__(
+        self, neo4j_adapter: Neo4jAdapter, entity_chroma_adapter: ChromaDBAdapter
+    ) -> None:
         self._neo4j = neo4j_adapter
         self._chroma = entity_chroma_adapter
         self._logger = get_logger(__name__)
@@ -98,69 +102,45 @@ class TickerValidator:
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def validate_and_enrich(self, tickers: List[str]) -> Dict[str, TickerInfo]:
-        """
-        Validate up to MAX_TICKERS tickers and enrich with yfinance data.
-
-        Returns a dict of {TICKER: TickerInfo}. Tickers beyond MAX_TICKERS
-        are silently dropped. All I/O is async-safe (to_thread wrapped).
-        """
         tickers = [t.upper().strip() for t in tickers[:MAX_TICKERS] if t.strip()]
         if not tickers:
             return {}
 
-        # ── Step 1: batch validate via fast_info ──────────────────────────────
+        # Single thread call — one HTTP session for validation + enrichment together
         results: Dict[str, TickerInfo] = await asyncio.to_thread(
-            self._batch_validate_sync, tickers
+            self._batch_validate_and_enrich_sync, tickers
         )
 
-        # ── Step 2: separate valid equities into new vs known ─────────────────
-        valid_equities = [
-            t
-            for t, info in results.items()
-            if info.is_valid and info.is_equity and not info.needs_confirmation
-        ]
-
-        new_tickers: List[str] = []
-        for t in valid_equities:
-            # TODO: swap for neo4j get_company_entity_by_ticker() to avoid
-            #       the yfinance .info network call for already-known companies.
+        # ── Check novelty and schedule taxonomy upsert for new companies ──────────
+        for t, info in results.items():
+            if not info.is_valid or not info.is_equity or info.needs_confirmation:
+                continue
             existing_id = await self._neo4j.entity_exists_by_ticker(t)
             if existing_id:
-                results[t].is_new = False
+                info.is_new = False
             else:
-                results[t].is_new = True
-                new_tickers.append(t)
-
-        # ── Step 3: batch-fetch full .info for ALL valid equities ─────────────
-        # New tickers: info used for context AND taxonomy upsert.
-        # Known tickers: info used only for context block (description preserved in graph).
-        if valid_equities:
-            enriched = await asyncio.to_thread(self._batch_enrich_sync, valid_equities)
-            for t, data in enriched.items():
-                if t in results:
-                    info = results[t]
-                    info.long_name = data.get("long_name", t)
-                    info.description = data.get("description", "")
-                    info.sector = data.get("sector", "")
-                    info.industry = data.get("industry", "")
-
-        # ── Step 4: background taxonomy upsert for new companies only ─────────
-        for t in new_tickers:
-            info = results[t]
-            if info.long_name:
-                asyncio.create_task(
-                    self._upsert_company_taxonomy(info),
-                    name=f"taxonomy_upsert_{t}",
-                )
+                info.is_new = True
+                if info.long_name:
+                    await asyncio.create_task(
+                        self._upsert_company_taxonomy(info),
+                        name=f"taxonomy_upsert_{t}",
+                    )
 
         return results
 
     # ── Sync helpers (executed in thread pool) ────────────────────────────────
 
-    def _batch_validate_sync(self, tickers: List[str]) -> Dict[str, TickerInfo]:
+    def _batch_validate_and_enrich_sync(
+        self, tickers: List[str]
+    ) -> Dict[str, TickerInfo]:
         """
-        Batch-validate tickers using yf.Tickers fast_info.
-        Falls back to yf.Lookup for tickers whose fast_info raises.
+        Single-pass validation and enrichment using one yf.Tickers batch session.
+
+        For each ticker:
+        1. fast_info determines validity and quote type (cheap, no full payload).
+        2. .info is fetched only for confirmed valid equities (longName, sector,
+            industry, longBusinessSummary).
+        3. Lookup fallback fires only when fast_info raises, keeping latency low.
         """
         results: Dict[str, TickerInfo] = {}
         try:
@@ -169,7 +149,11 @@ class TickerValidator:
             self._logger.error("yf.Tickers init failed: %s", exc)
             for t in tickers:
                 results[t] = TickerInfo(
-                    ticker=t, is_valid=False, is_equity=False, quote_type=None
+                    ticker=t,
+                    is_valid=False,
+                    is_equity=False,
+                    quote_type=None,
+                    needs_confirmation=True,
                 )
             return results
 
@@ -177,17 +161,22 @@ class TickerValidator:
             ticker_obj = batch.tickers.get(t)
             if ticker_obj is None:
                 results[t] = TickerInfo(
-                    ticker=t, is_valid=False, is_equity=False, quote_type=None
+                    ticker=t,
+                    is_valid=False,
+                    is_equity=False,
+                    quote_type=None,
+                    needs_confirmation=True,
                 )
                 continue
+
+            # ── Step 1: validate via fast_info ────────────────────────────────────
             try:
                 fi = ticker_obj.fast_info
                 quote_type: Optional[str] = getattr(fi, "quote_type", None)
                 is_valid = quote_type is not None
                 is_equity = str(quote_type or "").upper() in _EQUITY_QUOTE_TYPES
-                # Non-equity securities (ETF, MUTUALFUND, etc.) need confirmation
                 needs_confirmation = is_valid and not is_equity
-                results[t] = TickerInfo(
+                info_result = TickerInfo(
                     ticker=t,
                     is_valid=is_valid,
                     is_equity=is_equity,
@@ -195,7 +184,6 @@ class TickerValidator:
                     needs_confirmation=needs_confirmation,
                 )
             except Exception as exc:
-                # fast_info failed — ticker may be invalid or a company name
                 self._logger.warning(
                     "fast_info failed for '%s': %s — attempting Lookup fallback", t, exc
                 )
@@ -205,37 +193,37 @@ class TickerValidator:
                     is_valid=False,
                     is_equity=False,
                     quote_type=None,
-                    needs_confirmation=bool(suggestions),
+                    needs_confirmation=True,
                     suggestions=suggestions,
                 )
+                continue
+
+            # ── Step 2: enrich via .info (valid equities only) ────────────────────
+            if is_valid and is_equity:
+                try:
+                    info = ticker_obj.info or {}
+                    info_result.long_name = info.get("longName", t)
+                    info_result.description = info.get("longBusinessSummary", "")
+                    info_result.sector = info.get("sector", "")
+                    info_result.industry = info.get("industry", "")
+                except Exception as exc:
+                    self._logger.warning(
+                        ".info fetch failed for '%s': %s — proceeding without enrichment",
+                        t,
+                        exc,
+                    )
+                    # Ticker is still valid; enrichment failure is non-fatal.
+
+            results[t] = info_result
+
+            self._logger.info(
+                "_batch_validate_and_enrich_sync results: (%s) -> (%s)  -> (%s)",
+                info_result.sector,
+                info_result.industry,
+                info_result.ticker,
+            )
 
         return results
-
-    def _batch_enrich_sync(self, tickers: List[str]) -> Dict[str, dict]:
-        """Batch-fetch .info for a list of already-validated tickers."""
-        enriched: Dict[str, dict] = {}
-        try:
-            batch = yf.Tickers(" ".join(tickers))
-        except Exception as exc:
-            self._logger.error("yf.Tickers enrich init failed: %s", exc)
-            return enriched
-
-        for t in tickers:
-            ticker_obj = batch.tickers.get(t)
-            if ticker_obj is None:
-                continue
-            try:
-                info = ticker_obj.info or {}
-                enriched[t] = {
-                    "long_name": info.get("longName", t),
-                    "description": info.get("longBusinessSummary", ""),
-                    "sector": info.get("sector", ""),
-                    "industry": info.get("industry", ""),
-                }
-            except Exception as exc:
-                self._logger.warning(".info fetch failed for '%s': %s", t, exc)
-
-        return enriched
 
     def _lookup_sync(self, query: str) -> List[str]:
         """Use yf.Lookup as fallback to find ticker suggestions for ambiguous input."""

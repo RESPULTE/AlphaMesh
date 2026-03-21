@@ -55,16 +55,22 @@ def _build_clarification_message(needs_confirmation: Dict[str, "TickerInfo"]) ->
     """Format a user-facing message asking for ticker confirmation."""
     lines = ["Before proceeding, I want to confirm the securities you're asking about:"]
     for ticker, info in needs_confirmation.items():
-        if info.suggestions:
+        if not info.is_valid and info.suggestions:
             suggestions_str = ", ".join(f"**{s}**" for s in info.suggestions[:3])
             lines.append(
-                f"• **{ticker}** wasn't recognised as a ticker. "
-                f"Did you mean one of these? {suggestions_str}"
+                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
+                f"Did you mean one of: {suggestions_str}?"
+            )
+        elif not info.is_valid:
+            lines.append(
+                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
+                f"Please double-check the symbol and try again."
             )
         else:
+            # Valid but non-equity (ETF, MUTUALFUND, etc.)
             qt = info.quote_type or "unknown type"
             lines.append(
-                f"• **{ticker}** appears to be a `{qt}` (not a common equity). "
+                f"• **{ticker}** appears to be a `{qt}` rather than a common equity. "
                 f"Is this correct, or did you mean a different symbol?"
             )
     lines.append("\nPlease reply with the correct ticker symbol(s) and I'll proceed.")

@@ -17,9 +17,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
 
     agent = OrchestratorAgent()
     messages = [
-        HumanMessage(
-            content="I am interested in learning about AVICI's recent financial performance."
-        )
+        HumanMessage(content="I am interested in learning about APPLEWES's recent news")
     ]
 
     try:

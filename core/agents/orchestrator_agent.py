@@ -431,13 +431,15 @@ class OrchestratorAgent:
 
         # ── Check for tickers needing user confirmation ───────────────────────────
         needing_confirmation = {
-            t: info for t, info in results.items() if info.needs_confirmation
+            t: info
+            for t, info in results.items()
+            if info.needs_confirmation or not info.is_valid
         }
         if needing_confirmation:
             clarification = _build_clarification_message(needing_confirmation)
             updated_plan = plan.model_copy(update={"final_answer": clarification})
             logger.info(
-                "_validate_and_enrich_node: %d ticker(s) need confirmation: %s",
+                "_validate_and_enrich_node: %d ticker(s) need confirmation or are invalid: %s",
                 len(needing_confirmation),
                 list(needing_confirmation.keys()),
             )
