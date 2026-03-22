@@ -162,6 +162,19 @@ class OrchestratorState(BaseModel):
     fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)
     sources: List[CitedSource] = Field(default_factory=list)
 
+    turn_id: str = Field(
+        default="",
+        description="UUID generated once per run() call for turn-level provenance.",
+    )
+    ticker_metadata: Dict[str, dict] = Field(
+        default_factory=dict,
+        description=(
+            "Per-ticker enrichment from yfinance, keyed by ticker symbol. "
+            "Values: {long_name, sector, industry, description}. "
+            "Populated by _validate_and_enrich_node; current turn only."
+        ),
+    )
+
 
 class FinalResponse(BaseModel):
     model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)

@@ -1,48 +1,38 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.logger import get_logger
-from core.memory.graph.models import (
-    UserInvestmentInterestNode,
-    UserLearningInterestNode,
-)
 from core.memory.graph.nodeset_manager import NodeSetManager
-from core.memory.graph.utils import generate_uuid5
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
-_STATUS_RANK: Dict[str, int] = {
-    "Bought": 0,
-    "Interested": 1,
-    "Understood": 2,
-    "Confused": 3,
-    "Sold": 4,
-    "Avoids": 5,
-    "Not Interested": 6,
-}
-
-CACHE_MAX_INTERESTS = 10  # max entries kept per user in the in-process cache
+CACHE_MAX_INTERESTS = 20  # raised from 10 to accommodate domain-grouped entries
+_MAX_WEIGHT = 10.0  # normalization cap for score computation
 
 
 @dataclass
 class InterestCacheEntry:
+    """One user interest signal, ready for prompt injection and cache ranking."""
+
     kind: Literal["investment", "learning"]
-    node: Union[UserInvestmentInterestNode, UserLearningInterestNode]
-    target_names: List[str]
+    category: str  # domain category (sector name or concept category)
+    entity_name: str
+    entity_type: str
+    weight: float  # cumulative confidence weight from all reinforcing turns
+    status: Literal["Active", "Invalidated", "Paused"]
+    invalidated: bool
     cached_at: datetime
-    confidence: float = 0.5  # float throughout; no binary mapping
+    reason: Optional[str] = None  # excerpt from user message that created this
 
 
 class UserContext(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    investment_interests: List[UserInvestmentInterestNode] = Field(default_factory=list)
-    learning_interests: List[UserLearningInterestNode] = Field(default_factory=list)
+    model_config = ConfigDict(extra="ignore", arbitrary_types_allowed=True)
+    investment_entries: List[Any] = Field(default_factory=list)
+    learning_entries: List[Any] = Field(default_factory=list)
 
 
 class UserContextService:
@@ -59,144 +49,147 @@ class UserContextService:
     def _normalize_email(self, user_email: str) -> str:
         return str(user_email or "").strip().lower()
 
-    def _parse_dt(self, value: object) -> datetime:
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, (int, float)):
-            try:
-                return datetime.fromtimestamp(float(value), tz=timezone.utc)
-            except Exception:
-                return datetime.fromtimestamp(0, tz=timezone.utc)
-        if isinstance(value, str):
-            try:
-                return datetime.fromisoformat(value)
-            except ValueError:
-                pass
-        return datetime.fromtimestamp(0, tz=timezone.utc)
-
-    def _deterministic_id(
-        self, user_email: str, status: str, target_ids: List[str], interest_type: str
-    ) -> str:
-        normalized = self._normalize_email(user_email)
-        sorted_ids = sorted({tid for tid in target_ids if tid})
-        key = f"{normalized}|{status}|{interest_type}|{','.join(sorted_ids)}"
-        return generate_uuid5(key)
+    def _build_user_context(self, entries: List[InterestCacheEntry]) -> UserContext:
+        return UserContext(
+            investment_entries=[e for e in entries if e.kind == "investment"],
+            learning_entries=[e for e in entries if e.kind == "learning"],
+        )
 
     def _rank_and_cap(
         self, entries: List[InterestCacheEntry]
     ) -> List[InterestCacheEntry]:
         """
-        Composite score: 60% signal confidence + 40% recency (30-day linear decay).
-        High-confidence recent signals surface first.
+        Composite score: 60% normalized weight + 40% recency (30-day linear decay).
+        Invalidated entries are penalized (×0.3) but retained for context.
         """
         now_ts = datetime.now(timezone.utc).timestamp()
 
         def _score(e: InterestCacheEntry) -> float:
-            recency_ts = e.cached_at.timestamp() if e.cached_at else 0.0
-            age_days = max(0.0, (now_ts - recency_ts) / 86400.0)
+            age_days = max(0.0, (now_ts - e.cached_at.timestamp()) / 86400.0)
             recency_score = max(0.0, 1.0 - age_days / 30.0)
-            return 0.6 * e.confidence + 0.4 * recency_score
+            normalized_weight = min(1.0, e.weight / _MAX_WEIGHT)
+            base = 0.6 * normalized_weight + 0.4 * recency_score
+            return base * 0.3 if e.invalidated else base
 
         entries.sort(key=_score, reverse=True)
         return entries[:CACHE_MAX_INTERESTS]
 
-    def _build_user_context(self, entries: List[InterestCacheEntry]) -> UserContext:
-        """Reconstruct a UserContext from a (possibly truncated) entries list."""
-        return UserContext(
-            investment_interests=[e.node for e in entries if e.kind == "investment"],
-            learning_interests=[e.node for e in entries if e.kind == "learning"],
-        )
-
     async def load_for_user(self, user_email: str) -> UserContext:
+        """
+        Load interest data from Neo4j into the in-memory cache.
+        Traverses NodeSet → UserInterestDomain → UserInterestEdge → Entity.
+        Safe to call multiple times — returns cached result if already warm.
+        """
         normalized = self._normalize_email(user_email)
         if not normalized:
             return UserContext()
 
         cached = self._cache.get(normalized)
         if cached and "entries" in cached:
-            return self._build_user_context(cached["entries"])
+            return self._build_user_context(cached["entries"])  # type: ignore[arg-type]
 
-        await self._nodeset_manager.get_or_create_user_nodeset(normalized)
-
-        investment_rows, learning_rows = await asyncio.gather(
-            self._neo4j_adapter.get_user_investment_interests(normalized),
-            self._neo4j_adapter.get_user_learning_interests(normalized),
+        _, nodeset_id = await self._nodeset_manager.get_or_create_user_nodeset(
+            normalized
         )
+
+        rows = await self._neo4j_adapter.get_user_interest_data(normalized, nodeset_id)
 
         now = datetime.now(timezone.utc)
         entries: List[InterestCacheEntry] = []
-        target_names_lookup: Dict[str, List[str]] = {}
 
-        for row in investment_rows or []:
-            node_raw = row.get("node") if isinstance(row, dict) else None
-            props = dict(node_raw) if node_raw is not None else {}
-            targets = row.get("targets") if isinstance(row, dict) else []
-            target_ids = [t.get("id") for t in targets or [] if t and t.get("id")]
-            names = [t.get("name") for t in targets or [] if t and t.get("name")]
-            target_names_lookup[props.get("id", "")] = names
+        for row in rows or []:
+            d = dict(row.get("d") or {})
+            e = dict(row.get("e") or {})
+            entity = dict(row.get("entity") or {})
 
-            # Read confidence as float; guard against legacy "high"/"low" strings
-            raw_conf = props.get("confidence", 0.5)
-            if isinstance(raw_conf, str):
-                confidence_float = 0.8 if raw_conf == "high" else 0.4
-            else:
-                try:
-                    confidence_float = float(raw_conf)
-                except (TypeError, ValueError):
-                    confidence_float = 0.5
+            if not d or not e or not entity:
+                continue
 
-            node = UserInvestmentInterestNode(
-                id=str(props.get("id") or ""),
-                user_email=str(props.get("user_email") or normalized),
-                status=str(props.get("status") or ""),
-                reason=str(props.get("reason") or ""),
-                confidence=confidence_float,
-                updated_at=self._parse_dt(props.get("updated_at")),
-                target_entity_ids=target_ids,
-            )
             entries.append(
                 InterestCacheEntry(
-                    "investment",
-                    node,
-                    names,
+                    kind=d.get("domain_type", "investment"),
+                    category=d.get("category", "general"),
+                    entity_name=entity.get("name", ""),
+                    entity_type=entity.get("entity_type", ""),
+                    weight=float(e.get("weight", 0.0)),
+                    status=e.get("status", "Active"),
+                    invalidated=bool(e.get("invalidated", False)),
                     cached_at=now,
-                    confidence=confidence_float,
+                    reason=None,
                 )
             )
 
-        for row in learning_rows or []:
-            node_raw = row.get("node") if isinstance(row, dict) else None
-            props = dict(node_raw) if node_raw is not None else {}
-            targets = row.get("targets") if isinstance(row, dict) else []
-            target_ids = [t.get("id") for t in targets or [] if t and t.get("id")]
-            names = [t.get("name") for t in targets or [] if t and t.get("name")]
-            target_names_lookup[props.get("id", "")] = names
-            node = UserLearningInterestNode(
-                id=str(props.get("id") or ""),
-                user_email=str(props.get("user_email") or normalized),
-                status=str(props.get("status") or ""),
-                reason=str(props.get("reason") or ""),
-                updated_at=self._parse_dt(props.get("updated_at")),
-                target_entity_ids=target_ids,
-            )
-            # LearningInterestNode has no confidence field in schema; default 0.5
-            entries.append(
-                InterestCacheEntry(
-                    "learning", node, names, cached_at=now, confidence=0.5
-                )
-            )
+        ranked = self._rank_and_cap(entries)
+        self._cache[normalized] = {"entries": ranked, "loaded_at": now}
+        return self._build_user_context(ranked)
 
-        entries = self._rank_and_cap(entries)
-        self._cache[normalized] = {
-            "entries": entries,
-            "target_names": target_names_lookup,
-            "loaded_at": now,
+    def update_cache(
+        self,
+        new_entries: List[InterestCacheEntry],
+        user_email: str,
+    ) -> None:
+        """
+        Merge new interest entries into the in-memory cache without any graph write.
+        Graph persistence is fully delegated to write_user_signals → schedule().
+
+        Called immediately after schedule() dispatches the background graph task
+        so that get_formatted_context() in subsequent turns of the same session
+        reflects new signals without waiting for Neo4j.
+
+        Merge semantics:
+        - Reinforce: accumulate weight on existing entry.
+        - Invalidate: replace entry with invalidated=True version.
+        - New entity: insert fresh entry.
+        """
+        normalized = self._normalize_email(user_email)
+        if not normalized:
+            return
+
+        cached = self._cache.get(normalized)
+        existing: List[InterestCacheEntry] = (
+            list(cached["entries"])  # type: ignore[arg-type]
+            if cached and "entries" in cached
+            else []
+        )
+
+        # Key: (kind, category, entity_name) — uniquely identifies one interest edge
+        existing_map: Dict[tuple, InterestCacheEntry] = {
+            (e.kind, e.category, e.entity_name): e for e in existing
         }
-        return self._build_user_context(entries)
+
+        for new_entry in new_entries:
+            key = (new_entry.kind, new_entry.category, new_entry.entity_name)
+            existing_entry = existing_map.get(key)
+            if existing_entry:
+                if new_entry.invalidated:
+                    # Invalidation always wins — replace entirely
+                    existing_map[key] = new_entry
+                else:
+                    # Reinforce: accumulate weight, refresh timestamp
+                    existing_entry.weight += new_entry.weight
+                    existing_entry.status = new_entry.status
+                    existing_entry.cached_at = new_entry.cached_at
+                    if new_entry.reason:
+                        existing_entry.reason = new_entry.reason
+            else:
+                existing_map[key] = new_entry
+
+        merged = self._rank_and_cap(list(existing_map.values()))
+        self._cache[normalized] = {
+            "entries": merged,
+            "loaded_at": datetime.now(timezone.utc),
+        }
 
     def get_formatted_context(
         self, user_email: Optional[str], limit: int = CACHE_MAX_INTERESTS
     ) -> str:
+        """
+        Format cached interest data into a structured block for LLM prompt injection.
+
+        Groups active entries by domain category. Invalidated entries are listed
+        separately with a directive to only surface them when highly relevant
+        and to ask the user before doing so.
+        """
         if not user_email:
             return "USER CONTEXT: None"
         normalized = self._normalize_email(user_email)
@@ -204,125 +197,70 @@ class UserContextService:
         if not cached or "entries" not in cached:
             return "USER CONTEXT: None"
 
-        entries: List[InterestCacheEntry] = cached["entries"][:limit]
+        entries: List[InterestCacheEntry] = list(cached["entries"])[:limit]  # type: ignore[arg-type]
         if not entries:
             return "USER CONTEXT: None"
+
+        def _format_section(
+            kind_entries: List[InterestCacheEntry],
+            section_title: str,
+        ) -> str:
+            if not kind_entries:
+                return ""
+
+            active = [e for e in kind_entries if not e.invalidated]
+            invalidated = [e for e in kind_entries if e.invalidated]
+            lines = [section_title]
+
+            # Group active by category
+            from collections import defaultdict
+
+            by_category: Dict[str, List[InterestCacheEntry]] = defaultdict(list)
+            for e in active:
+                by_category[e.category].append(e)
+
+            for category, cat_entries in sorted(by_category.items()):
+                total_weight = sum(e.weight for e in cat_entries)
+                lines.append(
+                    f"\n{category.replace('_', ' ').title()} "
+                    f"(total weight: {total_weight:.1f}):"
+                )
+                for e in sorted(cat_entries, key=lambda x: x.weight, reverse=True):
+                    reason_tail = f" — {e.reason[:80]}" if e.reason else ""
+                    lines.append(
+                        f"  • {e.entity_name} [{e.status}, weight={e.weight:.1f}]"
+                        f"{reason_tail}"
+                    )
+
+            if invalidated:
+                lines.append(
+                    "\n[Previously invalidated — surface ONLY if highly relevant. "
+                    "If you reference these, first ask the user whether they would "
+                    "like to continue with this topic:]"
+                )
+                for e in sorted(invalidated, key=lambda x: x.weight, reverse=True):
+                    lines.append(
+                        f"  • {e.entity_name} "
+                        f"[weight={e.weight:.1f} before invalidation, {e.category}]"
+                    )
+
+            return "\n".join(lines)
 
         investment_entries = [e for e in entries if e.kind == "investment"]
         learning_entries = [e for e in entries if e.kind == "learning"]
 
-        blocks: List[str] = []
+        blocks = []
+        inv = _format_section(investment_entries, "USER INVESTMENT PROFILE:")
+        if inv:
+            blocks.append(inv)
+        learn = _format_section(learning_entries, "USER LEARNING PROFILE:")
+        if learn:
+            blocks.append(learn)
 
-        if investment_entries:
-            lines = []
-            for idx, entry in enumerate(investment_entries, start=1):
-                target_str = (
-                    ", ".join(entry.target_names)
-                    if entry.target_names
-                    else ", ".join(entry.node.target_entity_ids) or "(unknown target)"
-                )
-                reason = entry.node.reason.strip() if entry.node.reason else ""
-                tail = f" - {reason}" if reason else ""
-                cached_ts = (
-                    entry.cached_at.strftime("%Y-%m-%d %H:%M UTC")
-                    if entry.cached_at
-                    else "unknown"
-                )
-                lines.append(
-                    f"{idx}. [{entry.node.status}] {target_str}{tail}  (cached {cached_ts})"
-                )
-            blocks.append("USER INVESTMENT PROFILE:\n" + "\n".join(lines))
-
-        if learning_entries:
-            lines = []
-            for idx, entry in enumerate(learning_entries, start=1):
-                target_str = (
-                    ", ".join(entry.target_names)
-                    if entry.target_names
-                    else ", ".join(entry.node.target_entity_ids) or "(unknown target)"
-                )
-                reason = entry.node.reason.strip() if entry.node.reason else ""
-                tail = f" - {reason}" if reason else ""
-                cached_ts = (
-                    entry.cached_at.strftime("%Y-%m-%d %H:%M UTC")
-                    if entry.cached_at
-                    else "unknown"
-                )
-                lines.append(
-                    f"{idx}. [{entry.node.status}] {target_str}{tail}  (cached {cached_ts})"
-                )
-            blocks.append("USER LEARNING PROFILE:\n" + "\n".join(lines))
-
-        return "\n\n".join(blocks)
-
-    async def schedule_upsert(
-        self,
-        interest_node: Any,
-        user_email: str,
-    ) -> None:
-        normalized = self._normalize_email(user_email)
-        if not normalized:
-            return
-
-        try:
-            _, nodeset_id = await self._nodeset_manager.get_or_create_user_nodeset(
-                normalized
-            )
-            node_type = interest_node.__class__.__name__
-
-            interest_node.id = self._deterministic_id(
-                normalized,
-                getattr(interest_node, "status", ""),
-                getattr(interest_node, "target_entity_ids", []),
-                node_type,
-            )
-            interest_node.user_email = normalized
-            await self._neo4j_adapter.upsert_user_connected_nodes(
-                interest_node, nodeset_id
-            )
-
-            now = datetime.now(timezone.utc)
-            kind: Literal["investment", "learning"] = (
-                "investment"
-                if isinstance(interest_node, UserInvestmentInterestNode)
-                else "learning"
-            )
-            confidence_float = float(getattr(interest_node, "confidence", 0.5))
-
-            new_entry = InterestCacheEntry(
-                kind=kind,
-                node=interest_node,
-                target_names=[],
-                cached_at=now,
-                confidence=confidence_float,
-            )
-            cached = self._cache.get(normalized)
-            if cached and "entries" in cached:
-                existing: List[InterestCacheEntry] = cached["entries"]
-                existing = [e for e in existing if e.node.id != interest_node.id]
-                existing.append(new_entry)
-                self._cache[normalized]["entries"] = self._rank_and_cap(existing)
-        except Exception:
-            self._logger.exception(
-                "UserContextService.schedule_upsert failed for user %s", user_email
-            )
+        return "\n\n".join(blocks) if blocks else "USER CONTEXT: None"
 
     def invalidate(self, user_email: str) -> None:
+        """Evict a user's cache entry (e.g. on explicit session reset)."""
         normalized = self._normalize_email(user_email)
         if normalized in self._cache:
             del self._cache[normalized]
-
-    def schedule_upsert_fire_and_forget(
-        self,
-        interest_node: Any,
-        user_email: str,
-    ) -> None:
-        async def _run():
-            try:
-                await self.schedule_upsert(interest_node, user_email)
-            except Exception:
-                self._logger.exception(
-                    "UserContextService.schedule_upsert failed for user %s", user_email
-                )
-
-        asyncio.create_task(_run())

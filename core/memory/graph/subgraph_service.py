@@ -142,27 +142,36 @@ class SubgraphExtractionService:
     ) -> nx.DiGraph:
         """
         Deduplicate entity names (fuzzy then semantic) and build an nx.DiGraph.
-        No LLM calls, no I/O.  Idempotent — safe to call multiple times.
 
-        Each relationship dict may carry optional `from_node_props` / `to_node_props`
-        dicts with extra entity attributes (e.g. ticker, description sourced from
-        yfinance).  These are attached as `node_props` on the nx node and forwarded
-        to _resolve_entity during persistence, so canonical attributes survive the
-        full dedup pipeline.
+        User-scoped node types (UserInterestDomain, UserInterestEdge, TurnNode)
+        bypass fuzzy/semantic dedup entirely — their names are deterministic UUIDs
+        which are canonical by construction and must not be fuzzy-matched against
+        domain entity names.
+
+        Each relationship dict may carry optional from_node_props / to_node_props
+        with extra attributes forwarded to _resolve_entity / _resolve_user_node
+        during persistence.
         """
+        from core.memory.graph.models import _USER_SCOPED_TYPES
+
         graph = nx.DiGraph()
         if not relationships:
             return graph
 
-        # Collect all entity (name, type) pairs
+        # ── Separate user-scoped entities from domain entities ────────────────────
         entities: List[Tuple[str, str]] = []
+        user_scoped_pairs: List[Tuple[str, str]] = []
+
         for rel in relationships:
             for key in ("from_name", "to_name"):
                 name = str(rel.get(key, "") or "").strip()
-                type_ = str(
-                    rel.get("from_type" if key == "from_name" else "to_type", "") or ""
-                ).strip()
-                if name and type_:
+                type_key = "from_type" if key == "from_name" else "to_type"
+                type_ = str(rel.get(type_key, "") or "").strip()
+                if not name or not type_:
+                    continue
+                if type_ in _USER_SCOPED_TYPES:
+                    user_scoped_pairs.append((name, type_))
+                else:
                     entities.append((name, type_))
 
         alias_to_canon = dict(self._entity_name_cache)
@@ -172,6 +181,11 @@ class SubgraphExtractionService:
             if canon not in canonical_by_type[entity_type]:
                 canonical_by_type[entity_type].append(canon)
 
+        # Pre-populate alias map for user-scoped types — name maps to itself
+        for name, type_ in user_scoped_pairs:
+            alias_to_canon[(name.lower(), type_)] = name
+
+        # ── Fuzzy + semantic dedup for domain entities only ───────────────────────
         unresolved: List[Tuple[str, str]] = []
         for name, entity_type in entities:
             key = (name.lower(), entity_type)
@@ -227,6 +241,7 @@ class SubgraphExtractionService:
 
         self._entity_name_cache = alias_to_canon
 
+        # ── Build nx.DiGraph ──────────────────────────────────────────────────────
         for rel in relationships:
             from_name_raw = str(rel.get("from_name", "") or "").strip()
             to_name_raw = str(rel.get("to_name", "") or "").strip()
@@ -244,10 +259,6 @@ class SubgraphExtractionService:
             from_node_props = rel.get("from_node_props") or {}
             to_node_props = rel.get("to_node_props") or {}
 
-            # Add nodes — preserve existing non-empty node_props on subsequent
-            # encounters of the same entity (e.g. Sector appears as both `to` in
-            # Industry→Sector and `from` in Sector→Market; props from either pass
-            # should not clobber each other).
             if from_id not in graph:
                 graph.add_node(
                     from_id,
@@ -283,25 +294,6 @@ class SubgraphExtractionService:
             graph.add_edge(from_id, to_id, **edge_attrs)
 
         return graph
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 3. Persistence
-    # ──────────────────────────────────────────────────────────────────────────
-
-    async def persist_graph(self, graph: nx.DiGraph, *, conversation_id: str) -> None:
-        """Write the graph to Neo4j via the ingestor. No-ops on empty graph."""
-        if graph is None or graph.number_of_edges() == 0:
-            return
-        await self._ingestor._upsert_graph_to_neo4j(graph, conversation_id)
-        logger.debug(
-            "persist_graph: wrote %d edges for conversation '%s'",
-            graph.number_of_edges(),
-            conversation_id,
-        )
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 4. Fire-and-forget scheduling — single entry point for all agents
-    # ──────────────────────────────────────────────────────────────────────────
 
     async def schedule(
         self,
@@ -365,3 +357,14 @@ class SubgraphExtractionService:
             await task
 
         return subgraph_id
+
+    async def persist_graph(self, graph: nx.DiGraph, *, conversation_id: str) -> None:
+        """Write the graph to Neo4j via the ingestor. No-ops on empty graph."""
+        if graph is None or graph.number_of_edges() == 0:
+            return
+        await self._ingestor._upsert_graph_to_neo4j(graph, conversation_id)
+        logger.debug(
+            "persist_graph: wrote %d edges for conversation '%s'",
+            graph.number_of_edges(),
+            conversation_id,
+        )

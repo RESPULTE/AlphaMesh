@@ -156,22 +156,19 @@ class DualStoreIngestor:
     # ─────────────────────────────────────────────────────────────────────────
     # Public: graph write-back
     # ─────────────────────────────────────────────────────────────────────────
-
     async def _upsert_graph_to_neo4j(
         self, graph: nx.DiGraph, conversation_id: str
     ) -> None:
         """
         Persist a relationship subgraph to Neo4j.
 
-        Entity resolution and edge writes are parallelised:
-        Phase 1 — resolve all unique entity IDs concurrently.
-        Phase 2 — write all relationship edges concurrently.
-
-        node_props carried on each nx node (set by build_graph from the
-        `from_node_props`/`to_node_props` fields in the relationship dicts)
-        are forwarded to _resolve_entity as `raw`, so yfinance-sourced
-        attributes (ticker, description) survive the full dedup pipeline.
+        Phase 1: resolve all unique entities concurrently.
+                Domain entities → _resolve_entity (fuzzy+semantic dedup).
+                User-scoped nodes → _resolve_user_node (deterministic, no dedup).
+        Phase 2: write all relationship edges concurrently.
         """
+        from core.memory.graph.models import _USER_SCOPED_TYPES
+
         if graph is None or graph.number_of_edges() == 0:
             return
 
@@ -185,32 +182,42 @@ class DualStoreIngestor:
                     conversation_id,
                 )
 
-        # ── Phase 1: resolve all unique entities concurrently ─────────────────
+        # ── Phase 1: resolve all unique entities ──────────────────────────────────
         entity_cache: Dict[Tuple[str, str], str] = {}
 
-        # Build a deduped map of (name, type) → node_props so that if the same
-        # entity appears under multiple node_ids, its enriched props are preserved.
         unique_entities: Dict[Tuple[str, str], dict] = {}
         for node_id in graph.nodes:
             node_data = graph.nodes[node_id]
-            name = normalize_entity_name(node_data.get("name"))
-            etype = normalize_entity_type(node_data.get("entity_type"))
-            if name and etype:
-                existing_props = unique_entities.get((name, etype), {})
-                incoming_props = node_data.get("node_props") or {}
-                # Keep whichever props dict is richer (non-empty wins over empty)
-                unique_entities[(name, etype)] = (
-                    incoming_props if incoming_props else existing_props
-                )
+            name = (node_data.get("name") or "").strip()
+            raw_etype = (node_data.get("entity_type") or "").strip()
+            if not name or not raw_etype:
+                continue
 
-        async def _resolve_safe(name: str, etype: str, node_props: dict) -> None:
+            if raw_etype in _USER_SCOPED_TYPES:
+                etype = raw_etype  # no normalization for user-scoped types
+            else:
+                etype = normalize_entity_type(raw_etype)
+                if not etype:
+                    continue
+
+            key = (name, etype)
+            incoming_props = node_data.get("node_props") or {}
+            existing_props = unique_entities.get(key, {})
+            unique_entities[key] = incoming_props if incoming_props else existing_props
+
+        async def _resolve_safe(name: str, etype: str, props: dict) -> None:
             try:
-                await self._resolve_entity(
-                    name, etype, entity_cache, raw=node_props or None
-                )
+                if etype in _USER_SCOPED_TYPES:
+                    await self._resolve_user_node(
+                        name, etype, entity_cache, node_props=props
+                    )
+                else:
+                    await self._resolve_entity(
+                        name, etype, entity_cache, raw=props or None
+                    )
             except Exception:
                 self._logger.exception(
-                    "_upsert_graph_to_neo4j: entity resolution failed for '%s' (%s)",
+                    "_upsert_graph_to_neo4j: resolution failed for '%s' (%s)",
                     name,
                     etype,
                 )
@@ -222,14 +229,28 @@ class DualStoreIngestor:
             ]
         )
 
-        # ── Phase 2: write all edges concurrently ─────────────────────────────
+        # ── Phase 2: write all edges ──────────────────────────────────────────────
         async def _write_edge(source_id: str, target_id: str, attrs: dict) -> None:
             source_node = graph.nodes.get(source_id, {})
             target_node = graph.nodes.get(target_id, {})
+
             from_name = normalize_entity_name(source_node.get("name"))
             to_name = normalize_entity_name(target_node.get("name"))
-            from_type = normalize_entity_type(source_node.get("entity_type"))
-            to_type = normalize_entity_type(target_node.get("entity_type"))
+
+            raw_from_type = (source_node.get("entity_type") or "").strip()
+            raw_to_type = (target_node.get("entity_type") or "").strip()
+
+            # User-scoped types bypass normalize_entity_type validation
+            from_type = (
+                raw_from_type
+                if raw_from_type in _USER_SCOPED_TYPES
+                else normalize_entity_type(raw_from_type)
+            )
+            to_type = (
+                raw_to_type
+                if raw_to_type in _USER_SCOPED_TYPES
+                else normalize_entity_type(raw_to_type)
+            )
 
             if not from_name or not to_name or not from_type or not to_type:
                 return
@@ -727,3 +748,61 @@ class DualStoreIngestor:
         if source_agent:
             props["source_agent"] = source_agent
         return props
+
+    async def _resolve_user_node(
+        self,
+        name: str,
+        entity_type: str,
+        entity_cache: Dict[Tuple[str, str], str],
+        node_props: dict,
+    ) -> Optional[str]:
+        """
+        Persist a user-scoped node (UserInterestDomain, UserInterestEdge, TurnNode).
+
+        Unlike _resolve_entity, this path:
+        - Does not run fuzzy/semantic dedup (IDs are deterministic UUIDs).
+        - Does not write to Chroma (user nodes are not semantically retrieved).
+        - Delegates each type to a specialised Neo4j merge method.
+        - Handles BELONGS_TO_NODESET assignment for UserInterestDomain nodes.
+        """
+        key = entity_key(name, entity_type)
+        if key in entity_cache:
+            return entity_cache[key]
+
+        node_id: Optional[str] = None
+
+        if entity_type == "UserInterestDomain":
+            node_id = node_props.get("id") or name
+            await self._neo4j_adapter.merge_user_interest_domain(
+                domain_id=node_id,
+                props=node_props,
+            )
+            # Attach to user NodeSet (Q3: side-effect inside resolve, Option A)
+            nodeset_id = node_props.get("nodeset_id")
+            if nodeset_id:
+                await self._nodeset_manager.assign_to_node(
+                    node_id, "UserInterestDomain", nodeset_id
+                )
+
+        elif entity_type == "UserInterestEdge":
+            node_id = node_props.get("id") or name
+            operation = node_props.get("operation", "reinforce")
+            weight_delta = float(node_props.get("weight_delta", 1.0))
+            await self._neo4j_adapter.merge_user_interest_edge(
+                edge_id=node_id,
+                props=node_props,
+                operation=operation,
+                weight_delta=weight_delta,
+            )
+
+        elif entity_type == "TurnNode":
+            node_id = node_props.get("id") or name
+            await self._neo4j_adapter.merge_turn_node(
+                turn_id=node_id,
+                props=node_props,
+            )
+
+        if node_id:
+            entity_cache[key] = node_id
+
+        return node_id

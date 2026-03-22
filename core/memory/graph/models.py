@@ -53,6 +53,10 @@ ALLOWED_RELATIONSHIP_TYPES = [
     "ACQUIRED_BY",
     "RELATED_TO",
     "BELONGS_TO",
+    "HAS_INTEREST_IN",
+    "TARGETS",
+    "SOURCED_FROM",
+    "INVALIDATED_BY",
 ]
 
 # ── RelationshipType literal: add BELONGS_TO ─────────────────────────────────
@@ -66,6 +70,10 @@ RelationshipType = Literal[
     "MITIGATES",
     "COMPETES_WITH",
     "ACQUIRED_BY",
+    "HAS_INTEREST_IN",
+    "TARGETS",
+    "SOURCED_FROM",
+    "INVALIDATED_BY",
     "REPORTED_BY",
     "RELATED_TO",
     "BELONGS_TO",
@@ -94,6 +102,60 @@ _ENTITY_TYPE_WEIGHTS: dict[str, float] = {
     "Sector": 0.45,
     "Market": 0.30,
 }
+
+# ── User-scoped node types: bypass fuzzy/semantic dedup in build_graph ─────────
+_USER_SCOPED_TYPES = frozenset(
+    {
+        "UserInterestDomain",
+        "UserInterestEdge",
+        "TurnNode",
+    }
+)
+
+# ── New models ─────────────────────────────────────────────────────────────────
+
+
+class UserInterestDomain(BaseModel):
+    """Semantic grouping node anchoring a user's interests by category."""
+
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    user_email: str
+    domain_type: Literal["investment", "learning"]
+    category: str  # sector name for investment; concept category for learning
+    created_at: datetime
+
+
+class UserInterestEdge(BaseModel):
+    """
+    Reified edge tracking a user's interest in a specific entity.
+    Acts as a first-class node to carry provenance, weight, and status.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    user_email: str
+    domain_type: Literal["investment", "learning"]
+    category: str
+    entity_id: str  # resolved UUID of the target entity
+    weight: float = 0.0  # cumulative confidence signal; incremented on reinforce
+    status: Literal["Active", "Invalidated", "Paused"] = "Active"
+    invalidated: bool = False
+    created_at: datetime
+    last_updated_at: datetime
+
+
+class TurnNode(BaseModel):
+    """
+    Represents a single conversation turn for full provenance tracking.
+    UserInterestEdge nodes link to TurnNodes via SOURCED_FROM / INVALIDATED_BY.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    id: str  # turn_id (uuid4 per OrchestratorAgent.run() call)
+    conversation_id: str
+    user_message_excerpt: str  # first 200 chars of user message
+    created_at: datetime
 
 
 class DocumentMetadata(BaseModel):

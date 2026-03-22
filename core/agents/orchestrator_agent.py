@@ -39,6 +39,7 @@ import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -217,11 +218,15 @@ class OrchestratorAgent:
                     "run: failed to read user context from cache for %s", user_email
                 )
 
+        turn_id = str(uuid4())
+        logger.info("run: turn_id=%s", turn_id)
+
         initial_state = OrchestratorState(
             messages=messages,
             conversation_id=conversation_id,
             user_email=user_email,
             user_context_block=user_context_block,
+            turn_id=turn_id,
         )
         try:
             raw = await self._graph.ainvoke(initial_state)
@@ -459,7 +464,21 @@ class OrchestratorAgent:
             len(tickers),
             list(company_context_blocks.keys()),
         )
-        return {"company_context_blocks": company_context_blocks}
+
+        ticker_metadata: Dict[str, dict] = {}
+        for t, info in results.items():
+            if info.is_valid and info.is_equity:
+                ticker_metadata[t] = {
+                    "long_name": info.long_name,
+                    "sector": info.sector,
+                    "industry": info.industry,
+                    "description": info.description,
+                }
+
+        return {
+            "company_context_blocks": company_context_blocks,
+            "ticker_metadata": ticker_metadata,
+        }
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
         """
@@ -618,6 +637,8 @@ class OrchestratorAgent:
             payload = build_signal_payload(
                 user_email=state.user_email,
                 conversation_id=state.conversation_id,
+                turn_id=state.turn_id,  # ← ADD
+                ticker_metadata=state.ticker_metadata,  # ← ADD
                 user_message=user_message,
                 detected_investment_signals=state.plan.detected_investment_signals
                 or [],

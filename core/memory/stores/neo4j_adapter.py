@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -374,5 +375,113 @@ class Neo4jAdapter:
                 "props": props,
                 "nodeset_id": nodeset_id,
                 "target_ids": getattr(node, "target_entity_ids", []) or [],
+            },
+        )
+
+    async def merge_user_interest_domain(self, domain_id: str, props: dict) -> None:
+        """
+        Merge a UserInterestDomain node.
+        ON CREATE: full props written.
+        ON MATCH:  only last_seen_at updated — category and domain_type are immutable.
+        """
+        cypher = (
+            "MERGE (d:UserInterestDomain {id: $id}) "
+            "ON CREATE SET d += $props "
+            "ON MATCH SET d.last_seen_at = $now"
+        )
+        clean = {k: v for k, v in props.items() if k != "nodeset_id"}
+        await self._execute_write(
+            cypher,
+            {
+                "id": domain_id,
+                "props": clean,
+                "now": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    async def merge_user_interest_edge(
+        self,
+        edge_id: str,
+        props: dict,
+        operation: str,
+        weight_delta: float,
+    ) -> None:
+        """
+        Merge a UserInterestEdge with operation-specific MATCH behaviour.
+
+        operation="reinforce": increments weight, ensures Active status (unless
+                            already invalidated by user — in that case status
+                            is left alone so invalidation is not silently reversed).
+        operation="invalidate": sets invalidated=True and status=Invalidated.
+        """
+        if operation == "reinforce":
+            cypher = (
+                "MERGE (e:UserInterestEdge {id: $id}) "
+                "ON CREATE SET e += $props, e.weight = $weight_delta, "
+                "              e.status = 'Active', e.invalidated = false "
+                "ON MATCH SET  e.weight = e.weight + $weight_delta, "
+                "              e.last_updated_at = $now, "
+                "              e.status = CASE WHEN e.invalidated THEN e.status "
+                "                              ELSE 'Active' END"
+            )
+        else:  # invalidate
+            cypher = (
+                "MERGE (e:UserInterestEdge {id: $id}) "
+                "ON CREATE SET e += $props, e.weight = 0.0, "
+                "              e.status = 'Invalidated', e.invalidated = true "
+                "ON MATCH SET  e.status = 'Invalidated', e.invalidated = true, "
+                "              e.last_updated_at = $now"
+            )
+        clean_props = {
+            k: v for k, v in props.items() if k not in ("weight_delta", "operation")
+        }
+        await self._execute_write(
+            cypher,
+            {
+                "id": edge_id,
+                "props": clean_props,
+                "weight_delta": weight_delta,
+                "now": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    async def merge_turn_node(self, turn_id: str, props: dict) -> None:
+        """
+        Merge a TurnNode. Idempotent — the same turn may source multiple edges
+        so this is called once per turn per signal, not per relationship.
+        """
+        cypher = "MERGE (t:TurnNode {id: $id}) " "ON CREATE SET t += $props"
+        await self._execute_write(cypher, {"id": turn_id, "props": props})
+
+    async def get_entity_category(self, entity_id: str) -> Optional[str]:
+        """Return the category field of an entity (used for FinancialConcept category)."""
+        cypher = "MATCH (e:Entity {id: $id}) " "RETURN e.category AS category LIMIT 1"
+        records = await self._execute_read(cypher, {"id": entity_id})
+        return records[0].get("category") if records else None
+
+    async def get_user_interest_data(
+        self, user_email: str, nodeset_id: str
+    ) -> List[dict]:
+        """
+        Full 3-hop read: NodeSet → Domain → Edge → Entity + provenance turns.
+        Returns all edges including invalidated ones; caller filters as needed.
+        """
+        cypher = (
+            "MATCH (ns:NodeSet {id: $nodeset_id})"
+            "<-[:BELONGS_TO_NODESET]-(d:UserInterestDomain {user_email: $user_email})"
+            "-[:HAS_INTEREST_IN]->(e:UserInterestEdge)"
+            "-[:TARGETS]->(entity:Entity) "
+            "OPTIONAL MATCH (e)-[:SOURCED_FROM]->(t:TurnNode) "
+            "OPTIONAL MATCH (e)-[:INVALIDATED_BY]->(it:TurnNode) "
+            "RETURN d, e, entity, "
+            "       collect(DISTINCT t)  AS source_turns, "
+            "       collect(DISTINCT it) AS invalidating_turns "
+            "ORDER BY d.category ASC, e.weight DESC"
+        )
+        return await self._execute_read(
+            cypher,
+            {
+                "nodeset_id": nodeset_id,
+                "user_email": user_email,
             },
         )
