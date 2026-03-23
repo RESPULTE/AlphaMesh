@@ -168,7 +168,6 @@ class ServiceManager:
                 raise
         return self._entity_resolver
 
-
     def get_relationship_extractor(self):
         from core.memory.graph.relationship_extractor import RelationshipExtractor
 
@@ -262,8 +261,6 @@ class ServiceManager:
                 raise
         return self._user_context_service
 
-    # â”€â”€ UPDATED: SubgraphExtractionService shim â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
     def get_subgraph_service(self):
         from core.memory.graph.subgraph_service import SubgraphExtractionService
 
@@ -308,5 +305,3 @@ class ServiceManager:
 
 
 service_manager = ServiceManager()
-
-

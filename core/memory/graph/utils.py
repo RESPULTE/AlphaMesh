@@ -8,10 +8,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
-from langchain_core.messages import BaseMessage
-from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
 
-from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.models import (
     ALLOWED_ENTITY_TYPES,
@@ -120,31 +117,3 @@ def parse_relationships_block(raw: str) -> Optional[List[dict]]:
     if not isinstance(relationships, list):
         return None
     return relationships
-
-
-async def extract_with_retry(
-    llm,
-    prompt_messages: List[BaseMessage],
-    max_attempts: int = settings.EXTRACTION_LLM_RETRY_ATTEMPTS,
-) -> ExtractionResult:
-    async for attempt in AsyncRetrying(
-        stop=stop_after_attempt(max_attempts),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        reraise=True,
-    ):
-        with attempt:
-            response = await llm.ainvoke(prompt_messages)
-            analysis_text, relationships = parse_xml_blocks(response.content)
-            if relationships is None:
-                return ExtractionResult(
-                    analysis=analysis_text,
-                    relationships=[],
-                    parse_success=False,
-                )
-            return ExtractionResult(
-                analysis=analysis_text,
-                relationships=relationships,
-                parse_success=True,
-            )
-
-    return ExtractionResult(analysis="", relationships=[], parse_success=False)

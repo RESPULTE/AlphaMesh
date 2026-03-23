@@ -22,7 +22,6 @@ Changes in this revision
    passes) + 1 analyst call = 2 LLM calls for the happy path.
 
 3. Relationship extraction removed from the _analyst_node critical path.
-   The blocking extract_with_retry call (1–4s, potentially retried) is gone.
    schedule_subgraph_extraction is called with relationships=[] and
    relationships_extracted=False, which routes to the background
    retry_relationships_only path using analysis_text as input.

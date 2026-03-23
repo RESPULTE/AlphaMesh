@@ -37,9 +37,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Type
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.models.base_agent_models import BaseAgentInput
@@ -54,6 +55,7 @@ from core.agents.prompts.news_agent_prompts import (
 )
 from core.config import settings
 from core.logger import get_logger
+from core.memory.graph.utils import ExtractionResult, parse_xml_blocks
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
@@ -465,7 +467,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         final_ranked = service_manager.get_reranker().rank(final_chunks)
 
-        # Extract entities only from the reranked set � chunks that actually
+        # Extract entities only from the reranked set � chunks that actually
         # contributed to this query. Fire-and-forget: extraction enriches the
         # graph for future retrieval but does not affect the current analysis.
         # Memory chunks already marked EXTRACTED are skipped by the idempotency
@@ -484,7 +486,6 @@ class NewsAnalysisAgent(AbstractAgent):
                 await task
 
         return {"final_chunks": final_ranked}
-
 
     # ── Node: analyse_news ────────────────────────────────────────────────────
 
@@ -621,4 +622,29 @@ class NewsAnalysisAgent(AbstractAgent):
         }
 
 
+async def extract_with_retry(
+    llm,
+    prompt_messages: List[BaseMessage],
+    max_attempts: int = settings.EXTRACTION_LLM_RETRY_ATTEMPTS,
+) -> ExtractionResult:
+    async for attempt in AsyncRetrying(
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True,
+    ):
+        with attempt:
+            response = await llm.ainvoke(prompt_messages)
+            analysis_text, relationships = parse_xml_blocks(response.content)
+            if relationships is None:
+                return ExtractionResult(
+                    analysis=analysis_text,
+                    relationships=[],
+                    parse_success=False,
+                )
+            return ExtractionResult(
+                analysis=analysis_text,
+                relationships=relationships,
+                parse_success=True,
+            )
 
+    return ExtractionResult(analysis="", relationships=[], parse_success=False)
