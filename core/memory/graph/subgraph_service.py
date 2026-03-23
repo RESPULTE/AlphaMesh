@@ -62,7 +62,7 @@ class SubgraphExtractionService:
         """
         Schedule a graph write.  Preserves the original schedule() contract:
           - Returns a task_id string for tracing (replaces the old subgraph_id).
-          - bypass_guards=True â†’ write_immediate (taxonomy / user signals bypass).
+          - bypass_guards=True â†’ enqueue(immediate=True) (taxonomy / user signals bypass).
           - relationships=None + llm provided â†’ LLM extraction before enqueue.
           - relationships=[] â†’ no-op (nothing to write).
           - EXTRACTION_ENABLED=False and no bypass â†’ no-op.
@@ -92,12 +92,15 @@ class SubgraphExtractionService:
         task_id = str(uuid4())
 
         if bypass_guards:
-            # System tasks bypass the queue â€” direct write
-            await self._queue_manager.write_immediate(
-                relationships=relationships,
+            # System tasks request immediate processing
+            task = GraphTask(
+                task_id=task_id,
+                turn_id=conversation_id or "system",
                 conversation_id=conversation_id or "system",
                 source_agent=agent_name,
+                relationships=relationships,
             )
+            await self._queue_manager.enqueue(task, immediate=True)
             return task_id
 
         # Normal path â€” enqueue for batched processing
@@ -129,5 +132,6 @@ class SubgraphExtractionService:
             system_prompt=system_prompt,
             max_attempts=max_attempts,
         )
+
 
 

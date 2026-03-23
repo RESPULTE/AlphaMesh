@@ -1,12 +1,12 @@
-"""
+﻿"""
 core/agents/ticker_validation.py
 
 Validates up to 3 ticker symbols via yfinance and enriches new ones with
 canonical metadata (long name, sector, industry, business description).
 
 Design notes
-────────────
-- Uses yf.Tickers for batched I/O — single HTTP session for all tickers.
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+- Uses yf.Tickers for batched I/O â€” single HTTP session for all tickers.
 - All blocking yfinance calls execute in asyncio.to_thread().
 - Validation path: fast_info.quote_type determines equity / non-equity / unknown.
 - Lookup fallback: triggered only when fast_info raises or returns no data,
@@ -25,10 +25,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+from uuid import uuid4
 
 import yfinance as yf
 
 from core.logger import get_logger
+from core.memory.graph.graph_queue import make_graph_task
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
@@ -38,9 +40,7 @@ MAX_TICKERS = 3
 _EQUITY_QUOTE_TYPES = frozenset({"EQUITY", "STOCK"})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Data model
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -76,9 +76,7 @@ class TickerInfo:
         return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Validator
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class TickerValidator:
@@ -87,7 +85,7 @@ class TickerValidator:
 
     For new companies, upserts Company and Industry entity nodes into both
     Neo4j and ChromaDB, and creates BELONGS_TO taxonomy edges
-    (Company → Industry → Sector) as a non-blocking background task.
+    (Company â†’ Industry â†’ Sector) as a non-blocking background task.
     """
 
     def __init__(
@@ -97,19 +95,17 @@ class TickerValidator:
         self._chroma = entity_chroma_adapter
         self._logger = get_logger(__name__)
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     async def validate_and_enrich(self, tickers: List[str]) -> Dict[str, TickerInfo]:
         tickers = [t.upper().strip() for t in tickers[:MAX_TICKERS] if t.strip()]
         if not tickers:
             return {}
 
-        # Single thread call — one HTTP session for validation + enrichment together
+        # Single thread call â€” one HTTP session for validation + enrichment together
         results: Dict[str, TickerInfo] = await asyncio.to_thread(
             self._batch_validate_and_enrich_sync, tickers
         )
 
-        # ── Check novelty and schedule taxonomy upsert for new companies ──────────
+        # â”€â”€ Check novelty and schedule taxonomy upsert for new companies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for t, info in results.items():
             if not info.is_valid or not info.is_equity or info.needs_confirmation:
                 continue
@@ -125,8 +121,6 @@ class TickerValidator:
                     )
 
         return results
-
-    # ── Sync helpers (executed in thread pool) ────────────────────────────────
 
     def _batch_validate_and_enrich_sync(
         self, tickers: List[str]
@@ -167,7 +161,6 @@ class TickerValidator:
                 )
                 continue
 
-            # ── Step 1: validate via fast_info ────────────────────────────────────
             try:
                 fi = ticker_obj.fast_info
                 quote_type: Optional[str] = getattr(fi, "quote_type", None)
@@ -183,7 +176,9 @@ class TickerValidator:
                 )
             except Exception as exc:
                 self._logger.warning(
-                    "fast_info failed for '%s': %s — attempting Lookup fallback", t, exc
+                    "fast_info failed for '%s': %s â€” attempting Lookup fallback",
+                    t,
+                    exc,
                 )
                 suggestions = self._lookup_sync(t)
                 results[t] = TickerInfo(
@@ -196,7 +191,6 @@ class TickerValidator:
                 )
                 continue
 
-            # ── Step 2: enrich via .info (valid equities only) ────────────────────
             if is_valid and is_equity:
                 try:
                     info = ticker_obj.info or {}
@@ -206,7 +200,7 @@ class TickerValidator:
                     info_result.industry = info.get("industry", "")
                 except Exception as exc:
                     self._logger.warning(
-                        ".info fetch failed for '%s': %s — proceeding without enrichment",
+                        ".info fetch failed for '%s': %s â€” proceeding without enrichment",
                         t,
                         exc,
                     )
@@ -233,12 +227,12 @@ class TickerValidator:
             self._logger.debug("Lookup fallback failed for '%s': %s", query, exc)
         return []
 
-    # ── Taxonomy upsert (runs as background asyncio task) ─────────────────────
+    # â”€â”€ Taxonomy upsert (runs as background asyncio task) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _upsert_company_taxonomy(self, info) -> None:
         """
         For a newly discovered company, write the full taxonomy chain
-        (Market → Sector → Industry → Company) via GraphQueueManager.write_immediate().
+        (Market â†’ Sector â†’ Industry â†’ Company) via GraphQueueManager.enqueue(immediate=True).
 
         Replaces the old schedule(bypass_guards=True) call.
         """
@@ -247,7 +241,7 @@ class TickerValidator:
             from core.services import service_manager
 
             market_props = {
-                "description": "Global equity market — top-level anchor node for the sector taxonomy."
+                "description": "Global equity market â€” top-level anchor node for the sector taxonomy."
             }
             sector_props = {
                 "description": ALL_MAIN_SECTORS.get(info.sector, info.sector)
@@ -324,11 +318,16 @@ class TickerValidator:
                 )
                 return
 
-            # Use write_immediate — taxonomy writes are self-contained, no batching needed
-            await service_manager.get_graph_queue_manager().write_immediate(
-                relationships=relationships,
+            # Use enqueue(immediate=True) â€” taxonomy writes are self-contained, no batching needed
+            task = make_graph_task(
+                turn_id=str(uuid4()),
                 conversation_id="taxonomy_bootstrap",
                 source_agent="taxonomy_bootstrap",
+                relationships=relationships,
+            )
+            await service_manager.get_graph_queue_manager().enqueue(
+                task,
+                immediate=True,
             )
 
             logger.info(

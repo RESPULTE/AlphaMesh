@@ -53,7 +53,7 @@ from core.memory.graph.graph_queue import make_graph_task
 from core.memory.user_signal_writeback import (
     build_signal_payload,
     build_user_signal_relationships,
-    update_in_memory_user_signal_cache,
+    update_user_signal_cache,
 )
 from core.services import service_manager
 
@@ -550,7 +550,7 @@ class OrchestratorAgent:
                         "_synthesize_node: failed to enqueue user signal relationships"
                     )
             if cache_entries:
-                update_in_memory_user_signal_cache(cache_entries, state.user_email)
+                update_user_signal_cache(cache_entries, state.user_email)
 
         per_agent_analyses: Dict[str, str] = {
             name: getattr(output, "analysis", "") or ""
@@ -563,3 +563,4 @@ class OrchestratorAgent:
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,
         }
+

@@ -29,7 +29,7 @@ Flow (normal path)
 
 Flow (bypass path â€” system tasks)
 
-  GraphQueueManager.write_immediate(relationships, conversation_id, source_agent)
+  GraphQueueManager.enqueue(task, immediate=True)
   â†’ EntityResolver.resolve_batch()
   â†’ Neo4jAdapter.write_relationships()
   â†’ (fire-and-forget asyncio.Task, no SQLite, no queue)
@@ -404,7 +404,7 @@ class GraphQueueManager:
     close_session(conversation_id)         â†’ drain queue + stop consumer
     enqueue(task: GraphTask) -> str        â†’ enqueue task, return task_id
     flush_turn(conversation_id, turn_id)   â†’ enqueue sentinel
-    write_immediate(relationships, ...)    â†’ bypass queue, direct write
+    enqueue(task, immediate=True)    â†’ bypass queue, direct write
     start()                                â†’ init SQLite + recover orphans + start cleanup
     shutdown()                             â†’ drain all queues gracefully
     """
@@ -462,9 +462,10 @@ class GraphQueueManager:
     # Enqueue and flush
     #
 
-    async def enqueue(self, task: GraphTask) -> str:
+    async def enqueue(self, task: GraphTask, immediate: bool = False) -> str:
         """
-        Persist task to SQLite, then put it on the conversation's queue.
+        Persist task to SQLite, then either enqueue it for turn-scoped batching
+        or process immediately if immediate=True.
         Creates the session lazily if not already open (safety net).
         Returns the task_id for tracing.
         """
@@ -477,6 +478,21 @@ class GraphQueueManager:
 
         # Persist to SQLite first (durability)
         await self._persist_task(task)
+
+        if immediate:
+            try:
+                await self._process_relationships_immediate(
+                    task.relationships,
+                    task.conversation_id,
+                    task.source_agent,
+                )
+            except Exception:
+                logger.exception(
+                    "GraphQueueManager.enqueue: immediate write failed for '%s'",
+                    task.source_agent,
+                )
+            await self._mark_processed([task.task_id])
+            return task.task_id
 
         # Lazy session creation (safety net â€” callers should call open_session explicitly)
         async with self._queues_lock:
@@ -497,7 +513,6 @@ class GraphQueueManager:
 
         await cq.put(task)
         return task.task_id
-
     async def flush_turn(self, conversation_id: str, turn_id: str) -> None:
         """
         Enqueue a sentinel for this turn.  No-op if no session is open.
@@ -518,100 +533,103 @@ class GraphQueueManager:
     # Bypass path â€” system tasks (taxonomy, user signals)
     #
 
-    async def write_immediate(
+    async def _process_relationships_immediate(
         self,
         relationships: List[dict],
         conversation_id: str,
         source_agent: str,
     ) -> None:
         """
-        Fire-and-forget: bypass queue, resolve entities and write edges directly.
-        Used for system tasks (taxonomy bootstrap, user signal writeback) that
-        are self-contained and don't need batching or turn-scoped dedup.
+        Process relationships immediately without using the queue.
+        Used when enqueue(immediate=True) is requested.
         """
         if not relationships:
             return
 
-        async def _do_write() -> None:
-            try:
-                # Separate and resolve (same logic as ConversationQueue._process_batch)
-                domain_rels = [
-                    r
-                    for r in relationships
-                    if str(r.get("from_type") or "") not in _USER_SCOPED_TYPES
-                    and str(r.get("to_type") or "") not in _USER_SCOPED_TYPES
-                ]
-                user_rels = [r for r in relationships if r not in domain_rels]
+        try:
+            # Separate and resolve (same logic as ConversationQueue._process_batch)
+            domain_rels = [
+                r
+                for r in relationships
+                if str(r.get("from_type") or "") not in _USER_SCOPED_TYPES
+                and str(r.get("to_type") or "") not in _USER_SCOPED_TYPES
+            ]
+            user_rels = [r for r in relationships if r not in domain_rels]
 
-                entity_cache: Dict[Tuple[str, str], str] = {}
+            entity_cache: Dict[Tuple[str, str], str] = {}
 
-                if domain_rels:
-                    unique_entities: List[Tuple[str, str, Optional[dict]]] = []
-                    seen: set = set()
-                    for rel in domain_rels:
-                        for name_key, type_key, props_key in [
-                            ("from_name", "from_type", "from_node_props"),
-                            ("to_name", "to_type", "to_node_props"),
-                        ]:
-                            name = normalize_entity_name(str(rel.get(name_key) or ""))
-                            etype = normalize_entity_type(
-                                str(rel.get(type_key) or "").strip()
+            if domain_rels:
+                unique_entities: List[Tuple[str, str, Optional[dict]]] = []
+                seen: set = set()
+                for rel in domain_rels:
+                    for name_key, type_key, props_key in [
+                        ("from_name", "from_type", "from_node_props"),
+                        ("to_name", "to_type", "to_node_props"),
+                    ]:
+                        name = normalize_entity_name(str(rel.get(name_key) or ""))
+                        etype = normalize_entity_type(
+                            str(rel.get(type_key) or "").strip()
+                        )
+                        if not name or not etype:
+                            continue
+                        k = (name.lower(), etype)
+                        if k not in seen:
+                            seen.add(k)
+                            unique_entities.append((name, etype, rel.get(props_key)))
+                resolved = await self._resolver.resolve_batch(unique_entities)
+                for (name, etype), eid in resolved.items():
+                    entity_cache[entity_key(name, etype)] = eid
+                await self._writer.write_relationships(
+                    domain_rels, conversation_id, source_agent, entity_cache
+                )
+
+            if user_rels:
+                user_cache: Dict[Tuple[str, str], str] = {**entity_cache}
+                for rel in user_rels:
+                    for name_key, type_key, props_key in [
+                        ("from_name", "from_type", "from_node_props"),
+                        ("to_name", "to_type", "to_node_props"),
+                    ]:
+                        name = str(rel.get(name_key) or "").strip()
+                        etype = str(rel.get(type_key) or "").strip()
+                        if not name or not etype or etype not in _USER_SCOPED_TYPES:
+                            continue
+                        k = entity_key(name, etype)
+                        if k not in user_cache:
+                            props = rel.get(props_key) or {}
+                            nid = await self._resolver.resolve_user_node(
+                                name, etype, props
                             )
-                            if not name or not etype:
-                                continue
-                            k = (name.lower(), etype)
-                            if k not in seen:
-                                seen.add(k)
-                                unique_entities.append(
-                                    (name, etype, rel.get(props_key))
-                                )
-                    resolved = await self._resolver.resolve_batch(unique_entities)
-                    for (name, etype), eid in resolved.items():
-                        entity_cache[entity_key(name, etype)] = eid
-                    await self._writer.write_relationships(
-                        domain_rels, conversation_id, source_agent, entity_cache
-                    )
-
-                if user_rels:
-                    user_cache: Dict[Tuple[str, str], str] = {**entity_cache}
-                    for rel in user_rels:
-                        for name_key, type_key, props_key in [
-                            ("from_name", "from_type", "from_node_props"),
-                            ("to_name", "to_type", "to_node_props"),
-                        ]:
-                            name = str(rel.get(name_key) or "").strip()
-                            etype = str(rel.get(type_key) or "").strip()
-                            if not name or not etype or etype not in _USER_SCOPED_TYPES:
-                                continue
-                            k = entity_key(name, etype)
-                            if k not in user_cache:
-                                props = rel.get(props_key) or {}
-                                nid = await self._resolver.resolve_user_node(
-                                    name, etype, props
-                                )
-                                if nid:
-                                    user_cache[k] = nid
-                    await self._writer.write_relationships(
-                        user_rels, conversation_id, source_agent, user_cache
-                    )
-
-                logger.info(
-                    "GraphQueueManager.write_immediate: wrote %d relationships for '%s'",
-                    len(relationships),
-                    source_agent,
-                )
-            except Exception:
-                logger.exception(
-                    "GraphQueueManager.write_immediate: failed for agent '%s'",
-                    source_agent,
+                            if nid:
+                                user_cache[k] = nid
+                await self._writer.write_relationships(
+                    user_rels, conversation_id, source_agent, user_cache
                 )
 
-        asyncio.create_task(_do_write(), name=f"write_immediate_{source_agent}")
+            logger.info(
+                "GraphQueueManager.enqueue(immediate=True): wrote %d relationships for '%s'",
+                len(relationships),
+                source_agent,
+            )
+        except Exception:
+            logger.exception(
+                "GraphQueueManager.enqueue(immediate=True): failed for agent '%s'",
+                source_agent,
+            )
 
-    #
-    # Startup and shutdown
-    #
-
+    async def _mark_processed(self, task_ids: List[str]) -> None:
+        if not task_ids:
+            return
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                now = time.time()
+                await db.executemany(
+                    "UPDATE graph_tasks SET status='PROCESSED', processed_at=? WHERE task_id=?",
+                    [(now, tid) for tid in task_ids],
+                )
+                await db.commit()
+        except Exception:
+            logger.exception("GraphQueueManager: failed to mark tasks processed")
     async def start(self) -> None:
         """
         Initialize SQLite, recover orphaned PENDING tasks, start TTL cleanup.
@@ -738,14 +756,14 @@ class GraphQueueManager:
             grouped.setdefault(key, []).append(task)
 
         for (conv_id, turn_id), group_tasks in grouped.items():
-            # Use write_immediate for bypass (no queue), but merge the batch manually
+            # Use immediate processing for bypass (no queue), but merge the batch manually
             all_rels: List[dict] = []
             for t in group_tasks:
                 all_rels.extend(t.relationships)
             source = "+".join({t.source_agent for t in group_tasks})
 
             try:
-                await self.write_immediate(all_rels, conv_id, source)
+                await self._process_relationships_immediate(all_rels, conv_id, source)
                 # Mark processed after fire-and-forget task is created
                 task_ids = [t.task_id for t in group_tasks]
                 async with aiosqlite.connect(self._db_path) as db:
@@ -819,3 +837,7 @@ def make_graph_task(
         source_agent=source_agent,
         relationships=relationships,
     )
+
+
+
+

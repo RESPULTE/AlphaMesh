@@ -1,17 +1,17 @@
 ﻿"""
 core/memory/user_signal_writeback.py
 
-Unified user signal write-back via GraphQueueManager.write_immediate().
+Unified user signal write-back via GraphQueueManager.enqueue(immediate=True).
 
 Changes from previous version
 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 - No longer calls SubgraphExtractionService.schedule(bypass_guards=True).
-- Now calls GraphQueueManager.write_immediate() directly for entity persistence
+- Now calls GraphQueueManager.enqueue(immediate=True) directly for entity persistence
   and edge writing.
 - Entity pre-resolution (_build_interest_relationships) now calls
   EntityResolver.resolve() directly instead of DualStoreIngestor.resolve_entity_id().
 - The _build_relationship_props helper is removed â€” Neo4jAdapter owns that now.
-  Relationship dicts are passed as-is to write_immediate() which delegates
+  Relationship dicts are passed as-is to enqueue(immediate=True) which delegates
   to Neo4jAdapter internally.
 
 Graph schema written here (unchanged)
@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from core.logger import get_logger
+from core.memory.graph.graph_queue import make_graph_task
 from core.memory.user_context_service import InterestCacheEntry
 
 logger = get_logger(__name__)
@@ -82,9 +83,6 @@ class UserSignalPayload:
     interest_edges: List[InterestEdge] = field(default_factory=list)
 
 
-# â”€â”€ Domain category derivation (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-
 def _derive_investment_category(
     entity_name: str,
     entity_type: str,
@@ -120,9 +118,6 @@ async def _derive_learning_category(
     if entity_type == "FinancialEvent":
         return "market_events"
     return "general"
-
-
-# â”€â”€ Relationship list builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 async def _build_interest_relationships(
@@ -399,7 +394,7 @@ async def build_user_signal_relationships(
         return [], []
 
 
-def update_in_memory_user_signal_cache(
+def update_user_signal_cache(
     cache_entries: List[InterestCacheEntry],
     user_email: str,
 ) -> None:
@@ -413,6 +408,35 @@ def update_in_memory_user_signal_cache(
     except Exception:
         logger.exception("update_user_signal_cache: failed for user '%s'", user_email)
 
+
+
+async def write_user_signals(payload: UserSignalPayload) -> None:
+    """
+    Persist all user interest signals from a conversation turn.
+
+    Steps:
+      1. Build relationship list with pre-resolved entity IDs.
+      2. Enqueue GraphTask with immediate=True for direct processing.
+      3. Update in-memory cache synchronously.
+    """
+    relationships, cache_entries = await build_user_signal_relationships(payload)
+    if not relationships:
+        return
+
+    try:
+        from core.services import service_manager
+
+        graph_queue = service_manager.get_graph_queue_manager()
+        task = make_graph_task(
+            turn_id=payload.turn_id,
+            conversation_id=payload.conversation_id,
+            source_agent="user_signal_writeback",
+            relationships=relationships,
+        )
+        await graph_queue.enqueue(task, immediate=True)
+        update_user_signal_cache(cache_entries, payload.user_email)
+    except Exception:
+        logger.exception("write_user_signals: failed for user '%s'", payload.user_email)
 
 def build_signal_payload(
     detected_investment_signals,
@@ -469,4 +493,6 @@ def build_signal_payload(
         learning_signals=learning_signals,
         interest_edges=edges,
     )
+
+
 
