@@ -1,23 +1,27 @@
 """
 core/memory/user_signal_writeback.py
-=====================================
 
-Unified user signal write-back via SubgraphExtractionService.schedule().
+Unified user signal write-back via GraphQueueManager.write_immediate().
 
-Graph schema written here
-─────────────────────────
+Changes from previous version
+──────────────────────────────
+- No longer calls SubgraphExtractionService.schedule(bypass_guards=True).
+- Now calls GraphQueueManager.write_immediate() directly for entity persistence
+  and edge writing.
+- Entity pre-resolution (_build_interest_relationships) now calls
+  EntityResolver.resolve() directly instead of DualStoreIngestor.resolve_entity_id().
+- The _build_relationship_props helper is removed — GraphWriter owns that now.
+  Relationship dicts are passed as-is to write_immediate() which delegates
+  to GraphWriter internally.
+
+Graph schema written here (unchanged)
+──────────────────────────────────────
 NodeSet (USER_{hash})
   ←─BELONGS_TO_NODESET─── UserInterestDomain {domain_type, category, user_email}
                                └─HAS_INTEREST_IN──> UserInterestEdge {weight, status, ...}
                                                          ├─TARGETS──────────> Entity
                                                          ├─SOURCED_FROM─────> TurnNode (reinforce)
                                                          └─INVALIDATED_BY──> TurnNode (invalidate)
-
-All graph writes go through SubgraphExtractionService.schedule(bypass_guards=True)
-so that entity deduplication runs before any Neo4j write.
-
-Cache is updated synchronously after schedule() dispatches the background task
-so the current session sees new signals immediately.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ from core.memory.user_context_service import InterestCacheEntry
 logger = get_logger(__name__)
 
 
-# ── Payload dataclasses ───────────────────────────────────────────────────────
+# ── Payload dataclasses (unchanged) ──────────────────────────────────────────
 
 
 @dataclass
@@ -57,8 +61,6 @@ class LearningSignal:
 
 @dataclass
 class InterestEdge:
-    """Pre-extracted cross-domain interest edge from synthesis LLM."""
-
     entity_name: str
     entity_type: str
     user_signal_type: str
@@ -72,16 +74,15 @@ class InterestEdge:
 class UserSignalPayload:
     user_email: str
     conversation_id: str
-    turn_id: str  # uuid4 per OrchestratorAgent.run()
+    turn_id: str
     user_message: str
     ticker_metadata: Dict[str, dict] = field(default_factory=dict)
-    # {ticker: {long_name, sector, industry, description}}
     investment_signals: List[InvestmentSignal] = field(default_factory=list)
     learning_signals: List[LearningSignal] = field(default_factory=list)
     interest_edges: List[InterestEdge] = field(default_factory=list)
 
 
-# ── Domain category derivation ────────────────────────────────────────────────
+# ── Domain category derivation (unchanged) ────────────────────────────────────
 
 
 def _derive_investment_category(
@@ -89,13 +90,6 @@ def _derive_investment_category(
     entity_type: str,
     ticker_metadata: Dict[str, dict],
 ) -> str:
-    """
-    Derive the domain category for an investment signal.
-
-    Company targets: look up sector from ticker_metadata (keyed by ticker symbol
-    and also checked against long_name for robustness).
-    Sector targets: use the sector name directly.
-    """
     if entity_type == "Sector":
         return entity_name
     if entity_type == "Company":
@@ -116,13 +110,6 @@ async def _derive_learning_category(
     entity_id: str,
     neo4j,
 ) -> str:
-    """
-    Derive the domain category for a learning signal.
-
-    FinancialConcept: fetch category from Neo4j (valuation, risk, etc.).
-    FinancialEvent:   fixed category "market_events".
-    Fallback:         "general".
-    """
     if entity_type == "FinancialConcept":
         try:
             category = await neo4j.get_entity_category(entity_id)
@@ -140,24 +127,17 @@ async def _derive_learning_category(
 
 async def _build_interest_relationships(
     payload: UserSignalPayload,
-    ingestor,
+    entity_resolver,  # EntityResolver instance
     neo4j,
     nodeset_id: str,
 ) -> Tuple[List[dict], List[InterestCacheEntry]]:
     """
-    Pre-resolve all domain entity IDs, then build the full relationship list
-    expressing the UserInterestDomain → UserInterestEdge → Entity + TurnNode chain.
+    Pre-resolve all domain entity IDs, then build the full relationship list.
 
-    Pre-resolution (Option A) is necessary to compute deterministic UUIDs for
-    UserInterestEdge nodes, which depend on the resolved entity ID.
-
-    Returns (relationships, cache_entries) so the caller can dispatch to
-    schedule() and update_cache() in one pass.
+    Changes from previous version:
+    - Uses entity_resolver.resolve() instead of ingestor.resolve_entity_id().
+    - The entity_cache dict is local to this call (not shared with the queue).
     """
-    from core.memory.graph.nodeset_manager import (
-        canonical_nodeset_id,
-        get_user_nodeset_name,
-    )
     from core.memory.graph.utils import generate_uuid5
 
     now = datetime.now(timezone.utc)
@@ -182,8 +162,6 @@ async def _build_interest_relationships(
         entity_type: str,
         is_invalidation: bool,
     ) -> None:
-        """Append the three standard relationships for one UserInterestEdge."""
-        # 1. Edge ─HAS_INTEREST_IN─> Domain
         relationships.append(
             {
                 "from_name": edge_id,
@@ -197,7 +175,6 @@ async def _build_interest_relationships(
                 "to_node_props": domain_props,
             }
         )
-        # 2. Edge ─TARGETS─> Entity
         relationships.append(
             {
                 "from_name": edge_id,
@@ -211,7 +188,6 @@ async def _build_interest_relationships(
                 "to_node_props": {},
             }
         )
-        # 3. Edge ─SOURCED_FROM / INVALIDATED_BY─> TurnNode
         rel_type = "INVALIDATED_BY" if is_invalidation else "SOURCED_FROM"
         relationships.append(
             {
@@ -232,11 +208,14 @@ async def _build_interest_relationships(
         operation = "invalidate" if is_invalidation else "reinforce"
 
         for entity in signal.target_entities:
-            resolved_id = await ingestor.resolve_entity_id(
-                entity.entity_name,
-                entity.entity_type,
-                entity_cache=entity_cache,
-            )
+            # Use EntityResolver instead of ingestor.resolve_entity_id
+            resolved_id = entity_cache.get((entity.entity_name, entity.entity_type))
+            if resolved_id is None:
+                resolved_id = await entity_resolver.resolve(
+                    entity.entity_name, entity.entity_type
+                )
+                if resolved_id:
+                    entity_cache[(entity.entity_name, entity.entity_type)] = resolved_id
             if not resolved_id:
                 continue
 
@@ -296,11 +275,13 @@ async def _build_interest_relationships(
         operation = "invalidate" if is_invalidation else "reinforce"
 
         for entity in signal.target_entities:
-            resolved_id = await ingestor.resolve_entity_id(
-                entity.entity_name,
-                entity.entity_type,
-                entity_cache=entity_cache,
-            )
+            resolved_id = entity_cache.get((entity.entity_name, entity.entity_type))
+            if resolved_id is None:
+                resolved_id = await entity_resolver.resolve(
+                    entity.entity_name, entity.entity_type
+                )
+                if resolved_id:
+                    entity_cache[(entity.entity_name, entity.entity_type)] = resolved_id
             if not resolved_id:
                 continue
 
@@ -378,21 +359,16 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
     Persist all user interest signals from a conversation turn.
 
     Steps:
-      1. Resolve domain entity IDs + build full relationship list.
-      2. Dispatch to schedule(bypass_guards=True) for unified graph write
-         (dedup → Neo4j + Chroma via _upsert_graph_to_neo4j).
-      3. Update in-memory cache synchronously so the current session sees
-         new signals immediately without waiting for Neo4j.
-
-    Never raises — all exceptions are caught and logged.
+      1. Build relationship list with pre-resolved entity IDs.
+      2. Call GraphQueueManager.write_immediate() — bypasses queue for immediate write.
+      3. Update in-memory cache synchronously.
     """
     logger.info(
-        "write_user_signals: user='%s' turn='%s' " "investment=%d learning=%d edges=%d",
+        "write_user_signals: user='%s' turn='%s' investment=%d learning=%d",
         payload.user_email,
         payload.turn_id,
         len(payload.investment_signals),
         len(payload.learning_signals),
-        len(payload.interest_edges),
     )
 
     if not payload.user_email or not payload.conversation_id:
@@ -411,16 +387,16 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
         )
         from core.services import service_manager
 
-        ingestor = service_manager.get_ingestor()
+        entity_resolver = service_manager.get_entity_resolver()
         neo4j = service_manager.get_neo4j_adapter()
-        subgraph_svc = service_manager.get_subgraph_service()
+        graph_queue = service_manager.get_graph_queue_manager()
         user_ctx_svc = service_manager.get_user_context_service()
 
         nodeset_id = canonical_nodeset_id(get_user_nodeset_name(payload.user_email))
 
-        # ── Step 1: build relationship list with pre-resolved entity IDs ──────
+        # ── Step 1: build relationship list ───────────────────────────────────
         relationships, cache_entries = await _build_interest_relationships(
-            payload, ingestor, neo4j, nodeset_id
+            payload, entity_resolver, neo4j, nodeset_id
         )
 
         if not relationships:
@@ -429,18 +405,14 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
             )
             return
 
-        # ── Step 2: unified graph write via schedule() ────────────────────────
-        await subgraph_svc.schedule(
-            agent_name="user_signal_writeback",
-            conversation_id=payload.conversation_id,
-            analysis_text="",
-            llm=None,
-            system_prompt="",
+        # ── Step 2: write via GraphQueueManager.write_immediate ───────────────
+        await graph_queue.write_immediate(
             relationships=relationships,
-            bypass_guards=True,
+            conversation_id=payload.conversation_id,
+            source_agent="user_signal_writeback",
         )
 
-        # ── Step 3: update in-memory cache immediately ────────────────────────
+        # ── Step 3: update in-memory cache ────────────────────────────────────
         if cache_entries:
             user_ctx_svc.update_cache(cache_entries, payload.user_email)
 
@@ -449,9 +421,9 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
 
 
 def build_signal_payload(
-    detected_investment_signals: List[InvestmentSignal],
-    detected_learning_signals: List[LearningSignal],
-    interest_edges: List[dict],
+    detected_investment_signals,
+    detected_learning_signals,
+    interest_edges,
     user_message: str,
     user_email: Optional[str],
     conversation_id: Optional[str],

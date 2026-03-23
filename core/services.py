@@ -1,11 +1,21 @@
-# services.py
+# core/services.py
 from core.config import settings
 
 
 class ServiceManager:
     """
-    A centralized manager for initializing and providing access to external services.
-    This pattern avoids global variables and makes dependencies explicit.
+    Centralised manager for all service singletons.
+
+    Changes from previous version
+    ──────────────────────────────
+    - get_subgraph_store()      → REMOVED (SubgraphStore deleted)
+    - get_entity_resolver()     → NEW
+    - get_graph_writer()        → NEW
+    - get_relationship_extractor() → NEW
+    - get_graph_queue_manager() → NEW
+    - get_ingestor()            → now injects entity_resolver instead of embedding_func
+    - get_subgraph_service()    → now constructs shim with queue_manager + extractor
+    - startup()                 → now starts GraphQueueManager
     """
 
     def __init__(self):
@@ -16,17 +26,19 @@ class ServiceManager:
         self._chroma_adapter = None
         self._entity_chroma_adapter = None
         self._nodeset_manager = None
+        self._entity_resolver = None
+        self._graph_writer = None
+        self._relationship_extractor = None
+        self._graph_queue_manager = None
         self._dual_store_ingestor = None
         self._retriever = None
         self._reranker = None
         self._memory_retrieval_service = None
         self._user_context_service = None
-        self._subgraph_store = None
         self._subgraph_service = None
         self._ticker_validator = None
 
     def get_agent(self, temperature=0.0):
-        """Initializes and returns the language model instance."""
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
 
         if self._llm is None:
@@ -35,19 +47,15 @@ class ServiceManager:
                     model=settings.LLM_MODEL,
                     temperature=temperature,
                     google_api_key=settings.GOOGLE_API_KEY,
-                    # location=settings.GOOGLE_CLOUD_LOCATION,
-                    # project=settings.GOOGLE_CLOUD_PROJECT,
                 )
             except Exception as e:
                 print(f"Error initializing LLM: {e}")
                 raise
         if temperature != self._llm.temperature:
             self._llm.temperature = temperature
-
         return self._llm
 
     def get_embedding_func(self):
-        """Initializes and returns the embedding model instance."""
         from langchain_google_genai.embeddings import GoogleGenerativeAIEmbeddings
 
         if self._embedding_func is None:
@@ -55,8 +63,6 @@ class ServiceManager:
                 self._embedding_func = GoogleGenerativeAIEmbeddings(
                     model=settings.EMBEDDING_MODEL,
                     google_api_key=settings.GOOGLE_API_KEY,
-                    # location=settings.GOOGLE_CLOUD_LOCATION,
-                    # project=settings.GOOGLE_CLOUD_PROJECT,
                 )
             except Exception as e:
                 print(f"Error initializing embedding function: {e}")
@@ -64,15 +70,12 @@ class ServiceManager:
         return self._embedding_func
 
     def get_graph_search_type(self) -> str:
-        """Returns the Cognee search type for graph retrieval."""
         return "graph_completion"
 
     def get_chunk_search_type(self) -> str:
-        """Returns the Cognee search type for vector/chunk retrieval."""
         return "chunks"
 
     def get_financial_database(self):
-        # FIX: was importing from non-existent 'core.agents.get_financial_data'
         from core.agents.financial_db import FinancialDatabase
 
         if self._financial_db is None:
@@ -148,6 +151,67 @@ class ServiceManager:
                 raise
         return self._nodeset_manager
 
+    # ── NEW: EntityResolver ───────────────────────────────────────────────────
+
+    def get_entity_resolver(self):
+        from core.memory.graph.entity_resolver import EntityResolver
+
+        if self._entity_resolver is None:
+            try:
+                self._entity_resolver = EntityResolver(
+                    neo4j_adapter=self.get_neo4j_adapter(),
+                    entity_chroma_adapter=self.get_entity_chroma_adapter(),
+                    embedding_func=self.get_embedding_func(),
+                    fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
+                    semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
+                )
+            except Exception as e:
+                print(f"Error initializing EntityResolver: {e}")
+                raise
+        return self._entity_resolver
+
+    # ── NEW: GraphWriter ──────────────────────────────────────────────────────
+
+    def get_graph_writer(self):
+        from core.memory.graph.graph_writer import GraphWriter
+
+        if self._graph_writer is None:
+            try:
+                self._graph_writer = GraphWriter(
+                    neo4j_adapter=self.get_neo4j_adapter(),
+                )
+            except Exception as e:
+                print(f"Error initializing GraphWriter: {e}")
+                raise
+        return self._graph_writer
+
+    # ── NEW: RelationshipExtractor ────────────────────────────────────────────
+
+    def get_relationship_extractor(self):
+        from core.memory.graph.relationship_extractor import RelationshipExtractor
+
+        if self._relationship_extractor is None:
+            self._relationship_extractor = RelationshipExtractor()
+        return self._relationship_extractor
+
+    # ── NEW: GraphQueueManager ────────────────────────────────────────────────
+
+    def get_graph_queue_manager(self):
+        from core.memory.graph.graph_queue import GraphQueueManager
+
+        if self._graph_queue_manager is None:
+            try:
+                self._graph_queue_manager = GraphQueueManager(
+                    entity_resolver=self.get_entity_resolver(),
+                    graph_writer=self.get_graph_writer(),
+                )
+            except Exception as e:
+                print(f"Error initializing GraphQueueManager: {e}")
+                raise
+        return self._graph_queue_manager
+
+    # ── UPDATED: Ingestor now injects entity_resolver ─────────────────────────
+
     def get_ingestor(self):
         from core.memory.ingestion.chunker import ArticleChunker
         from core.memory.ingestion.ingestor import DualStoreIngestor
@@ -162,10 +226,9 @@ class ServiceManager:
                     chroma_adapter=self.get_chroma_adapter(),
                     entity_chroma_adapter=self.get_entity_chroma_adapter(),
                     nodeset_manager=self.get_nodeset_manager(),
-                    embedding_func=self.get_embedding_func(),
+                    entity_resolver=self.get_entity_resolver(),  # ← replaces embedding_func
                     chunker=chunker,
                     llm=self.get_agent(),
-                    subgraph_store=self.get_subgraph_store(),
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreIngestor: {e}")
@@ -217,30 +280,20 @@ class ServiceManager:
                 raise
         return self._user_context_service
 
-    def get_subgraph_store(self):
-        from core.memory.stores.subgraph_store import SubgraphStore
-
-        if self._subgraph_store is None:
-            try:
-                self._subgraph_store = SubgraphStore(
-                    redis_url=settings.REDIS_URL,
-                    ttl=settings.SUBGRAPH_TTL_SECONDS,
-                )
-            except Exception as e:
-                print(f"Error initializing SubgraphStore: {e}")
-                raise
-        return self._subgraph_store
+    # ── UPDATED: SubgraphExtractionService shim ───────────────────────────────
 
     def get_subgraph_service(self):
         from core.memory.graph.subgraph_service import SubgraphExtractionService
 
         if self._subgraph_service is None:
-            self._subgraph_service = SubgraphExtractionService(
-                ingestor=self.get_ingestor(),
-                embedding_func=self.get_embedding_func(),
-                fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-                semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
-            )
+            try:
+                self._subgraph_service = SubgraphExtractionService(
+                    queue_manager=self.get_graph_queue_manager(),
+                    extractor=self.get_relationship_extractor(),
+                )
+            except Exception as e:
+                print(f"Error initializing SubgraphExtractionService: {e}")
+                raise
         return self._subgraph_service
 
     def get_ticker_validator(self):
@@ -259,11 +312,17 @@ class ServiceManager:
 
     async def startup(self) -> None:
         """
-        Run once at application startup before serving any requests.
-        Bootstraps the Market + Sector entity taxonomy in both stores
-        and initializes all default NodeSets.
+        Run once at application startup.
+        Order matters: NodeSetManager bootstrap must finish before GraphQueueManager
+        starts (recovery may write to Neo4j).
         """
         await self.get_nodeset_manager().initialize_default_nodesets()
+        await self.get_graph_queue_manager().start()  # ← NEW
+
+    async def shutdown(self) -> None:
+        """Run at application teardown to drain graph queues gracefully."""
+        if self._graph_queue_manager is not None:
+            await self._graph_queue_manager.shutdown()
 
 
 service_manager = ServiceManager()

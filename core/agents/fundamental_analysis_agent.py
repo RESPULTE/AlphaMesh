@@ -64,6 +64,8 @@ from core.agents.fundamental_agent_prompts import (
 )
 from core.agents.models import BaseAgentInput
 from core.logger import get_logger
+from core.memory.graph.extraction_prompts import ANALYSIS_ONLY_RELATIONSHIP_PROMPT
+from core.memory.graph.graph_queue import make_graph_task
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -635,20 +637,36 @@ class FundamentalAnalysisAgent(AbstractAgent):
             logger.error("[analyst] Analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
 
-        # ── Schedule background relationship extraction ───────────────────────
-        subgraph_id = await service_manager.get_subgraph_service().schedule(
-            agent_name=self.name(),
-            conversation_id=state.conversation_id or "",
-            analysis_text=analysis_text,
-            llm=service_manager.get_agent(temperature=0.7),
-            system_prompt="",  # can now be different
-            relationships=None,  # always needs extraction
-        )
+        task_id = None
+        if state.conversation_id and analysis_text:
+            try:
+
+                extractor = service_manager.get_relationship_extractor()
+                relationships = await extractor.extract(
+                    text=analysis_text,
+                    llm=service_manager.get_agent(temperature=0.7),
+                    system_prompt=ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+                )
+                if relationships:
+                    task = make_graph_task(
+                        turn_id=state.conversation_id,
+                        conversation_id=state.conversation_id,
+                        source_agent=self.name(),
+                        relationships=relationships,
+                    )
+                    task_id = await service_manager.get_graph_queue_manager().enqueue(
+                        task
+                    )
+            except Exception:
+                logger.exception(
+                    "_analyst_node: failed to extract or enqueue relationships"
+                )
+
         return {
             "financial_data": filtered_df,
             "analysis": analysis_text,
-            "relationships_extracted": False,
-            "subgraph_id": subgraph_id,
+            "relationships_extracted": bool(task_id),
+            "subgraph_id": task_id,
         }
 
     def _extract_relevant_rows(

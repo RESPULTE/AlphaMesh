@@ -49,17 +49,9 @@ from core.agents.models import (
     NewsAgentState,
 )
 from core.agents.news_fetcher import build_news_query, fetch_articles
-from core.agents.prompts import (
-    NEWS_ANALYSIS_USER_PROMPT,
-    NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
-)
+from core.agents.prompts import NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT
 from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.extraction_prompts import (
-    ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
-    COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
-)
-from core.memory.graph.utils import extract_with_retry
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
@@ -488,11 +480,22 @@ class NewsAnalysisAgent(AbstractAgent):
 
     # ── Node: analyse_news ────────────────────────────────────────────────────
 
-    async def _analyse_news_node(self, state: NewsAgentState) -> dict:
+    async def _analyse_news_node(self, state) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""
+        import re as _re
+
+        from core.agents.models import CitedSource
+        from core.agents.prompts import NEWS_ANALYSIS_USER_PROMPT
+        from core.memory.graph.extraction_prompts import (
+            ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+            COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
+        )
+        from core.memory.graph.graph_queue import make_graph_task
+        from core.memory.graph.utils import extract_with_retry
+        from core.memory.retrieval.models import RetrievedChunk
+
         chunks = state.final_chunks
         if not chunks:
-            logger.warning("_analyse_news_node: no chunks available")
             return {
                 "analysis": "No relevant news data was found for this query.",
                 "sources": [],
@@ -542,7 +545,6 @@ class NewsAnalysisAgent(AbstractAgent):
             relationships_extracted = response.parse_success
         except Exception as exc:
             logger.error("_analyse_news_node: extraction failed: %s", exc)
-            # Fallback: plain LLM call without relationship extraction
             fallback_response = await self._llm.ainvoke(
                 [
                     SystemMessage(content=ANALYSIS_ONLY_RELATIONSHIP_PROMPT),
@@ -559,14 +561,13 @@ class NewsAnalysisAgent(AbstractAgent):
             relationships = []
             relationships_extracted = False
 
-        # ── Update entity cache ───────────────────────────────────────────────
         if conversation_id and relationships:
             _merge_cached_entities(conversation_id, relationships)
 
-        # ── Citation filtering: keep only sources cited in the analysis ───────
+        # Citation filtering (unchanged)
         cited_ids = set(int(m) for m in _re.findall(r"\[(\d+)\]", analysis_text))
         _cited_in_order = sorted(cited_ids)
-        _old_to_new: dict[int, int] = {
+        _old_to_new: dict = {
             old_id: new_id for new_id, old_id in enumerate(_cited_in_order, start=1)
         }
 
@@ -576,7 +577,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         analysis_text = _re.sub(r"\[(\d+)\]", _remap, analysis_text)
 
-        _sources_by_old_id: dict[int, CitedSource] = {s.source_id: s for s in sources}
+        _sources_by_old_id = {s.source_id: s for s in sources}
         sources = [
             CitedSource(
                 source_id=new_id,
@@ -587,21 +588,24 @@ class NewsAnalysisAgent(AbstractAgent):
             for old_id, new_id in _old_to_new.items()
             if old_id in _sources_by_old_id
         ]
-        # ── End citation filtering ─────────────────────────────────────────────
 
-        subgraph_svc = service_manager.get_subgraph_service()
-        subgraph_id = await subgraph_svc.schedule(
-            agent_name=self.name(),
-            conversation_id=state.conversation_id or "",
-            analysis_text=analysis_text,
-            llm=self._llm,
-            system_prompt=ANALYSIS_ONLY_RELATIONSHIP_PROMPT,  # agent owns this choice
-            relationships=response.relationships if response.parse_success else None,
-        )
+        # ── CHANGED: enqueue via GraphQueueManager instead of schedule() ──────
+        task_id = None
+        if relationships_extracted and relationships and state.conversation_id:
+            try:
+                task = make_graph_task(
+                    turn_id=state.conversation_id,  # turn_id set by orchestrator flush
+                    conversation_id=state.conversation_id,
+                    source_agent=self.name(),
+                    relationships=relationships,
+                )
+                task_id = await service_manager.get_graph_queue_manager().enqueue(task)
+            except Exception:
+                logger.exception("_analyse_news_node: failed to enqueue graph task")
 
         return {
             "analysis": analysis_text,
             "sources": sources,
-            "subgraph_id": subgraph_id,
+            "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
         }

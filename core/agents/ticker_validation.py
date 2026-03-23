@@ -235,44 +235,28 @@ class TickerValidator:
 
     # ── Taxonomy upsert (runs as background asyncio task) ─────────────────────
 
-    async def _upsert_company_taxonomy(self, info: TickerInfo) -> None:
+    async def _upsert_company_taxonomy(self, info) -> None:
         """
-        For a newly discovered company, build the full Market→Sector→Industry→Company
-        taxonomy chain as a relationship list and route it through
-        SubgraphExtractionService.schedule(bypass_guards=True).
+        For a newly discovered company, write the full taxonomy chain
+        (Market → Sector → Industry → Company) via GraphQueueManager.write_immediate().
 
-        This ensures:
-        - Fuzzy + semantic entity deduplication runs before any write.
-        - All writes go through _resolve_entity → _persist_entity (Neo4j + Chroma).
-        - BELONGS_TO edges correctly connect to the pre-existing Sector/Market
-            nodes bootstrapped at startup.
-        - No direct Neo4j/Chroma calls from this layer.
-
-        All exceptions are caught so a taxonomy failure never surfaces to the user.
+        Replaces the old schedule(bypass_guards=True) call.
         """
         try:
             from core.memory.graph.models import ALL_MAIN_SECTORS
             from core.services import service_manager
 
-            market_props: dict = {
-                "description": (
-                    "Global equity market — top-level anchor node for the sector taxonomy."
-                )
+            market_props = {
+                "description": "Global equity market — top-level anchor node for the sector taxonomy."
             }
-            sector_props: dict = {
+            sector_props = {
                 "description": ALL_MAIN_SECTORS.get(info.sector, info.sector)
             }
-            industry_props: dict = {
-                "description": f"Industry segment: {info.industry}."
-            }
-            company_props: dict = {
-                "description": info.description,
-                "ticker": info.ticker,
-            }
+            industry_props = {"description": f"Industry segment: {info.industry}."}
+            company_props = {"description": info.description, "ticker": info.ticker}
 
-            relationships: List[dict] = []
+            relationships = []
 
-            # ── Sector → Market ───────────────────────────────────────────────────
             if info.sector:
                 relationships.append(
                     {
@@ -288,7 +272,6 @@ class TickerValidator:
                     }
                 )
 
-            # ── Industry → Sector ─────────────────────────────────────────────────
             if info.industry and info.sector:
                 relationships.append(
                     {
@@ -298,16 +281,12 @@ class TickerValidator:
                         "to_name": info.sector,
                         "to_type": "Sector",
                         "confidence": "high",
-                        "reason": (
-                            f"{info.industry} is an industry segment "
-                            f"within the {info.sector} sector."
-                        ),
+                        "reason": f"{info.industry} is an industry segment within the {info.sector} sector.",
                         "from_node_props": industry_props,
                         "to_node_props": sector_props,
                     }
                 )
 
-            # ── Company → Industry (preferred) or Company → Sector (fallback) ────
             if info.long_name:
                 if info.industry:
                     relationships.append(
@@ -318,10 +297,7 @@ class TickerValidator:
                             "to_name": info.industry,
                             "to_type": "Industry",
                             "confidence": "high",
-                            "reason": (
-                                f"{info.long_name} ({info.ticker}) operates in "
-                                f"the {info.industry} industry."
-                            ),
+                            "reason": f"{info.long_name} ({info.ticker}) operates in the {info.industry} industry.",
                             "from_node_props": company_props,
                             "to_node_props": industry_props,
                         }
@@ -335,46 +311,33 @@ class TickerValidator:
                             "to_name": info.sector,
                             "to_type": "Sector",
                             "confidence": "high",
-                            "reason": (
-                                f"{info.long_name} ({info.ticker}) operates in "
-                                f"the {info.sector} sector."
-                            ),
+                            "reason": f"{info.long_name} ({info.ticker}) operates in the {info.sector} sector.",
                             "from_node_props": company_props,
                             "to_node_props": sector_props,
                         }
                     )
 
             if not relationships:
-                self._logger.warning(
-                    "_upsert_company_taxonomy: no relationships built for '%s' "
-                    "(sector=%s, industry=%s)",
+                logger.warning(
+                    "_upsert_company_taxonomy: no relationships built for '%s'",
                     info.ticker,
-                    info.sector,
-                    info.industry,
                 )
                 return
 
-            await service_manager.get_subgraph_service().schedule(
-                agent_name="taxonomy_bootstrap",
-                conversation_id="taxonomy_bootstrap",
-                analysis_text="",
-                llm=None,  # relationships are pre-supplied — no LLM call needed
-                system_prompt="",
+            # Use write_immediate — taxonomy writes are self-contained, no batching needed
+            await service_manager.get_graph_queue_manager().write_immediate(
                 relationships=relationships,
-                bypass_guards=True,
+                conversation_id="taxonomy_bootstrap",
+                source_agent="taxonomy_bootstrap",
             )
 
-            self._logger.info(
-                "_upsert_company_taxonomy: scheduled %d BELONGS_TO edge(s) "
-                "for '%s' (%s → %s → %s → Market)",
+            logger.info(
+                "_upsert_company_taxonomy: scheduled %d BELONGS_TO edge(s) for '%s'",
                 len(relationships),
                 info.ticker,
-                info.long_name,
-                info.industry or "(no industry)",
-                info.sector or "(no sector)",
             )
 
         except Exception:
-            self._logger.exception(
+            logger.exception(
                 "_upsert_company_taxonomy failed for ticker '%s'", info.ticker
             )

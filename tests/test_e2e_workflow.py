@@ -9,12 +9,14 @@ from langchain_core.messages import HumanMessage
 from core.agents.models import BaseAgentInput
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.agents.orchestrator_agent import OrchestratorAgent
+from core.services import service_manager
 
 
 @pytest.mark.asyncio
 async def test_full_orchestrator_pipeline_live() -> None:
     logging.basicConfig(level=logging.INFO)
 
+    await service_manager.startup()
     agent = OrchestratorAgent()
     messages = [
         HumanMessage(content="I am interested in learning about APPLEWES's recent news")

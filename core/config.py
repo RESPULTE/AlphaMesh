@@ -115,5 +115,7 @@ class Settings(BaseSettings):
     GOOGLE_CLOUD_LOCATION: str
     GOOGLE_CLOUD_PROJECT: str
 
+    GRAPH_QUEUE_DB_PATH: str = "./data/graph_tasks.db"
+
 
 settings = Settings()
