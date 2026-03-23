@@ -112,5 +112,8 @@ class Settings(BaseSettings):
     # Minimum character count for scraped body to be considered useful.
     _MIN_BODY_LENGTH = 150
 
+    GOOGLE_CLOUD_LOCATION: str
+    GOOGLE_CLOUD_PROJECT: str
+
 
 settings = Settings()
