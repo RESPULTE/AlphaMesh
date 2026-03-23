@@ -34,8 +34,9 @@ class ServiceManager:
                 self._llm = ChatGoogleGenerativeAI(
                     model=settings.LLM_MODEL,
                     temperature=temperature,
-                    location=settings.GOOGLE_CLOUD_LOCATION,
-                    project=settings.GOOGLE_CLOUD_PROJECT,
+                    google_api_key=settings.GOOGLE_API_KEY,
+                    # location=settings.GOOGLE_CLOUD_LOCATION,
+                    # project=settings.GOOGLE_CLOUD_PROJECT,
                 )
             except Exception as e:
                 print(f"Error initializing LLM: {e}")
@@ -54,8 +55,8 @@ class ServiceManager:
                 self._embedding_func = GoogleGenerativeAIEmbeddings(
                     model=settings.EMBEDDING_MODEL,
                     google_api_key=settings.GOOGLE_API_KEY,
-                    location=settings.GOOGLE_CLOUD_LOCATION,
-                    project=settings.GOOGLE_CLOUD_PROJECT,
+                    # location=settings.GOOGLE_CLOUD_LOCATION,
+                    # project=settings.GOOGLE_CLOUD_PROJECT,
                 )
             except Exception as e:
                 print(f"Error initializing embedding function: {e}")
