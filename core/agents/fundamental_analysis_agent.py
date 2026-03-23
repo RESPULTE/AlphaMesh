@@ -63,8 +63,8 @@ from core.agents.prompts.fundamental_agent_prompts import (
     _TOOL_PLANNER_USER,
 )
 from core.logger import get_logger
-from core.memory.graph.extraction_prompts import ANALYSIS_ONLY_RELATIONSHIP_PROMPT
-from core.memory.graph.graph_queue import make_graph_task
+from core.memory.graph.extraction_prompts import DEFERRED_RELATIONSHIP_SYSTEM_PROMPT
+from core.memory.graph.graph_queue import make_extraction_task
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -624,6 +624,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             f"Financial Data:\n{data_str}\n\n"
             f"Tool Results:\n{tool_summary or 'None'}"
         )
+        success = False
         try:
             response = await service_manager.get_agent(temperature=0.7).ainvoke(
                 [
@@ -632,39 +633,36 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 ]
             )
             analysis_text = response.content if response else ""
+            success = True
         except Exception as exc:
             logger.error("[analyst] Analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
 
         task_id = None
-        if state.conversation_id and analysis_text:
+        if state.conversation_id and analysis_text and success:
+            turn_id = getattr(state, "turn_id", None) or state.conversation_id
             try:
-
-                extractor = service_manager.get_relationship_extractor()
-                relationships = await extractor.extract(
-                    text=analysis_text,
-                    llm=service_manager.get_agent(temperature=0.7),
-                    system_prompt=ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
+                task = make_extraction_task(
+                    turn_id=turn_id,
+                    conversation_id=state.conversation_id,
+                    source_agent=self.name(),
+                    extraction_text=analysis_text,
+                    system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                    llm_config={"temperature": 0.7},
                 )
-                if relationships:
-                    task = make_graph_task(
-                        turn_id=state.conversation_id,
-                        conversation_id=state.conversation_id,
-                        source_agent=self.name(),
-                        relationships=relationships,
-                    )
-                    task_id = await service_manager.get_graph_queue_manager().enqueue(
-                        task
-                    )
+                task_id = await service_manager.get_graph_queue_manager().enqueue(
+                    task,
+                    system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                )
             except Exception:
                 logger.exception(
-                    "_analyst_node: failed to extract or enqueue relationships"
+                    "_analyst_node: failed to enqueue deferred relationship extraction"
                 )
 
         return {
             "financial_data": filtered_df,
             "analysis": analysis_text,
-            "relationships_extracted": bool(task_id),
+            "relationships_extracted": False,
             "subgraph_id": task_id,
         }
 

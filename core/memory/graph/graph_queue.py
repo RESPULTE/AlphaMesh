@@ -1,51 +1,51 @@
-﻿"""
+"""
 core/memory/graph/graph_queue.py
 
 Centralised, non-blocking graph write pipeline.
 
 Architecture
 
-GraphTask       â€” payload dataclass: relationship dicts + routing metadata
-_SentinelTask   â€” poison-pill: signals consumer to flush one turn's accumulated tasks
-ConversationQueue â€” one per active conversation_id: owns asyncio.Queue + consumer coroutine
-GraphQueueManager â€” singleton: manages all ConversationQueues, SQLite persistence, startup/shutdown
+GraphTask       — payload dataclass: relationship dicts + routing metadata
+_SentinelTask   — poison-pill: signals consumer to flush one turn's accumulated tasks
+ConversationQueue — one per active conversation_id: owns asyncio.Queue + consumer coroutine
+GraphQueueManager — singleton: manages all ConversationQueues, SQLite persistence, startup/shutdown
 
 Flow (normal path)
 
   1. Agent calls GraphQueueManager.enqueue(GraphTask)
-     â†’ Task persisted to SQLite (status=PENDING)
-     â†’ Task put on ConversationQueue._queue
+     → Task persisted to SQLite (status=PENDING)
+     → Task put on ConversationQueue._queue
   2. Consumer accumulates GraphTask items in _pending[turn_id]
   3. Orchestrator calls GraphQueueManager.flush_turn(conversation_id, turn_id)
-     â†’ _SentinelTask put on queue
-  4. Consumer pops sentinel â†’ processes all tasks for that turn_id:
+     → _SentinelTask put on queue
+  4. Consumer pops sentinel → processes all tasks for that turn_id:
      a. Merge all relationship lists
      b. Separate user-scoped from domain relationships
-     c. EntityResolver.resolve_batch() â€” type-scoped dedup + Neo4j/Chroma upsert
-     d. Neo4jAdapter.write_relationships() â€” domain edges
-     e. Neo4jAdapter.write_relationships() â€” user-scoped edges (no dedup)
+     c. EntityResolver.resolve_batch() — type-scoped dedup + Neo4j/Chroma upsert
+     d. Neo4jAdapter.write_relationships() — domain edges
+     e. Neo4jAdapter.write_relationships() — user-scoped edges (no dedup)
      f. Mark all GraphTasks for this turn PROCESSED in SQLite
   5. Consumer waits for next sentinel
 
-Flow (bypass path â€” system tasks)
+Flow (bypass path — system tasks)
 
   GraphQueueManager.enqueue(task, immediate=True)
-  â†’ EntityResolver.resolve_batch()
-  â†’ Neo4jAdapter.write_relationships()
-  â†’ (fire-and-forget asyncio.Task, no SQLite, no queue)
+  → EntityResolver.resolve_batch()
+  → Neo4jAdapter.write_relationships()
+  → (fire-and-forget asyncio.Task, no SQLite, no queue)
 
 Recovery on restart
 
   GraphQueueManager.start()
-  â†’ Scan SQLite for PENDING tasks
-  â†’ Process each orphaned task directly (bypass queue) sorted by turn_id
-  â†’ Mark processed
+  → Scan SQLite for PENDING tasks
+  → Process each orphaned task directly (bypass queue) sorted by turn_id
+  → Mark processed
 
 Session lifecycle
 
-  open_session(conversation_id)  â€” creates ConversationQueue + starts consumer
-  close_session(conversation_id) â€” drains queue, stops consumer, evicts from _queues
-  TTL cleanup (safety net)       â€” every 5 min, evicts idle queues (30 min inactivity)
+  open_session(conversation_id)  — creates ConversationQueue + starts consumer
+  close_session(conversation_id) — drains queue, stops consumer, evicts from _queues
+  TTL cleanup (safety net)       — every 5 min, evicts idle queues (30 min inactivity)
 
 Multi-user safety
 
@@ -59,10 +59,11 @@ Multi-user safety
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import aiosqlite
@@ -70,6 +71,7 @@ import aiosqlite
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.models import _USER_SCOPED_TYPES
+from core.memory.graph.relationship_extractor import RelationshipExtractor
 from core.memory.graph.utils import (
     entity_key,
     normalize_entity_name,
@@ -79,10 +81,25 @@ from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 logger = get_logger(__name__)
 
-# SQLite path â€” co-located with the financial data DB
+# SQLite path — co-located with the financial data DB
 _GRAPH_TASKS_DB = "./data/graph_tasks.db"
 _TTL_SECONDS = 1800  # 30 min inactivity before queue eviction
 _CLEANUP_INTERVAL = 300  # 5 min between TTL sweeps
+
+# Global in-memory mapping of prompt_id -> prompt text
+_PROMPT_REGISTRY: Dict[str, str] = {}
+
+
+def _prompt_id(system_prompt: str) -> str:
+    return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+
+
+def _register_prompt_local(prompt_id: str, prompt: str) -> None:
+    _PROMPT_REGISTRY[prompt_id] = prompt
+
+
+def _get_prompt(prompt_id: str) -> Optional[str]:
+    return _PROMPT_REGISTRY.get(prompt_id)
 
 
 #
@@ -99,6 +116,9 @@ class GraphTask:
     conversation_id: str
     source_agent: str
     relationships: List[dict]  # already-extracted dicts, no nx objects
+    extraction_text: Optional[str] = None
+    system_prompt_id: Optional[str] = None
+    llm_config: Optional[dict] = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -115,7 +135,7 @@ _QueueItem = GraphTask | _SentinelTask
 
 
 #
-# ConversationQueue â€” one per active conversation
+# ConversationQueue — one per active conversation
 #
 
 
@@ -130,15 +150,21 @@ class ConversationQueue:
         conversation_id: str,
         entity_resolver: EntityResolver,
         graph_writer: Neo4jAdapter,
+        relationship_extractor: RelationshipExtractor,
+        llm_provider: Callable[[Optional[dict]], Any],
+        prompt_resolver: Callable[[str], Optional[str]],
         db_path: str,
     ) -> None:
         self.conversation_id = conversation_id
         self._resolver = entity_resolver
         self._writer = graph_writer
+        self._extractor = relationship_extractor
+        self._llm_provider = llm_provider
+        self._prompt_resolver = prompt_resolver
         self._db_path = db_path
 
         self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
-        self._pending: Dict[str, List[GraphTask]] = {}  # turn_id â†’ [GraphTask, ...]
+        self._pending: Dict[str, List[GraphTask]] = {}  # turn_id → [GraphTask, ...]
         self._last_activity: float = time.monotonic()
         self._consumer_task: Optional[asyncio.Task] = None
         self._closing = False
@@ -227,6 +253,30 @@ class ConversationQueue:
     # Batch processing
     #
 
+    async def _extract_relationships_for_task(self, task: GraphTask) -> List[dict]:
+        if not task.extraction_text or not task.system_prompt_id:
+            return []
+        prompt = self._prompt_resolver(task.system_prompt_id)
+        if not prompt:
+            logger.warning(
+                "ConversationQueue: missing system prompt for id '%s'",
+                task.system_prompt_id,
+            )
+            return []
+        try:
+            llm = self._llm_provider(task.llm_config)
+            return await self._extractor.extract(
+                text=task.extraction_text,
+                llm=llm,
+                system_prompt=prompt,
+                max_attempts=1,
+            )
+        except Exception:
+            logger.exception(
+                "ConversationQueue: extraction failed for task '%s'", task.task_id
+            )
+            return []
+
     async def _process_batch(self, tasks: List[GraphTask], turn_id: str) -> None:
         """
         Process all GraphTasks for one turn as a single merged batch.
@@ -235,16 +285,16 @@ class ConversationQueue:
           1. Merge all relationship lists from all tasks
           2. Separate user-scoped from domain relationships
           3. Collect unique domain entity descriptors
-          4. EntityResolver.resolve_batch() â€” type-scoped dedup + Neo4j/Chroma upsert
-          5. Neo4jAdapter.write_relationships() â€” domain edges
+          4. EntityResolver.resolve_batch() — type-scoped dedup + Neo4j/Chroma upsert
+          5. Neo4jAdapter.write_relationships() — domain edges
           6. Build user_entity_cache for user-scoped nodes
-          7. EntityResolver.resolve_user_node() â€” for each unique user-scoped entity
-          8. Neo4jAdapter.write_relationships() â€” user-scoped edges
+          7. EntityResolver.resolve_user_node() — for each unique user-scoped entity
+          8. Neo4jAdapter.write_relationships() — user-scoped edges
           9. Mark all tasks PROCESSED in SQLite
         """
         task_ids = [t.task_id for t in tasks]
         logger.info(
-            "ConversationQueue: processing batch â€” turn_id='%s' tasks=%d",
+            "ConversationQueue: processing batch — turn_id='%s' tasks=%d",
             turn_id,
             len(tasks),
         )
@@ -253,9 +303,13 @@ class ConversationQueue:
         all_relationships: List[dict] = []
         source_agents: List[str] = []
         for task in tasks:
-            all_relationships.extend(task.relationships)
-            if task.source_agent not in source_agents:
-                source_agents.append(task.source_agent)
+            rels = task.relationships or []
+            if not rels and task.extraction_text:
+                rels = await self._extract_relationships_for_task(task)
+            if rels:
+                all_relationships.extend(rels)
+                if task.source_agent not in source_agents:
+                    source_agents.append(task.source_agent)
 
         if not all_relationships:
             await self._mark_processed(task_ids)
@@ -363,7 +417,7 @@ class ConversationQueue:
             )
 
         logger.info(
-            "ConversationQueue: batch done â€” turn_id='%s' domain_edges=%d user_edges=%d",
+            "ConversationQueue: batch done — turn_id='%s' domain_edges=%d user_edges=%d",
             turn_id,
             domain_written,
             user_written,
@@ -390,7 +444,7 @@ class ConversationQueue:
 
 
 #
-# GraphQueueManager â€” singleton managed by service_manager
+# GraphQueueManager — singleton managed by service_manager
 #
 
 
@@ -400,23 +454,28 @@ class GraphQueueManager:
 
     Public API
 
-    open_session(conversation_id)          â†’ create queue + start consumer
-    close_session(conversation_id)         â†’ drain queue + stop consumer
-    enqueue(task: GraphTask) -> str        â†’ enqueue task, return task_id
-    flush_turn(conversation_id, turn_id)   â†’ enqueue sentinel
-    enqueue(task, immediate=True)    â†’ bypass queue, direct write
-    start()                                â†’ init SQLite + recover orphans + start cleanup
-    shutdown()                             â†’ drain all queues gracefully
+    open_session(conversation_id)          → create queue + start consumer
+    close_session(conversation_id)         → drain queue + stop consumer
+    enqueue(task: GraphTask) -> str        → enqueue task, return task_id
+    flush_turn(conversation_id, turn_id)   → enqueue sentinel
+    enqueue(task, immediate=True)    → bypass queue, direct write
+    start()                                → init SQLite + recover orphans + start cleanup
+    shutdown()                             → drain all queues gracefully
     """
 
     def __init__(
         self,
         entity_resolver: EntityResolver,
         graph_writer: Neo4jAdapter,
+        relationship_extractor: RelationshipExtractor,
+        llm_provider: Callable[[Optional[dict]], Any],
         db_path: str = _GRAPH_TASKS_DB,
     ) -> None:
         self._resolver = entity_resolver
         self._writer = graph_writer
+        self._extractor = relationship_extractor
+        self._llm_provider = llm_provider
+        self._prompt_registry: Dict[str, str] = {}
         self._db_path = db_path
 
         self._queues: Dict[str, ConversationQueue] = {}
@@ -440,6 +499,9 @@ class GraphQueueManager:
                 conversation_id=conversation_id,
                 entity_resolver=self._resolver,
                 graph_writer=self._writer,
+                relationship_extractor=self._extractor,
+                llm_provider=self._llm_provider,
+                prompt_resolver=_get_prompt,
                 db_path=self._db_path,
             )
             cq.start()
@@ -462,27 +524,60 @@ class GraphQueueManager:
     # Enqueue and flush
     #
 
-    async def enqueue(self, task: GraphTask, immediate: bool = False) -> str:
+    async def enqueue(
+        self,
+        task: GraphTask,
+        immediate: bool = False,
+        extraction_text: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        llm_config: Optional[dict] = None,
+    ) -> str:
         """
         Persist task to SQLite, then either enqueue it for turn-scoped batching
         or process immediately if immediate=True.
         Creates the session lazily if not already open (safety net).
         Returns the task_id for tracing.
         """
-        if not task.relationships:
+        if extraction_text is not None:
+            task.extraction_text = extraction_text
+        if llm_config is not None:
+            task.llm_config = llm_config
+        if system_prompt is not None:
+            task.system_prompt_id = await self._register_prompt(system_prompt)
+
+        has_relationships = bool(task.relationships)
+        has_extraction = bool(task.extraction_text and task.system_prompt_id)
+
+        if not has_relationships and not has_extraction:
             logger.debug(
                 "GraphQueueManager.enqueue: skipping empty task from '%s'",
                 task.source_agent,
             )
             return task.task_id
 
+        if task.extraction_text and not task.system_prompt_id:
+            logger.warning(
+                "GraphQueueManager.enqueue: missing system_prompt_id for task '%s'",
+                task.task_id,
+            )
+            return task.task_id
+
+        if task.system_prompt_id and task.system_prompt_id not in self._prompt_registry:
+            logger.warning(
+                "GraphQueueManager.enqueue: prompt_id '%s' not registered; extraction may fail",
+                task.system_prompt_id,
+            )
+
         # Persist to SQLite first (durability)
         await self._persist_task(task)
 
         if immediate:
             try:
+                relationships = task.relationships
+                if not relationships and has_extraction:
+                    relationships = await self._extract_relationships_for_task(task)
                 await self._process_relationships_immediate(
-                    task.relationships,
+                    relationships,
                     task.conversation_id,
                     task.source_agent,
                 )
@@ -494,7 +589,7 @@ class GraphQueueManager:
             await self._mark_processed([task.task_id])
             return task.task_id
 
-        # Lazy session creation (safety net â€” callers should call open_session explicitly)
+        # Lazy session creation (safety net — callers should call open_session explicitly)
         async with self._queues_lock:
             cq = self._queues.get(task.conversation_id)
             if cq is None:
@@ -506,6 +601,9 @@ class GraphQueueManager:
                     conversation_id=task.conversation_id,
                     entity_resolver=self._resolver,
                     graph_writer=self._writer,
+                    relationship_extractor=self._extractor,
+                    llm_provider=self._llm_provider,
+                    prompt_resolver=_get_prompt,
                     db_path=self._db_path,
                 )
                 cq.start()
@@ -513,6 +611,7 @@ class GraphQueueManager:
 
         await cq.put(task)
         return task.task_id
+
     async def flush_turn(self, conversation_id: str, turn_id: str) -> None:
         """
         Enqueue a sentinel for this turn.  No-op if no session is open.
@@ -529,9 +628,29 @@ class GraphQueueManager:
             return
         await cq.put(_SentinelTask(turn_id=turn_id, conversation_id=conversation_id))
 
-    #
-    # Bypass path â€” system tasks (taxonomy, user signals)
-    #
+    async def _extract_relationships_for_task(self, task: GraphTask) -> List[dict]:
+        if not task.extraction_text or not task.system_prompt_id:
+            return []
+        prompt = _get_prompt(task.system_prompt_id)
+        if not prompt:
+            logger.warning(
+                "GraphQueueManager: missing system prompt for id '%s'",
+                task.system_prompt_id,
+            )
+            return []
+        try:
+            llm = self._llm_provider(task.llm_config)
+            return await self._extractor.extract(
+                text=task.extraction_text,
+                llm=llm,
+                system_prompt=prompt,
+                max_attempts=1,
+            )
+        except Exception:
+            logger.exception(
+                "GraphQueueManager: extraction failed for task '%s'", task.task_id
+            )
+            return []
 
     async def _process_relationships_immediate(
         self,
@@ -630,6 +749,7 @@ class GraphQueueManager:
                 await db.commit()
         except Exception:
             logger.exception("GraphQueueManager: failed to mark tasks processed")
+
     async def start(self) -> None:
         """
         Initialize SQLite, recover orphaned PENDING tasks, start TTL cleanup.
@@ -661,6 +781,36 @@ class GraphQueueManager:
         logger.info("GraphQueueManager: shutdown complete")
 
     #
+    async def _register_prompt(self, prompt: str) -> str:
+        prompt_id = _prompt_id(prompt)
+        if self._prompt_registry.get(prompt_id) == prompt:
+            return prompt_id
+        self._prompt_registry[prompt_id] = prompt
+        _register_prompt_local(prompt_id, prompt)
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO graph_prompt_registry (prompt_id, prompt_text, created_at) VALUES (?, ?, ?)",
+                    (prompt_id, prompt, time.time()),
+                )
+                await db.commit()
+        except Exception:
+            logger.exception("GraphQueueManager: failed to persist prompt registry")
+        return prompt_id
+
+    async def _load_prompt_registry(self) -> None:
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute(
+                    "SELECT prompt_id, prompt_text FROM graph_prompt_registry"
+                ) as cursor:
+                    rows = await cursor.fetchall()
+            for pid, prompt in rows:
+                self._prompt_registry[pid] = prompt
+                _register_prompt_local(pid, prompt)
+        except Exception:
+            logger.exception("GraphQueueManager: failed to load prompt registry")
+
     # SQLite persistence
     #
 
@@ -674,6 +824,9 @@ class GraphQueueManager:
                     conversation_id TEXT NOT NULL,
                     source_agent    TEXT NOT NULL,
                     relationships   TEXT NOT NULL,
+                    extraction_text TEXT,
+                    system_prompt_id TEXT,
+                    llm_config      TEXT,
                     status          TEXT NOT NULL DEFAULT 'PENDING',
                     created_at      REAL NOT NULL,
                     processed_at    REAL,
@@ -682,12 +835,37 @@ class GraphQueueManager:
             """
             )
             await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS graph_prompt_registry (
+                    prompt_id   TEXT PRIMARY KEY,
+                    prompt_text TEXT NOT NULL,
+                    created_at  REAL NOT NULL
+                )
+                """
+            )
+
+            # Ensure new columns exist for deferred extraction
+            async with db.execute("PRAGMA table_info(graph_tasks)") as cursor:
+                cols = {row[1] for row in await cursor.fetchall()}
+            for col, col_type in [
+                ("extraction_text", "TEXT"),
+                ("system_prompt_id", "TEXT"),
+                ("llm_config", "TEXT"),
+            ]:
+                if col not in cols:
+                    await db.execute(
+                        f"ALTER TABLE graph_tasks ADD COLUMN {col} {col_type}"
+                    )
+
+            await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_gt_status_created ON graph_tasks(status, created_at)"
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_gt_conversation ON graph_tasks(conversation_id, turn_id)"
             )
             await db.commit()
+
+        await self._load_prompt_registry()
         logger.info("GraphQueueManager: SQLite initialized at '%s'", self._db_path)
 
     async def _persist_task(self, task: GraphTask) -> None:
@@ -695,14 +873,21 @@ class GraphQueueManager:
             async with aiosqlite.connect(self._db_path) as db:
                 await db.execute(
                     """INSERT OR IGNORE INTO graph_tasks
-                       (task_id, turn_id, conversation_id, source_agent, relationships, status, created_at)
-                       VALUES (?, ?, ?, ?, ?, 'PENDING', ?)""",
+                       (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
                     (
                         task.task_id,
                         task.turn_id,
                         task.conversation_id,
                         task.source_agent,
                         json.dumps(task.relationships),
+                        task.extraction_text,
+                        task.system_prompt_id,
+                        (
+                            json.dumps(task.llm_config)
+                            if task.llm_config is not None
+                            else None
+                        ),
                         task.created_at,
                     ),
                 )
@@ -715,12 +900,12 @@ class GraphQueueManager:
     async def _recover_pending_tasks(self) -> None:
         """
         On startup, find PENDING tasks from previous sessions and process them
-        directly (bypass queue â€” no session needed).
+        directly (bypass queue � no session needed).
         """
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 async with db.execute(
-                    "SELECT task_id, turn_id, conversation_id, source_agent, relationships, created_at "
+                    "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, created_at "
                     "FROM graph_tasks WHERE status='PENDING' ORDER BY created_at ASC"
                 ) as cursor:
                     rows = await cursor.fetchall()
@@ -737,17 +922,27 @@ class GraphQueueManager:
             "GraphQueueManager: recovering %d orphaned PENDING task(s)", len(rows)
         )
 
-        tasks = [
-            GraphTask(
+        tasks: List[GraphTask] = []
+        for row in rows:
+            llm_config = json.loads(row[7]) if row[7] else None
+            task = GraphTask(
                 task_id=row[0],
                 turn_id=row[1],
                 conversation_id=row[2],
                 source_agent=row[3],
-                relationships=json.loads(row[4]),
-                created_at=row[5],
+                relationships=json.loads(row[4]) if row[4] else [],
+                extraction_text=row[5],
+                system_prompt_id=row[6],
+                llm_config=llm_config,
+                created_at=row[8],
             )
-            for row in rows
-        ]
+            if (
+                not task.relationships
+                and task.extraction_text
+                and task.system_prompt_id
+            ):
+                task.relationships = await self._extract_relationships_for_task(task)
+            tasks.append(task)
 
         # Group by conversation_id + turn_id and process each group
         grouped: Dict[Tuple[str, str], List[GraphTask]] = {}
@@ -756,23 +951,17 @@ class GraphQueueManager:
             grouped.setdefault(key, []).append(task)
 
         for (conv_id, turn_id), group_tasks in grouped.items():
-            # Use immediate processing for bypass (no queue), but merge the batch manually
             all_rels: List[dict] = []
             for t in group_tasks:
-                all_rels.extend(t.relationships)
-            source = "+".join({t.source_agent for t in group_tasks})
+                all_rels.extend(t.relationships or [])
+            if not all_rels:
+                await self._mark_processed([t.task_id for t in group_tasks])
+                continue
 
+            source = "+".join({t.source_agent for t in group_tasks})
             try:
                 await self._process_relationships_immediate(all_rels, conv_id, source)
-                # Mark processed after fire-and-forget task is created
-                task_ids = [t.task_id for t in group_tasks]
-                async with aiosqlite.connect(self._db_path) as db:
-                    now = time.time()
-                    await db.executemany(
-                        "UPDATE graph_tasks SET status='PROCESSED', processed_at=? WHERE task_id=?",
-                        [(now, tid) for tid in task_ids],
-                    )
-                    await db.commit()
+                await self._mark_processed([t.task_id for t in group_tasks])
             except Exception:
                 logger.exception(
                     "GraphQueueManager: recovery failed for conversation '%s' turn '%s'",
@@ -780,7 +969,6 @@ class GraphQueueManager:
                     turn_id,
                 )
 
-    #
     # TTL cleanup
     #
 
@@ -839,5 +1027,22 @@ def make_graph_task(
     )
 
 
-
-
+def make_extraction_task(
+    turn_id: str,
+    conversation_id: str,
+    source_agent: str,
+    extraction_text: str,
+    system_prompt: str,
+    llm_config: Optional[dict] = None,
+) -> GraphTask:
+    """Convenience constructor for deferred extraction tasks."""
+    return GraphTask(
+        task_id=str(uuid4()),
+        turn_id=turn_id,
+        conversation_id=conversation_id,
+        source_agent=source_agent,
+        relationships=[],
+        extraction_text=extraction_text,
+        system_prompt_id=_prompt_id(system_prompt),
+        llm_config=llm_config,
+    )

@@ -182,17 +182,22 @@ class ServiceManager:
 
         if self._graph_queue_manager is None:
             try:
+                def _llm_provider(config: dict | None):
+                    temperature = 0.0
+                    if config and isinstance(config, dict):
+                        temperature = float(config.get("temperature", 0.0))
+                    return self.get_agent(temperature=temperature)
+
                 self._graph_queue_manager = GraphQueueManager(
                     entity_resolver=self.get_entity_resolver(),
                     graph_writer=self.get_neo4j_adapter(),
+                    relationship_extractor=self.get_relationship_extractor(),
+                    llm_provider=_llm_provider,
                 )
             except Exception as e:
                 print(f"Error initializing GraphQueueManager: {e}")
                 raise
         return self._graph_queue_manager
-
-    # â”€â”€ UPDATED: Ingestor now injects entity_resolver â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
     def get_ingestor(self):
         from core.memory.ingestion.chunker import ArticleChunker
         from core.memory.ingestion.ingestor import DualStoreIngestor
@@ -305,3 +310,5 @@ class ServiceManager:
 
 
 service_manager = ServiceManager()
+
+

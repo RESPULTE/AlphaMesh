@@ -35,8 +35,10 @@ class BaseAgentInput(BaseModel):
         default=None, description="End date (format: YYYY-MM-DD)."
     )
 
-    # ── Internal / excluded from serialisation ────────────────────────────────
-    conversation_id: Optional[str] = Field(default=None, exclude=True)
+    # ── Internal (still serialized into agent state) ──────────────────────────
+    # NOTE: Do not exclude from serialization; LangGraph initial state is built
+    # from model_dump() and downstream agents need this for graph queue writes.
+    conversation_id: Optional[str] = Field(default=None)
 
     granularity: Optional[Literal["yearly", "quarterly"]] = Field(
         default="yearly",

@@ -1,4 +1,4 @@
-"""Prompt templates for chunk-level entity extraction."""
+﻿"""Prompt templates for chunk-level entity extraction."""
 
 from __future__ import annotations
 
@@ -97,4 +97,16 @@ Each entry: {"from_name": str, "from_type": "Company|FinancialConcept|FinancialE
 
 Analysis:
 {analysis_text}
+""".strip()
+
+
+DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = """\
+Given the analysis text below, extract only relationships between entities already mentioned.
+Return ONLY:
+<relationships>
+[JSON array of relationships between entities already mentioned in the analysis.
+Each entry: {"from_name": str, "from_type": "Company|FinancialConcept|FinancialEvent",
+ "relation": "AFFECTS|CAUSED_BY|INCREASES|DECREASES|CORRELATED_WITH|EXPOSES_TO|MITIGATES|COMPETES_WITH|ACQUIRED_BY|REPORTED_BY|RELATED_TO",
+ "to_name": str, "to_type": str, "confidence": "high|low", "reason": "1-3 sentences"}]
+</relationships>
 """.strip()

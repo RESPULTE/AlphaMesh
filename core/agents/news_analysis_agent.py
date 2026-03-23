@@ -12,7 +12,7 @@ Changes
   retrieval as a background asyncio task stored on the state.
   The task is awaited later in `_rendezvous_node`, exactly as before.
 
-- `run()` no longer reads `input_data.memory_task` — the news agent now
+- `run()` no longer reads `input_data.memory_task` � the news agent now
   self-manages its memory retrieval lifecycle entirely.  BaseAgentInput no
   longer carries a `memory_task` field.
 
@@ -25,8 +25,8 @@ Changes
   sequential round-trip.
 
 Graph topology:
-  rewrite_queries → fetch_news → ingest_articles → rendezvous → analyse_news
-                 ↘ (memory_task fires in background) ↗
+  rewrite_queries ? fetch_news ? ingest_articles ? rendezvous ? analyse_news
+                 ? (memory_task fires in background) ?
 """
 
 from __future__ import annotations
@@ -37,10 +37,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Type
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
-from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.models.base_agent_models import BaseAgentInput
@@ -55,7 +54,7 @@ from core.agents.prompts.news_agent_prompts import (
 )
 from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.utils import ExtractionResult, parse_xml_blocks
+from core.memory.graph.utils import parse_xml_blocks
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
@@ -255,7 +254,7 @@ class NewsAnalysisAgent(AbstractAgent):
         final_state = await self._graph.ainvoke(state_payload)
         return NewsAgentOutput(**final_state)
 
-    # ── Graph construction ────────────────────────────────────────────────────
+    # -- Graph construction ----------------------------------------------------
 
     def _build_graph(self):
         """Compile the linear LangGraph workflow."""
@@ -276,7 +275,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         return workflow.compile()
 
-    # ── Node: rewrite_queries ─────────────────────────────────────────────────
+    # -- Node: rewrite_queries -------------------------------------------------
 
     async def _rewrite_queries_node(self, state: NewsAgentState) -> dict:
         """
@@ -285,7 +284,7 @@ class NewsAnalysisAgent(AbstractAgent):
         fire the memory retrieval as a background asyncio task.
 
         The task is stored on `memory_task` and awaited later in
-        `_rendezvous_node`, which runs after news ingestion completes —
+        `_rendezvous_node`, which runs after news ingestion completes �
         effectively making memory retrieval concurrent with news fetching.
 
         Falls back gracefully: if the LLM call or task creation fails,
@@ -307,7 +306,7 @@ class NewsAnalysisAgent(AbstractAgent):
             )
         except Exception:
             logger.exception(
-                "_rewrite_queries_node: query rewrite LLM call failed — "
+                "_rewrite_queries_node: query rewrite LLM call failed � "
                 "memory retrieval will be skipped"
             )
 
@@ -337,22 +336,22 @@ class NewsAnalysisAgent(AbstractAgent):
         # carries it through the state dict; return it explicitly here.
         return {"memory_task": memory_task}
 
-    # ── Node: fetch_news ──────────────────────────────────────────────────────
+    # -- Node: fetch_news ------------------------------------------------------
 
     async def _fetch_news_node(self, state: NewsAgentState) -> dict:
         """
         Fetch news articles from NewsAPI and enrich them with full content
         scraped by trafilatura.
 
-        • build_news_query() constructs a boolean NewsAPI query that combines
+        � build_news_query() constructs a boolean NewsAPI query that combines
           the ticker symbol with optional company name / keywords.
-        • Results are filtered to a curated list of trusted financial domains.
-        • trafilatura replaces the truncated NewsAPI `content` field (~200 chars)
+        � Results are filtered to a curated list of trusted financial domains.
+        � trafilatura replaces the truncated NewsAPI `content` field (~200 chars)
           with the full article body.
-        • Falls back gracefully to the NewsAPI snippet when scraping fails.
+        � Falls back gracefully to the NewsAPI snippet when scraping fails.
         """
         logger.info(
-            "_fetch_news_node: fetching news for ticker='%s' (%s → %s)",
+            "_fetch_news_node: fetching news for ticker='%s' (%s ? %s)",
             state.ticker,
             state.start_date,
             state.end_date,
@@ -376,7 +375,7 @@ class NewsAnalysisAgent(AbstractAgent):
             raise
 
         logger.info(
-            "Fetched %d articles for ticker '%s' (%s → %s).",
+            "Fetched %d articles for ticker '%s' (%s ? %s).",
             len(articles),
             state.ticker,
             state.start_date,
@@ -384,7 +383,7 @@ class NewsAnalysisAgent(AbstractAgent):
         )
         return {"raw_articles": articles}
 
-    # ── Node: ingest_articles ─────────────────────────────────────────────────
+    # -- Node: ingest_articles -------------------------------------------------
 
     async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
         """
@@ -397,7 +396,7 @@ class NewsAnalysisAgent(AbstractAgent):
         against the query before reranking. The in-memory return value is
         intentionally ignored for this reason.
 
-        The two queries are fired in parallel — they are independent and each
+        The two queries are fired in parallel � they are independent and each
         involves an embedding round-trip.
         """
         if not state.raw_articles:
@@ -440,14 +439,14 @@ class NewsAnalysisAgent(AbstractAgent):
             len(existing_chunk_ids),
         )
         # chunk_ids retained in state for schema compatibility but no longer
-        # consumed downstream — entity extraction uses final_ranked IDs in
+        # consumed downstream � entity extraction uses final_ranked IDs in
         # _rendezvous_node instead.
         return {
             "chunk_ids": new_chunk_ids + existing_chunk_ids,
             "retrieved_chunks": retrieved_chunks,
         }
 
-    # ── Node: rendezvous ──────────────────────────────────────────────────────
+    # -- Node: rendezvous ------------------------------------------------------
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         memory_context: MemoryContext | None = None
@@ -467,7 +466,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         final_ranked = service_manager.get_reranker().rank(final_chunks)
 
-        # Extract entities only from the reranked set � chunks that actually
+        # Extract entities only from the reranked set ? chunks that actually
         # contributed to this query. Fire-and-forget: extraction enriches the
         # graph for future retrieval but does not affect the current analysis.
         # Memory chunks already marked EXTRACTED are skipped by the idempotency
@@ -487,7 +486,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         return {"final_chunks": final_ranked}
 
-    # ── Node: analyse_news ────────────────────────────────────────────────────
+    # -- Node: analyse_news ----------------------------------------------------
 
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""
@@ -498,11 +497,10 @@ class NewsAnalysisAgent(AbstractAgent):
             NEWS_ANALYSIS_USER_PROMPT,
         )
         from core.memory.graph.extraction_prompts import (
-            ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
             COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
+            DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
         )
-        from core.memory.graph.graph_queue import make_graph_task
-        from core.memory.graph.utils import extract_with_retry
+        from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
         from core.memory.retrieval.models import RetrievedChunk
 
         chunks = state.final_chunks
@@ -550,25 +548,22 @@ class NewsAnalysisAgent(AbstractAgent):
         ]
 
         try:
-            response = await extract_with_retry(self._llm, messages)
-            analysis_text = response.analysis
-            relationships = response.relationships
-            relationships_extracted = response.parse_success
+            response = await self._llm.ainvoke(messages)
+            raw = response.content if response else ""
+            analysis_text = raw
+            relationships: List[dict] = []
+            relationships_extracted = False
+            try:
+                parsed_analysis, parsed_relationships = parse_xml_blocks(raw)
+                analysis_text = parsed_analysis
+                if parsed_relationships is not None:
+                    relationships = parsed_relationships
+                    relationships_extracted = True
+            except Exception:
+                logger.error("_analyse_news_node: parse failed; deferring extraction")
         except Exception as exc:
-            logger.error("_analyse_news_node: extraction failed: %s", exc)
-            fallback_response = await self._llm.ainvoke(
-                [
-                    SystemMessage(content=ANALYSIS_ONLY_RELATIONSHIP_PROMPT),
-                    HumanMessage(
-                        content=NEWS_ANALYSIS_USER_PROMPT.format(
-                            query=state.query,
-                            entities_section=entities_section,
-                            context=context_block,
-                        )
-                    ),
-                ]
-            )
-            analysis_text = fallback_response.content if fallback_response else ""
+            logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
+            analysis_text = "Analysis could not be generated due to an internal error."
             relationships = []
             relationships_extracted = False
 
@@ -600,17 +595,35 @@ class NewsAnalysisAgent(AbstractAgent):
             if old_id in _sources_by_old_id
         ]
 
-        # ── CHANGED: enqueue via GraphQueueManager instead of schedule() ──────
         task_id = None
-        if relationships_extracted and relationships and state.conversation_id:
+        if state.conversation_id:
+            turn_id = getattr(state, "turn_id", None) or state.conversation_id
             try:
-                task = make_graph_task(
-                    turn_id=state.conversation_id,  # turn_id set by orchestrator flush
-                    conversation_id=state.conversation_id,
-                    source_agent=self.name(),
-                    relationships=relationships,
-                )
-                task_id = await service_manager.get_graph_queue_manager().enqueue(task)
+                if relationships_extracted and relationships:
+                    task = make_graph_task(
+                        turn_id=turn_id,
+                        conversation_id=state.conversation_id,
+                        source_agent=self.name(),
+                        relationships=relationships,
+                    )
+                    task_id = await service_manager.get_graph_queue_manager().enqueue(
+                        task
+                    )
+                elif analysis_text:
+                    task = make_extraction_task(
+                        turn_id=turn_id,
+                        conversation_id=state.conversation_id,
+                        source_agent=self.name(),
+                        extraction_text=analysis_text,
+                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                        llm_config={
+                            "temperature": getattr(self._llm, "temperature", 0.7)
+                        },
+                    )
+                    task_id = await service_manager.get_graph_queue_manager().enqueue(
+                        task,
+                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                    )
             except Exception:
                 logger.exception("_analyse_news_node: failed to enqueue graph task")
 
@@ -620,31 +633,3 @@ class NewsAnalysisAgent(AbstractAgent):
             "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
         }
-
-
-async def extract_with_retry(
-    llm,
-    prompt_messages: List[BaseMessage],
-    max_attempts: int = settings.EXTRACTION_LLM_RETRY_ATTEMPTS,
-) -> ExtractionResult:
-    async for attempt in AsyncRetrying(
-        stop=stop_after_attempt(max_attempts),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        reraise=True,
-    ):
-        with attempt:
-            response = await llm.ainvoke(prompt_messages)
-            analysis_text, relationships = parse_xml_blocks(response.content)
-            if relationships is None:
-                return ExtractionResult(
-                    analysis=analysis_text,
-                    relationships=[],
-                    parse_success=False,
-                )
-            return ExtractionResult(
-                analysis=analysis_text,
-                relationships=relationships,
-                parse_success=True,
-            )
-
-    return ExtractionResult(analysis="", relationships=[], parse_success=False)

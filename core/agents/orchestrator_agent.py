@@ -1,8 +1,8 @@
-﻿"""
+"""
 core/agents/orchestrator_agent.py
 
 Changes from previous version
-â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+──────────────────────────────
 1. run() now calls graph_queue_manager.open_session() before graph.ainvoke()
    and graph_queue_manager.flush_turn() + close_session() after it returns.
    This is the single addition required for the graph queue lifecycle.
@@ -49,7 +49,8 @@ from core.agents.utils import (
 )
 from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.graph_queue import make_graph_task
+from core.memory.graph.extraction_prompts import DEFERRED_RELATIONSHIP_SYSTEM_PROMPT
+from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
 from core.memory.user_signal_writeback import (
     build_signal_payload,
     build_user_signal_relationships,
@@ -97,7 +98,7 @@ class OrchestratorAgent:
             logger.exception("Failed to load portfolio from %s", path)
             return []
 
-    # â”€â”€ Graph wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Graph wiring ──────────────────────────────────────────────────────────
 
     def _router(self, state: OrchestratorState) -> str:
         if state.plan is None:
@@ -146,7 +147,7 @@ class OrchestratorAgent:
         workflow.add_edge("synthesiser", END)
         return workflow.compile()
 
-    # â”€â”€ Public entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Public entry point ────────────────────────────────────────────────────
 
     async def run(
         self,
@@ -158,10 +159,10 @@ class OrchestratorAgent:
         Entry point for one conversation turn.
 
         Graph queue lifecycle:
-          1. open_session() â€” ensures a ConversationQueue exists for this conversation.
-          2. graph.ainvoke() â€” agents enqueue GraphTasks during execution.
-          3. flush_turn()    â€” signals consumer to process all tasks for this turn.
-          4. close_session() is NOT called here â€” sessions persist across turns
+          1. open_session() — ensures a ConversationQueue exists for this conversation.
+          2. graph.ainvoke() — agents enqueue GraphTasks during execution.
+          3. flush_turn()    — signals consumer to process all tasks for this turn.
+          4. close_session() is NOT called here — sessions persist across turns
              and are closed by the API layer when the user disconnects.
         """
         user_context_block = "USER CONTEXT: None"
@@ -179,7 +180,7 @@ class OrchestratorAgent:
         turn_id = str(uuid4())
         logger.info("run: turn_id=%s", turn_id)
 
-        # â”€â”€ Step 1: open session (idempotent â€” no-op if already open) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 1: open session (idempotent — no-op if already open) ─────────
         if conversation_id:
             try:
                 await service_manager.get_graph_queue_manager().open_session(
@@ -206,7 +207,7 @@ class OrchestratorAgent:
                 summary="I encountered an internal error. Please try again."
             )
 
-        # â”€â”€ Step 2: flush turn (fire-and-forget â€” returns immediately) â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 2: flush turn (fire-and-forget — returns immediately) ────────
         if conversation_id:
             try:
                 await service_manager.get_graph_queue_manager().flush_turn(
@@ -240,7 +241,7 @@ class OrchestratorAgent:
             agent_analyses=getattr(raw, "agent_analyses", {}) or {},
         )
 
-    # â”€â”€ Prompt builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Prompt builders ───────────────────────────────────────────────────────
 
     def _build_synthesis_prompt(
         self,
@@ -313,7 +314,7 @@ class OrchestratorAgent:
             interest_edges=interest_edges,
         )
 
-    # â”€â”€ Nodes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Nodes ─────────────────────────────────────────────────────────────────
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
         available_agents_desc = "\n".join(
@@ -341,7 +342,7 @@ class OrchestratorAgent:
             )
             return {"plan": plan}
         except Exception:
-            logger.exception("_plan_node: LLM call failed â€” using safe fallback plan")
+            logger.exception("_plan_node: LLM call failed — using safe fallback plan")
             return {"plan": OrchestratorPlan()}
 
     async def _direct_answer_node(self, state: OrchestratorState) -> Dict[str, Any]:
@@ -433,7 +434,7 @@ class OrchestratorAgent:
         for name, res in zip(names, results):
             if isinstance(res, Exception):
                 logger.error(
-                    "_execute_node: agent '%s' failed â€” %s", name, res, exc_info=res
+                    "_execute_node: agent '%s' failed — %s", name, res, exc_info=res
                 )
             else:
                 outputs[name] = res
@@ -500,25 +501,34 @@ class OrchestratorAgent:
                     "The raw data was retrieved but could not be summarised."
                 )
 
-        # â”€â”€ Cross-domain graph write-back (via GraphQueueManager.enqueue) â”€â”€â”€â”€â”€
-        if (
-            multi_agent
-            and state.conversation_id
-            and synthesis_result.cross_relationships
-        ):
+        # Cross-domain graph write-back (queued via GraphQueueManager.enqueue)
+        if multi_agent and state.conversation_id:
             try:
-                task = make_graph_task(
-                    turn_id=state.turn_id,
-                    conversation_id=state.conversation_id,
-                    source_agent=self.name(),
-                    relationships=synthesis_result.cross_relationships,
-                )
-                await service_manager.get_graph_queue_manager().enqueue(task)
+                if synthesis_result.cross_relationships:
+                    task = make_graph_task(
+                        turn_id=state.turn_id,
+                        conversation_id=state.conversation_id,
+                        source_agent=self.name(),
+                        relationships=synthesis_result.cross_relationships,
+                    )
+                    await service_manager.get_graph_queue_manager().enqueue(task)
+                elif analysis_text:
+                    task = make_extraction_task(
+                        turn_id=state.turn_id,
+                        conversation_id=state.conversation_id,
+                        source_agent=self.name(),
+                        extraction_text=analysis_text,
+                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                        llm_config={"temperature": 0.0},
+                    )
+                    await service_manager.get_graph_queue_manager().enqueue(
+                        task,
+                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                    )
             except Exception:
                 logger.exception(
                     "_synthesize_node: failed to enqueue cross-domain relationships"
                 )
-
         # User signal write-back (queued via GraphQueueManager.enqueue)
         if state.user_email and state.plan and state.conversation_id:
             user_message = _extract_last_human_message(state.messages)
@@ -544,7 +554,7 @@ class OrchestratorAgent:
                         source_agent=self.name(),
                         relationships=relationships,
                     )
-                    service_manager.get_graph_queue_manager().enqueue(task)
+                    await service_manager.get_graph_queue_manager().enqueue(task)
                 except Exception:
                     logger.exception(
                         "_synthesize_node: failed to enqueue user signal relationships"
@@ -563,4 +573,8 @@ class OrchestratorAgent:
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,
         }
+
+
+
+
 
