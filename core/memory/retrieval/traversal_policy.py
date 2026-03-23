@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-
 from core.memory.graph.models import _ENTITY_TYPE_WEIGHTS, _RELATIONSHIP_WEIGHTS
 from core.memory.retrieval.models import NeighborCandidate, RetrieverState
 

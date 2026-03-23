@@ -18,11 +18,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
 
     await service_manager.startup()
     agent = OrchestratorAgent()
-    messages = [
-        HumanMessage(
-            content="I am interested in learning about APPLEWES's recent news and also its recent growth in fcf yoy"
-        )
-    ]
+    messages = [HumanMessage(content="")]
 
     try:
         output = await agent.run(

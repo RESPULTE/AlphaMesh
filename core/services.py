@@ -7,14 +7,12 @@ class ServiceManager:
     Centralised manager for all service singletons.
 
     Changes from previous version
-    â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    - get_subgraph_store()      â†’ REMOVED (SubgraphStore deleted)
-    - get_entity_resolver()     â†’ NEW
-    - get_relationship_extractor() â†’ NEW
-    - get_graph_queue_manager() â†’ NEW
-    - get_ingestor()            â†’ now injects entity_resolver instead of embedding_func
-    - get_subgraph_service()    â†’ now constructs shim with queue_manager + extractor
-    - startup()                 â†’ now starts GraphQueueManager
+    ──────────────────────────────
+    - get_retriever(): uses prefilter= instead of reranker= — DualStoreRetriever
+      now takes a CompositePrefilter directly; the full TwoStageReranker (with
+      Jina) is used only at the final selection point in _rendezvous_node.
+    - get_reranker(): returns TwoStageReranker (CompositePrefilter + Jina).
+    - get_prefilter(): new — returns the shared CompositePrefilter singleton.
     """
 
     def __init__(self):
@@ -30,6 +28,7 @@ class ServiceManager:
         self._graph_queue_manager = None
         self._dual_store_ingestor = None
         self._retriever = None
+        self._prefilter = None
         self._reranker = None
         self._memory_retrieval_service = None
         self._user_context_service = None
@@ -149,7 +148,7 @@ class ServiceManager:
                 raise
         return self._nodeset_manager
 
-    # â”€â”€ NEW: EntityResolver â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── EntityResolver ────────────────────────────────────────────────────────
 
     def get_entity_resolver(self):
         from core.memory.graph.entity_resolver import EntityResolver
@@ -175,7 +174,7 @@ class ServiceManager:
             self._relationship_extractor = RelationshipExtractor()
         return self._relationship_extractor
 
-    # â”€â”€ NEW: GraphQueueManager â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── GraphQueueManager ─────────────────────────────────────────────────────
 
     def get_graph_queue_manager(self):
         from core.memory.graph.graph_queue import GraphQueueManager
@@ -200,6 +199,8 @@ class ServiceManager:
                 raise
         return self._graph_queue_manager
 
+    # ── Ingestor ──────────────────────────────────────────────────────────────
+
     def get_ingestor(self):
         from core.memory.ingestion.chunker import ArticleChunker
         from core.memory.ingestion.ingestor import DualStoreIngestor
@@ -214,7 +215,7 @@ class ServiceManager:
                     chroma_adapter=self.get_chroma_adapter(),
                     entity_chroma_adapter=self.get_entity_chroma_adapter(),
                     nodeset_manager=self.get_nodeset_manager(),
-                    entity_resolver=self.get_entity_resolver(),  # â† replaces embedding_func
+                    entity_resolver=self.get_entity_resolver(),
                     chunker=chunker,
                     llm=self.get_agent(),
                 )
@@ -231,25 +232,54 @@ class ServiceManager:
                 self._retriever = DualStoreRetriever(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
-                    reranker=self.get_reranker(),
+                    prefilter=self.get_prefilter(),
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreRetriever: {e}")
                 raise
         return self._retriever
 
+    def get_prefilter(self):
+        """
+        Return the shared CompositePrefilter singleton.
+
+        Used directly by DualStoreRetriever for fast intermediate ordering of
+        memory chunks, and as stage 1 inside TwoStageReranker.
+        """
+        from core.memory.retrieval.reranker import CompositePrefilter
+
+        if self._prefilter is None:
+            try:
+                self._prefilter = CompositePrefilter(
+                    alpha=settings.RERANK_ALPHA,
+                    beta=settings.RERANK_BETA,
+                    prefilter_k=settings.RERANK_PREFILTER_K,
+                )
+            except Exception as e:
+                print(f"Error initializing CompositePrefilter: {e}")
+                raise
+        return self._prefilter
+
     def get_reranker(self):
-        from core.memory.retrieval.reranker import CompositeReranker
+        """
+        Return the TwoStageReranker singleton.
+
+        Used at the final selection point (_rendezvous_node) where all chunk
+        sources are combined and the Jina cross-encoder makes the definitive
+        top-k selection.
+        """
+        from core.memory.retrieval.reranker import TwoStageReranker
 
         if self._reranker is None:
             try:
-                self._reranker = CompositeReranker(
-                    alpha=settings.RERANK_ALPHA,
-                    beta=settings.RERANK_BETA,
+                self._reranker = TwoStageReranker(
+                    prefilter=self.get_prefilter(),
                     top_k=settings.RERANK_FINAL_TOP_K,
+                    jina_api_key=settings.JINA_API_KEY,
+                    jina_model=settings.JINA_RERANKER_MODEL,
                 )
             except Exception as e:
-                print(f"Error initializing CompositeReranker: {e}")
+                print(f"Error initializing TwoStageReranker: {e}")
                 raise
         return self._reranker
 
@@ -302,7 +332,7 @@ class ServiceManager:
         starts (recovery may write to Neo4j).
         """
         await self.get_nodeset_manager().initialize_default_nodesets()
-        await self.get_graph_queue_manager().start()  # â† NEW
+        await self.get_graph_queue_manager().start()
 
     async def shutdown(self) -> None:
         """Run at application teardown to drain graph queues gracefully."""

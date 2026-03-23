@@ -341,9 +341,10 @@ class OrchestratorAgent:
                 plan.ticker,
             )
             return {"plan": plan}
+
         except Exception:
             logger.exception("_plan_node: LLM call failed — using safe fallback plan")
-            return {"plan": OrchestratorPlan()}
+            return {"plan": None}
 
     async def _direct_answer_node(self, state: OrchestratorState) -> Dict[str, Any]:
         answer = (state.plan.final_answer or "").strip() if state.plan else ""
@@ -573,8 +574,3 @@ class OrchestratorAgent:
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,
         }
-
-
-
-
-

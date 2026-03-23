@@ -18,12 +18,11 @@ class Settings(BaseSettings):
 
     # LLM and Embedding Configuration
     GOOGLE_API_KEY: Optional[str] = Field(default=None, validation_alias="LLM_API_KEY")
-    LLM_MODEL: str
-
     EMBEDDING_API_KEY: Optional[str] = Field(
         default=None, validation_alias="EMBEDDING_API_KEY"
     )
-    EMBEDDING_MODEL: str
+    LLM_MODEL: str = "gemini-2.5-flash-lite"
+    EMBEDDING_MODEL: str = "gemini-embedding-001"
 
     # Neo4j Configuration
     NEO4J_URI: str
@@ -112,10 +111,14 @@ class Settings(BaseSettings):
     # Minimum character count for scraped body to be considered useful.
     _MIN_BODY_LENGTH = 150
 
-    GOOGLE_CLOUD_LOCATION: str
-    GOOGLE_CLOUD_PROJECT: str
+    GOOGLE_CLOUD_LOCATION: Optional[str] = None
+    GOOGLE_CLOUD_PROJECT: Optional[str] = None
 
     GRAPH_QUEUE_DB_PATH: str = "./data/graph_tasks.db"
+
+    RERANK_PREFILTER_K: int = 40  # candidates passed to Jina; ~2-3× final_top_k
+    JINA_API_KEY: Optional[str] = None  # leave unset to run composite-only (no Jina)
+    JINA_RERANKER_MODEL: str = "jina-reranker-v2-base-multilingual"
 
 
 settings = Settings()

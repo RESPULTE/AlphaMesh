@@ -35,6 +35,7 @@ class RetrieverState(TypedDict):
 
 
 class RewrittenQueries(BaseModel):
+    # Domain-specific retrieval strings produced by the query-rewrite LLM call.
     company_query: Optional[str] = None
     sector_query: Optional[str] = None
     market_query: Optional[str] = None
@@ -42,6 +43,10 @@ class RewrittenQueries(BaseModel):
     active_domains: List[Literal["company", "sector", "market", "knowledge"]] = Field(
         default_factory=list
     )
+    # Set programmatically after the LLM call — not produced by the LLM.
+    # Carries the agent-level query (already orchestrator-rewritten) for use
+    # as the Jina reranker's query string in _rendezvous_node.
+    original_query: Optional[str] = None
 
 
 class RetrievedChunk(BaseModel):

@@ -20,7 +20,6 @@ TraversalPolicy
 NeighborCandidate / GraphChunkRow
     Typed dataclasses that normalise raw Neo4j dict rows at the adapter
     boundary, eliminating scattered string-key access inside node logic.
-
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ from core.memory.retrieval.models import (
     RetrieverState,
     RewrittenQueries,
 )
-from core.memory.retrieval.reranker import CompositeReranker
+from core.memory.retrieval.reranker import CompositePrefilter
 from core.memory.retrieval.traversal_policy import TraversalPolicy
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
@@ -128,11 +127,11 @@ class DualStoreRetriever:
         self,
         neo4j_adapter: Neo4jAdapter,
         chroma_adapter: ChromaDBAdapter,
-        reranker: CompositeReranker,
+        prefilter: CompositePrefilter,
     ) -> None:
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
-        self._reranker = reranker
+        self._prefilter = prefilter
         self._logger = get_logger(__name__)
 
         self._max_iterations = settings.RETRIEVER_MAX_ITERATIONS
@@ -494,12 +493,12 @@ class DualStoreRetriever:
                     chunk_map[normalized.chunk_id] = normalized
 
         pre_rerank_count = len(chunk_map)
-        ranked = self._reranker.rank(list(chunk_map.values()))
+        prefiltered = self._prefilter.score(list(chunk_map.values()))
 
         self._logger.info(
-            "Comprehensive retrieve: domains=%s unique_chunks=%d reranked=%d",
+            "Comprehensive retrieve: domains=%s unique_chunks=%d prefiltered=%d",
             list(active_queries.keys()),
             pre_rerank_count,
-            len(ranked),
+            len(prefiltered),
         )
-        return MemoryContext(chunks=ranked, rewritten_queries=rewritten_queries)
+        return MemoryContext(chunks=prefiltered, rewritten_queries=rewritten_queries)

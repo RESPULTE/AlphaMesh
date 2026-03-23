@@ -283,9 +283,9 @@ class NewsAnalysisAgent(AbstractAgent):
         memory retrieval strings (company / sector / market) and immediately
         fire the memory retrieval as a background asyncio task.
 
-        The task is stored on `memory_task` and awaited later in
-        `_rendezvous_node`, which runs after news ingestion completes �
-        effectively making memory retrieval concurrent with news fetching.
+        original_query is stamped onto the RewrittenQueries object here so
+        that TwoStageReranker.rank() has the right query string available when
+        _rendezvous_node calls it on the final combined chunk pool.
 
         Falls back gracefully: if the LLM call or task creation fails,
         `memory_task` remains None and the rendezvous node skips memory.
@@ -299,6 +299,10 @@ class NewsAnalysisAgent(AbstractAgent):
                     HumanMessage(content=state.query),
                 ]
             )
+            # Stamp the agent-level query so the final Jina reranker call in
+            # _rendezvous_node has a focused, orchestrator-rewritten query string.
+            if rewritten_queries is not None:
+                rewritten_queries.original_query = state.query
             logger.info(
                 "_rewrite_queries_node: domains=%s for query='%.80s'",
                 rewritten_queries.active_domains if rewritten_queries else [],
@@ -306,7 +310,7 @@ class NewsAnalysisAgent(AbstractAgent):
             )
         except Exception:
             logger.exception(
-                "_rewrite_queries_node: query rewrite LLM call failed � "
+                "_rewrite_queries_node: query rewrite LLM call failed — "
                 "memory retrieval will be skipped"
             )
 
@@ -332,8 +336,6 @@ class NewsAnalysisAgent(AbstractAgent):
                     "_rewrite_queries_node: failed to create memory retrieval task"
                 )
 
-        # memory_task is excluded from Pydantic serialisation but LangGraph
-        # carries it through the state dict; return it explicitly here.
         return {"memory_task": memory_task}
 
     # -- Node: fetch_news ------------------------------------------------------
@@ -464,13 +466,16 @@ class NewsAnalysisAgent(AbstractAgent):
         if memory_context is not None:
             final_chunks = final_chunks + memory_context.chunks
 
-        final_ranked = service_manager.get_reranker().rank(final_chunks)
+        # TwoStageReranker: composite prefilter → Jina cross-encoder.
+        # query comes from state.query (the agent-level, orchestrator-rewritten
+        # query — already focused for news analysis).
+        final_ranked = await service_manager.get_reranker().rank(
+            state.query, final_chunks
+        )
 
-        # Extract entities only from the reranked set ? chunks that actually
+        # Extract entities only from the reranked set — chunks that actually
         # contributed to this query. Fire-and-forget: extraction enriches the
         # graph for future retrieval but does not affect the current analysis.
-        # Memory chunks already marked EXTRACTED are skipped by the idempotency
-        # guard inside extract_entities_for_chunks at no cost.
         pending_chunk_ids = [
             chunk.chunk_id
             for chunk in final_ranked
