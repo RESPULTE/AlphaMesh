@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import pytest
 from langchain_core.messages import HumanMessage
 
-from core.agents.models import BaseAgentInput
+from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.agents.orchestrator_agent import OrchestratorAgent
 from core.services import service_manager

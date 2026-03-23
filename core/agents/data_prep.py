@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from core.agents.fundamental_agent_models import _AgentState
+from core.agents.models.fundamental_agent_models import _AgentState
 from core.logger import get_logger
 
 logger = get_logger(__name__)

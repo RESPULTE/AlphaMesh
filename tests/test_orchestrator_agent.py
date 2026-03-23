@@ -7,7 +7,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableLambda
 
 import core.agents.orchestrator_agent as orchestrator_module
-from core.agents.models import CitedSource, NewsAgentOutput
+from core.agents.models.news_agent_models import CitedSource, NewsAgentOutput
 from core.agents.orchestrator_agent import (
     FinalResponse,
     OrchestratorAgent,

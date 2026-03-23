@@ -130,7 +130,6 @@ class UserContextService:
     ) -> None:
         """
         Merge new interest entries into the in-memory cache without any graph write.
-        Graph persistence is fully delegated to write_user_signals → schedule().
 
         Called immediately after schedule() dispatches the background graph task
         so that get_formatted_context() in subsequent turns of the same session

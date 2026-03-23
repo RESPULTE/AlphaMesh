@@ -5,7 +5,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.financial_tools import ToolResult
-from core.agents.models import BaseAgentInput, BaseAgentOutput
+from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Tool Call Specification and Iterative Plan Models

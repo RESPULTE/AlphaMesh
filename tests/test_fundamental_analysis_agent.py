@@ -65,7 +65,6 @@ from core.agents.financial_tools import (
     get_tool_descriptions,
     set_adapter,
 )
-from core.agents.fundamental_agent_models import BaseAgentInput, ToolCallSpec
 from core.agents.fundamental_analysis_agent import (
     FundamentalAnalysisAgent,
     FundamentalAnalysisOutput,
@@ -73,7 +72,8 @@ from core.agents.fundamental_analysis_agent import (
     _AgentState,
     _format_value,
 )
-from core.agents.models import BaseAgentInput
+from core.agents.models.base_agent_models import BaseAgentInput
+from core.agents.models.fundamental_agent_models import BaseAgentInput, ToolCallSpec
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pytest configuration

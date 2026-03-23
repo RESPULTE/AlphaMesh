@@ -42,14 +42,16 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from core.agents.base_agent import AbstractAgent
-from core.agents.models import (
-    BaseAgentInput,
+from core.agents.models.base_agent_models import BaseAgentInput
+from core.agents.models.news_agent_models import (
     CitedSource,
     NewsAgentOutput,
     NewsAgentState,
 )
 from core.agents.news_fetcher import build_news_query, fetch_articles
-from core.agents.prompts import NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT
+from core.agents.prompts.news_agent_prompts import (
+    NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
+)
 from core.config import settings
 from core.logger import get_logger
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
@@ -484,8 +486,10 @@ class NewsAnalysisAgent(AbstractAgent):
         """Generate a grounded financial analysis from retrieved chunks."""
         import re as _re
 
-        from core.agents.models import CitedSource
-        from core.agents.prompts import NEWS_ANALYSIS_USER_PROMPT
+        from core.agents.models.news_agent_models import CitedSource
+        from core.agents.prompts.orchestrator_agent_prompts import (
+            NEWS_ANALYSIS_USER_PROMPT,
+        )
         from core.memory.graph.extraction_prompts import (
             ANALYSIS_ONLY_RELATIONSHIP_PROMPT,
             COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,

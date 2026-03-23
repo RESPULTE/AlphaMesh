@@ -1,27 +1,27 @@
-"""
+﻿"""
 core/memory/user_signal_writeback.py
 
 Unified user signal write-back via GraphQueueManager.write_immediate().
 
 Changes from previous version
-──────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 - No longer calls SubgraphExtractionService.schedule(bypass_guards=True).
 - Now calls GraphQueueManager.write_immediate() directly for entity persistence
   and edge writing.
 - Entity pre-resolution (_build_interest_relationships) now calls
   EntityResolver.resolve() directly instead of DualStoreIngestor.resolve_entity_id().
-- The _build_relationship_props helper is removed — GraphWriter owns that now.
+- The _build_relationship_props helper is removed â€” Neo4jAdapter owns that now.
   Relationship dicts are passed as-is to write_immediate() which delegates
-  to GraphWriter internally.
+  to Neo4jAdapter internally.
 
 Graph schema written here (unchanged)
-──────────────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 NodeSet (USER_{hash})
-  ←─BELONGS_TO_NODESET─── UserInterestDomain {domain_type, category, user_email}
-                               └─HAS_INTEREST_IN──> UserInterestEdge {weight, status, ...}
-                                                         ├─TARGETS──────────> Entity
-                                                         ├─SOURCED_FROM─────> TurnNode (reinforce)
-                                                         └─INVALIDATED_BY──> TurnNode (invalidate)
+  â†â”€BELONGS_TO_NODESETâ”€â”€â”€ UserInterestDomain {domain_type, category, user_email}
+                               â””â”€HAS_INTEREST_INâ”€â”€> UserInterestEdge {weight, status, ...}
+                                                         â”œâ”€TARGETSâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€> Entity
+                                                         â”œâ”€SOURCED_FROMâ”€â”€â”€â”€â”€> TurnNode (reinforce)
+                                                         â””â”€INVALIDATED_BYâ”€â”€> TurnNode (invalidate)
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from core.memory.user_context_service import InterestCacheEntry
 logger = get_logger(__name__)
 
 
-# ── Payload dataclasses (unchanged) ──────────────────────────────────────────
+# â”€â”€ Payload dataclasses (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 @dataclass
@@ -82,7 +82,7 @@ class UserSignalPayload:
     interest_edges: List[InterestEdge] = field(default_factory=list)
 
 
-# ── Domain category derivation (unchanged) ────────────────────────────────────
+# â”€â”€ Domain category derivation (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _derive_investment_category(
@@ -122,7 +122,7 @@ async def _derive_learning_category(
     return "general"
 
 
-# ── Relationship list builder ─────────────────────────────────────────────────
+# â”€â”€ Relationship list builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 async def _build_interest_relationships(
@@ -351,20 +351,17 @@ async def _build_interest_relationships(
     return relationships, cache_entries
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
-
-
-async def write_user_signals(payload: UserSignalPayload) -> None:
+async def build_user_signal_relationships(
+    payload: UserSignalPayload,
+) -> Tuple[List[dict], List[InterestCacheEntry]]:
     """
-    Persist all user interest signals from a conversation turn.
+    Build all user interest relationships for a conversation turn.
 
-    Steps:
-      1. Build relationship list with pre-resolved entity IDs.
-      2. Call GraphQueueManager.write_immediate() — bypasses queue for immediate write.
-      3. Update in-memory cache synchronously.
+    Returns (relationships, cache_entries). No graph writes or cache updates
+    are performed here.
     """
     logger.info(
-        "write_user_signals: user='%s' turn='%s' investment=%d learning=%d",
+        "build_user_signal_relationships: user='%s' turn='%s' investment=%d learning=%d",
         payload.user_email,
         payload.turn_id,
         len(payload.investment_signals),
@@ -373,12 +370,12 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
 
     if not payload.user_email or not payload.conversation_id:
         logger.warning(
-            "write_user_signals: missing user_email or conversation_id — skipping"
+            "build_user_signal_relationships: missing user_email or conversation_id â€” skipping"
         )
-        return
+        return [], []
 
     if not payload.investment_signals and not payload.learning_signals:
-        return
+        return [], []
 
     try:
         from core.memory.graph.nodeset_manager import (
@@ -389,35 +386,32 @@ async def write_user_signals(payload: UserSignalPayload) -> None:
 
         entity_resolver = service_manager.get_entity_resolver()
         neo4j = service_manager.get_neo4j_adapter()
-        graph_queue = service_manager.get_graph_queue_manager()
-        user_ctx_svc = service_manager.get_user_context_service()
-
         nodeset_id = canonical_nodeset_id(get_user_nodeset_name(payload.user_email))
 
-        # ── Step 1: build relationship list ───────────────────────────────────
         relationships, cache_entries = await _build_interest_relationships(
             payload, entity_resolver, neo4j, nodeset_id
         )
-
-        if not relationships:
-            logger.info(
-                "write_user_signals: no relationships built — skipping graph write"
-            )
-            return
-
-        # ── Step 2: write via GraphQueueManager.write_immediate ───────────────
-        await graph_queue.write_immediate(
-            relationships=relationships,
-            conversation_id=payload.conversation_id,
-            source_agent="user_signal_writeback",
-        )
-
-        # ── Step 3: update in-memory cache ────────────────────────────────────
-        if cache_entries:
-            user_ctx_svc.update_cache(cache_entries, payload.user_email)
-
+        return relationships, cache_entries
     except Exception:
-        logger.exception("write_user_signals: failed for user '%s'", payload.user_email)
+        logger.exception(
+            "build_user_signal_relationships: failed for user '%s'", payload.user_email
+        )
+        return [], []
+
+
+def update_in_memory_user_signal_cache(
+    cache_entries: List[InterestCacheEntry],
+    user_email: str,
+) -> None:
+    if not cache_entries or not user_email:
+        return
+    try:
+        from core.services import service_manager
+
+        user_ctx_svc = service_manager.get_user_context_service()
+        user_ctx_svc.update_cache(cache_entries, user_email)
+    except Exception:
+        logger.exception("update_user_signal_cache: failed for user '%s'", user_email)
 
 
 def build_signal_payload(
@@ -475,3 +469,4 @@ def build_signal_payload(
         learning_signals=learning_signals,
         interest_edges=edges,
     )
+

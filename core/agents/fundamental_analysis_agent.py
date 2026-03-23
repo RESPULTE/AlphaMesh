@@ -50,19 +50,19 @@ from core.agents.data_prep import (
 )
 from core.agents.financial_db import FinancialDatabase
 from core.agents.financial_tools import TOOL_REGISTRY, ToolResult, get_tool_descriptions
-from core.agents.fundamental_agent_models import (
+from core.agents.models.base_agent_models import BaseAgentInput
+from core.agents.models.fundamental_agent_models import (
     FundamentalAnalysisOutput,
     IterativeToolPlan,
     ToolCallBatch,
     ToolCallSpec,
     _AgentState,
 )
-from core.agents.fundamental_agent_prompts import (
+from core.agents.prompts.fundamental_agent_prompts import (
     _ANALYST_SYSTEM,
     _TOOL_PLANNER_SYSTEM,
     _TOOL_PLANNER_USER,
 )
-from core.agents.models import BaseAgentInput
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import ANALYSIS_ONLY_RELATIONSHIP_PROMPT
 from core.memory.graph.graph_queue import make_graph_task

@@ -1,17 +1,15 @@
-"""
+﻿"""
 core/agents/orchestrator_agent.py
 
 Changes from previous version
-──────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 1. run() now calls graph_queue_manager.open_session() before graph.ainvoke()
    and graph_queue_manager.flush_turn() + close_session() after it returns.
    This is the single addition required for the graph queue lifecycle.
 
 2. _synthesize_node() replaces subgraph_svc.schedule() with a direct
    GraphQueueManager.enqueue() call for cross-domain relationships.
-   User signal writeback (write_user_signals) is unchanged — it uses
-   write_immediate() internally.
-
+   User signal writeback now enqueues GraphTasks for turn-scoped batching.
 Everything else is unchanged from the previous version.
 """
 
@@ -27,15 +25,16 @@ from langgraph.graph import END, START, StateGraph
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
-from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
-from core.agents.news_analysis_agent import NewsAnalysisAgent
-from core.agents.orchestrator_models import (
+from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
+from core.agents.models.news_agent_models import CitedSource
+from core.agents.models.orchestrator_models import (
     FinalResponse,
     OrchestratorPlan,
     OrchestratorState,
     SynthesisResult,
 )
-from core.agents.prompts import (
+from core.agents.news_analysis_agent import NewsAnalysisAgent
+from core.agents.prompts.orchestrator_agent_prompts import (
     ORCHESTRATOR_PLANNER_SYSTEM_PROMPT,
     SYNTHESISER_SINGLE_AGENT_PROMPT,
     SYNTHESISER_USER_CONTEXT_SECTION,
@@ -46,13 +45,16 @@ from core.agents.utils import (
     _build_combined_company_context,
     _extract_last_human_message,
     _last_n_messages,
-    _safe_create_task,
     _safe_json,
 )
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.graph_queue import make_graph_task
-from core.memory.user_signal_writeback import build_signal_payload, write_user_signals
+from core.memory.user_signal_writeback import (
+    build_signal_payload,
+    build_user_signal_relationships,
+    update_in_memory_user_signal_cache,
+)
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -95,7 +97,7 @@ class OrchestratorAgent:
             logger.exception("Failed to load portfolio from %s", path)
             return []
 
-    # ── Graph wiring ──────────────────────────────────────────────────────────
+    # â”€â”€ Graph wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _router(self, state: OrchestratorState) -> str:
         if state.plan is None:
@@ -144,7 +146,7 @@ class OrchestratorAgent:
         workflow.add_edge("synthesiser", END)
         return workflow.compile()
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    # â”€â”€ Public entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def run(
         self,
@@ -156,10 +158,10 @@ class OrchestratorAgent:
         Entry point for one conversation turn.
 
         Graph queue lifecycle:
-          1. open_session() — ensures a ConversationQueue exists for this conversation.
-          2. graph.ainvoke() — agents enqueue GraphTasks during execution.
-          3. flush_turn()    — signals consumer to process all tasks for this turn.
-          4. close_session() is NOT called here — sessions persist across turns
+          1. open_session() â€” ensures a ConversationQueue exists for this conversation.
+          2. graph.ainvoke() â€” agents enqueue GraphTasks during execution.
+          3. flush_turn()    â€” signals consumer to process all tasks for this turn.
+          4. close_session() is NOT called here â€” sessions persist across turns
              and are closed by the API layer when the user disconnects.
         """
         user_context_block = "USER CONTEXT: None"
@@ -177,7 +179,7 @@ class OrchestratorAgent:
         turn_id = str(uuid4())
         logger.info("run: turn_id=%s", turn_id)
 
-        # ── Step 1: open session (idempotent — no-op if already open) ─────────
+        # â”€â”€ Step 1: open session (idempotent â€” no-op if already open) â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if conversation_id:
             try:
                 await service_manager.get_graph_queue_manager().open_session(
@@ -204,7 +206,7 @@ class OrchestratorAgent:
                 summary="I encountered an internal error. Please try again."
             )
 
-        # ── Step 2: flush turn (fire-and-forget — returns immediately) ────────
+        # â”€â”€ Step 2: flush turn (fire-and-forget â€” returns immediately) â”€â”€â”€â”€â”€â”€â”€â”€
         if conversation_id:
             try:
                 await service_manager.get_graph_queue_manager().flush_turn(
@@ -238,7 +240,7 @@ class OrchestratorAgent:
             agent_analyses=getattr(raw, "agent_analyses", {}) or {},
         )
 
-    # ── Prompt builders ───────────────────────────────────────────────────────
+    # â”€â”€ Prompt builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_synthesis_prompt(
         self,
@@ -311,7 +313,7 @@ class OrchestratorAgent:
             interest_edges=interest_edges,
         )
 
-    # ── Nodes ─────────────────────────────────────────────────────────────────
+    # â”€â”€ Nodes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
         available_agents_desc = "\n".join(
@@ -339,7 +341,7 @@ class OrchestratorAgent:
             )
             return {"plan": plan}
         except Exception:
-            logger.exception("_plan_node: LLM call failed — using safe fallback plan")
+            logger.exception("_plan_node: LLM call failed â€” using safe fallback plan")
             return {"plan": OrchestratorPlan()}
 
     async def _direct_answer_node(self, state: OrchestratorState) -> Dict[str, Any]:
@@ -431,7 +433,7 @@ class OrchestratorAgent:
         for name, res in zip(names, results):
             if isinstance(res, Exception):
                 logger.error(
-                    "_execute_node: agent '%s' failed — %s", name, res, exc_info=res
+                    "_execute_node: agent '%s' failed â€” %s", name, res, exc_info=res
                 )
             else:
                 outputs[name] = res
@@ -498,7 +500,7 @@ class OrchestratorAgent:
                     "The raw data was retrieved but could not be summarised."
                 )
 
-        # ── Cross-domain graph write-back (via GraphQueueManager.enqueue) ─────
+        # â”€â”€ Cross-domain graph write-back (via GraphQueueManager.enqueue) â”€â”€â”€â”€â”€
         if (
             multi_agent
             and state.conversation_id
@@ -517,7 +519,7 @@ class OrchestratorAgent:
                     "_synthesize_node: failed to enqueue cross-domain relationships"
                 )
 
-        # ── User signal write-back (unchanged — uses write_immediate internally) ─
+        # User signal write-back (queued via GraphQueueManager.enqueue)
         if state.user_email and state.plan and state.conversation_id:
             user_message = _extract_last_human_message(state.messages)
             payload = build_signal_payload(
@@ -531,9 +533,24 @@ class OrchestratorAgent:
                 detected_learning_signals=state.plan.detected_learning_signals or [],
                 interest_edges=synthesis_result.interest_edges or [],
             )
-            task = _safe_create_task(write_user_signals(payload))
-            if settings.EXTRACTION_IMMEDIATE:
-                await task
+            relationships, cache_entries = await build_user_signal_relationships(
+                payload
+            )
+            if relationships:
+                try:
+                    task = make_graph_task(
+                        turn_id=state.turn_id,
+                        conversation_id=state.conversation_id,
+                        source_agent=self.name(),
+                        relationships=relationships,
+                    )
+                    service_manager.get_graph_queue_manager().enqueue(task)
+                except Exception:
+                    logger.exception(
+                        "_synthesize_node: failed to enqueue user signal relationships"
+                    )
+            if cache_entries:
+                update_in_memory_user_signal_cache(cache_entries, state.user_email)
 
         per_agent_analyses: Dict[str, str] = {
             name: getattr(output, "analysis", "") or ""

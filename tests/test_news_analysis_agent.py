@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.documents import Document
 
-from core.agents.models import BaseAgentInput
+from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk
 
@@ -136,7 +136,9 @@ async def test_news_agent_with_memory_task(mock_service_manager):
         market_query=None,
         knowledge_query=None,
     )
-    memory_context = MemoryContext(chunks=[memory_chunk], rewritten_queries=mock_queries)
+    memory_context = MemoryContext(
+        chunks=[memory_chunk], rewritten_queries=mock_queries
+    )
 
     import asyncio
 

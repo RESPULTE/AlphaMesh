@@ -1,54 +1,54 @@
-"""
+﻿"""
 core/memory/graph/graph_queue.py
 
 Centralised, non-blocking graph write pipeline.
 
 Architecture
-────────────
-GraphTask       — payload dataclass: relationship dicts + routing metadata
-_SentinelTask   — poison-pill: signals consumer to flush one turn's accumulated tasks
-ConversationQueue — one per active conversation_id: owns asyncio.Queue + consumer coroutine
-GraphQueueManager — singleton: manages all ConversationQueues, SQLite persistence, startup/shutdown
+
+GraphTask       â€” payload dataclass: relationship dicts + routing metadata
+_SentinelTask   â€” poison-pill: signals consumer to flush one turn's accumulated tasks
+ConversationQueue â€” one per active conversation_id: owns asyncio.Queue + consumer coroutine
+GraphQueueManager â€” singleton: manages all ConversationQueues, SQLite persistence, startup/shutdown
 
 Flow (normal path)
-──────────────────
+
   1. Agent calls GraphQueueManager.enqueue(GraphTask)
-     → Task persisted to SQLite (status=PENDING)
-     → Task put on ConversationQueue._queue
+     â†’ Task persisted to SQLite (status=PENDING)
+     â†’ Task put on ConversationQueue._queue
   2. Consumer accumulates GraphTask items in _pending[turn_id]
   3. Orchestrator calls GraphQueueManager.flush_turn(conversation_id, turn_id)
-     → _SentinelTask put on queue
-  4. Consumer pops sentinel → processes all tasks for that turn_id:
+     â†’ _SentinelTask put on queue
+  4. Consumer pops sentinel â†’ processes all tasks for that turn_id:
      a. Merge all relationship lists
      b. Separate user-scoped from domain relationships
-     c. EntityResolver.resolve_batch() — type-scoped dedup + Neo4j/Chroma upsert
-     d. GraphWriter.write_relationships() — domain edges
-     e. GraphWriter.write_relationships() — user-scoped edges (no dedup)
+     c. EntityResolver.resolve_batch() â€” type-scoped dedup + Neo4j/Chroma upsert
+     d. Neo4jAdapter.write_relationships() â€” domain edges
+     e. Neo4jAdapter.write_relationships() â€” user-scoped edges (no dedup)
      f. Mark all GraphTasks for this turn PROCESSED in SQLite
   5. Consumer waits for next sentinel
 
-Flow (bypass path — system tasks)
-──────────────────────────────────
+Flow (bypass path â€” system tasks)
+
   GraphQueueManager.write_immediate(relationships, conversation_id, source_agent)
-  → EntityResolver.resolve_batch()
-  → GraphWriter.write_relationships()
-  → (fire-and-forget asyncio.Task, no SQLite, no queue)
+  â†’ EntityResolver.resolve_batch()
+  â†’ Neo4jAdapter.write_relationships()
+  â†’ (fire-and-forget asyncio.Task, no SQLite, no queue)
 
 Recovery on restart
-────────────────────
+
   GraphQueueManager.start()
-  → Scan SQLite for PENDING tasks
-  → Process each orphaned task directly (bypass queue) sorted by turn_id
-  → Mark processed
+  â†’ Scan SQLite for PENDING tasks
+  â†’ Process each orphaned task directly (bypass queue) sorted by turn_id
+  â†’ Mark processed
 
 Session lifecycle
-──────────────────
-  open_session(conversation_id)  — creates ConversationQueue + starts consumer
-  close_session(conversation_id) — drains queue, stops consumer, evicts from _queues
-  TTL cleanup (safety net)       — every 5 min, evicts idle queues (30 min inactivity)
+
+  open_session(conversation_id)  â€” creates ConversationQueue + starts consumer
+  close_session(conversation_id) â€” drains queue, stops consumer, evicts from _queues
+  TTL cleanup (safety net)       â€” every 5 min, evicts idle queues (30 min inactivity)
 
 Multi-user safety
-──────────────────
+
   Each conversation_id has its own ConversationQueue with its own asyncio.Queue
   and consumer coroutine.  The only shared state across conversations is:
     - GraphQueueManager._queues dict (protected by asyncio.Lock)
@@ -69,25 +69,25 @@ import aiosqlite
 
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
-from core.memory.graph.graph_writer import GraphWriter
 from core.memory.graph.models import _USER_SCOPED_TYPES
 from core.memory.graph.utils import (
     entity_key,
     normalize_entity_name,
     normalize_entity_type,
 )
+from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 logger = get_logger(__name__)
 
-# SQLite path — co-located with the financial data DB
+# SQLite path â€” co-located with the financial data DB
 _GRAPH_TASKS_DB = "./data/graph_tasks.db"
 _TTL_SECONDS = 1800  # 30 min inactivity before queue eviction
 _CLEANUP_INTERVAL = 300  # 5 min between TTL sweeps
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+#
 # Data structures
-# ──────────────────────────────────────────────────────────────────────────────
+#
 
 
 @dataclass
@@ -114,9 +114,9 @@ class _SentinelTask:
 _QueueItem = GraphTask | _SentinelTask
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ConversationQueue — one per active conversation
-# ──────────────────────────────────────────────────────────────────────────────
+#
+# ConversationQueue â€” one per active conversation
+#
 
 
 class ConversationQueue:
@@ -129,7 +129,7 @@ class ConversationQueue:
         self,
         conversation_id: str,
         entity_resolver: EntityResolver,
-        graph_writer: GraphWriter,
+        graph_writer: Neo4jAdapter,
         db_path: str,
     ) -> None:
         self.conversation_id = conversation_id
@@ -138,7 +138,7 @@ class ConversationQueue:
         self._db_path = db_path
 
         self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
-        self._pending: Dict[str, List[GraphTask]] = {}  # turn_id → [GraphTask, ...]
+        self._pending: Dict[str, List[GraphTask]] = {}  # turn_id â†’ [GraphTask, ...]
         self._last_activity: float = time.monotonic()
         self._consumer_task: Optional[asyncio.Task] = None
         self._closing = False
@@ -182,10 +182,6 @@ class ConversationQueue:
             and not self._pending
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Consumer loop
-    # ──────────────────────────────────────────────────────────────────────────
-
     async def _consume(self) -> None:
         """
         Main consumer coroutine.  Runs until a shutdown sentinel is received.
@@ -227,9 +223,9 @@ class ConversationQueue:
                 "ConversationQueue: consumer stopped for '%s'", self.conversation_id
             )
 
-    # ──────────────────────────────────────────────────────────────────────────
+    #
     # Batch processing
-    # ──────────────────────────────────────────────────────────────────────────
+    #
 
     async def _process_batch(self, tasks: List[GraphTask], turn_id: str) -> None:
         """
@@ -239,21 +235,21 @@ class ConversationQueue:
           1. Merge all relationship lists from all tasks
           2. Separate user-scoped from domain relationships
           3. Collect unique domain entity descriptors
-          4. EntityResolver.resolve_batch() — type-scoped dedup + Neo4j/Chroma upsert
-          5. GraphWriter.write_relationships() — domain edges
+          4. EntityResolver.resolve_batch() â€” type-scoped dedup + Neo4j/Chroma upsert
+          5. Neo4jAdapter.write_relationships() â€” domain edges
           6. Build user_entity_cache for user-scoped nodes
-          7. EntityResolver.resolve_user_node() — for each unique user-scoped entity
-          8. GraphWriter.write_relationships() — user-scoped edges
+          7. EntityResolver.resolve_user_node() â€” for each unique user-scoped entity
+          8. Neo4jAdapter.write_relationships() â€” user-scoped edges
           9. Mark all tasks PROCESSED in SQLite
         """
         task_ids = [t.task_id for t in tasks]
         logger.info(
-            "ConversationQueue: processing batch — turn_id='%s' tasks=%d",
+            "ConversationQueue: processing batch â€” turn_id='%s' tasks=%d",
             turn_id,
             len(tasks),
         )
 
-        # ── Step 1: Merge all relationships ───────────────────────────────────
+        #  Step 1: Merge all relationships
         all_relationships: List[dict] = []
         source_agents: List[str] = []
         for task in tasks:
@@ -268,7 +264,7 @@ class ConversationQueue:
         conversation_id = tasks[0].conversation_id
         source_agent_label = "+".join(source_agents)
 
-        # ── Step 2: Separate user-scoped from domain relationships ─────────────
+        #  Step 2: Separate user-scoped from domain relationships
         domain_rels: List[dict] = []
         user_rels: List[dict] = []
         for rel in all_relationships:
@@ -279,7 +275,7 @@ class ConversationQueue:
             else:
                 domain_rels.append(rel)
 
-        # ── Step 3 & 4: Resolve domain entities ────────────────────────────────
+        #  Step 3 & 4: Resolve domain entities
         domain_entity_cache: Dict[Tuple[str, str], str] = {}
         if domain_rels:
             unique_domain_entities: List[Tuple[str, str, Optional[dict]]] = []
@@ -305,14 +301,14 @@ class ConversationQueue:
             for (name, etype), entity_id in resolved.items():
                 domain_entity_cache[entity_key(name, etype)] = entity_id
 
-        # ── Step 5: Write domain edges ─────────────────────────────────────────
+        #  Step 5: Write domain edges
         domain_written = 0
         if domain_rels:
             domain_written = await self._writer.write_relationships(
                 domain_rels, conversation_id, source_agent_label, domain_entity_cache
             )
 
-        # ── Step 6 & 7: Resolve user-scoped nodes ─────────────────────────────
+        #  Step 6 & 7: Resolve user-scoped nodes
         user_entity_cache: Dict[Tuple[str, str], str] = {}
         if user_rels:
             # Collect unique user-scoped entity descriptors
@@ -357,7 +353,7 @@ class ConversationQueue:
                 if node_id:
                     user_entity_cache[entity_key(name, etype)] = node_id
 
-        # ── Step 8: Write user-scoped edges ────────────────────────────────────
+        #  Step 8: Write user-scoped edges
         user_written = 0
         if user_rels:
             # Merge domain + user entity caches for edge writing
@@ -367,13 +363,13 @@ class ConversationQueue:
             )
 
         logger.info(
-            "ConversationQueue: batch done — turn_id='%s' domain_edges=%d user_edges=%d",
+            "ConversationQueue: batch done â€” turn_id='%s' domain_edges=%d user_edges=%d",
             turn_id,
             domain_written,
             user_written,
         )
 
-        # ── Step 9: Mark tasks processed ──────────────────────────────────────
+        #  Step 9: Mark tasks processed
         await self._mark_processed(task_ids)
 
     async def _mark_processed(self, task_ids: List[str]) -> None:
@@ -393,9 +389,9 @@ class ConversationQueue:
             )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GraphQueueManager — singleton managed by service_manager
-# ──────────────────────────────────────────────────────────────────────────────
+#
+# GraphQueueManager â€” singleton managed by service_manager
+#
 
 
 class GraphQueueManager:
@@ -403,20 +399,20 @@ class GraphQueueManager:
     Singleton that manages all ConversationQueue instances.
 
     Public API
-    ──────────
-    open_session(conversation_id)          → create queue + start consumer
-    close_session(conversation_id)         → drain queue + stop consumer
-    enqueue(task: GraphTask) -> str        → enqueue task, return task_id
-    flush_turn(conversation_id, turn_id)   → enqueue sentinel
-    write_immediate(relationships, ...)    → bypass queue, direct write
-    start()                                → init SQLite + recover orphans + start cleanup
-    shutdown()                             → drain all queues gracefully
+
+    open_session(conversation_id)          â†’ create queue + start consumer
+    close_session(conversation_id)         â†’ drain queue + stop consumer
+    enqueue(task: GraphTask) -> str        â†’ enqueue task, return task_id
+    flush_turn(conversation_id, turn_id)   â†’ enqueue sentinel
+    write_immediate(relationships, ...)    â†’ bypass queue, direct write
+    start()                                â†’ init SQLite + recover orphans + start cleanup
+    shutdown()                             â†’ drain all queues gracefully
     """
 
     def __init__(
         self,
         entity_resolver: EntityResolver,
-        graph_writer: GraphWriter,
+        graph_writer: Neo4jAdapter,
         db_path: str = _GRAPH_TASKS_DB,
     ) -> None:
         self._resolver = entity_resolver
@@ -428,9 +424,9 @@ class GraphQueueManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._started = False
 
-    # ──────────────────────────────────────────────────────────────────────────
+    #
     # Session lifecycle
-    # ──────────────────────────────────────────────────────────────────────────
+    #
 
     async def open_session(self, conversation_id: str) -> None:
         """
@@ -462,9 +458,9 @@ class GraphQueueManager:
         await cq.drain_and_stop()
         logger.info("GraphQueueManager: closed session '%s'", conversation_id)
 
-    # ──────────────────────────────────────────────────────────────────────────
+    #
     # Enqueue and flush
-    # ──────────────────────────────────────────────────────────────────────────
+    #
 
     async def enqueue(self, task: GraphTask) -> str:
         """
@@ -482,7 +478,7 @@ class GraphQueueManager:
         # Persist to SQLite first (durability)
         await self._persist_task(task)
 
-        # Lazy session creation (safety net — callers should call open_session explicitly)
+        # Lazy session creation (safety net â€” callers should call open_session explicitly)
         async with self._queues_lock:
             cq = self._queues.get(task.conversation_id)
             if cq is None:
@@ -518,9 +514,9 @@ class GraphQueueManager:
             return
         await cq.put(_SentinelTask(turn_id=turn_id, conversation_id=conversation_id))
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Bypass path — system tasks (taxonomy, user signals)
-    # ──────────────────────────────────────────────────────────────────────────
+    #
+    # Bypass path â€” system tasks (taxonomy, user signals)
+    #
 
     async def write_immediate(
         self,
@@ -612,9 +608,9 @@ class GraphQueueManager:
 
         asyncio.create_task(_do_write(), name=f"write_immediate_{source_agent}")
 
-    # ──────────────────────────────────────────────────────────────────────────
+    #
     # Startup and shutdown
-    # ──────────────────────────────────────────────────────────────────────────
+    #
 
     async def start(self) -> None:
         """
@@ -646,9 +642,9 @@ class GraphQueueManager:
 
         logger.info("GraphQueueManager: shutdown complete")
 
-    # ──────────────────────────────────────────────────────────────────────────
+    #
     # SQLite persistence
-    # ──────────────────────────────────────────────────────────────────────────
+    #
 
     async def _init_db(self) -> None:
         async with aiosqlite.connect(self._db_path) as db:
@@ -701,7 +697,7 @@ class GraphQueueManager:
     async def _recover_pending_tasks(self) -> None:
         """
         On startup, find PENDING tasks from previous sessions and process them
-        directly (bypass queue — no session needed).
+        directly (bypass queue â€” no session needed).
         """
         try:
             async with aiosqlite.connect(self._db_path) as db:
@@ -766,9 +762,9 @@ class GraphQueueManager:
                     turn_id,
                 )
 
-    # ──────────────────────────────────────────────────────────────────────────
+    #
     # TTL cleanup
-    # ──────────────────────────────────────────────────────────────────────────
+    #
 
     async def _ttl_cleanup_loop(self) -> None:
         """Background task: evict idle queues every 5 minutes."""
@@ -807,11 +803,6 @@ class GraphQueueManager:
                 await db.commit()
         except Exception:
             logger.exception("GraphQueueManager: failed to purge old processed tasks")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Factory helper used by service_manager
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 def make_graph_task(

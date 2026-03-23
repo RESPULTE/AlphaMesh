@@ -5,7 +5,8 @@ import pandas as pd
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.agents.models import BaseAgentInput, BaseAgentOutput, CitedSource
+from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
+from core.agents.models.news_agent_models import CitedSource
 from core.memory.graph.models import RelationshipType
 
 

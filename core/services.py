@@ -1,4 +1,4 @@
-# core/services.py
+﻿# core/services.py
 from core.config import settings
 
 
@@ -7,15 +7,14 @@ class ServiceManager:
     Centralised manager for all service singletons.
 
     Changes from previous version
-    ──────────────────────────────
-    - get_subgraph_store()      → REMOVED (SubgraphStore deleted)
-    - get_entity_resolver()     → NEW
-    - get_graph_writer()        → NEW
-    - get_relationship_extractor() → NEW
-    - get_graph_queue_manager() → NEW
-    - get_ingestor()            → now injects entity_resolver instead of embedding_func
-    - get_subgraph_service()    → now constructs shim with queue_manager + extractor
-    - startup()                 → now starts GraphQueueManager
+    â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    - get_subgraph_store()      â†’ REMOVED (SubgraphStore deleted)
+    - get_entity_resolver()     â†’ NEW
+    - get_relationship_extractor() â†’ NEW
+    - get_graph_queue_manager() â†’ NEW
+    - get_ingestor()            â†’ now injects entity_resolver instead of embedding_func
+    - get_subgraph_service()    â†’ now constructs shim with queue_manager + extractor
+    - startup()                 â†’ now starts GraphQueueManager
     """
 
     def __init__(self):
@@ -27,7 +26,6 @@ class ServiceManager:
         self._entity_chroma_adapter = None
         self._nodeset_manager = None
         self._entity_resolver = None
-        self._graph_writer = None
         self._relationship_extractor = None
         self._graph_queue_manager = None
         self._dual_store_ingestor = None
@@ -151,7 +149,7 @@ class ServiceManager:
                 raise
         return self._nodeset_manager
 
-    # ── NEW: EntityResolver ───────────────────────────────────────────────────
+    # â”€â”€ NEW: EntityResolver â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_entity_resolver(self):
         from core.memory.graph.entity_resolver import EntityResolver
@@ -170,22 +168,6 @@ class ServiceManager:
                 raise
         return self._entity_resolver
 
-    # ── NEW: GraphWriter ──────────────────────────────────────────────────────
-
-    def get_graph_writer(self):
-        from core.memory.graph.graph_writer import GraphWriter
-
-        if self._graph_writer is None:
-            try:
-                self._graph_writer = GraphWriter(
-                    neo4j_adapter=self.get_neo4j_adapter(),
-                )
-            except Exception as e:
-                print(f"Error initializing GraphWriter: {e}")
-                raise
-        return self._graph_writer
-
-    # ── NEW: RelationshipExtractor ────────────────────────────────────────────
 
     def get_relationship_extractor(self):
         from core.memory.graph.relationship_extractor import RelationshipExtractor
@@ -194,7 +176,7 @@ class ServiceManager:
             self._relationship_extractor = RelationshipExtractor()
         return self._relationship_extractor
 
-    # ── NEW: GraphQueueManager ────────────────────────────────────────────────
+    # â”€â”€ NEW: GraphQueueManager â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_graph_queue_manager(self):
         from core.memory.graph.graph_queue import GraphQueueManager
@@ -203,14 +185,14 @@ class ServiceManager:
             try:
                 self._graph_queue_manager = GraphQueueManager(
                     entity_resolver=self.get_entity_resolver(),
-                    graph_writer=self.get_graph_writer(),
+                    graph_writer=self.get_neo4j_adapter(),
                 )
             except Exception as e:
                 print(f"Error initializing GraphQueueManager: {e}")
                 raise
         return self._graph_queue_manager
 
-    # ── UPDATED: Ingestor now injects entity_resolver ─────────────────────────
+    # â”€â”€ UPDATED: Ingestor now injects entity_resolver â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_ingestor(self):
         from core.memory.ingestion.chunker import ArticleChunker
@@ -226,7 +208,7 @@ class ServiceManager:
                     chroma_adapter=self.get_chroma_adapter(),
                     entity_chroma_adapter=self.get_entity_chroma_adapter(),
                     nodeset_manager=self.get_nodeset_manager(),
-                    entity_resolver=self.get_entity_resolver(),  # ← replaces embedding_func
+                    entity_resolver=self.get_entity_resolver(),  # â† replaces embedding_func
                     chunker=chunker,
                     llm=self.get_agent(),
                 )
@@ -280,7 +262,7 @@ class ServiceManager:
                 raise
         return self._user_context_service
 
-    # ── UPDATED: SubgraphExtractionService shim ───────────────────────────────
+    # â”€â”€ UPDATED: SubgraphExtractionService shim â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_subgraph_service(self):
         from core.memory.graph.subgraph_service import SubgraphExtractionService
@@ -317,7 +299,7 @@ class ServiceManager:
         starts (recovery may write to Neo4j).
         """
         await self.get_nodeset_manager().initialize_default_nodesets()
-        await self.get_graph_queue_manager().start()  # ← NEW
+        await self.get_graph_queue_manager().start()  # â† NEW
 
     async def shutdown(self) -> None:
         """Run at application teardown to drain graph queues gracefully."""
@@ -326,3 +308,5 @@ class ServiceManager:
 
 
 service_manager = ServiceManager()
+
+

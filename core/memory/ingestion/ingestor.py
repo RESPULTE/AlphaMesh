@@ -1,16 +1,16 @@
-"""
+﻿"""
 core/memory/ingestion/ingestor.py
 
 Dual-store ingestion pipeline for news articles.
 
 Changes from previous version
-──────────────────────────────
-- _upsert_graph_to_neo4j()  → REMOVED (moved to GraphWriter + ConversationQueue)
-- _resolve_entity()         → REMOVED (moved to EntityResolver)
-- _resolve_user_node()      → REMOVED (moved to EntityResolver)
-- find_similar_entities()   → REMOVED (moved to EntityResolver)
-- _persist_entity()         → REMOVED (moved to EntityResolver)
-- resolve_entity_id()       → delegates to injected EntityResolver
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+- _upsert_graph_to_neo4j()  â†’ REMOVED (moved to Neo4jAdapter + ConversationQueue)
+- _resolve_entity()         â†’ REMOVED (moved to EntityResolver)
+- _resolve_user_node()      â†’ REMOVED (moved to EntityResolver)
+- find_similar_entities()   â†’ REMOVED (moved to EntityResolver)
+- _persist_entity()         â†’ REMOVED (moved to EntityResolver)
+- resolve_entity_id()       â†’ delegates to injected EntityResolver
 - __init__() now receives entity_resolver: EntityResolver instead of embedding_func
 
 DualStoreIngestor's single responsibility: ingest articles into Neo4j + ChromaDB.
@@ -67,9 +67,9 @@ class DualStoreIngestor:
         self._llm = llm
         self._logger = get_logger(__name__)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Public: article ingestion
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def ingest_articles(
         self, articles: List[dict]
@@ -129,9 +129,9 @@ class DualStoreIngestor:
         doc_meta, chunk_records = self._chunker.chunk_article(article)
         return doc_meta, chunk_records
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Public: entity ID resolution (delegates to EntityResolver)
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def resolve_entity_id(
         self,
@@ -144,9 +144,9 @@ class DualStoreIngestor:
         """Public wrapper: resolve or create an entity and return its ID."""
         return await self._entity_resolver.resolve(name, entity_type, props=raw)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Public: entity extraction
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def extract_entities_for_chunks(
         self, chunk_ids: List[str], force: bool = False
@@ -163,9 +163,9 @@ class DualStoreIngestor:
             self._logger.exception("Entity extraction failed for chunks.")
             return []
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Private: write helpers
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _write_document_nodes(
         self, docs: List[DocumentMetadata], global_anchor_id: str
@@ -285,9 +285,9 @@ class DualStoreIngestor:
                 "Failed to mark chunk %s pending in ChromaDB.", chunk_id
             )
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Private: entity extraction pipeline
-    # ─────────────────────────────────────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def _extract_entities_for_chunks(
         self, chunk_ids: List[str], force: bool = False
@@ -458,3 +458,4 @@ class DualStoreIngestor:
                 deduped_entities[eid] = entity
 
         return list(deduped_entities.values())
+
