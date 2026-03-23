@@ -31,7 +31,6 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from core.logger import get_logger
-from core.memory.graph.graph_queue import make_graph_task
 from core.memory.user_context_service import InterestCacheEntry
 
 logger = get_logger(__name__)
@@ -409,35 +408,6 @@ def update_user_signal_cache(
         logger.exception("update_user_signal_cache: failed for user '%s'", user_email)
 
 
-
-async def write_user_signals(payload: UserSignalPayload) -> None:
-    """
-    Persist all user interest signals from a conversation turn.
-
-    Steps:
-      1. Build relationship list with pre-resolved entity IDs.
-      2. Enqueue GraphTask with immediate=True for direct processing.
-      3. Update in-memory cache synchronously.
-    """
-    relationships, cache_entries = await build_user_signal_relationships(payload)
-    if not relationships:
-        return
-
-    try:
-        from core.services import service_manager
-
-        graph_queue = service_manager.get_graph_queue_manager()
-        task = make_graph_task(
-            turn_id=payload.turn_id,
-            conversation_id=payload.conversation_id,
-            source_agent="user_signal_writeback",
-            relationships=relationships,
-        )
-        await graph_queue.enqueue(task, immediate=True)
-        update_user_signal_cache(cache_entries, payload.user_email)
-    except Exception:
-        logger.exception("write_user_signals: failed for user '%s'", payload.user_email)
-
 def build_signal_payload(
     detected_investment_signals,
     detected_learning_signals,
@@ -493,6 +463,3 @@ def build_signal_payload(
         learning_signals=learning_signals,
         interest_edges=edges,
     )
-
-
-

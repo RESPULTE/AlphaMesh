@@ -127,21 +127,6 @@ class DualStoreIngestor:
         doc_meta, chunk_records = self._chunker.chunk_article(article)
         return doc_meta, chunk_records
 
-    # Public: entity ID resolution (delegates to EntityResolver)
-
-    async def resolve_entity_id(
-        self,
-        name: str,
-        entity_type: str,
-        *,
-        raw=None,
-        entity_cache: Optional[Dict] = None,
-    ) -> Optional[str]:
-        """Public wrapper: resolve or create an entity and return its ID."""
-        return await self._entity_resolver.resolve(name, entity_type, props=raw)
-
-    # Public: entity extraction
-
     async def extract_entities_for_chunks(
         self, chunk_ids: List[str], force: bool = False
     ) -> List[EntityNode]:

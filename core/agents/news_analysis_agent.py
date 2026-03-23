@@ -482,7 +482,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
     # ── Node: analyse_news ────────────────────────────────────────────────────
 
-    async def _analyse_news_node(self, state) -> dict:
+    async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""
         import re as _re
 
