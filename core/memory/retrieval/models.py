@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
@@ -16,14 +17,19 @@ class NodeSelectionOutput(BaseModel):
 
 
 class RetrieverState(TypedDict):
-    """LangGraph state for the dual-store retriever."""
+    """LangGraph state for the dual-store retriever.
+
+    candidate_neighbors was intentionally removed: it was written by
+    select_neighbor_frontier but never read by any downstream node.
+    Keeping unread fields in LangGraph state causes unnecessary serialisation
+    overhead and misleads readers about what data is actually consumed.
+    """
 
     query: str
     accumulated_chunks: List["RetrievedChunk"]
     visited_entity_ids: List[str]
     visited_chunk_ids: List[str]
     current_frontier: List[str]
-    candidate_neighbors: List[dict]
     iteration: int
     should_continue: bool
 
@@ -93,17 +99,31 @@ class RetrievedChunk(BaseModel):
         )
 
     @classmethod
-    def from_raw_chunk(
+    def normalize_for_reranking(
         cls,
         chunk: "RetrievedChunk",
         domain: str,
     ) -> "RetrievedChunk":
-        """Normalize a RetrievedChunk with ranking fields populated."""
-        embedding_score = float(chunk.score) if chunk.score is not None else 0.0
-        graph_depth = 0
+        """
+        Return a copy of *chunk* with reranking fields properly populated.
+
+        For vector chunks: embedding_score is taken from chunk.score.
+        For graph chunks:  embedding_score is 0.0 (no similarity score available);
+                           graph_depth is preserved from the chunk if already set by
+                           the traversal (hop-aware), otherwise defaults to 1.
+
+        Previously named from_raw_chunk.  Renamed because the input is always
+        a fully-typed RetrievedChunk, not a raw/untyped source.
+        """
         if chunk.source == "graph":
             embedding_score = 0.0
-            graph_depth = 1
+            # Preserve the hop depth set by _fetch_frontier_chunks_node so the
+            # reranker's depth_bonus reflects actual traversal distance.
+            graph_depth = chunk.graph_depth if chunk.graph_depth > 0 else 1
+        else:
+            embedding_score = float(chunk.score) if chunk.score is not None else 0.0
+            graph_depth = 0
+
         return cls(
             chunk_id=chunk.chunk_id,
             text=chunk.text,
@@ -123,7 +143,46 @@ class RetrievedChunk(BaseModel):
             composite_score=chunk.composite_score,
         )
 
+    # Keep the old name as a deprecated alias so any external callers that
+    # haven't been updated yet continue to work without modification.
+    from_raw_chunk = normalize_for_reranking
+
 
 class MemoryContext(BaseModel):
     chunks: List[RetrievedChunk]
     rewritten_queries: RewrittenQueries
+
+
+@dataclass
+class NeighborCandidate:
+    """
+    Typed representation of one row returned by Neo4jAdapter.get_entity_neighbors().
+
+    Confines string-key access to _parse_neighbor() so node logic works with
+    typed attributes instead of raw dict lookups.
+    """
+
+    source_entity_id: str
+    neighbor_entity_id: str
+    neighbor_name: str
+    neighbor_type: str
+    relationship_type: str
+
+
+@dataclass
+class GraphChunkRow:
+    """
+    Typed representation of one row returned by Neo4jAdapter.get_chunks_for_entities().
+
+    extraction_status is included so PENDING vs EXTRACTED state flows correctly
+    into RetrievedChunk objects and avoids spurious re-extraction queuing.
+    """
+
+    chunk_id: str
+    chunk_text: str
+    chunk_index: Optional[int] = None
+    document_id: Optional[str] = None
+    article_title: Optional[str] = None
+    source_url: Optional[str] = None
+    published_at: Optional[Any] = None
+    extraction_status: str = "PENDING"

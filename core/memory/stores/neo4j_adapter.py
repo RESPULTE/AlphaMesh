@@ -222,7 +222,7 @@ class Neo4jAdapter:
         """
         Write edges to Neo4j. Entity IDs must be pre-resolved in entity_cache.
 
-        entity_cache maps (name.lower(), entity_type) â†’ canonical_id.
+        entity_cache maps (name.lower(), entity_type) → canonical_id.
         Any edge whose from/to entity is not in entity_cache is skipped with a warning.
 
         Returns the number of edges successfully written.
@@ -266,7 +266,7 @@ class Neo4jAdapter:
 
             if not resolved_source or not resolved_target:
                 self._logger.warning(
-                    "write_relationships: unresolved entity â€” "
+                    "write_relationships: unresolved entity — "
                     "from='%s' (%s) resolved=%s | to='%s' (%s) resolved=%s",
                     from_name,
                     from_type,
@@ -413,16 +413,28 @@ class Neo4jAdapter:
     async def get_chunks_for_entities(
         self, entity_ids: List[str], exclude_chunk_ids: List[str]
     ) -> List[dict]:
-        """Return chunks that mention the provided entities."""
+        """
+        Return chunks that mention the provided entities.
+
+        extraction_status is included so that the retriever can correctly
+        propagate PENDING vs EXTRACTED state to RetrievedChunk objects — without
+        this field, all graph-expanded chunks defaulted to PENDING and were
+        unnecessarily re-queued for entity extraction on every retrieval.
+        """
         if not entity_ids:
             return []
         cypher = (
             "MATCH (c:Chunk)-[:MENTIONS_ENTITY]->(e:Entity) "
             "WHERE e.id IN $entity_ids "
             "AND ($exclude_chunk_ids IS NULL OR NOT c.id IN $exclude_chunk_ids) "
-            "RETURN c.id AS chunk_id, c.text AS chunk_text, c.article_title AS article_title, c.source_url AS source_url, "
-            "c.chunk_index AS chunk_index, c.document_id AS document_id, "
-            "c.published_at AS published_at"
+            "RETURN c.id AS chunk_id, "
+            "c.text AS chunk_text, "
+            "c.article_title AS article_title, "
+            "c.source_url AS source_url, "
+            "c.chunk_index AS chunk_index, "
+            "c.document_id AS document_id, "
+            "c.published_at AS published_at, "
+            "c.extraction_status AS extraction_status"
         )
         records = await self._execute_read(
             cypher,
@@ -524,7 +536,7 @@ class Neo4jAdapter:
         """
         Merge a UserInterestDomain node.
         ON CREATE: full props written.
-        ON MATCH:  only last_seen_at updated â€” category and domain_type are immutable.
+        ON MATCH:  only last_seen_at updated — category and domain_type are immutable.
         """
         cypher = (
             "MERGE (d:UserInterestDomain {id: $id}) "
@@ -552,7 +564,7 @@ class Neo4jAdapter:
         Merge a UserInterestEdge with operation-specific MATCH behaviour.
 
         operation="reinforce": increments weight, ensures Active status (unless
-                            already invalidated by user â€” in that case status
+                            already invalidated by user — in that case status
                             is left alone so invalidation is not silently reversed).
         operation="invalidate": sets invalidated=True and status=Invalidated.
         """
@@ -589,7 +601,7 @@ class Neo4jAdapter:
 
     async def merge_turn_node(self, turn_id: str, props: dict) -> None:
         """
-        Merge a TurnNode. Idempotent â€” the same turn may source multiple edges
+        Merge a TurnNode. Idempotent — the same turn may source multiple edges
         so this is called once per turn per signal, not per relationship.
         """
         cypher = "MERGE (t:TurnNode {id: $id}) " "ON CREATE SET t += $props"
@@ -605,7 +617,7 @@ class Neo4jAdapter:
         self, user_email: str, nodeset_id: str
     ) -> List[dict]:
         """
-        Full 3-hop read: NodeSet â†’ Domain â†’ Edge â†’ Entity + provenance turns.
+        Full 3-hop read: NodeSet → Domain → Edge → Entity + provenance turns.
         Returns all edges including invalidated ones; caller filters as needed.
         """
         cypher = (

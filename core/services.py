@@ -182,6 +182,7 @@ class ServiceManager:
 
         if self._graph_queue_manager is None:
             try:
+
                 def _llm_provider(config: dict | None):
                     temperature = 0.0
                     if config and isinstance(config, dict):
@@ -198,6 +199,7 @@ class ServiceManager:
                 print(f"Error initializing GraphQueueManager: {e}")
                 raise
         return self._graph_queue_manager
+
     def get_ingestor(self):
         from core.memory.ingestion.chunker import ArticleChunker
         from core.memory.ingestion.ingestor import DualStoreIngestor
@@ -229,7 +231,6 @@ class ServiceManager:
                 self._retriever = DualStoreRetriever(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
-                    llm=self.get_agent(),
                     reranker=self.get_reranker(),
                 )
             except Exception as e:
@@ -310,5 +311,3 @@ class ServiceManager:
 
 
 service_manager = ServiceManager()
-
-
