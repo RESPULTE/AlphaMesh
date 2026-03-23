@@ -465,12 +465,17 @@ class NewsAnalysisAgent(AbstractAgent):
 
         final_ranked = service_manager.get_reranker().rank(final_chunks)
 
-        # Extract entities only from the reranked set — chunks that actually
+        # Extract entities only from the reranked set � chunks that actually
         # contributed to this query. Fire-and-forget: extraction enriches the
         # graph for future retrieval but does not affect the current analysis.
         # Memory chunks already marked EXTRACTED are skipped by the idempotency
         # guard inside extract_entities_for_chunks at no cost.
-        pending_chunk_ids = [chunk.chunk_id for chunk in final_ranked if chunk.chunk_id]
+        pending_chunk_ids = [
+            chunk.chunk_id
+            for chunk in final_ranked
+            if chunk.chunk_id and chunk.extraction_status == "PENDING"
+        ]
+        pending_chunk_ids = list(dict.fromkeys(pending_chunk_ids))
         if pending_chunk_ids:
             task = asyncio.create_task(
                 self._ingestor.extract_entities_for_chunks(pending_chunk_ids)
@@ -479,6 +484,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 await task
 
         return {"final_chunks": final_ranked}
+
 
     # ── Node: analyse_news ────────────────────────────────────────────────────
 
@@ -613,3 +619,6 @@ class NewsAnalysisAgent(AbstractAgent):
             "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
         }
+
+
+

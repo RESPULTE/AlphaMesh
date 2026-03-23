@@ -1,16 +1,16 @@
-﻿"""
+"""
 core/memory/ingestion/ingestor.py
 
 Dual-store ingestion pipeline for news articles.
 
 Changes from previous version
-â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-- _upsert_graph_to_neo4j()  â†’ REMOVED (moved to Neo4jAdapter + ConversationQueue)
-- _resolve_entity()         â†’ REMOVED (moved to EntityResolver)
-- _resolve_user_node()      â†’ REMOVED (moved to EntityResolver)
-- find_similar_entities()   â†’ REMOVED (moved to EntityResolver)
-- _persist_entity()         â†’ REMOVED (moved to EntityResolver)
-- resolve_entity_id()       â†’ delegates to injected EntityResolver
+──────────────────────────────
+- _upsert_graph_to_neo4j()  → REMOVED (moved to Neo4jAdapter + ConversationQueue)
+- _resolve_entity()         → REMOVED (moved to EntityResolver)
+- _resolve_user_node()      → REMOVED (moved to EntityResolver)
+- find_similar_entities()   → REMOVED (moved to EntityResolver)
+- _persist_entity()         → REMOVED (moved to EntityResolver)
+- resolve_entity_id()       → delegates to injected EntityResolver
 - __init__() now receives entity_resolver: EntityResolver instead of embedding_func
 
 DualStoreIngestor's single responsibility: ingest articles into Neo4j + ChromaDB.
@@ -262,6 +262,21 @@ class DualStoreIngestor:
                 "Failed to mark chunk %s pending in ChromaDB.", chunk_id
             )
 
+    async def _mark_chunk_extracted_in_chroma(self, chunk_id: Optional[str]) -> None:
+        if not chunk_id:
+            return
+        try:
+            docs = await self._chroma_adapter.get_documents_by_ids([chunk_id])
+            if not docs:
+                return
+            meta = dict(docs[0].metadata or {})
+            meta["extraction_status"] = "EXTRACTED"
+            await self._chroma_adapter.update_metadata([chunk_id], [meta])
+        except Exception:
+            self._logger.exception(
+                "Failed to mark chunk %s extracted in ChromaDB.", chunk_id
+            )
+
     # Private: entity extraction pipeline
 
     async def _extract_entities_for_chunks(
@@ -428,8 +443,12 @@ class DualStoreIngestor:
                 result.chunk_id,
             ):
                 continue
+            await self._mark_chunk_extracted_in_chroma(result.chunk_id)
 
             for eid, entity in chunk_entities.items():
                 deduped_entities[eid] = entity
 
         return list(deduped_entities.values())
+
+
+
