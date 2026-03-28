@@ -48,6 +48,7 @@ from core.agents.utils import (
     _safe_json,
 )
 from core.config import settings
+from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import DEFERRED_RELATIONSHIP_SYSTEM_PROMPT
 from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
@@ -333,6 +334,10 @@ class OrchestratorAgent:
                     HumanMessage(content=latest_human),
                 ]
             )
+            publish_progress(
+                "orchestrator",
+                f"Routing → agents={plan.target_agents or []}, needs_memory={plan.needs_memory}",
+            )
             logger.info(
                 "_plan_node: agents=%s needs_memory=%s final_answer=%s ticker=%s",
                 plan.target_agents,
@@ -361,6 +366,9 @@ class OrchestratorAgent:
             return {"company_context_blocks": {}}
 
         try:
+            publish_progress(
+                "orchestrator", f"Validating ticker(s): {', '.join(tickers)}"
+            )
             validator = service_manager.get_ticker_validator()
             results: Dict[str, TickerInfo] = await validator.validate_and_enrich(
                 tickers
@@ -407,6 +415,9 @@ class OrchestratorAgent:
             return {"agent_outputs": {}}
 
         valid_names = [n for n in plan.target_agents if n in self._agents]
+
+        publish_progress("orchestrator", f"Dispatching to: {', '.join(valid_names)}")
+
         primary_ticker = plan.tickers[0] if plan.tickers else None
         combined_context = _build_combined_company_context(
             plan.tickers, state.company_context_blocks
@@ -471,6 +482,8 @@ class OrchestratorAgent:
         analysis_text = ""
         synthesis_result = SynthesisResult(analysis_text="")
 
+        publish_progress("orchestrator", "Synthesising final response…")
+
         if not context_parts and not state.user_context_block and not portfolio_block:
             analysis_text = (
                 "I wasn't able to retrieve data for your query at this time. "
@@ -495,6 +508,8 @@ class OrchestratorAgent:
                 )
                 synthesis_result = self._parse_synthesis_output(raw, multi_agent)
                 analysis_text = synthesis_result.analysis_text
+
+                publish_success("orchestrator", "Synthesis complete.")
             except Exception:
                 logger.exception("_synthesize_node: LLM synthesis failed")
                 analysis_text = (
@@ -573,4 +588,5 @@ class OrchestratorAgent:
             "fundamental_data": fundamental_df,
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,
+            "tickers": state.plan.tickers if state.plan else [],
         }

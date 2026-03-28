@@ -184,6 +184,10 @@ class FinalResponse(BaseModel):
     fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)
     sources: List[CitedSource] = Field(default_factory=list)
     agent_analyses: Dict[str, str] = Field(default_factory=dict)
+    tickers: List[str] = Field(
+        default_factory=list,
+        description="Ticker symbols processed in this turn (populated by orchestrator).",
+    )
 
 
 class CrossDomainRelationship(BaseModel):

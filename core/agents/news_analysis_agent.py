@@ -53,6 +53,7 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
 )
 from core.config import settings
+from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
 from core.memory.graph.utils import parse_xml_blocks
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
@@ -292,6 +293,9 @@ class NewsAnalysisAgent(AbstractAgent):
         """
         rewritten_queries: RewrittenQueries | None = None
         try:
+            publish_progress(
+                "news_agent", "Expanding query for multi-domain memory retrieval…"
+            )
             structured_llm = self._llm.with_structured_output(RewrittenQueries)
             rewritten_queries = await structured_llm.ainvoke(
                 [
@@ -359,6 +363,8 @@ class NewsAnalysisAgent(AbstractAgent):
             state.end_date,
         )
 
+        publish_progress("news_agent", f"Fetching recent news for '{state.ticker}'…")
+
         q = build_news_query(ticker=state.ticker)
         logger.info("NewsAPI query: %s", q)
 
@@ -372,6 +378,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 page=1,
                 page_size=50,
             )
+            publish_success("news_agent", f"Fetched {len(articles)} article(s)")
         except Exception as exc:
             logger.error("News fetch pipeline failed: %s", exc)
             raise
@@ -404,9 +411,18 @@ class NewsAnalysisAgent(AbstractAgent):
         if not state.raw_articles:
             return {"chunk_ids": [], "retrieved_chunks": []}
 
+        publish_progress(
+            "news_agent",
+            f"Ingesting {len(state.raw_articles)} article(s) into dual-store memory…",
+        )
+
         try:
             new_chunk_ids, existing_chunk_ids, _ = (
                 await service_manager.get_ingestor().ingest_articles(state.raw_articles)
+            )
+            publish_success(
+                "news_agent",
+                f"Ingestion done — {len(new_chunk_ids)} new chunks, {len(existing_chunk_ids)} existing",
             )
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
@@ -466,6 +482,11 @@ class NewsAnalysisAgent(AbstractAgent):
         if memory_context is not None:
             final_chunks = final_chunks + memory_context.chunks
 
+        total = len(final_chunks) + (
+            len(memory_context.chunks) if memory_context else 0
+        )
+        publish_progress("news_agent", f"Reranking {total} candidate chunk(s)…")
+
         # TwoStageReranker: composite prefilter → Jina cross-encoder.
         # query comes from state.query (the agent-level, orchestrator-rewritten
         # query — already focused for news analysis).
@@ -515,6 +536,9 @@ class NewsAnalysisAgent(AbstractAgent):
                 "sources": [],
                 "entities_enriched": [],
             }
+        publish_progress(
+            "news_agent", f"Generating grounded news analysis ({len(chunks)} chunk(s))…"
+        )
 
         sources, chunk_to_source_id = _build_deduplicated_sources(chunks)
 
@@ -561,11 +585,14 @@ class NewsAnalysisAgent(AbstractAgent):
             try:
                 parsed_analysis, parsed_relationships = parse_xml_blocks(raw)
                 analysis_text = parsed_analysis
+                publish_success("news_agent", "News analysis complete.")
+
                 if parsed_relationships is not None:
                     relationships = parsed_relationships
                     relationships_extracted = True
             except Exception:
                 logger.error("_analyse_news_node: parse failed; deferring extraction")
+
         except Exception as exc:
             logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."

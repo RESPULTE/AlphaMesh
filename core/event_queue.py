@@ -59,17 +59,17 @@ from enum import IntEnum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
-
 # ─────────────────────────────────────────────────────────────
 # Event levels
 # ─────────────────────────────────────────────────────────────
 
+
 class EventLevel(IntEnum):
-    DEBUG   = 10
-    INFO    = 20
+    DEBUG = 10
+    INFO = 20
     SUCCESS = 25
     WARNING = 30
-    ERROR   = 40
+    ERROR = 40
 
     @property
     def label(self) -> str:
@@ -78,21 +78,21 @@ class EventLevel(IntEnum):
     @property
     def icon(self) -> str:
         return {
-            EventLevel.DEBUG:   "·",
-            EventLevel.INFO:    "→",
+            EventLevel.DEBUG: "·",
+            EventLevel.INFO: "→",
             EventLevel.SUCCESS: "✓",
             EventLevel.WARNING: "⚠",
-            EventLevel.ERROR:   "✗",
+            EventLevel.ERROR: "✗",
         }[self]
 
     @property
     def ansi(self) -> str:
         return {
-            EventLevel.DEBUG:   "\033[90m",   # grey
-            EventLevel.INFO:    "\033[36m",   # cyan
-            EventLevel.SUCCESS: "\033[32m",   # green
-            EventLevel.WARNING: "\033[33m",   # yellow
-            EventLevel.ERROR:   "\033[31m",   # red
+            EventLevel.DEBUG: "\033[90m",  # grey
+            EventLevel.INFO: "\033[36m",  # cyan
+            EventLevel.SUCCESS: "\033[32m",  # green
+            EventLevel.WARNING: "\033[33m",  # yellow
+            EventLevel.ERROR: "\033[31m",  # red
         }[self]
 
 
@@ -103,11 +103,11 @@ _RESET = "\033[0m"
 # Event — a single published message
 # ─────────────────────────────────────────────────────────────
 
+
 class Event:
     """One message published by an agent."""
 
-    __slots__ = ("id", "response_id", "source", "message", "level",
-                 "data", "timestamp")
+    __slots__ = ("id", "response_id", "source", "message", "level", "data", "timestamp")
 
     def __init__(
         self,
@@ -117,18 +117,18 @@ class Event:
         level: EventLevel = EventLevel.INFO,
         data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self.id          = str(uuid4())
+        self.id = str(uuid4())
         self.response_id = response_id
-        self.source      = source
-        self.message     = message
-        self.level       = level
-        self.data        = data
-        self.timestamp   = datetime.now(timezone.utc)
+        self.source = source
+        self.message = message
+        self.level = level
+        self.data = data
+        self.timestamp = datetime.now(timezone.utc)
 
     # ── Formatting ──────────────────────────────────────────
 
     def to_console_line(self, *, color: bool = True) -> str:
-        ts    = self.timestamp.strftime("%H:%M:%S.%f")[:-3]
+        ts = self.timestamp.strftime("%H:%M:%S.%f")[:-3]
         parts = (
             f"[{ts}]"
             f"  [{self.response_id}]"
@@ -142,13 +142,13 @@ class Event:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "id":          self.id,
+            "id": self.id,
             "response_id": self.response_id,
-            "source":      self.source,
-            "message":     self.message,
-            "level":       self.level.label,
-            "data":        self.data,
-            "timestamp":   self.timestamp.isoformat(),
+            "source": self.source,
+            "message": self.message,
+            "level": self.level.label,
+            "data": self.data,
+            "timestamp": self.timestamp.isoformat(),
         }
 
     def __repr__(self) -> str:
@@ -159,14 +159,15 @@ class Event:
 # Response group — a labelled bucket of events
 # ─────────────────────────────────────────────────────────────
 
+
 class ResponseGroup:
     """All events that belong to one response cycle."""
 
     def __init__(self, response_id: str, label: str, opened_by: str) -> None:
         self.response_id = response_id
-        self.label       = label          # e.g. "response_1"
-        self.opened_by   = opened_by
-        self.opened_at   = datetime.now(timezone.utc)
+        self.label = label  # e.g. "response_1"
+        self.opened_by = opened_by
+        self.opened_at = datetime.now(timezone.utc)
         self.closed_at: Optional[datetime] = None
         self.events: List[Event] = []
 
@@ -201,18 +202,19 @@ class ResponseGroup:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "response_id": self.response_id,
-            "label":       self.label,
-            "opened_by":   self.opened_by,
-            "opened_at":   self.opened_at.isoformat(),
-            "closed_at":   self.closed_at.isoformat() if self.closed_at else None,
+            "label": self.label,
+            "opened_by": self.opened_by,
+            "opened_at": self.opened_at.isoformat(),
+            "closed_at": self.closed_at.isoformat() if self.closed_at else None,
             "duration_ms": self.duration_ms,
-            "events":      [e.to_dict() for e in self.events],
+            "events": [e.to_dict() for e in self.events],
         }
 
 
 # ─────────────────────────────────────────────────────────────
 # Sinks — where events get forwarded
 # ─────────────────────────────────────────────────────────────
+
 
 class ConsoleSink:
     """
@@ -229,9 +231,9 @@ class ConsoleSink:
         show_data: bool = False,
         show_group_banners: bool = True,
     ) -> None:
-        self.min_level          = min_level
-        self.color              = color and _tty_supports_color()
-        self.show_data          = show_data
+        self.min_level = min_level
+        self.color = color and _tty_supports_color()
+        self.show_data = show_data
         self.show_group_banners = show_group_banners
 
     def on_event(self, event: Event) -> None:
@@ -240,9 +242,10 @@ class ConsoleSink:
         print(event.to_console_line(color=self.color), flush=True)
         if self.show_data and event.data:
             import json
+
             print(
-                "  " + json.dumps(event.data, indent=2, default=str)
-                .replace("\n", "\n  "),
+                "  "
+                + json.dumps(event.data, indent=2, default=str).replace("\n", "\n  "),
                 flush=True,
             )
 
@@ -251,98 +254,18 @@ class ConsoleSink:
             return
         w = 68
         line = f"  ▶  {group.label.upper()}  ·  {group.opened_by}  "
-        bar  = "─" * w
+        bar = "─" * w
         text = f"\n{bar}\n{line}\n{bar}"
         print((_color(text, "\033[36m") if self.color else text), flush=True)
 
     def on_group_closed(self, group: ResponseGroup) -> None:
         if not self.show_group_banners:
             return
-        w    = 68
+        w = 68
         line = f"  ◀  {group.summary_line()}  "
-        bar  = "─" * w
+        bar = "─" * w
         text = f"{bar}\n{line}\n{bar}\n"
         print((_color(text, "\033[32m") if self.color else text), flush=True)
-
-
-class StreamlitSink:
-    """
-    Streams events into a Streamlit status/expander block.
-
-    Usage in your Streamlit app
-    ---------------------------
-
-        import streamlit as st
-        from event_queue import get_queue, StreamlitSink
-
-        queue = get_queue()
-
-        # Attach the sink once, passing a Streamlit placeholder
-        status_placeholder = st.empty()
-        queue.add_sink(StreamlitSink(placeholder=status_placeholder))
-
-        # Run your agent (synchronously or via asyncio.run)
-        run_agent(user_query)
-
-    The sink writes into an `st.status()` container so the user sees
-    a live expanding list of agent steps while the run is in progress.
-    If no placeholder is provided, it calls st.write() directly.
-    """
-
-    def __init__(self, placeholder=None, min_level: EventLevel = EventLevel.INFO) -> None:
-        self.min_level   = min_level
-        self._placeholder = placeholder
-        self._container  = None   # holds the st.status context
-
-    def _ensure_container(self, group: ResponseGroup):
-        """Lazily create the Streamlit container for this group."""
-        try:
-            import streamlit as st
-            label = f"**{group.label}** — {group.opened_by}"
-            if self._placeholder:
-                self._container = self._placeholder.status(label, expanded=True)
-            else:
-                self._container = st.status(label, expanded=True)
-        except Exception:
-            self._container = None
-
-    def on_event(self, event: Event) -> None:
-        if event.level < self.min_level:
-            return
-        try:
-            import streamlit as st
-            icon_map = {
-                EventLevel.DEBUG:   "⚙️",
-                EventLevel.INFO:    "ℹ️",
-                EventLevel.SUCCESS: "✅",
-                EventLevel.WARNING: "⚠️",
-                EventLevel.ERROR:   "❌",
-            }
-            icon    = icon_map.get(event.level, "•")
-            ts      = event.timestamp.strftime("%H:%M:%S")
-            message = f"{icon} `{ts}` **{event.source}** — {event.message}"
-
-            if self._container:
-                self._container.write(message)
-            else:
-                st.write(message)
-        except Exception:
-            pass   # never crash the agent because of a UI sink
-
-    def on_group_opened(self, group: ResponseGroup) -> None:
-        self._ensure_container(group)
-
-    def on_group_closed(self, group: ResponseGroup) -> None:
-        try:
-            if self._container:
-                dur = f"{group.duration_ms:.0f}ms" if group.duration_ms else "?"
-                self._container.update(
-                    label=f"**{group.label}** — {group.opened_by} ({dur})",
-                    state="complete",
-                    expanded=False,
-                )
-        except Exception:
-            pass
 
 
 class FileSink:
@@ -358,16 +281,20 @@ class FileSink:
         min_level: EventLevel = EventLevel.DEBUG,
         json_lines: bool = False,
     ) -> None:
-        self.min_level  = min_level
-        self.path       = path
+        self.min_level = min_level
+        self.path = path
         self.json_lines = json_lines
         import os
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+
+        os.makedirs(
+            os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True
+        )
 
     def on_event(self, event: Event) -> None:
         if event.level < self.min_level:
             return
         import json
+
         line = (
             json.dumps(event.to_dict(), default=str)
             if self.json_lines
@@ -421,6 +348,7 @@ class CallableSink:
 # EventQueue — the main class
 # ─────────────────────────────────────────────────────────────
 
+
 class EventQueue:
     """
     Central store and dispatcher for agent events.
@@ -437,9 +365,9 @@ class EventQueue:
     """
 
     def __init__(self, auto_console: bool = True) -> None:
-        self._lock   = threading.Lock()
+        self._lock = threading.Lock()
         self._sinks: list = []
-        self._groups: List[ResponseGroup]     = []
+        self._groups: List[ResponseGroup] = []
         self._by_label: Dict[str, ResponseGroup] = {}
         self._counter: int = 0
         self._active_group: Optional[ResponseGroup] = None
@@ -472,9 +400,9 @@ class EventQueue:
     ) -> "EventQueue":
         """Reconfigure the built-in console sink."""
         if self._console_sink:
-            self._console_sink.min_level          = min_level
-            self._console_sink.color              = color and _tty_supports_color()
-            self._console_sink.show_data          = show_data
+            self._console_sink.min_level = min_level
+            self._console_sink.color = color and _tty_supports_color()
+            self._console_sink.show_data = show_data
             self._console_sink.show_group_banners = show_group_banners
         return self
 
@@ -609,7 +537,7 @@ class EventQueue:
             print(f"[EventQueue] No response found with label '{label}'")
             return
 
-        w   = 68
+        w = 68
         bar = "─" * w
         header = f"\n{bar}\n  {group.summary_line()}\n{bar}"
         print(_color(header, "\033[36m") if color else header)
@@ -681,6 +609,7 @@ def get_queue() -> EventQueue:
 # Helpers
 # ─────────────────────────────────────────────────────────────
 
+
 def _tty_supports_color() -> bool:
     return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
@@ -692,6 +621,7 @@ def _color(text: str, ansi_code: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # Agent integration helper (optional mixin)
 # ─────────────────────────────────────────────────────────────
+
 
 class AgentPublisher:
     """
@@ -732,6 +662,49 @@ class AgentPublisher:
         self._q().error(self.source, message, data=data)
 
 
+from contextvars import ContextVar as _ContextVar
+from typing import Optional as _Opt
+
+_current_response_label: _ContextVar[_Opt[str]] = _ContextVar(
+    "alphaMesh_response_label", default=None
+)
+"""
+Holds the EventQueue response-group label for the current async task tree.
+ 
+Set by AnalysisRunner before calling OrchestratorAgent.run() and propagated
+automatically to sub-tasks (asyncio copies ContextVar context on task creation).
+Agents read this via the publish helpers below — they never set it themselves.
+"""
+
+
+def _agent_publish(
+    source: str, message: str, level: "EventLevel"
+) -> None:  # noqa: F821
+    """Internal: publish one event using the active response label (if any)."""
+    label = _current_response_label.get()
+    get_queue().publish(source, message, level=level, response_label=label)
+
+
+def publish_progress(source: str, message: str) -> None:
+    """Publish an INFO-level progress event from an agent node."""
+    _agent_publish(source, message, EventLevel.INFO)  # noqa: F821
+
+
+def publish_success(source: str, message: str) -> None:
+    """Publish a SUCCESS-level event from an agent node."""
+    _agent_publish(source, message, EventLevel.SUCCESS)  # noqa: F821
+
+
+def publish_warning(source: str, message: str) -> None:
+    """Publish a WARNING-level event from an agent node."""
+    _agent_publish(source, message, EventLevel.WARNING)  # noqa: F821
+
+
+def publish_error_event(source: str, message: str) -> None:
+    """Publish an ERROR-level event from an agent node."""
+    _agent_publish(source, message, EventLevel.ERROR)  # noqa: F821
+
+
 # ─────────────────────────────────────────────────────────────
 # Self-contained demo  (python event_queue.py)
 # ─────────────────────────────────────────────────────────────
@@ -747,28 +720,31 @@ if __name__ == "__main__":
     print("\n=== Simulating request 1 ===")
     q.start_response("orchestrator")
 
-    q.info("orchestrator",   "Received query: 'What is AAPL doing?'")
-    q.info("orchestrator",   "Routing to: news_agent, fundamentals_agent")
+    q.info("orchestrator", "Received query: 'What is AAPL doing?'")
+    q.info("orchestrator", "Routing to: news_agent, fundamentals_agent")
     time.sleep(0.05)
 
-    q.info("news_agent",     "Fetching from NewsAPI — ticker=AAPL")
-    q.debug("news_agent",    "Date range: 2025-03-07 → 2025-03-14")
-    q.success("news_agent",  "Fetched 34 articles")
+    q.info("news_agent", "Fetching from NewsAPI — ticker=AAPL")
+    q.debug("news_agent", "Date range: 2025-03-07 → 2025-03-14")
+    q.success("news_agent", "Fetched 34 articles")
     time.sleep(0.05)
 
-    q.info("news_agent",     "Ingesting into ChromaDB …")
-    q.success("news_agent",  "Ingested 89 chunks")
+    q.info("news_agent", "Ingesting into ChromaDB …")
+    q.success("news_agent", "Ingested 89 chunks")
     time.sleep(0.05)
 
-    q.info("fundamentals",   "Pulling financial data for AAPL")
-    q.success("fundamentals","P/E=28.4  Revenue=$124B  YoY=+6.1%",
-              data={"pe": 28.4, "revenue": "124B"})
+    q.info("fundamentals", "Pulling financial data for AAPL")
+    q.success(
+        "fundamentals",
+        "P/E=28.4  Revenue=$124B  YoY=+6.1%",
+        data={"pe": 28.4, "revenue": "124B"},
+    )
     time.sleep(0.05)
 
-    q.info("retriever",      "Running dual-store retrieval …")
-    q.success("retriever",   "Retrieved 12 chunks (vector=8, graph=4)")
-    q.info("orchestrator",   "Synthesising final answer …")
-    q.success("orchestrator","Response ready")
+    q.info("retriever", "Running dual-store retrieval …")
+    q.success("retriever", "Retrieved 12 chunks (vector=8, graph=4)")
+    q.info("orchestrator", "Synthesising final answer …")
+    q.success("orchestrator", "Response ready")
 
     q.end_response()
 
@@ -776,13 +752,13 @@ if __name__ == "__main__":
 
     print("\n=== Simulating request 2 ===")
     q.start_response("orchestrator")
-    q.info("orchestrator",   "Received query: 'Compare MSFT vs GOOGL'")
-    q.warning("news_agent",  "NewsAPI rate limit close: 8 requests remaining")
-    q.info("news_agent",     "Fetched 21 articles for MSFT")
-    q.info("news_agent",     "Fetched 18 articles for GOOGL")
-    q.error("fundamentals",  "Timeout fetching GOOGL fundamentals — retrying")
-    q.success("fundamentals","GOOGL data retrieved on retry")
-    q.success("orchestrator","Comparison response ready")
+    q.info("orchestrator", "Received query: 'Compare MSFT vs GOOGL'")
+    q.warning("news_agent", "NewsAPI rate limit close: 8 requests remaining")
+    q.info("news_agent", "Fetched 21 articles for MSFT")
+    q.info("news_agent", "Fetched 18 articles for GOOGL")
+    q.error("fundamentals", "Timeout fetching GOOGL fundamentals — retrying")
+    q.success("fundamentals", "GOOGL data retrieved on retry")
+    q.success("orchestrator", "Comparison response ready")
     q.end_response()
 
     # ── Replay a specific group ───────────────────────────────
@@ -791,6 +767,9 @@ if __name__ == "__main__":
 
     # ── Export to dict ────────────────────────────────────────
     import json
+
     data = q.export()
-    print(f"\n=== Exported {len(data)} response group(s), "
-          f"{sum(len(g['events']) for g in data)} total events ===")
+    print(
+        f"\n=== Exported {len(data)} response group(s), "
+        f"{sum(len(g['events']) for g in data)} total events ==="
+    )
