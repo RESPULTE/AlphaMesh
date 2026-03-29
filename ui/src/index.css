@@ -1,0 +1,70 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Outfit:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-headline: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-label: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-primary: #00C805;
+  --color-on-primary: #000000;
+  --color-primary-container: #003900;
+  --color-on-primary-container: #7AFF7C;
+  
+  --color-secondary: #00E676;
+  --color-on-secondary: #000000;
+  --color-secondary-container: #005227;
+  --color-on-secondary-container: #69FF9E;
+  
+  --color-tertiary: #00B0FF;
+  --color-on-tertiary: #000000;
+  --color-tertiary-container: #003554;
+  --color-on-tertiary-container: #80D8FF;
+  
+  --color-error: #FF5252;
+  --color-on-error: #000000;
+  --color-error-container: #93000A;
+  --color-on-error-container: #FFDAD6;
+  
+  --color-surface: #0A0A0A;
+  --color-on-surface: #FFFFFF;
+  --color-surface-variant: #1A1A1A;
+  --color-on-surface-variant: #A3A3A3;
+  
+  --color-outline: #404040;
+  --color-outline-variant: #262626;
+  
+  --color-surface-container-lowest: #000000;
+  --color-surface-container-low: #141414;
+  --color-surface-container: #1A1A1A;
+  --color-surface-container-high: #262626;
+  --color-surface-container-highest: #333333;
+}
+
+body {
+  background-color: var(--color-surface);
+  color: var(--color-on-surface);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar for a cleaner look */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-surface-container-lowest);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-outline-variant);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-outline);
+}
