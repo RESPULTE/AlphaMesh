@@ -20,8 +20,6 @@ Changes
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Orchestrator — planner
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,14 +83,7 @@ Each signal MUST include a `confidence` score (0.0–1.0):
 # Synthesiser prompts
 # ──────────────────────────────────────────────────────────────────────────────
 
-SYNTHESISER_USER_CONTEXT_SECTION = """\
-USER PORTFOLIO & INTERESTS:
-{user_context}
-
-When the user context above is not 'USER CONTEXT: None', you MUST reference the user's relevant holdings, watchlist entries, or interests in your final response where they are pertinent to the question. Do not silently ignore them.
-""".strip()
-
-SYNTHESISER_SINGLE_AGENT_PROMPT = """\
+SYNTHESISER_PROMPT = """\
 You are a Senior Financial Analyst.
 
 USER CONTEXT (if available):
@@ -101,161 +92,9 @@ USER CONTEXT (if available):
 PORTFOLIO HOLDINGS:
 {portfolio}
 
-You are given a single agent's analysis and the user question. Personalize the response to the user's portfolio where relevant (e.g., impact on held companies, clarification of risks/opportunities).
+You are given multiple agents' findings and the user question. Produce a cohesive narrative financial analysis grounded in those findings. Use numeric in-text citations like [1], [2] when referencing news sources. Personalise the response where the user context contains relevant holdings or interests.
 
-REQUIRED OUTPUT FORMAT (strictly):
-<response>
-...your narrative financial analysis for the user...
-</response>
-
-Do not output anything outside the <response> block.
+Formatting requirements:
+- Output ONLY the summary text, no tags or extra headers.
+- Write one short paragraph per agent output (if only one agent, produce one paragraph).
 """.strip()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Multi-agent synthesis prompt — base template (two mandatory blocks)
-# ──────────────────────────────────────────────────────────────────────────────
-
-_WRITEBACK_BASE = """\
-You are a Senior Financial Analyst and Knowledge Graph Architect.
-
-USER CONTEXT (if available):
-{user_context}
-
-PORTFOLIO HOLDINGS:
-{portfolio}
-
-Your task has TWO mandatory parts, in this exact order:
-
-PART 1 — CROSS-DOMAIN RELATIONSHIPS (do this FIRST)
-Before writing the user response, reason about relationships between entities surfaced across different agents.
-
-Output a <cross_domain_relationships> block as a JSON array. Each entry must be:
-{{
-  "from_name": "<entity name>",
-  "from_type": "Company | FinancialEvent | FinancialConcept | Sector",
-  "relation": "<RELATION_TYPE>",
-  "to_name": "<entity name>",
-  "to_type": "Company | FinancialEvent | FinancialConcept | Sector",
-  "confidence": "high | low",
-  "reason": "1-3 sentences",
-  "source_agent_from": "news_agent | fundamentals_agent",
-  "source_agent_to": "news_agent | fundamentals_agent"
-}}
-
-Allowed RELATION_TYPE values (use exact strings):
-  AFFECTS | CAUSED_BY | INCREASES | DECREASES | CORRELATED_WITH |
-  MITIGATES | EXPOSES_TO | REPORTED_BY | COMPETES_WITH | ACQUIRED_BY | RELATED_TO
-
-CONFIDENCE rules:
-  "high" = explicitly stated in agent findings with specific evidence
-  "low"  = inferred or implied without direct evidence
-
-PART 2 — USER RESPONSE (do this SECOND, using Part 1 as your foundation)
-Write a cohesive narrative financial analysis grounded in the agent findings.
-Use numeric in-text citations like [1], [2] when referencing news sources.
-Personalise the response where the user context contains relevant holdings or interests.\
-"""
-
-# Optional third block injected when signals are present
-_WRITEBACK_SIGNAL_BLOCK = """\
-
-
-PART 3 — USER INTEREST RELATIONSHIPS (only when agent findings overlap with the signals below)
-Given the user's detected signals, extract relationships between domain entities and those signals.
-Only emit edges where the agent findings provide direct evidence — do not speculate.
-
-DETECTED INVESTMENT SIGNALS:
-{investment_signals}
-
-DETECTED LEARNING SIGNALS:
-{learning_signals}
-
-Output a <user_interest_relationships> block as a JSON array. Each entry:
-{{{{
-  "entity_name": "<domain entity name>",
-  "entity_type": "Company | FinancialEvent | FinancialConcept | Sector",
-  "user_signal_type": "investment | learning",
-  "target_entity_name": "<entity name from the signal's target_entities list>",
-  "relationship": "THREATENS | SUPPORTS | CLARIFIES | CONFUSES_FURTHER",
-  "reason": "1-2 sentences grounded in agent findings",
-  "confidence": "high | low"
-}}}}
-
-If no relevant edges exist, output: <user_interest_relationships>[]</user_interest_relationships>\
-"""
-
-_WRITEBACK_FORMAT_NO_SIGNALS = """\
-
-
-REQUIRED OUTPUT FORMAT (strictly):
-<cross_domain_relationships>
-[...json array or empty array []...]
-</cross_domain_relationships>
-<response>
-...your narrative financial analysis for the user...
-</response>
-
-Do not output anything outside these two blocks.\
-"""
-
-_WRITEBACK_FORMAT_WITH_SIGNALS = """\
-
-
-REQUIRED OUTPUT FORMAT (strictly):
-<cross_domain_relationships>
-[...json array or empty array []...]
-</cross_domain_relationships>
-<user_interest_relationships>
-[...json array or empty array []...]
-</user_interest_relationships>
-<response>
-...your narrative financial analysis for the user...
-</response>
-
-Do not output anything outside these three blocks.\
-"""
-
-# The bare constant is kept for simple cases where signals are not available
-# at prompt-build time.  Prefer build_writeback_system_prompt().
-SYNTHESISER_WRITEBACK_SYSTEM_PROMPT = (
-    _WRITEBACK_BASE + _WRITEBACK_FORMAT_NO_SIGNALS
-).strip()
-
-
-def build_writeback_system_prompt(
-    investment_signals: Optional[List] = None,
-    learning_signals: Optional[List] = None,
-) -> str:
-    """
-    Build the multi-agent synthesis system prompt, optionally injecting the
-    user-interest-relationships block when signals are present.
-
-    Parameters
-    ----------
-    investment_signals:
-        List of InvestmentSignalDetection objects (or any repr()-able objects).
-        Pass None or empty list when there are no signals.
-    learning_signals:
-        List of LearningSignalDetection objects. Same rules as above.
-
-    Returns
-    -------
-    A complete system prompt string ready to be used as the ``system`` message
-    in ChatPromptTemplate.  Still contains {user_context} and {portfolio}
-    placeholders that LangChain fills at invoke time.
-    """
-    has_signals = bool(investment_signals or learning_signals)
-
-    if not has_signals:
-        return SYNTHESISER_WRITEBACK_SYSTEM_PROMPT
-
-    signal_block = _WRITEBACK_SIGNAL_BLOCK.format(
-        investment_signals=investment_signals or [],
-        learning_signals=learning_signals or [],
-    )
-    return (_WRITEBACK_BASE + signal_block + _WRITEBACK_FORMAT_WITH_SIGNALS).strip()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Fundamental analysis agent prompts
-# ──────────────────────────────────────────────────────────────────────────────

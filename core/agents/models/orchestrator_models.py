@@ -1,4 +1,3 @@
-from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional
 
 import pandas as pd
@@ -7,7 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
 from core.agents.models.news_agent_models import CitedSource
-from core.memory.graph.models import RelationshipType
 
 
 class UserInterestEntity(BaseModel):
@@ -188,30 +186,3 @@ class FinalResponse(BaseModel):
         default_factory=list,
         description="Ticker symbols processed in this turn (populated by orchestrator).",
     )
-
-
-class CrossDomainRelationship(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    from_name: str
-    from_type: Literal["Company", "FinancialEvent", "FinancialConcept", "Sector"]
-    relation: RelationshipType
-    to_name: str
-    to_type: Literal["Company", "FinancialEvent", "FinancialConcept", "Sector"]
-    confidence: Literal["high", "low"]
-    reason: str
-    source_agent_from: Literal["news_agent", "fundamentals_agent"]
-    source_agent_to: Literal["news_agent", "fundamentals_agent"]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SynthesisResult — returned by _parse_synthesis_output
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class SynthesisResult:
-    """Typed container for all blocks parsed from a single synthesis LLM call."""
-
-    analysis_text: str
-    cross_relationships: List[dict] = field(default_factory=list)
-    interest_edges: List[dict] = field(default_factory=list)

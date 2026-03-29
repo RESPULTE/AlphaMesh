@@ -7,20 +7,17 @@ Changes from previous version
    and graph_queue_manager.flush_turn() + close_session() after it returns.
    This is the single addition required for the graph queue lifecycle.
 
-2. _synthesize_node() replaces subgraph_svc.schedule() with a direct
-   GraphQueueManager.enqueue() call for cross-domain relationships.
-   User signal writeback now enqueues GraphTasks for turn-scoped batching.
+2. _synthesize_node() only returns analysis text and no longer enqueues
+   deferred relationship extraction; only investment-signal writeback is queued.
 Everything else is unchanged from the previous version.
 """
 
 import asyncio
 import json
-import re
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import END, START, StateGraph
 
 from core.agents.base_agent import AbstractAgent
@@ -31,27 +28,22 @@ from core.agents.models.orchestrator_models import (
     FinalResponse,
     OrchestratorPlan,
     OrchestratorState,
-    SynthesisResult,
 )
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.agents.prompts.orchestrator_agent_prompts import (
     ORCHESTRATOR_PLANNER_SYSTEM_PROMPT,
-    SYNTHESISER_SINGLE_AGENT_PROMPT,
-    SYNTHESISER_USER_CONTEXT_SECTION,
-    build_writeback_system_prompt,
+    SYNTHESISER_PROMPT,
 )
 from core.agents.utils import (
     _build_clarification_message,
     _build_combined_company_context,
     _extract_last_human_message,
     _last_n_messages,
-    _safe_json,
 )
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
-from core.memory.graph.extraction_prompts import DEFERRED_RELATIONSHIP_SYSTEM_PROMPT
-from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
+from core.memory.graph.graph_queue import make_graph_task
 from core.memory.user_signal_writeback import (
     build_signal_payload,
     build_user_signal_relationships,
@@ -60,16 +52,6 @@ from core.memory.user_signal_writeback import (
 from core.services import service_manager
 
 logger = get_logger(__name__)
-
-_RESPONSE_RE = re.compile(r"<response>(.*?)</response>", re.DOTALL | re.IGNORECASE)
-_CROSS_RE = re.compile(
-    r"<cross_domain_relationships>(.*?)</cross_domain_relationships>",
-    re.DOTALL | re.IGNORECASE,
-)
-_INTEREST_RE = re.compile(
-    r"<user_interest_relationships>(.*?)</user_interest_relationships>",
-    re.DOTALL | re.IGNORECASE,
-)
 
 AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
 _SYNTHESIS_HISTORY_WINDOW: int = 6
@@ -256,76 +238,21 @@ class OrchestratorAgent:
 
     # ── Prompt builders ───────────────────────────────────────────────────────
 
-    def _build_synthesis_prompt(
+    def _build_synthesis_system_prompt(
         self,
-        user_context_section: str,
-        multi_agent: bool,
-        investment_signals: Optional[List] = None,
-        learning_signals: Optional[List] = None,
-    ) -> ChatPromptTemplate:
-        if multi_agent:
-            system_prompt = (
-                user_context_section
-                + "\n\n"
-                + build_writeback_system_prompt(investment_signals, learning_signals)
-                + "\n\nAgent Findings:\n{context}"
-            )
-            human_prompt = "Produce cross-domain relationships, user interest relationships (if applicable), and final analysis."
-        else:
-            system_prompt = (
-                user_context_section
-                + SYNTHESISER_SINGLE_AGENT_PROMPT
-                + "\n\nAgent Findings:\n{context}"
-            )
-            human_prompt = "Produce the final analysis response."
-
-        return ChatPromptTemplate.from_messages(
-            [
-                ("system", system_prompt),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", human_prompt),
-            ]
-        )
-
-    async def _invoke_synthesis_llm(
-        self,
-        prompt: ChatPromptTemplate,
-        state: OrchestratorState,
+        user_context: str,
+        portfolio: str,
         context_parts: List[str],
-        portfolio_block: str,
-        history: List[BaseMessage],
     ) -> str:
-        chain = prompt | self._llm
-        response = await chain.ainvoke(
-            {
-                "history": history,
-                "context": "\n\n".join(context_parts),
-                "user_context": state.user_context_block,
-                "portfolio": portfolio_block,
-            }
+        rendered = SYNTHESISER_PROMPT.format(
+            user_context=user_context, portfolio=portfolio
         )
-        return response.content if response else ""
+        context_block = "\n\nAgent Findings:\n" + "\n\n".join(context_parts)
+        return rendered + context_block
 
-    def _parse_synthesis_output(self, raw: str, multi_agent: bool) -> SynthesisResult:
-        cross_relationships: List[dict] = []
-        interest_edges: List[dict] = []
-
-        if multi_agent:
-            cross_match = _CROSS_RE.search(raw)
-            if cross_match:
-                cross_relationships = _safe_json(cross_match.group(1))
-            interest_match = _INTEREST_RE.search(raw)
-            if interest_match:
-                interest_edges = _safe_json(interest_match.group(1))
-
-        resp_match = _RESPONSE_RE.search(raw)
-        analysis_text = resp_match.group(1).strip() if resp_match else raw.strip()
-
-        return SynthesisResult(
-            analysis_text=analysis_text,
-            cross_relationships=cross_relationships,
-            interest_edges=interest_edges,
-        )
+    @staticmethod
+    def _extract_response_text(raw: str) -> str:
+        return raw.strip()
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
 
@@ -486,13 +413,9 @@ class OrchestratorAgent:
         portfolio_block = json.dumps(portfolio, indent=2) if portfolio else "[]"
         multi_agent = len(state.agent_outputs) > 1
 
-        user_context_section = SYNTHESISER_USER_CONTEXT_SECTION.format(
-            user_context=state.user_context_block
-        )
         history_window = _last_n_messages(state.messages, _SYNTHESIS_HISTORY_WINDOW)
 
         analysis_text = ""
-        synthesis_result = SynthesisResult(analysis_text="")
 
         publish_progress("orchestrator", "Synthesising final response…")
 
@@ -503,23 +426,20 @@ class OrchestratorAgent:
             )
         else:
             try:
-                investment_signals = (
-                    (state.plan.detected_investment_signals or []) if state.plan else []
+                system_prompt = self._build_synthesis_system_prompt(
+                    user_context=state.user_context_block,
+                    portfolio=portfolio_block,
+                    context_parts=context_parts,
                 )
-                learning_signals = (
-                    (state.plan.detected_learning_signals or []) if state.plan else []
+                messages: List[BaseMessage] = [
+                    SystemMessage(content=system_prompt),
+                    *history_window,
+                    HumanMessage(content="Produce the final analysis response."),
+                ]
+                response = await self._llm.ainvoke(messages)
+                analysis_text = self._extract_response_text(
+                    response.content if response else ""
                 )
-                prompt = self._build_synthesis_prompt(
-                    user_context_section,
-                    multi_agent,
-                    investment_signals=investment_signals if multi_agent else None,
-                    learning_signals=learning_signals if multi_agent else None,
-                )
-                raw = await self._invoke_synthesis_llm(
-                    prompt, state, context_parts, portfolio_block, history_window
-                )
-                synthesis_result = self._parse_synthesis_output(raw, multi_agent)
-                analysis_text = synthesis_result.analysis_text
 
                 publish_success("orchestrator", "Synthesis complete.")
             except Exception:
@@ -529,66 +449,39 @@ class OrchestratorAgent:
                     "The raw data was retrieved but could not be summarised."
                 )
 
-        # Cross-domain graph write-back (queued via GraphQueueManager.enqueue)
-        if multi_agent and state.conversation_id:
-            try:
-                if synthesis_result.cross_relationships:
-                    task = make_graph_task(
-                        turn_id=state.turn_id,
-                        conversation_id=state.conversation_id,
-                        source_agent=self.name(),
-                        relationships=synthesis_result.cross_relationships,
-                    )
-                    await service_manager.get_graph_queue_manager().enqueue(task)
-                elif analysis_text:
-                    task = make_extraction_task(
-                        turn_id=state.turn_id,
-                        conversation_id=state.conversation_id,
-                        source_agent=self.name(),
-                        extraction_text=analysis_text,
-                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-                        llm_config={"temperature": 0.0},
-                    )
-                    await service_manager.get_graph_queue_manager().enqueue(
-                        task,
-                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-                    )
-            except Exception:
-                logger.exception(
-                    "_synthesize_node: failed to enqueue cross-domain relationships"
-                )
-        # User signal write-back (queued via GraphQueueManager.enqueue)
+        # User signal write-back (investment signals only)
         if state.user_email and state.plan and state.conversation_id:
-            user_message = _extract_last_human_message(state.messages)
-            payload = build_signal_payload(
-                user_email=state.user_email,
-                conversation_id=state.conversation_id,
-                turn_id=state.turn_id,
-                ticker_metadata=state.ticker_metadata,
-                user_message=user_message,
-                detected_investment_signals=state.plan.detected_investment_signals
-                or [],
-                detected_learning_signals=state.plan.detected_learning_signals or [],
-                interest_edges=synthesis_result.interest_edges or [],
-            )
-            relationships, cache_entries = await build_user_signal_relationships(
-                payload
-            )
-            if relationships:
-                try:
-                    task = make_graph_task(
-                        turn_id=state.turn_id,
-                        conversation_id=state.conversation_id,
-                        source_agent=self.name(),
-                        relationships=relationships,
-                    )
-                    await service_manager.get_graph_queue_manager().enqueue(task)
-                except Exception:
-                    logger.exception(
-                        "_synthesize_node: failed to enqueue user signal relationships"
-                    )
-            if cache_entries:
-                update_user_signal_cache(cache_entries, state.user_email)
+            investment_signals = state.plan.detected_investment_signals or []
+            if investment_signals:
+                user_message = _extract_last_human_message(state.messages)
+                payload = build_signal_payload(
+                    user_email=state.user_email,
+                    conversation_id=state.conversation_id,
+                    turn_id=state.turn_id,
+                    ticker_metadata=state.ticker_metadata,
+                    user_message=user_message,
+                    detected_investment_signals=investment_signals,
+                    detected_learning_signals=[],
+                    interest_edges=[],
+                )
+                relationships, cache_entries = await build_user_signal_relationships(
+                    payload
+                )
+                if relationships:
+                    try:
+                        task = make_graph_task(
+                            turn_id=state.turn_id,
+                            conversation_id=state.conversation_id,
+                            source_agent=self.name(),
+                            relationships=relationships,
+                        )
+                        await service_manager.get_graph_queue_manager().enqueue(task)
+                    except Exception:
+                        logger.exception(
+                            "_synthesize_node: failed to enqueue user signal relationships"
+                        )
+                if cache_entries:
+                    update_user_signal_cache(cache_entries, state.user_email)
 
         per_agent_analyses: Dict[str, str] = {
             name: getattr(output, "analysis", "") or ""
