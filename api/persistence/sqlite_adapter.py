@@ -15,9 +15,10 @@ from typing import List, Optional
 
 import aiosqlite
 
-from api.persistence.base import ConversationPersistenceAdapter
+from api.persistence.base import ConversationPersistenceAdapter, SessionPersistenceAdapter
 
 _DEFAULT_DB_PATH = "./data/conversations.db"
+_DEFAULT_SESSIONS_DB_PATH = "./data/sessions.db"
 
 
 class SQLiteConversationAdapter(ConversationPersistenceAdapter):
@@ -165,3 +166,119 @@ class SQLiteConversationAdapter(ConversationPersistenceAdapter):
             }
             for row in rows
         ]
+
+
+class SQLiteSessionAdapter(SessionPersistenceAdapter):
+    """
+    Stores analysis session metadata in a local SQLite file.
+
+    Schema
+    â”€â”€â”€â”€â”€â”€
+    sessions (session_id PK, conversation_id, user_email, ticker, query, summary, created_at)
+    """
+
+    def __init__(self, db_path: str = _DEFAULT_SESSIONS_DB_PATH) -> None:
+        self._db_path = db_path
+        self._initialized = False
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id       TEXT PRIMARY KEY,
+                    conversation_id  TEXT NOT NULL,
+                    user_email       TEXT NOT NULL,
+                    ticker           TEXT,
+                    query            TEXT NOT NULL,
+                    summary          TEXT,
+                    created_at       TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sessions_user_created
+                ON sessions (user_email, created_at DESC)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sessions_ticker
+                ON sessions (user_email, ticker, created_at DESC)
+                """
+            )
+            await db.commit()
+        self._initialized = True
+
+    async def save_session(
+        self,
+        session_id: str,
+        conversation_id: str,
+        user_email: str,
+        ticker: Optional[str],
+        query: str,
+        summary: str,
+        created_at: str,
+    ) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO sessions
+                    (session_id, conversation_id, user_email, ticker, query, summary, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    conversation_id,
+                    user_email,
+                    ticker,
+                    query,
+                    summary,
+                    created_at,
+                ),
+            )
+            await db.commit()
+
+    async def list_sessions(
+        self,
+        user_email: str,
+        limit: int = 20,
+    ) -> List[dict]:
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT session_id, conversation_id, ticker, query, summary, created_at
+                FROM sessions
+                WHERE user_email = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_email, limit),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def list_sessions_by_ticker(
+        self,
+        user_email: str,
+        ticker: str,
+        limit: int = 10,
+    ) -> List[dict]:
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT session_id, conversation_id, query, summary, created_at
+                FROM sessions
+                WHERE user_email = ? AND ticker = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_email, ticker, limit),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(row) for row in rows]

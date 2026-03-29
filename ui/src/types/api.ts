@@ -52,9 +52,9 @@ export interface ChartDataPoint {
 export interface AnalysisResponse {
   ticker: string;
   companyName: string;
-  currentPrice: number;
-  priceChange: number;
-  priceChangePercent: number;
+  currentPrice: number | null;
+  priceChange: number | null;
+  priceChangePercent: number | null;
   marketStatus: string;
   chartData: ChartDataPoint[];
   agents: AgentAnalysis[];
@@ -62,56 +62,53 @@ export interface AnalysisResponse {
 }
 
 /**
- * API Integration Guidelines for Python Backend
- * 
- * To integrate this frontend with your Python backend, you should implement a 
- * Server-Sent Events (SSE) or WebSocket endpoint that streams the `AnalysisResponse` 
- * object in chunks.
- * 
- * Recommended Approach (Server-Sent Events):
- * 
- * 1. Endpoint: `GET /api/analyze?query={user_prompt}`
- * 2. Response Headers: `Content-Type: text/event-stream`
- * 3. Event Stream Format:
- * 
- * The backend should yield partial JSON objects as they are generated. 
- * For example, you can stream the `coreNarrative` character by character, 
- * or stream each `AgentAnalysis` as it completes.
- * 
- * Example Python (FastAPI) Backend:
- * ```python
- * from fastapi import FastAPI
- * from fastapi.responses import StreamingResponse
- * import json
- * import asyncio
- * 
- * app = FastAPI()
- * 
- * async def generate_analysis(query: str):
- *     # 1. Send initial shell (ticker, price, empty arrays)
- *     yield f"data: {json.dumps({'type': 'init', 'data': {'ticker': 'AAPL', 'companyName': 'Apple Inc.', 'currentPrice': 192.53}})}\n\n"
- *     
- *     # 2. Stream chart data
- *     await asyncio.sleep(1)
- *     yield f"data: {json.dumps({'type': 'chart', 'data': [{'time': '10:00', 'price': 190}, ...]})}\n\n"
- *     
- *     # 3. Stream agent 1
- *     await asyncio.sleep(2)
- *     yield f"data: {json.dumps({'type': 'agent', 'data': {'id': 'news', 'name': 'News Analysis Agent', ...}})}\n\n"
- *     
- *     # 4. Stream summary text chunk by chunk
- *     summary_text = "Apple is successfully transitioning..."
- *     for i in range(len(summary_text)):
- *         yield f"data: {json.dumps({'type': 'summary_chunk', 'data': summary_text[i]})}\n\n"
- *         await asyncio.sleep(0.05)
- *         
- *     yield f"data: {json.dumps({'type': 'done'})}\n\n"
- * 
- * @app.get("/api/analyze")
- * async def analyze(query: str):
- *     return StreamingResponse(generate_analysis(query), media_type="text/event-stream")
- * ```
- * 
- * In the frontend, we use an `EventSource` to listen to these events and 
- * update the React state incrementally, creating a fluid loading experience.
+ * API Integration Notes
+ *
+ * Current flow:
+ * 1) POST /api/v1/chat  â€” start analysis, returns request_id
+ * 2) GET  /api/v1/stream/{request_id}  â€” SSE stream
+ *
+ * The stream emits `progress`, `complete`, or `error` events. We map the
+ * `complete` payload (FinalResult) into the AnalysisResponse shape used by
+ * the UI.
  */
+
+export interface DataFramePayload {
+  index: string[];
+  columns: string[];
+  data: Array<Array<number | null>>;
+}
+
+export interface SourceItem {
+  source_id: number;
+  title: string;
+  url: string;
+  page_content?: string;
+}
+
+export interface TickerResult {
+  ticker: string;
+  analysis_text: string;
+  financial_data?: DataFramePayload | null;
+  sources: SourceItem[];
+}
+
+export interface FinalResult {
+  request_id: string;
+  conversation_id: string;
+  synthesis: string;
+  ticker_results: TickerResult[];
+  agent_analyses: Record<string, string>;
+  duration_ms: number;
+}
+
+export interface StreamEvent {
+  event_type: 'progress' | 'complete' | 'error';
+  request_id: string;
+  result?: FinalResult;
+  error?: string;
+  source?: string;
+  level?: string;
+  message?: string;
+  timestamp?: string;
+}

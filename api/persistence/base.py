@@ -69,3 +69,46 @@ class ConversationPersistenceAdapter(ABC):
         Each dict has keys: conversation_id, created_at, last_message_at,
         message_count.  Filtered by user_email when supplied.
         """
+
+
+class SessionPersistenceAdapter(ABC):
+    """
+    Abstract adapter for session metadata storage.
+
+    This keeps SessionService decoupled from the underlying store so we can
+    swap SQLite for Redis/external APIs later without touching routers.
+    """
+
+    @abstractmethod
+    async def initialize(self) -> None:
+        """Create schema / indices.  Idempotent â€” safe to call multiple times."""
+
+    @abstractmethod
+    async def save_session(
+        self,
+        session_id: str,
+        conversation_id: str,
+        user_email: str,
+        ticker: Optional[str],
+        query: str,
+        summary: str,
+        created_at: str,
+    ) -> None:
+        """Persist a single session record."""
+
+    @abstractmethod
+    async def list_sessions(
+        self,
+        user_email: str,
+        limit: int = 20,
+    ) -> List[dict]:
+        """Return the most recent `limit` sessions for a user, newest first."""
+
+    @abstractmethod
+    async def list_sessions_by_ticker(
+        self,
+        user_email: str,
+        ticker: str,
+        limit: int = 10,
+    ) -> List[dict]:
+        """Return sessions for a specific ticker, newest first."""

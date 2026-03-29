@@ -82,8 +82,6 @@ def get_market_data_service() -> MarketDataService:
     return MarketDataService()
 
 
-def get_session_service() -> SessionService:
+def get_session_service(request: Request) -> SessionService:
     """Provide the SessionService singleton (initialised during lifespan startup)."""
-    # SessionService._initialized is guarded; _ensure_init() is idempotent.
-    # The lifespan hook calls initialize() explicitly so this is always warm.
-    return SessionService()
+    return request.app.state.session_service

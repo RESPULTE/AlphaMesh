@@ -183,6 +183,12 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
     );
   }
 
+  const priceText = data.currentPrice != null ? data.currentPrice.toFixed(2) : '--';
+  const changeText =
+    data.priceChange != null && data.priceChangePercent != null
+      ? `+${data.priceChange.toFixed(2)} (${data.priceChangePercent.toFixed(2)}%)`
+      : '—';
+
   return (
     <motion.main
       initial={{ opacity: 0, scale: 0.98 }}
@@ -224,23 +230,23 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
           <div>
             <div className="flex items-center gap-2 md:gap-3 mb-2 md:mb-4">
               <span className="bg-surface-container-low text-on-surface-variant px-2 py-0.5 md:px-3 md:py-1 rounded-full text-[8px] md:text-[10px] font-black font-label tracking-[0.15em] uppercase border border-outline-variant/20">
-                {data.ticker}
+                {data.ticker || 'N/A'}
               </span>
               <h1 className="font-headline text-xl md:text-2xl font-bold tracking-tight text-on-surface">
-                {data.companyName}
+                {data.companyName || 'Company'}
               </h1>
             </div>
             <div className="flex items-baseline gap-3 md:gap-6">
               <span className="font-headline text-4xl md:text-7xl font-black leading-none tracking-tighter text-on-surface filter drop-shadow-sm">
-                {data.currentPrice?.toFixed(2)}
+                {priceText}
               </span>
               <div className="flex flex-col">
                 <span className="text-primary font-black flex items-center text-sm md:text-xl">
                   <TrendingUp className="w-4 h-4 md:w-5 md:h-5 mr-1" />
-                  +{data.priceChange?.toFixed(2)} ({data.priceChangePercent?.toFixed(2)}%)
+                  {changeText}
                 </span>
                 <span className="text-on-surface-variant/60 text-[8px] md:text-[10px] font-bold font-label uppercase tracking-[0.2em] mt-0.5 md:mt-1">
-                  {data.marketStatus}
+                  {data.marketStatus || 'MARKET DATA UNAVAILABLE'}
                 </span>
               </div>
             </div>
@@ -291,7 +297,7 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
                       transition={{ repeat: Infinity, duration: 1.5 }}
                       className="text-on-surface-variant/50 font-medium"
                     >
-                      Loading Chart Data...
+                      {isStreaming ? 'Loading Chart Data...' : 'Market data unavailable'}
                     </motion.div>
                   </div>
                 )}

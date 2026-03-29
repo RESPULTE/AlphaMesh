@@ -33,7 +33,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.persistence.sqlite_adapter import SQLiteConversationAdapter
+from api.persistence.sqlite_adapter import (
+    SQLiteConversationAdapter,
+    SQLiteSessionAdapter,
+)
 from api.routers import chat, conversations, health, stream
 from api.services.analysis_runner import AnalysisRunner
 from api.services.conversation_store import ConversationStore
@@ -54,12 +57,6 @@ async def lifespan(app: FastAPI):
 
     # In lifespan, after service_manager.startup():
     from api.services.session_service import SessionService
-
-    _session_svc = SessionService()
-    await _session_svc.initialize()
-
-    # Replace CORS allowed_origins:
-    allow_origins = (settings.allowed_origins_list,)
 
     # Add new routers:
     from api.middleware.error_handling import register_exception_handlers
@@ -86,9 +83,14 @@ async def lifespan(app: FastAPI):
     await store.initialize()
     runner = AnalysisRunner(broadcaster=broadcaster, store=store)
 
+    session_adapter = SQLiteSessionAdapter(db_path=settings.SESSIONS_DB_PATH)
+    session_service = SessionService(adapter=session_adapter)
+    await session_service.initialize()
+
     app.state.broadcaster = broadcaster
     app.state.store = store
     app.state.runner = runner
+    app.state.session_service = session_service
 
     logger.info("AlphaMesh API: ready.")
     yield
