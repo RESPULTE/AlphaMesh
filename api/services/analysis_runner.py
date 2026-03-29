@@ -7,29 +7,13 @@ Orchestrates one analysis turn:
   3. Calls OrchestratorAgent.run() in the background.
   4. Builds FinalResult and enqueues the `complete` SSE event.
   5. Tears down the sink and schedules queue cleanup.
-
-Separation of concerns
-───────────────────────
-• OrchestratorAgent knows nothing about SSE or request_id.
-• EventQueue knows nothing about asyncio.Queue or SSE.
-• AnalysisRunner is the only place that wires them together.
-
-Concurrency
-───────────
-Each call to `launch()` creates an independent asyncio.Task.  Because
-OrchestratorAgent.run() is stateless and all service singletons (LLM, Neo4j,
-Chroma) are async-safe, concurrent tasks do not interfere.
-
-The ContextVar `_current_response_label` is inherited by the new task (Python
-asyncio tasks copy the ContextVar context from their creator).  Within the
-task, the ContextVar is overwritten with `token = _cv.set(label)` and reset
-in the finally block, so the creator's context is unaffected.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Optional
 from uuid import uuid4
@@ -38,16 +22,63 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from api.models.requests import ChatRequest
 from api.models.responses import DataFramePayload, FinalResult, SourceItem, TickerResult
-from api.services.conversation_store import ConversationStore
 from api.services.event_broadcaster import EventBroadcaster
 from api.sinks.sse_sink import SSESink
+from core.memory.conversation.store import ConversationStore
+from core.services import service_manager
 
 logger = logging.getLogger(__name__)
+
+_TICKER_RE = re.compile(r"\$?\b[A-Z]{1,5}\b")
+_STOPWORDS = {
+    "THE",
+    "AND",
+    "FOR",
+    "WITH",
+    "FROM",
+    "THIS",
+    "THAT",
+    "YOUR",
+    "WHAT",
+    "WILL",
+    "HAVE",
+    "HOLD",
+    "LONG",
+    "SHORT",
+    "ABOUT",
+    "FROM",
+    "INTO",
+    "OVER",
+}
+
+
+def _extract_ticker_candidate(text: str) -> Optional[str]:
+    if not text:
+        return None
+    candidates = _TICKER_RE.findall(text.upper())
+    for raw in candidates:
+        t = raw.replace("$", "")
+        if t and t not in _STOPWORDS:
+            return t
+    return None
+
+
+def _build_metrics_payload(final_response) -> Optional[DataFramePayload]:
+    fundamental_df = getattr(final_response, "fundamental_data", None)
+    if fundamental_df is None or getattr(fundamental_df, "empty", True):
+        return None
+    try:
+        return DataFramePayload.from_dataframe(fundamental_df)
+    except Exception:
+        logger.warning(
+            "_build_metrics_payload: DataFrame serialisation failed; skipping."
+        )
+        return None
 
 
 class AnalysisRunner:
     """
-    Wires OrchestratorAgent ↔ EventQueue ↔ SSE for a single analysis request.
+    Wires OrchestratorAgent ? EventQueue ? SSE for a single analysis request.
     """
 
     def __init__(
@@ -71,7 +102,46 @@ class AnalysisRunner:
         )
         return conversation_id
 
-    # ── Private ───────────────────────────────────────────────────────────────
+    async def _emit_market_data(
+        self,
+        event_queue: asyncio.Queue,
+        request_id: str,
+        ticker: str,
+    ) -> None:
+        market_svc: MarketDataService = service_manager.get_market_data_service()
+        try:
+            quote, chart = await asyncio.wait_for(
+                asyncio.gather(
+                    market_svc.get_quote(ticker),
+                    market_svc.get_intraday(ticker),
+                ),
+                timeout=10.0,
+            )
+            await event_queue.put(
+                {"event_type": "init", "request_id": request_id, "quote": quote}
+            )
+            await event_queue.put(
+                {"event_type": "chart", "request_id": request_id, "chart": chart}
+            )
+        except asyncio.TimeoutError:
+            await event_queue.put(
+                {
+                    "event_type": "init",
+                    "request_id": request_id,
+                    "quote": {"ticker": ticker, "companyName": ticker},
+                }
+            )
+        except Exception as exc:
+            logger.warning("Market data fetch failed: %s", exc)
+            await event_queue.put(
+                {
+                    "event_type": "init",
+                    "request_id": request_id,
+                    "quote": {"ticker": ticker, "companyName": ticker},
+                }
+            )
+
+    # -- Private --------------------------------------------------------------
 
     async def _run(
         self,
@@ -96,7 +166,7 @@ class AnalysisRunner:
         loop = asyncio.get_running_loop()
         t_start = time.monotonic()
 
-        # ── 1. Register response group + SSE sink ─────────────────────────────
+        # -- 1. Register response group + SSE sink -----------------------------
         response_label = queue.start_response("orchestrator")
         response_group = queue.get_response(response_label)
         response_id = response_group.response_id  # stable UUID for this run
@@ -109,25 +179,37 @@ class AnalysisRunner:
         )
         queue.add_sink(sink)
 
-        # ── 2. Bind ContextVar so agents publish to the right group ───────────
+        # -- 2. Bind ContextVar so agents publish to the right group ------------
         token = _current_response_label.set(response_label)
 
+        # -- 2a. Start market data fetch (best-effort) --------------------------
+        ticker_candidate = _extract_ticker_candidate(chat_request.message or "")
+        if ticker_candidate:
+            asyncio.create_task(
+                self._emit_market_data(event_queue, request_id, ticker_candidate),
+                name=f"market_{request_id[:8]}",
+            )
+
         try:
-            # ── 3. Prepare conversation ────────────────────────────────────────
+            # -- 3. Prepare conversation ---------------------------------------
             await self._store.ensure_conversation(
                 conversation_id, chat_request.user_email
             )
             history = await self._store.get_langchain_messages(conversation_id)
             messages = history + [HumanMessage(content=chat_request.message)]
 
-            # ── 4. Run the orchestrator ────────────────────────────────────────
+            # -- 4. Run the orchestrator ---------------------------------------
             final_response = await orchestrator.run(
                 messages=messages,
                 conversation_id=conversation_id,
                 user_email=chat_request.user_email,
             )
 
-            # ── 5. Persist conversation turn ──────────────────────────────────
+            final_ticker = (getattr(final_response, "tickers", []) or [None])[0]
+            if final_ticker and final_ticker != ticker_candidate:
+                await self._emit_market_data(event_queue, request_id, final_ticker)
+
+            # -- 5. Persist conversation turn ----------------------------------
             await self._store.add_messages(
                 conversation_id,
                 [
@@ -136,7 +218,18 @@ class AnalysisRunner:
                 ],
             )
 
-            # ── 6. Build wire-format result ───────────────────────────────────
+            # -- 6. Emit metrics payload (if available) ------------------------
+            metrics_payload = _build_metrics_payload(final_response)
+            if metrics_payload is not None:
+                await event_queue.put(
+                    {
+                        "event_type": "metrics",
+                        "request_id": request_id,
+                        "financial_data": metrics_payload.model_dump(),
+                    }
+                )
+
+            # -- 7. Build wire-format result -----------------------------------
             duration_ms = (time.monotonic() - t_start) * 1000
             final_result = _build_final_result(
                 request_id=request_id,
@@ -145,7 +238,7 @@ class AnalysisRunner:
                 duration_ms=duration_ms,
             )
 
-            # ── 7. Deliver completion event ───────────────────────────────────
+            # -- 8. Deliver completion event -----------------------------------
             await event_queue.put(
                 {
                     "event_type": "complete",
@@ -170,7 +263,7 @@ class AnalysisRunner:
                 pass
 
         finally:
-            # ── Teardown: remove sink, reset ContextVar, close response group ──
+            # -- Teardown: remove sink, reset ContextVar, close response group --
             queue.remove_sink(sink)
             _current_response_label.reset(token)
             # Close the response group without touching _active_group (race-safe)
@@ -181,9 +274,7 @@ class AnalysisRunner:
             self._broadcaster.schedule_cleanup(request_id)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Result builder (pure function — easy to unit-test)
-# ─────────────────────────────────────────────────────────────────────────────
+# -- Result builder (pure function � easy to unit-test) -----------------------
 
 
 def _build_final_result(
@@ -193,18 +284,7 @@ def _build_final_result(
     duration_ms: float,
 ) -> FinalResult:
     """
-    Map OrchestratorAgent's FinalResponse → API-layer FinalResult.
-
-    TickerResult strategy (current: single ticker)
-    ───────────────────────────────────────────────
-    • ticker          — first entry in final_response.tickers (added to
-                        FinalResponse by the orchestrator patch)
-    • analysis_text   — fundamentals analysis if available, else news analysis
-    • financial_data  — serialised fundamental DataFrame (may be None)
-    • sources         — cited news sources
-
-    When multi-ticker orchestration lands, this function grows a loop over
-    final_response.tickers with per-ticker data sourced from per-agent outputs.
+    Map OrchestratorAgent's FinalResponse ? API-layer FinalResult.
     """
     tickers = getattr(final_response, "tickers", [])
     agent_analyses: dict = getattr(final_response, "agent_analyses", {}) or {}
@@ -229,7 +309,7 @@ def _build_final_result(
                 "_build_final_result: DataFrame serialisation failed; skipping."
             )
 
-    # Map CitedSource → SourceItem
+    # Map CitedSource ? SourceItem
     sources = [
         SourceItem(
             source_id=s.source_id,

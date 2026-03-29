@@ -34,6 +34,9 @@ class ServiceManager:
         self._user_context_service = None
         self._subgraph_service = None
         self._ticker_validator = None
+        self._conversation_store = None
+        self._session_service = None
+        self._market_data_service = None
 
     def get_agent(self, temperature=0.0):
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
@@ -326,6 +329,43 @@ class ServiceManager:
                 raise
         return self._ticker_validator
 
+    def get_conversation_store(self):
+        from core.memory.conversation.store import ConversationStore
+        from core.memory.stores.sqlite_adapter import SQLiteConversationAdapter
+
+        if self._conversation_store is None:
+            try:
+                adapter = SQLiteConversationAdapter()
+                self._conversation_store = ConversationStore(adapter=adapter)
+            except Exception as e:
+                print(f"Error initializing ConversationStore: {e}")
+                raise
+        return self._conversation_store
+
+    def get_session_service(self):
+        from core.memory.sessions.session_service import SessionService
+        from core.memory.stores.sqlite_adapter import SQLiteSessionAdapter
+
+        if self._session_service is None:
+            try:
+                adapter = SQLiteSessionAdapter(db_path=settings.SESSIONS_DB_PATH)
+                self._session_service = SessionService(adapter=adapter)
+            except Exception as e:
+                print(f"Error initializing SessionService: {e}")
+                raise
+        return self._session_service
+
+    def get_market_data_service(self):
+        from core.market_data_service import MarketDataService
+
+        if self._market_data_service is None:
+            try:
+                self._market_data_service = MarketDataService()
+            except Exception as e:
+                print(f"Error initializing MarketDataService: {e}")
+                raise
+        return self._market_data_service
+
     async def startup(self) -> None:
         """
         Run once at application startup.
@@ -334,6 +374,8 @@ class ServiceManager:
         """
         await self.get_nodeset_manager().initialize_default_nodesets()
         await self.get_graph_queue_manager().start()
+        await self.get_conversation_store().initialize()
+        await self.get_session_service().initialize()
 
     async def shutdown(self) -> None:
         """Run at application teardown to drain graph queues gracefully."""
@@ -342,3 +384,6 @@ class ServiceManager:
 
 
 service_manager = ServiceManager()
+
+
+

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from api.dependencies import get_market_data_service
-from api.services.market_data_service import MarketDataService
+from core.market_data_service import MarketDataService
 
 router = APIRouter(tags=["market"])
 

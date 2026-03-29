@@ -4,20 +4,45 @@ import type {
   AnalysisResponse,
   DataFramePayload,
   FinalResult,
-  StreamEvent,
-  SummaryOfFindings
+  StreamEvent
 } from '../types/api';
 
 const DEFAULT_USER_EMAIL = 'demo@alphamesh.local';
 
 type PartialAnalysis = Partial<AnalysisResponse> | null;
 
-function emptySummary(): SummaryOfFindings {
+function emptySummary() {
   return {
     coreNarrative: '',
     agentConsensus: [],
     verdict: { label: '', description: '' }
   };
+}
+
+function placeholderAgents(): AgentAnalysis[] {
+  return [
+    {
+      id: 'news',
+      name: 'News Analysis Agent',
+      icon: 'news',
+      category: 'Intelligence Unit',
+      recentCatalyst: { title: '', description: '', timeAgo: '' },
+      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
+      fullReport: '',
+      references: []
+    },
+    {
+      id: 'fundamental',
+      name: 'Fundamental Agent',
+      icon: 'analytics',
+      category: 'Financial Lab',
+      recentCatalyst: { title: '', description: '', timeAgo: '' },
+      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
+      metrics: [],
+      quote: '',
+      fullReport: ''
+    }
+  ];
 }
 
 function baseResponse(): AnalysisResponse {
@@ -29,7 +54,7 @@ function baseResponse(): AnalysisResponse {
     priceChangePercent: null,
     marketStatus: 'MARKET DATA UNAVAILABLE',
     chartData: [],
-    agents: [],
+    agents: placeholderAgents(),
     summary: emptySummary()
   };
 }
@@ -48,8 +73,8 @@ function firstSentence(text: string): string {
   return match ? match[1] : text.slice(0, 160);
 }
 
-function deriveConsensus(agentAnalyses: Record<string, string>): SummaryOfFindings['agentConsensus'] {
-  const consensus: SummaryOfFindings['agentConsensus'] = [];
+function deriveConsensus(agentAnalyses: Record<string, string>): AnalysisResponse['summary']['agentConsensus'] {
+  const consensus: AnalysisResponse['summary']['agentConsensus'] = [];
   if (agentAnalyses.news_agent) {
     consensus.push({
       title: 'News Sentiment',
@@ -87,7 +112,7 @@ function buildTable(payload?: DataFramePayload | null): AgentAnalysis['tableData
     const rowLabel = payload.index[r];
     const rowValues = payload.data[r]
       .slice(columnStart)
-      .map((val) => (val == null ? 'â€”' : formatValue(val)));
+      .map((val) => (val == null ? '—' : formatValue(val)));
     rows.push([rowLabel, ...rowValues]);
   }
   return { title: 'Financial Data', headers, rows };
@@ -103,6 +128,36 @@ function buildMetrics(payload?: DataFramePayload | null): AgentAnalysis['metrics
     metrics.push({ label: payload.index[i].toUpperCase().slice(0, 12), value: formatValue(val) });
   }
   return metrics.length ? metrics : undefined;
+}
+
+function updateFundamentalAgent(prev: AnalysisResponse, payload: DataFramePayload): AnalysisResponse {
+  const metrics = buildMetrics(payload);
+  const tableData = buildTable(payload);
+  if (!metrics && !tableData) return prev;
+
+  const agents = prev.agents.length ? [...prev.agents] : placeholderAgents();
+  const idx = agents.findIndex((agent) => agent.id === 'fundamental');
+  if (idx === -1) {
+    agents.push({
+      id: 'fundamental',
+      name: 'Fundamental Agent',
+      icon: 'analytics',
+      category: 'Financial Lab',
+      recentCatalyst: { title: '', description: '', timeAgo: '' },
+      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
+      metrics,
+      tableData,
+      quote: ''
+    });
+  } else {
+    agents[idx] = {
+      ...agents[idx],
+      metrics: metrics ?? agents[idx].metrics,
+      tableData: tableData ?? agents[idx].tableData
+    };
+  }
+
+  return { ...prev, agents };
 }
 
 function mapFinalResult(result: FinalResult): AnalysisResponse {
@@ -157,7 +212,7 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
     });
   }
 
-  response.agents = agents;
+  response.agents = agents.length ? agents : placeholderAgents();
   response.summary = {
     coreNarrative: result.synthesis || tickerResult?.analysis_text || '',
     agentConsensus: deriveConsensus(agentAnalyses),
@@ -168,6 +223,21 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
   };
 
   return response;
+}
+
+function mergeFinalWithLive(next: AnalysisResponse, prev?: AnalysisResponse | null): AnalysisResponse {
+  if (!prev) return next;
+  return {
+    ...next,
+    ticker: next.ticker || prev.ticker,
+    companyName: next.companyName || prev.companyName,
+    currentPrice: next.currentPrice ?? prev.currentPrice,
+    priceChange: next.priceChange ?? prev.priceChange,
+    priceChangePercent: next.priceChangePercent ?? prev.priceChangePercent,
+    marketStatus: next.marketStatus || prev.marketStatus,
+    chartData: next.chartData.length ? next.chartData : prev.chartData,
+    agents: next.agents.length ? next.agents : prev.agents
+  };
 }
 
 export function useAnalysisStream(query: string | null) {
@@ -183,7 +253,7 @@ export function useAnalysisStream(query: string | null) {
 
     let isMounted = true;
     setIsStreaming(true);
-    setData(null);
+    setData(baseResponse());
 
     const closeStream = () => {
       if (eventSourceRef.current) {
@@ -231,40 +301,40 @@ export function useAnalysisStream(query: string | null) {
             return;
           }
 
+          if (payload.event_type === 'init') {
+            setData((prev) => {
+              const current = prev ?? baseResponse();
+              return {
+                ...current,
+                ticker: payload.quote.ticker ?? current.ticker,
+                companyName: payload.quote.companyName ?? current.companyName,
+                currentPrice: payload.quote.currentPrice ?? current.currentPrice,
+                priceChange: payload.quote.priceChange ?? current.priceChange,
+                priceChangePercent: payload.quote.priceChangePercent ?? current.priceChangePercent,
+                marketStatus: payload.quote.marketStatus ?? current.marketStatus
+              };
+            });
+            return;
+          }
+
+          if (payload.event_type === 'chart') {
+            setData((prev) => (prev ? { ...prev, chartData: payload.chart ?? [] } : prev));
+            return;
+          }
+
+          if (payload.event_type === 'metrics') {
+            setData((prev) => {
+              if (!prev) return prev;
+              return updateFundamentalAgent(prev as AnalysisResponse, payload.financial_data);
+            });
+            return;
+          }
+
           if (payload.event_type === 'complete' && payload.result) {
             const mapped = mapFinalResult(payload.result);
-            setData(mapped);
+            setData((prev) => mergeFinalWithLive(mapped, prev as AnalysisResponse));
             setIsStreaming(false);
             closeStream();
-
-            if (mapped.ticker) {
-              Promise.allSettled([
-                fetch(`/api/market/${mapped.ticker}/quote`).then((r) => (r.ok ? r.json() : null)),
-                fetch(`/api/market/${mapped.ticker}/intraday`).then((r) => (r.ok ? r.json() : null)),
-              ]).then((results) => {
-                if (!isMounted) return;
-                const quote = results[0].status === 'fulfilled' ? results[0].value : null;
-                const intraday = results[1].status === 'fulfilled' ? results[1].value : null;
-                if (quote) {
-                  setData((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          ticker: quote.ticker ?? prev.ticker,
-                          companyName: quote.companyName ?? prev.companyName,
-                          currentPrice: quote.currentPrice ?? prev.currentPrice,
-                          priceChange: quote.priceChange ?? prev.priceChange,
-                          priceChangePercent: quote.priceChangePercent ?? prev.priceChangePercent,
-                          marketStatus: quote.marketStatus ?? prev.marketStatus,
-                        }
-                      : prev
-                  );
-                }
-                if (intraday && Array.isArray(intraday)) {
-                  setData((prev) => (prev ? { ...prev, chartData: intraday } : prev));
-                }
-              });
-            }
           }
 
           if (payload.event_type === 'error') {

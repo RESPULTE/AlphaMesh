@@ -165,7 +165,7 @@ class StreamEvent(BaseModel):
       error     — unrecoverable failure; stream ends after this
     """
 
-    event_type: Literal["progress", "complete", "error"]
+    event_type: Literal["progress", "complete", "error", "init", "chart", "metrics"]
     request_id: str
 
     # ── present when event_type == "progress" ─────────────────────────────
@@ -179,6 +179,15 @@ class StreamEvent(BaseModel):
 
     # ── present when event_type == "error" ────────────────────────────────
     error: Optional[str] = None
+
+    # -- present when event_type == "init" (market quote) ----------------------
+    quote: Optional[Dict[str, Any]] = None
+
+    # -- present when event_type == "chart" (intraday series) ------------------
+    chart: Optional[List[Dict[str, Any]]] = None
+
+    # -- present when event_type == "metrics" (fundamentals DataFrame) ---------
+    financial_data: Optional[DataFramePayload] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,3 +211,6 @@ class ConversationSummary(BaseModel):
 class ConversationHistoryResponse(BaseModel):
     conversation_id: str
     messages: List[ConversationMessage]
+
+
+

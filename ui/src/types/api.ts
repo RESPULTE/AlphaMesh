@@ -49,6 +49,15 @@ export interface ChartDataPoint {
   price: number;
 }
 
+export interface MarketQuote {
+  ticker: string;
+  companyName: string;
+  currentPrice: number;
+  priceChange: number;
+  priceChangePercent: number;
+  marketStatus: string;
+}
+
 export interface AnalysisResponse {
   ticker: string;
   companyName: string;
@@ -65,12 +74,11 @@ export interface AnalysisResponse {
  * API Integration Notes
  *
  * Current flow:
- * 1) POST /api/v1/chat  â€” start analysis, returns request_id
- * 2) GET  /api/v1/stream/{request_id}  â€” SSE stream
+ * 1) POST /api/v1/chat  � start analysis, returns request_id
+ * 2) GET  /api/v1/stream/{request_id}  � SSE stream
  *
- * The stream emits `progress`, `complete`, or `error` events. We map the
- * `complete` payload (FinalResult) into the AnalysisResponse shape used by
- * the UI.
+ * The stream emits `progress`, `init`, `chart`, `metrics`, `complete`, or `error`.
+ * We map incremental payloads into the AnalysisResponse shape used by the UI.
  */
 
 export interface DataFramePayload {
@@ -102,13 +110,37 @@ export interface FinalResult {
   duration_ms: number;
 }
 
-export interface StreamEvent {
-  event_type: 'progress' | 'complete' | 'error';
-  request_id: string;
-  result?: FinalResult;
-  error?: string;
-  source?: string;
-  level?: string;
-  message?: string;
-  timestamp?: string;
-}
+export type StreamEvent =
+  | {
+      event_type: 'progress';
+      request_id: string;
+      source?: string;
+      level?: string;
+      message?: string;
+      timestamp?: string;
+    }
+  | {
+      event_type: 'complete';
+      request_id: string;
+      result: FinalResult;
+    }
+  | {
+      event_type: 'error';
+      request_id: string;
+      error: string;
+    }
+  | {
+      event_type: 'init';
+      request_id: string;
+      quote: MarketQuote;
+    }
+  | {
+      event_type: 'chart';
+      request_id: string;
+      chart: ChartDataPoint[];
+    }
+  | {
+      event_type: 'metrics';
+      request_id: string;
+      financial_data: DataFramePayload;
+    };

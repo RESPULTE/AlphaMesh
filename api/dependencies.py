@@ -4,7 +4,7 @@ api/dependencies.py
 FastAPI Depends() providers for shared service singletons.
 
 All services are created once during application startup (via the lifespan
-context manager in main.py) and stored on `app.state`.  Routers retrieve
+context manager in main.py) and stored on `app.state`. Routers retrieve
 them through these dependency functions rather than importing globals directly,
 which keeps each router independently testable.
 """
@@ -16,10 +16,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from api.auth.adapter import get_auth_adapter
 from api.services.analysis_runner import AnalysisRunner
-from api.services.conversation_store import ConversationStore
 from api.services.event_broadcaster import EventBroadcaster
-from api.services.market_data_service import MarketDataService
-from api.services.session_service import SessionService
+from core.market_data_service import MarketDataService
+from core.memory.conversation.store import ConversationStore
+from core.memory.sessions.session_service import SessionService
+from core.services import service_manager
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -72,14 +73,12 @@ def get_current_user_from_query(
     return email
 
 
-# ── Service dependencies (instantiated per-request via Depends) ───────────────
-# Keeping them as Depends factories decouples routers from concrete classes and
-# makes unit testing straightforward — swap the dependency override.
+# -- Service dependencies -----------------------------------------------------
 
 
 def get_market_data_service() -> MarketDataService:
-    """Provide a MarketDataService instance (backed by the shared module-level cache)."""
-    return MarketDataService()
+    """Provide a MarketDataService instance backed by the shared cache."""
+    return service_manager.get_market_data_service()
 
 
 def get_session_service(request: Request) -> SessionService:

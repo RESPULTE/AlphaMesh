@@ -12,13 +12,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.persistence.sqlite_adapter import (
-    SQLiteConversationAdapter,
-    SQLiteSessionAdapter,
-)
 from api.routers import chat, conversations, health, stream
 from api.services.analysis_runner import AnalysisRunner
-from api.services.conversation_store import ConversationStore
 from api.services.event_broadcaster import EventBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -34,22 +29,11 @@ async def lifespan(app: FastAPI):
 
     await service_manager.startup()
 
-    # Conversation persistence
-    from core.config import settings
-    from api.services.session_service import SessionService
-
-    adapter = SQLiteConversationAdapter(db_path="./data/conversations.db")
-    await adapter.initialize()
-
     # API-layer singletons
     broadcaster = EventBroadcaster()
-    store = ConversationStore(adapter=adapter)
-    await store.initialize()
+    store = service_manager.get_conversation_store()
     runner = AnalysisRunner(broadcaster=broadcaster, store=store)
-
-    session_adapter = SQLiteSessionAdapter(db_path=settings.SESSIONS_DB_PATH)
-    session_service = SessionService(adapter=session_adapter)
-    await session_service.initialize()
+    session_service = service_manager.get_session_service()
 
     app.state.broadcaster = broadcaster
     app.state.store = store

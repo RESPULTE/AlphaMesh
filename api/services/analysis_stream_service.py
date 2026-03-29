@@ -40,9 +40,9 @@ from typing import AsyncIterator, Optional
 
 from langchain_core.messages import HumanMessage
 
-from api.services.market_data_service import MarketDataService
+from core.services import service_manager
 from api.services.response_adapter import ResponseAdapter
-from api.services.session_service import SessionService
+from core.memory.sessions.session_service import SessionService
 from core.agents.models.base_agent_models import AgentSentiment
 from core.agents.orchestrator_agent import OrchestratorAgent
 from core.logger import get_logger
@@ -77,7 +77,7 @@ class AnalysisStreamService:
         # Each request gets its own OrchestratorAgent wrapper; the heavy
         # resources (LLM, Neo4j, Chroma) live in service_manager singletons.
         self._orchestrator = OrchestratorAgent()
-        self._market_svc = MarketDataService()
+        self._market_svc = service_manager.get_market_data_service()
         self._adapter = ResponseAdapter()
 
     async def stream(
@@ -225,3 +225,6 @@ class AnalysisStreamService:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
+
+
+

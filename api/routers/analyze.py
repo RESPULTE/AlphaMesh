@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 
 from api.dependencies import get_current_user_from_query, get_session_service
 from api.services.analysis_stream_service import AnalysisStreamService
-from api.services.session_service import SessionService
+from core.memory.sessions.session_service import SessionService
 
 router = APIRouter(tags=["analyze"])
 
@@ -35,3 +35,4 @@ async def analyze(
             "Connection": "keep-alive",
         },
     )
+
