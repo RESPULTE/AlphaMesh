@@ -166,7 +166,7 @@ class Neo4jAdapter:
         Merge an entity node with a dynamic label.
 
         ON CREATE: all properties are written in full.
-        ON MATCH:  only mutable metadata (aliases, nodeset_ids, ticker) is updated.
+        ON MATCH:  only mutable metadata (e.g. nodeset_ids, ticker) is updated.
                 name and description are intentionally preserved to protect
                 canonical values sourced from yfinance for Company, Sector,
                 Industry and Market entities.
@@ -180,8 +180,6 @@ class Neo4jAdapter:
             f"MERGE (e:Entity {{id: $id}}) "
             "ON CREATE SET e += $props "
             "ON MATCH SET "
-            "  e.aliases = CASE WHEN $props.aliases IS NOT NULL AND size($props.aliases) > 0 "
-            "               THEN $props.aliases ELSE e.aliases END, "
             "  e.nodeset_ids = CASE WHEN $props.nodeset_ids IS NOT NULL AND size($props.nodeset_ids) > 0 "
             "                   THEN $props.nodeset_ids ELSE e.nodeset_ids END, "
             "  e.ticker = CASE WHEN $props.ticker IS NOT NULL THEN $props.ticker ELSE e.ticker END "
@@ -617,7 +615,12 @@ class Neo4jAdapter:
 
     async def get_entity_category(self, entity_id: str) -> Optional[str]:
         """Return the category field of an entity (used for FinancialConcept category)."""
-        cypher = "MATCH (e:Entity {id: $id}) " "RETURN e.category AS category LIMIT 1"
+        cypher = (
+            "MATCH (e:Entity {id: $id}) "
+            "OPTIONAL MATCH (e)-[:BELONGS_TO]->(c:Entity:FinancialConceptCategory) "
+            "WITH e, collect(c.name) AS categories "
+            "RETURN coalesce(e.category, categories[0]) AS category LIMIT 1"
+        )
         records = await self._execute_read(cypher, {"id": entity_id})
         return records[0].get("category") if records else None
 
@@ -647,3 +650,4 @@ class Neo4jAdapter:
                 "user_email": user_email,
             },
         )
+

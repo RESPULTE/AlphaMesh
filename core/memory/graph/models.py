@@ -15,6 +15,22 @@ GLOBAL_ENTITY_NODESETS = {
     "Global Financial Events": "A global anchor nodeset containing broad FinancialEvent entities.",
 }
 
+# FinancialConcept category taxonomy (12-category analog to sectors).
+FINANCIAL_CONCEPT_CATEGORIES = {
+    "Monetary Policy & Rates": "Central bank policy, interest rates, yield curves, and rate expectations.",
+    "Inflation & Prices": "Price levels, inflation measures, purchasing power, and cost dynamics.",
+    "Growth & Business Cycle": "Macro growth, recessions, employment, and cycle indicators.",
+    "Corporate Fundamentals": "Earnings, revenue, margins, cash flow, balance sheets, and guidance.",
+    "Valuation & Pricing": "Valuation frameworks, multiples, intrinsic value, and pricing models.",
+    "Market Structure & Trading": "Liquidity, volume, order flow, market microstructure, and execution.",
+    "Risk & Volatility": "Risk metrics, volatility, drawdowns, correlation, and portfolio risk.",
+    "Credit & Fixed Income": "Bonds, yields, spreads, duration, and credit quality.",
+    "Derivatives & Hedging": "Options, futures, swaps, Greeks, hedging, and structured products.",
+    "FX & Global Markets": "Currencies, exchange rates, cross-border flows, and global linkages.",
+    "Commodities & Real Assets": "Energy, metals, agriculture, and real-asset exposures.",
+    "Regulation & Governance": "Regulation, compliance, governance, and market oversight.",
+}
+
 # ── ALL_MAIN_SECTORS: update to yfinance canonical names ─────────────────────
 ALL_MAIN_SECTORS = {
     "Technology": "Companies involved in research, development, and manufacturing of technologically based goods and services.",
@@ -35,6 +51,7 @@ ALLOWED_ENTITY_TYPES = {
     "Company",
     "FinancialEvent",
     "FinancialConcept",
+    "FinancialConceptCategory",
     "Sector",
     "Industry",
     "Market",
@@ -59,7 +76,7 @@ ALLOWED_RELATIONSHIP_TYPES = [
     "INVALIDATED_BY",
 ]
 
-# ── RelationshipType literal: add BELONGS_TO ─────────────────────────────────
+    # ── RelationshipType literal: add BELONGS_TO ─────────────────────────────────
 RelationshipType = Literal[
     "AFFECTS",
     "CAUSED_BY",
@@ -98,6 +115,7 @@ _ENTITY_TYPE_WEIGHTS: dict[str, float] = {
     "Company": 1.0,
     "FinancialEvent": 0.90,
     "FinancialConcept": 0.65,
+    "FinancialConceptCategory": 0.60,
     "Industry": 0.55,
     "Sector": 0.45,
     "Market": 0.30,
@@ -194,16 +212,18 @@ class EntityNode(BaseModel):
         "Company",
         "FinancialEvent",
         "FinancialConcept",
+        "FinancialConceptCategory",
         "Sector",
         "Industry",
         "Market",
     ]
+
     # For Company/Sector/Industry/Market: description is the canonical yfinance
     # value and is NEVER overwritten by LLM extraction (enforced in neo4j_adapter).
     description: str
     # Ticker symbol — only populated for Company entities via yfinance enrichment.
     ticker: Optional[str] = None
-    aliases: List[str] = Field(default_factory=list)
+    concept_categories: List[str] = Field(default_factory=list)
     nodeset_ids: List[str] = Field(default_factory=list)
 
 

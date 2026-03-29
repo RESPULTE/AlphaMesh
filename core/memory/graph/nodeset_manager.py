@@ -9,6 +9,7 @@ from typing import Dict, Optional
 from core.logger import get_logger
 from core.memory.graph.models import (
     ALL_MAIN_SECTORS,
+    FINANCIAL_CONCEPT_CATEGORIES,
     GLOBAL_ENTITY_NODESETS,
     EntityNode,
 )
@@ -131,6 +132,14 @@ class NodeSetManager:
         description = "Global anchor NodeSet for financial news ingestion."
         return await self.get_or_create("GlobalFinancialEvents", description)
 
+    async def get_global_financial_wisdom_id(self) -> str:
+        """Get or create the Global Financial Wisdom NodeSet ID."""
+        description = GLOBAL_ENTITY_NODESETS.get(
+            "Global Financial Wisdom",
+            "Global anchor NodeSet for FinancialConcept taxonomy.",
+        )
+        return await self.get_or_create("Global Financial Wisdom", description)
+
     async def get_or_create_user_nodeset(self, user_email: str) -> tuple[str, str]:
         """Get or create the private NodeSet for a user."""
         nodeset_name = get_user_nodeset_name(user_email)
@@ -228,6 +237,55 @@ class NodeSetManager:
         await asyncio.gather(*[_create_sector(name) for name in missing_sectors])
         self._logger.info("Sector entity bootstrap complete.")
 
+    async def _bootstrap_financial_concept_categories(
+        self, wisdom_nodeset_id: str
+    ) -> None:
+        """
+        Ensure all FinancialConceptCategory entity nodes exist and are linked to
+        the Global Financial Wisdom NodeSet.
+        """
+        category_ids = {
+            name: canonical_entity_id(name, "FinancialConceptCategory")
+            for name in FINANCIAL_CONCEPT_CATEGORIES
+        }
+
+        existence_results = await asyncio.gather(
+            *[self._neo4j_adapter.entity_exists(cid) for cid in category_ids.values()],
+            return_exceptions=True,
+        )
+
+        missing_categories = [
+            name
+            for (name, _cid), exists in zip(category_ids.items(), existence_results)
+            if not isinstance(exists, Exception) and not exists
+        ]
+
+        if not missing_categories:
+            return
+
+        self._logger.info(
+            "Bootstrapping %d FinancialConceptCategory nodes: %s",
+            len(missing_categories),
+            missing_categories,
+        )
+
+        async def _create_category(name: str) -> None:
+            category_id = category_ids[name]
+            description = FINANCIAL_CONCEPT_CATEGORIES[name]
+            category_node = EntityNode(
+                id=category_id,
+                name=name,
+                entity_type="FinancialConceptCategory",
+                description=description,
+                nodeset_ids=[wisdom_nodeset_id],
+            )
+            await self._upsert_entity_with_embedding(category_node)
+            await self.assign_to_node(category_id, "Entity", wisdom_nodeset_id)
+            self._logger.debug("Bootstrapped FinancialConceptCategory: %s", name)
+
+        await asyncio.gather(*[_create_category(name) for name in missing_categories])
+        self._logger.info("FinancialConceptCategory bootstrap complete.")
+
     # ── Public initializer (called at application startup) ───────────────────
 
     async def initialize_default_nodesets(self) -> None:
@@ -235,11 +293,13 @@ class NodeSetManager:
         Idempotent startup routine that:
           1. Creates global anchor NodeSets (existing behaviour).
           2. Creates per-sector NodeSets (existing behaviour).
-          3. Bootstraps the Market entity node in Neo4j + Chroma.
-          4. Bootstraps all 11 Sector entity nodes in Neo4j + Chroma,
+          3. Bootstraps FinancialConceptCategory nodes and links them to
+             Global Financial Wisdom via BELONGS_TO_NODESET.
+          4. Bootstraps the Market entity node in Neo4j + Chroma.
+          5. Bootstraps all 11 Sector entity nodes in Neo4j + Chroma,
              each linked to Market via a BELONGS_TO edge.
 
-        Safe to call multiple times — all operations are idempotent.
+        Safe to call multiple times all operations are idempotent.
         """
         self._logger.info(
             "Initializing default nodesets and canonical entity taxonomy..."
@@ -249,11 +309,14 @@ class NodeSetManager:
         for name, description in GLOBAL_ENTITY_NODESETS.items():
             await self.get_or_create(name, description)
 
+        wisdom_nodeset_id = await self.get_global_financial_wisdom_id()
         await self.get_global_financial_events_id()
 
         # ── 2. Sector nodesets (membership containers, separate from entities) ─
         for sector_name, description in ALL_MAIN_SECTORS.items():
             await self.get_or_create(sector_name, description)
+
+        await self._bootstrap_financial_concept_categories(wisdom_nodeset_id)
 
         # ── 3 & 4. Market + Sector entity nodes (taxonomy graph) ──────────────
         market_id = await self._bootstrap_market_entity()

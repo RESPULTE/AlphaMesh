@@ -27,6 +27,7 @@ from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.extraction_prompts import build_extraction_prompt
 from core.memory.graph.models import (
+    FINANCIAL_CONCEPT_CATEGORIES,
     BatchExtractionResult,
     ChunkExtractionResult,
     DocumentMetadata,
@@ -277,6 +278,52 @@ class DualStoreIngestor:
                 "Failed to mark chunk %s extracted in ChromaDB.", chunk_id
             )
 
+    async def _link_financial_concept_categories(self, entity: EntityNode) -> None:
+        """Link FinancialConcept entities to 1-3 category nodes."""
+        if entity.entity_type != "FinancialConcept":
+            return
+
+        raw_categories = list(entity.concept_categories or [])
+        if not raw_categories:
+            self._logger.warning(
+                "FinancialConcept '%s' missing concept_categories from LLM output",
+                entity.name,
+            )
+            return
+
+        allowed = set(FINANCIAL_CONCEPT_CATEGORIES)
+        categories = [c for c in raw_categories if c in allowed]
+        if not categories:
+            self._logger.warning(
+                "FinancialConcept '%s' returned unknown categories: %s",
+                entity.name,
+                raw_categories,
+            )
+            return
+
+        if len(categories) > 3:
+            categories = categories[:3]
+
+        for category in categories:
+            category_id = canonical_entity_id(category, "FinancialConceptCategory")
+            try:
+                await self._neo4j_adapter.merge_relationship(
+                    entity.id,
+                    category_id,
+                    "BELONGS_TO",
+                    {
+                        "relationship_type": "BELONGS_TO",
+                        "source_agent": "concept_taxonomy",
+                        "confidence": 1.0,
+                    },
+                )
+            except Exception:
+                self._logger.exception(
+                    "Failed to link FinancialConcept '%s' to category '%s'",
+                    entity.name,
+                    category,
+                )
+
     # Private: entity extraction pipeline
 
     async def _extract_entities_for_chunks(
@@ -377,6 +424,7 @@ class DualStoreIngestor:
                 ):
                     chunk_failed = True
                     break
+                await self._link_financial_concept_categories(entity)
 
             if chunk_failed:
                 continue

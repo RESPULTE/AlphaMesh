@@ -8,7 +8,6 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
-
 from core.logger import get_logger
 from core.memory.graph.models import (
     ALLOWED_ENTITY_TYPES,

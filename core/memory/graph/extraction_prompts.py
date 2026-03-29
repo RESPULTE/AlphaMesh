@@ -1,17 +1,22 @@
-﻿"""Prompt templates for chunk-level entity extraction."""
+"""Prompt templates for chunk-level entity extraction."""
 
 from __future__ import annotations
 
 from langchain_core.prompts import ChatPromptTemplate
 
+from core.memory.graph.models import FINANCIAL_CONCEPT_CATEGORIES
+
+_CONCEPT_CATEGORY_CHOICES = ", ".join(
+    f'"{name}"' for name in FINANCIAL_CONCEPT_CATEGORIES
+)
 CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     "You are an information extraction system. Extract entities and relationships from each "
     "news chunk provided. Only use information explicitly stated in each chunk. "
     "Do not infer relationships across multiple articles or chunks. "
     "Allowed entity types: Company, FinancialEvent, FinancialConcept. "
-    "Sector, Industry and Market entities are managed by the taxonomy pipeline and must NOT "
+    "Sector, Industry, Market and FinancialConceptCategory entities are managed by the taxonomy pipeline and must NOT "
     "be extracted from text. Each entity must include a short, single-sentence description "
-    "drawn only from the chunk text. "
+    f"drawn only from the chunk text. FinancialConcept entities MUST include concept_categories with 1-3 entries chosen only from: {_CONCEPT_CATEGORY_CHOICES}. "
     "Return a JSON object matching the BatchExtractionResult schema. "
     "Each entity must include a temporary local_id used by relationships; "
     "relationships must reference entities by local_id. "
@@ -28,7 +33,7 @@ CHUNK_EXTRACTION_SYSTEM_PROMPT = (
     '          "name": "<str>",\n'
     '          "entity_type": "<Company|FinancialEvent|FinancialConcept>",\n'
     '          "description": "<short summary from chunk text>",\n'
-    '          "aliases": ["<str>", "..."],\n'
+    '          "concept_categories": ["<str>", "..."],\n'
     '          "nodeset_ids": ["<str>", "..."]\n'
     "        }}\n"
     "      ],\n"
