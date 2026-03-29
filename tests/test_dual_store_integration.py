@@ -39,7 +39,7 @@ async def test_dual_store_ingestion_writes_to_vector_and_graph_store() -> None:
         nodeset_manager = service_manager.get_nodeset_manager()
 
         # --- Act ---
-        chunk_ids, _chunks = await ingestor.ingest_articles(articles)
+        chunk_ids, _, _chunks = await ingestor.ingest_articles(articles)
 
         # --- Assert ---
         assert chunk_ids, "Expected at least one chunk ID to be returned."
@@ -188,5 +188,3 @@ async def test_dual_store_ingestion_creates_multiple_chunks_when_overflowing() -
             await neo4j_adapter._execute_write(cleanup_cypher, {"ids": chunk_ids})
         except Exception:
             pass
-
-

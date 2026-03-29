@@ -86,6 +86,7 @@ class EntityResolver:
         name: str,
         entity_type: str,
         props: Optional[Any] = None,
+        allow_create: bool = True,
     ) -> Optional[str]:
         """
         Resolve a single domain entity to a canonical ID.
@@ -106,32 +107,31 @@ class EntityResolver:
             if cache_key in self._cache:
                 return self._cache[cache_key]
 
-        entity_id = await self._resolve_internal(name, etype, props)
+        entity_id = await self._resolve_internal(
+            name, etype, props, allow_create=allow_create
+        )
 
         if entity_id:
             await self._cache_set(cache_key, entity_id)
 
         return entity_id
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public: batch resolution with type-scoped dedup
-    # ──────────────────────────────────────────────────────────────────────────
-
     async def resolve_batch(
         self,
         entities: List[Tuple[str, str, Optional[dict]]],
+        allow_create: bool = True,
     ) -> Dict[Tuple[str, str], str]:
         """
         Resolve multiple (name, entity_type, props) tuples concurrently.
 
         Dedup is TYPE-SCOPED: fuzzy + semantic matching only runs between
-        entities of the same type.  Returns {(name, entity_type) → canonical_id}.
+        entities of the same type.  Returns {(name, entity_type) -> canonical_id}.
         Empty or invalid entries are silently skipped.
         """
         if not entities:
             return {}
 
-        # Deduplicate input list — same (name, type) should not be resolved twice
+        # Deduplicate input list � same (name, type) should not be resolved twice
         seen: set = set()
         unique: List[Tuple[str, str, Optional[dict]]] = []
         for name, etype, props in entities:
@@ -165,7 +165,9 @@ class EntityResolver:
         # Resolve concurrently (each resolution is idempotent)
         async def _resolve_one(name: str, etype: str, props: Optional[dict]) -> None:
             canonical_name = alias_map.get((name.lower(), etype), name)
-            entity_id = await self._resolve_internal(canonical_name, etype, props)
+            entity_id = await self._resolve_internal(
+                canonical_name, etype, props, allow_create=allow_create
+            )
             if entity_id:
                 result[(name, etype)] = entity_id
                 # Cache both the original name and the canonical alias
@@ -177,69 +179,12 @@ class EntityResolver:
         await asyncio.gather(*[_resolve_one(n, e, p) for n, e, p in uncached])
         return result
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public: user-scoped node resolution (no dedup, no cache)
-    # ──────────────────────────────────────────────────────────────────────────
-
-    async def resolve_user_node(
-        self,
-        name: str,
-        entity_type: str,
-        props: dict,
-    ) -> Optional[str]:
-        """
-        Persist a user-scoped node (UserInterestDomain, UserInterestEdge, TurnNode).
-        IDs are deterministic UUIDs — no fuzzy/semantic dedup, not cached.
-        Delegates to the appropriate Neo4j merge method by entity_type.
-        Returns the node ID or None on failure.
-        """
-        if entity_type not in _USER_SCOPED_TYPES:
-            logger.warning(
-                "resolve_user_node called for non-user-scoped type: %s", entity_type
-            )
-            return None
-
-        node_id: Optional[str] = None
-
-        try:
-            if entity_type == "UserInterestDomain":
-                node_id = props.get("id") or name
-                await self._neo4j.merge_user_interest_domain(
-                    domain_id=node_id, props=props
-                )
-
-            elif entity_type == "UserInterestEdge":
-                node_id = props.get("id") or name
-                operation = props.get("operation", "reinforce")
-                weight_delta = float(props.get("weight_delta", 1.0))
-                await self._neo4j.merge_user_interest_edge(
-                    edge_id=node_id,
-                    props=props,
-                    operation=operation,
-                    weight_delta=weight_delta,
-                )
-
-            elif entity_type == "TurnNode":
-                node_id = props.get("id") or name
-                await self._neo4j.merge_turn_node(turn_id=node_id, props=props)
-
-        except Exception:
-            logger.exception(
-                "resolve_user_node: failed to persist %s '%s'", entity_type, name
-            )
-            return None
-
-        return node_id
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Internal: single-entity resolution pipeline
-    # ──────────────────────────────────────────────────────────────────────────
-
     async def _resolve_internal(
         self,
         name: str,
         entity_type: str,
         props: Optional[Any] = None,
+        allow_create: bool = True,
     ) -> Optional[str]:
         """
         Resolve or create one domain entity.  Never touches the cache directly.
@@ -254,6 +199,9 @@ class EntityResolver:
         similar_id = await self._find_similar(name, entity_type, entity_id)
         if similar_id:
             return similar_id
+
+        if not allow_create:
+            return None
 
         # Create new entity
         node = self._build_entity_node(name, entity_type, entity_id, props)
@@ -302,8 +250,9 @@ class EntityResolver:
                 continue
             if candidate_ids is not None and candidate_id not in candidate_ids:
                 continue
-            if (1.0 - float(distance)) >= _SEMANTIC_MERGE_THRESHOLD:
-                return str(candidate_id)
+            if (1.0 - float(distance)) >= self._semantic_threshold:
+                if await self._neo4j.entity_exists(str(candidate_id)):
+                    return str(candidate_id)
 
         return None
 
@@ -470,3 +419,21 @@ class EntityResolver:
             ticker=ticker,
             nodeset_ids=nodeset_ids,
         )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

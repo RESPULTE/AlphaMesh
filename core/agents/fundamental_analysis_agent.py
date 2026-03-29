@@ -270,8 +270,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "[data_prep] %s | %s | %s → %s | periods=%s",
             ticker,
             granularity,
-            cfg.start_dt.date(),
-            cfg.end_dt.date(),
+            cfg.start_dt,
+            cfg.end_dt,
             cfg.periods,
         )
 

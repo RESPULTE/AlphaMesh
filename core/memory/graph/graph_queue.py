@@ -351,7 +351,7 @@ class ConversationQueue:
                             (name, etype, rel.get(props_key) or None)
                         )
 
-            resolved = await self._resolver.resolve_batch(unique_domain_entities)
+            resolved = await self._resolver.resolve_batch(unique_domain_entities, allow_create=False)
             for (name, etype), entity_id in resolved.items():
                 domain_entity_cache[entity_key(name, etype)] = entity_id
 
@@ -695,7 +695,7 @@ class GraphQueueManager:
                         if k not in seen:
                             seen.add(k)
                             unique_entities.append((name, etype, rel.get(props_key)))
-                resolved = await self._resolver.resolve_batch(unique_entities)
+                resolved = await self._resolver.resolve_batch(unique_entities, allow_create=False)
                 for (name, etype), eid in resolved.items():
                     entity_cache[entity_key(name, etype)] = eid
                 await self._writer.write_relationships(
@@ -1046,3 +1046,6 @@ def make_extraction_task(
         system_prompt_id=_prompt_id(system_prompt),
         llm_config=llm_config,
     )
+
+
+

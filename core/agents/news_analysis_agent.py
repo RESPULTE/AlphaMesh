@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import re as _re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Type
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -99,10 +99,10 @@ def _get_default_date_range(
 
 
 def _constrain_date_range(
-    start_date: datetime,
-    end_date: datetime,
+    start_date: date,
+    end_date: date,
     api_limit_days: int = 28,
-) -> Tuple[datetime, datetime]:
+) -> Tuple[date, date]:
     """
     Constrain date range to valid API query bounds.
 
@@ -118,15 +118,12 @@ def _constrain_date_range(
         Tuple of (constrained_start, constrained_end) as date objects in YYYY-MM-DD format
     """
     # Use consistent timezone awareness for comparison
-    if start_date.tzinfo or end_date.tzinfo:
-        now = datetime.now(timezone.utc).date()
-    else:
-        now = datetime.now().date()
+    now = datetime.now().date()
 
     api_limit_date = now - timedelta(days=api_limit_days)
 
-    start_date_only = start_date.date()
-    end_date_only = end_date.date()
+    start_date_only = start_date
+    end_date_only = end_date
 
     if end_date_only > now:
         end_date_only = now

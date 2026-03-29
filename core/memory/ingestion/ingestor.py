@@ -352,11 +352,8 @@ class DualStoreIngestor:
             for entity in result.entities:
                 if not entity.description:
                     entity.description = entity.name
-                entity_id = canonical_entity_id(entity.name, entity.entity_type)
-                local_key = entity.local_id or entity_id
-                entity.id = entity_id
-                local_id_map[local_key] = entity
-                chunk_entities[entity.id] = entity
+                canonical_id = canonical_entity_id(entity.name, entity.entity_type)
+                local_key = entity.local_id or canonical_id
 
                 # Use EntityResolver for persistence (replaces direct _resolve_entity calls)
                 resolved_id = await self._entity_resolver.resolve(
@@ -365,6 +362,10 @@ class DualStoreIngestor:
                 if not resolved_id:
                     chunk_failed = True
                     break
+
+                entity.id = resolved_id
+                local_id_map[local_key] = entity
+                chunk_entities[resolved_id] = entity
 
                 if not await self._upsert_with_retry(
                     lambda cid=result.chunk_id, eid=resolved_id: (
@@ -449,6 +450,10 @@ class DualStoreIngestor:
                 deduped_entities[eid] = entity
 
         return list(deduped_entities.values())
+
+
+
+
 
 
 

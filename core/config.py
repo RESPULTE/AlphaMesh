@@ -55,8 +55,8 @@ class Settings(BaseSettings):
     SUBGRAPH_TTL_SECONDS: int = 3600
 
     # ── In-memory dedup thresholds ────────────────────────────────────────────
-    EXTRACTION_FUZZY_THRESHOLD: float = 85.0
-    EXTRACTION_SEMANTIC_THRESHOLD: float = 0.85
+    EXTRACTION_FUZZY_THRESHOLD: float = 80.0
+    EXTRACTION_SEMANTIC_THRESHOLD: float = 0.82
 
     # ── Portfolio ─────────────────────────────────────────────────────────────
     PORTFOLIO_JSON_PATH: str = "data/portfolio.json"
@@ -160,3 +160,5 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
