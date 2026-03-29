@@ -176,7 +176,7 @@ async def fetch_articles(
     *,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-    page_size: int = 50,
+    page_size: int = 10,
     page: int = 1,
     language: str = "en",
     sort_by: str = "relevancy",

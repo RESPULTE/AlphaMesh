@@ -1,4 +1,4 @@
-﻿# core/services.py
+# core/services.py
 from core.config import settings
 
 
@@ -7,12 +7,12 @@ class ServiceManager:
     Centralised manager for all service singletons.
 
     Changes from previous version
-    ──────────────────────────────
-    - get_retriever(): uses prefilter= instead of reranker= — DualStoreRetriever
+    ------------------------------
+    - get_retriever(): uses prefilter= instead of reranker= � DualStoreRetriever
       now takes a CompositePrefilter directly; the full TwoStageReranker (with
       Jina) is used only at the final selection point in _rendezvous_node.
     - get_reranker(): returns TwoStageReranker (CompositePrefilter + Jina).
-    - get_prefilter(): new — returns the shared CompositePrefilter singleton.
+    - get_prefilter(): new � returns the shared CompositePrefilter singleton.
     """
 
     def __init__(self):
@@ -148,7 +148,7 @@ class ServiceManager:
                 raise
         return self._nodeset_manager
 
-    # ── EntityResolver ────────────────────────────────────────────────────────
+    # -- EntityResolver --------------------------------------------------------
 
     def get_entity_resolver(self):
         from core.memory.graph.entity_resolver import EntityResolver
@@ -174,7 +174,7 @@ class ServiceManager:
             self._relationship_extractor = RelationshipExtractor()
         return self._relationship_extractor
 
-    # ── GraphQueueManager ─────────────────────────────────────────────────────
+    # -- GraphQueueManager -----------------------------------------------------
 
     def get_graph_queue_manager(self):
         from core.memory.graph.graph_queue import GraphQueueManager
@@ -192,6 +192,7 @@ class ServiceManager:
                     entity_resolver=self.get_entity_resolver(),
                     graph_writer=self.get_neo4j_adapter(),
                     relationship_extractor=self.get_relationship_extractor(),
+                    entity_extractor=self.get_ingestor().extract_entities_for_chunks,
                     llm_provider=_llm_provider,
                 )
             except Exception as e:
@@ -199,7 +200,7 @@ class ServiceManager:
                 raise
         return self._graph_queue_manager
 
-    # ── Ingestor ──────────────────────────────────────────────────────────────
+    # -- Ingestor --------------------------------------------------------------
 
     def get_ingestor(self):
         from core.memory.ingestion.chunker import ArticleChunker

@@ -4,13 +4,13 @@ core/memory/ingestion/ingestor.py
 Dual-store ingestion pipeline for news articles.
 
 Changes from previous version
-──────────────────────────────
-- _upsert_graph_to_neo4j()  → REMOVED (moved to Neo4jAdapter + ConversationQueue)
-- _resolve_entity()         → REMOVED (moved to EntityResolver)
-- _resolve_user_node()      → REMOVED (moved to EntityResolver)
-- find_similar_entities()   → REMOVED (moved to EntityResolver)
-- _persist_entity()         → REMOVED (moved to EntityResolver)
-- resolve_entity_id()       → delegates to injected EntityResolver
+----------------------------------------------------------------------------
+- _upsert_graph_to_neo4j()  ? REMOVED (moved to Neo4jAdapter + ConversationQueue)
+- _resolve_entity()         ? REMOVED (moved to EntityResolver)
+- _resolve_user_node()      ? REMOVED (moved to EntityResolver)
+- find_similar_entities()   ? REMOVED (moved to EntityResolver)
+- _persist_entity()         ? REMOVED (moved to EntityResolver)
+- resolve_entity_id()       ? delegates to injected EntityResolver
 - __init__() now receives entity_resolver: EntityResolver instead of embedding_func
 
 DualStoreIngestor's single responsibility: ingest articles into Neo4j + ChromaDB.
@@ -420,17 +420,23 @@ class DualStoreIngestor:
                 ]
                 if new_entities:
                     try:
-                        await asyncio.gather(
-                            *[
-                                self._entity_chroma_adapter.upsert_entity_embedding(
-                                    entity_id=e.id,
-                                    name=e.name,
-                                    description=e.description,
-                                    entity_type=e.entity_type,
-                                )
-                                for e in new_entities
-                            ]
+                        batch_size = max(settings.ENTITY_EMBEDDING_BATCH_SIZE, 1)
+                        max_concurrency = max(
+                            settings.ENTITY_EMBEDDING_MAX_CONCURRENCY, 1
                         )
+                        semaphore = asyncio.Semaphore(max_concurrency)
+
+                        async def _upsert_batch(batch: List[EntityNode]) -> None:
+                            async with semaphore:
+                                await self._entity_chroma_adapter.upsert_entity_embeddings_batch(
+                                    batch
+                                )
+
+                        batches = [
+                            new_entities[i : i + batch_size]
+                            for i in range(0, len(new_entities), batch_size)
+                        ]
+                        await asyncio.gather(*[_upsert_batch(b) for b in batches])
                     except Exception:
                         self._logger.exception(
                             "Failed to batch-upsert entity embeddings for chunk %s",
@@ -450,10 +456,3 @@ class DualStoreIngestor:
                 deduped_entities[eid] = entity
 
         return list(deduped_entities.values())
-
-
-
-
-
-
-

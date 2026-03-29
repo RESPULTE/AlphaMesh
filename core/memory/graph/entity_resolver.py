@@ -22,6 +22,7 @@ safe because Neo4j MERGE is idempotent and the cache will converge.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -29,7 +30,7 @@ from rapidfuzz import fuzz
 
 from core.config import settings
 from core.logger import get_logger
-from core.memory.graph.models import _USER_SCOPED_TYPES, EntityNode
+from core.memory.graph.models import EntityNode
 from core.memory.graph.utils import (
     canonical_entity_id,
     entity_key,
@@ -42,9 +43,37 @@ logger = get_logger(__name__)
 
 _MAX_CACHE_SIZE = 10_000
 _EVICT_FRACTION = 0.20  # evict oldest 20% when cap reached
-_FUZZY_CANDIDATE_THRESHOLD = 0.50
-_SEMANTIC_MERGE_THRESHOLD = 0.85
-_VECTOR_TOP_K = 10
+
+_CORP_SUFFIXES = {
+    "inc",
+    "inc.",
+    "incorporated",
+    "corp",
+    "corp.",
+    "corporation",
+    "co",
+    "co.",
+    "company",
+    "ltd",
+    "ltd.",
+    "limited",
+    "plc",
+    "llc",
+    "l.l.c.",
+    "sa",
+    "ag",
+    "nv",
+    "bv",
+    "gmbh",
+}
+
+
+def _normalize_company_alias(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+    if not cleaned:
+        return ""
+    tokens = [t for t in cleaned.split() if t and t not in _CORP_SUFFIXES]
+    return " ".join(tokens)
 
 
 class EntityResolver:
@@ -131,7 +160,7 @@ class EntityResolver:
         if not entities:
             return {}
 
-        # Deduplicate input list � same (name, type) should not be resolved twice
+        # Deduplicate input list � same (name, type) should not be resolved twice
         seen: set = set()
         unique: List[Tuple[str, str, Optional[dict]]] = []
         for name, etype, props in entities:
@@ -212,47 +241,67 @@ class EntityResolver:
         self, name: str, entity_type: str, exclude_id: str
     ) -> Optional[str]:
         """Check Neo4j fuzzy candidates, then Chroma semantic similarity."""
-        if self._chroma is None:
-            return None
+        fuzzy_candidates: List[dict] = []
+        candidate_ids: Optional[set] = None
 
         try:
             fuzzy_candidates = await self._neo4j.find_fuzzy_entity_candidates(
                 entity_type=entity_type,
                 name=name,
                 exclude_id=exclude_id,
-                threshold=_FUZZY_CANDIDATE_THRESHOLD,
-                limit=_VECTOR_TOP_K,
+                threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
+                limit=settings.MEMORY_VECTOR_TOP_K,
             )
-            candidate_ids = set(fuzzy_candidates) if fuzzy_candidates else None
+            candidate_ids = (
+                {c.get("id") for c in fuzzy_candidates if c.get("id")}
+                if fuzzy_candidates
+                else None
+            )
         except Exception:
             logger.exception(
                 "_find_similar: fuzzy candidate query failed for '%s'", name
             )
             candidate_ids = None
 
-        description = normalize_entity_description(None, name)
-        text = f"{name}. {description}"
-        try:
-            results = await self._chroma.query_entity_similar(
-                text=text,
-                entity_type=entity_type,
-                n_results=_VECTOR_TOP_K,
-            )
-        except Exception:
-            logger.exception(
-                "_find_similar: entity embedding search failed for '%s'", name
-            )
-            return None
+        if fuzzy_candidates and entity_type == "Company":
+            normalized = _normalize_company_alias(name)
+            if normalized:
+                for cand in fuzzy_candidates:
+                    cand_name = cand.get("name") or ""
+                    if _normalize_company_alias(cand_name) == normalized:
+                        return str(cand.get("id"))
 
-        for doc, distance in results:
-            candidate_id = doc.id or (doc.metadata or {}).get("entity_id")
-            if not candidate_id or distance is None:
-                continue
-            if candidate_ids is not None and candidate_id not in candidate_ids:
-                continue
-            if (1.0 - float(distance)) >= self._semantic_threshold:
-                if await self._neo4j.entity_exists(str(candidate_id)):
-                    return str(candidate_id)
+        if self._chroma is not None:
+            description = normalize_entity_description(None, name)
+            text = f"{name}. {description}"
+            try:
+                results = await self._chroma.query_entity_similar(
+                    text=text,
+                    entity_type=entity_type,
+                    n_results=settings.MEMORY_VECTOR_TOP_K,
+                )
+            except Exception:
+                logger.exception(
+                    "_find_similar: entity embedding search failed for '%s'", name
+                )
+                results = []
+
+            for doc, distance in results:
+                candidate_id = doc.id or (doc.metadata or {}).get("entity_id")
+                if not candidate_id or distance is None:
+                    continue
+                if candidate_ids is not None and candidate_id not in candidate_ids:
+                    continue
+                if (1.0 - float(distance)) >= self._semantic_threshold:
+                    if await self._neo4j.entity_exists(str(candidate_id)):
+                        return str(candidate_id)
+
+        # Fallback: accept very strong fuzzy match even if embeddings are weak
+        if fuzzy_candidates:
+            for cand in fuzzy_candidates:
+                sim = cand.get("similarity")
+                if isinstance(sim, (int, float)) and sim >= 0.90:
+                    return str(cand.get("id"))
 
         return None
 
@@ -275,6 +324,38 @@ class EntityResolver:
     # ──────────────────────────────────────────────────────────────────────────
     # Internal: type-scoped fuzzy + semantic dedup
     # ──────────────────────────────────────────────────────────────────────────
+    async def _embed_documents_batched(
+        self,
+        names: List[str],
+    ) -> Dict[str, np.ndarray]:
+        if not names or self._embedding_func is None:
+            return {}
+        batch_size = max(settings.ENTITY_EMBEDDING_BATCH_SIZE, 1)
+        max_concurrency = max(settings.ENTITY_EMBEDDING_MAX_CONCURRENCY, 1)
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def _embed_batch(batch: List[str]) -> List[List[float]]:
+            async with semaphore:
+                return await asyncio.to_thread(
+                    self._embedding_func.embed_documents, batch
+                )
+
+        batches = [names[i : i + batch_size] for i in range(0, len(names), batch_size)]
+        results = await asyncio.gather(
+            *[_embed_batch(b) for b in batches], return_exceptions=True
+        )
+
+        emb_map: Dict[str, np.ndarray] = {}
+        for batch, result in zip(batches, results):
+            if isinstance(result, Exception):
+                logger.exception(
+                    "_type_scoped_dedup: embedding batch failed", exc_info=result
+                )
+                continue
+            for name, vec in zip(batch, result, strict=False):
+                emb_map[name] = np.array(vec)
+
+        return emb_map
 
     async def _type_scoped_dedup(
         self,
@@ -328,18 +409,11 @@ class EntityResolver:
             if not unresolved_keys or self._embedding_func is None:
                 continue
 
-            all_names = list({name for name, _ in unresolved_keys} | set(canonicals))
-            try:
-                embeddings = await asyncio.to_thread(
-                    self._embedding_func.embed_documents, all_names
-                )
-                emb_map = {n: np.array(v) for n, v in zip(all_names, embeddings)}
-            except Exception:
-                logger.exception(
-                    "_type_scoped_dedup: embedding call failed for type '%s'", etype
-                )
+            unresolved_names = [name for name, _ in unresolved_keys]
+            all_names = list(dict.fromkeys(unresolved_names + canonicals))
+            emb_map = await self._embed_documents_batched(all_names)
+            if not emb_map:
                 continue
-
             for name, _ in unresolved_keys:
                 key = (name.lower(), etype)
                 if key in alias_map:
@@ -419,21 +493,3 @@ class EntityResolver:
             ticker=ticker,
             nodeset_ids=nodeset_ids,
         )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

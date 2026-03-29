@@ -508,12 +508,25 @@ class NewsAnalysisAgent(AbstractAgent):
             if chunk.chunk_id and chunk.extraction_status == "PENDING"
         ]
         pending_chunk_ids = list(dict.fromkeys(pending_chunk_ids))
-        if pending_chunk_ids:
-            task = asyncio.create_task(
-                self._ingestor.extract_entities_for_chunks(pending_chunk_ids)
-            )
-            if settings.EXTRACTION_IMMEDIATE:
-                await task
+        if pending_chunk_ids and state.conversation_id:
+            turn_id = getattr(state, "turn_id", None) or state.conversation_id
+            try:
+                task = make_extraction_task(
+                    turn_id=turn_id,
+                    conversation_id=state.conversation_id,
+                    source_agent=self.name(),
+                    extraction_text=None,
+                    system_prompt=None,
+                    task_kind="chunk_entities",
+                    chunk_ids=pending_chunk_ids,
+                )
+                await service_manager.get_graph_queue_manager().enqueue(
+                    task, immediate=settings.EXTRACTION_IMMEDIATE
+                )
+            except Exception:
+                logger.exception(
+                    "_rendezvous_node: failed to enqueue chunk entity extraction"
+                )
 
         return {"final_chunks": final_ranked}
 
@@ -665,3 +678,11 @@ class NewsAnalysisAgent(AbstractAgent):
             "relationships_extracted": relationships_extracted,
             "sentiment": sentiment,
         }
+
+
+
+
+
+
+
+

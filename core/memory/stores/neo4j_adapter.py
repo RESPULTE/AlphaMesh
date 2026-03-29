@@ -1,4 +1,4 @@
-﻿"""Async Neo4j adapter for graph I/O."""
+"""Async Neo4j adapter for graph I/O."""
 
 from __future__ import annotations
 
@@ -97,13 +97,13 @@ class Neo4jAdapter:
         exclude_id: str = "",
         threshold: float = 0.50,
         limit: int = 10,
-    ) -> List[str]:
+    ) -> List[dict]:
         cypher = (
             "MATCH (e:Entity) "
             "WHERE e.entity_type = $entity_type AND e.name IS NOT NULL AND e.id <> $exclude_id "
             "WITH e, apoc.text.sorensenDiceSimilarity(toLower(e.name), toLower($name)) AS sim "
             "WHERE sim >= $threshold "
-            "RETURN e.id AS id "
+            "RETURN e.id AS id, e.name AS name, sim AS similarity "
             "ORDER BY sim DESC "
             "LIMIT $limit"
         )
@@ -117,7 +117,15 @@ class Neo4jAdapter:
                 "limit": limit,
             },
         )
-        return [record.get("id") for record in records if record.get("id")]
+        return [
+            {
+                "id": record.get("id"),
+                "name": record.get("name"),
+                "similarity": record.get("similarity"),
+            }
+            for record in records
+            if record.get("id")
+        ]
 
     async def merge_document_node(self, node: DocumentNode) -> None:
         """Merge a document node and update its properties."""
@@ -222,7 +230,7 @@ class Neo4jAdapter:
         """
         Write edges to Neo4j. Entity IDs must be pre-resolved in entity_cache.
 
-        entity_cache maps (name.lower(), entity_type) → canonical_id.
+        entity_cache maps (name.lower(), entity_type) ? canonical_id.
         Any edge whose from/to entity is not in entity_cache is skipped with a warning.
 
         Returns the number of edges successfully written.
@@ -266,7 +274,7 @@ class Neo4jAdapter:
 
             if not resolved_source or not resolved_target:
                 self._logger.warning(
-                    "write_relationships: unresolved entity — "
+                    "write_relationships: unresolved entity"
                     "from='%s' (%s) resolved=%s | to='%s' (%s) resolved=%s",
                     from_name,
                     from_type,
@@ -417,7 +425,7 @@ class Neo4jAdapter:
         Return chunks that mention the provided entities.
 
         extraction_status is included so that the retriever can correctly
-        propagate PENDING vs EXTRACTED state to RetrievedChunk objects — without
+        propagate PENDING vs EXTRACTED state to RetrievedChunk objects � without
         this field, all graph-expanded chunks defaulted to PENDING and were
         unnecessarily re-queued for entity extraction on every retrieval.
         """
@@ -536,7 +544,7 @@ class Neo4jAdapter:
         """
         Merge a UserInterestDomain node.
         ON CREATE: full props written.
-        ON MATCH:  only last_seen_at updated — category and domain_type are immutable.
+        ON MATCH:  only last_seen_at updated � category and domain_type are immutable.
         """
         cypher = (
             "MERGE (d:UserInterestDomain {id: $id}) "
@@ -564,7 +572,7 @@ class Neo4jAdapter:
         Merge a UserInterestEdge with operation-specific MATCH behaviour.
 
         operation="reinforce": increments weight, ensures Active status (unless
-                            already invalidated by user — in that case status
+                            already invalidated by user � in that case status
                             is left alone so invalidation is not silently reversed).
         operation="invalidate": sets invalidated=True and status=Invalidated.
         """
@@ -601,7 +609,7 @@ class Neo4jAdapter:
 
     async def merge_turn_node(self, turn_id: str, props: dict) -> None:
         """
-        Merge a TurnNode. Idempotent — the same turn may source multiple edges
+        Merge a TurnNode. Idempotent � the same turn may source multiple edges
         so this is called once per turn per signal, not per relationship.
         """
         cypher = "MERGE (t:TurnNode {id: $id}) " "ON CREATE SET t += $props"
@@ -617,7 +625,7 @@ class Neo4jAdapter:
         self, user_email: str, nodeset_id: str
     ) -> List[dict]:
         """
-        Full 3-hop read: NodeSet → Domain → Edge → Entity + provenance turns.
+        Full 3-hop read: NodeSet ? Domain ? Edge ? Entity + provenance turns.
         Returns all edges including invalidated ones; caller filters as needed.
         """
         cypher = (

@@ -89,6 +89,9 @@ _CLEANUP_INTERVAL = 300  # 5 min between TTL sweeps
 # Global in-memory mapping of prompt_id -> prompt text
 _PROMPT_REGISTRY: Dict[str, str] = {}
 
+_TASK_KIND_RELATIONSHIPS = "relationships"
+_TASK_KIND_CHUNK_ENTITIES = "chunk_entities"
+
 
 def _prompt_id(system_prompt: str) -> str:
     return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
@@ -102,20 +105,16 @@ def _get_prompt(prompt_id: str) -> Optional[str]:
     return _PROMPT_REGISTRY.get(prompt_id)
 
 
-#
-# Data structures
-#
-
-
 @dataclass
 class GraphTask:
-    """Payload for one agent's graph write request."""
 
     task_id: str  # uuid4; returned to caller for tracing
     turn_id: str  # groups tasks within one orchestrator turn
     conversation_id: str
     source_agent: str
-    relationships: List[dict]  # already-extracted dicts, no nx objects
+    task_kind: str = _TASK_KIND_RELATIONSHIPS
+    chunk_ids: Optional[List[str]] = None
+    relationships: List[dict] = field(default_factory=list)
     extraction_text: Optional[str] = None
     system_prompt_id: Optional[str] = None
     llm_config: Optional[dict] = None
@@ -151,6 +150,7 @@ class ConversationQueue:
         entity_resolver: EntityResolver,
         graph_writer: Neo4jAdapter,
         relationship_extractor: RelationshipExtractor,
+        entity_extractor: Callable[[List[str]], Any],
         llm_provider: Callable[[Optional[dict]], Any],
         prompt_resolver: Callable[[str], Optional[str]],
         db_path: str,
@@ -159,6 +159,7 @@ class ConversationQueue:
         self._resolver = entity_resolver
         self._writer = graph_writer
         self._extractor = relationship_extractor
+        self._entity_extractor = entity_extractor
         self._llm_provider = llm_provider
         self._prompt_resolver = prompt_resolver
         self._db_path = db_path
@@ -254,6 +255,8 @@ class ConversationQueue:
     #
 
     async def _extract_relationships_for_task(self, task: GraphTask) -> List[dict]:
+        if task.task_kind == _TASK_KIND_CHUNK_ENTITIES:
+            return []
         if not task.extraction_text or not task.system_prompt_id:
             return []
         prompt = self._prompt_resolver(task.system_prompt_id)
@@ -299,10 +302,28 @@ class ConversationQueue:
             len(tasks),
         )
 
+        chunk_tasks = [t for t in tasks if t.task_kind == _TASK_KIND_CHUNK_ENTITIES]
+        rel_tasks = [t for t in tasks if t.task_kind != _TASK_KIND_CHUNK_ENTITIES]
+
+        if chunk_tasks:
+            chunk_ids: List[str] = []
+            for task in chunk_tasks:
+                if task.chunk_ids:
+                    chunk_ids.extend(task.chunk_ids)
+            chunk_ids = list(dict.fromkeys(chunk_ids))
+            if chunk_ids:
+                try:
+                    await self._entity_extractor(chunk_ids)
+                except Exception:
+                    logger.exception(
+                        "ConversationQueue: chunk entity extraction failed for turn_id='%s'",
+                        turn_id,
+                    )
+
         #  Step 1: Merge all relationships
         all_relationships: List[dict] = []
         source_agents: List[str] = []
-        for task in tasks:
+        for task in rel_tasks:
             rels = task.relationships or []
             if not rels and task.extraction_text:
                 rels = await self._extract_relationships_for_task(task)
@@ -351,7 +372,9 @@ class ConversationQueue:
                             (name, etype, rel.get(props_key) or None)
                         )
 
-            resolved = await self._resolver.resolve_batch(unique_domain_entities, allow_create=False)
+            resolved = await self._resolver.resolve_batch(
+                unique_domain_entities, allow_create=False
+            )
             for (name, etype), entity_id in resolved.items():
                 domain_entity_cache[entity_key(name, etype)] = entity_id
 
@@ -468,12 +491,14 @@ class GraphQueueManager:
         entity_resolver: EntityResolver,
         graph_writer: Neo4jAdapter,
         relationship_extractor: RelationshipExtractor,
+        entity_extractor: Callable[[List[str]], Any],
         llm_provider: Callable[[Optional[dict]], Any],
         db_path: str = _GRAPH_TASKS_DB,
     ) -> None:
         self._resolver = entity_resolver
         self._writer = graph_writer
         self._extractor = relationship_extractor
+        self._entity_extractor = entity_extractor
         self._llm_provider = llm_provider
         self._prompt_registry: Dict[str, str] = {}
         self._db_path = db_path
@@ -500,6 +525,7 @@ class GraphQueueManager:
                 entity_resolver=self._resolver,
                 graph_writer=self._writer,
                 relationship_extractor=self._extractor,
+                entity_extractor=self._entity_extractor,
                 llm_provider=self._llm_provider,
                 prompt_resolver=_get_prompt,
                 db_path=self._db_path,
@@ -523,7 +549,6 @@ class GraphQueueManager:
     #
     # Enqueue and flush
     #
-
     async def enqueue(
         self,
         task: GraphTask,
@@ -542,27 +567,49 @@ class GraphQueueManager:
             task.extraction_text = extraction_text
         if llm_config is not None:
             task.llm_config = llm_config
-        if system_prompt is not None:
+
+        is_chunk_entities = task.task_kind == _TASK_KIND_CHUNK_ENTITIES
+        if system_prompt is not None and not is_chunk_entities:
             task.system_prompt_id = await self._register_prompt(system_prompt)
 
-        has_relationships = bool(task.relationships)
-        has_extraction = bool(task.extraction_text and task.system_prompt_id)
+        has_chunk_entities = bool(task.chunk_ids) if is_chunk_entities else False
+        has_relationships = bool(task.relationships) if not is_chunk_entities else False
+        has_extraction = (
+            bool(task.extraction_text and task.system_prompt_id)
+            if not is_chunk_entities
+            else False
+        )
 
-        if not has_relationships and not has_extraction:
+        if is_chunk_entities and not has_chunk_entities:
+            logger.warning(
+                "GraphQueueManager.enqueue: missing chunk_ids for '%s'",
+                task.task_id,
+            )
+            return task.task_id
+
+        if not has_relationships and not has_extraction and not has_chunk_entities:
             logger.debug(
                 "GraphQueueManager.enqueue: skipping empty task from '%s'",
                 task.source_agent,
             )
             return task.task_id
 
-        if task.extraction_text and not task.system_prompt_id:
+        if (
+            (not is_chunk_entities)
+            and task.extraction_text
+            and not task.system_prompt_id
+        ):
             logger.warning(
                 "GraphQueueManager.enqueue: missing system_prompt_id for task '%s'",
                 task.task_id,
             )
             return task.task_id
 
-        if task.system_prompt_id and task.system_prompt_id not in self._prompt_registry:
+        if (
+            (not is_chunk_entities)
+            and task.system_prompt_id
+            and task.system_prompt_id not in self._prompt_registry
+        ):
             logger.warning(
                 "GraphQueueManager.enqueue: prompt_id '%s' not registered; extraction may fail",
                 task.system_prompt_id,
@@ -573,14 +620,18 @@ class GraphQueueManager:
 
         if immediate:
             try:
-                relationships = task.relationships
-                if not relationships and has_extraction:
-                    relationships = await self._extract_relationships_for_task(task)
-                await self._process_relationships_immediate(
-                    relationships,
-                    task.conversation_id,
-                    task.source_agent,
-                )
+                if is_chunk_entities:
+                    if task.chunk_ids:
+                        await self._entity_extractor(task.chunk_ids)
+                else:
+                    relationships = task.relationships
+                    if not relationships and has_extraction:
+                        relationships = await self._extract_relationships_for_task(task)
+                    await self._process_relationships_immediate(
+                        relationships,
+                        task.conversation_id,
+                        task.source_agent,
+                    )
             except Exception:
                 logger.exception(
                     "GraphQueueManager.enqueue: immediate write failed for '%s'",
@@ -589,7 +640,7 @@ class GraphQueueManager:
             await self._mark_processed([task.task_id])
             return task.task_id
 
-        # Lazy session creation (safety net — callers should call open_session explicitly)
+        # Lazy session creation (safety net � callers should call open_session explicitly)
         async with self._queues_lock:
             cq = self._queues.get(task.conversation_id)
             if cq is None:
@@ -602,6 +653,7 @@ class GraphQueueManager:
                     entity_resolver=self._resolver,
                     graph_writer=self._writer,
                     relationship_extractor=self._extractor,
+                    entity_extractor=self._entity_extractor,
                     llm_provider=self._llm_provider,
                     prompt_resolver=_get_prompt,
                     db_path=self._db_path,
@@ -629,6 +681,8 @@ class GraphQueueManager:
         await cq.put(_SentinelTask(turn_id=turn_id, conversation_id=conversation_id))
 
     async def _extract_relationships_for_task(self, task: GraphTask) -> List[dict]:
+        if task.task_kind == _TASK_KIND_CHUNK_ENTITIES:
+            return []
         if not task.extraction_text or not task.system_prompt_id:
             return []
         prompt = _get_prompt(task.system_prompt_id)
@@ -678,6 +732,11 @@ class GraphQueueManager:
             entity_cache: Dict[Tuple[str, str], str] = {}
 
             if domain_rels:
+                # Taxonomy bootstrap must be allowed to create missing nodes.
+                allow_create = (
+                    source_agent == "taxonomy_bootstrap"
+                    or conversation_id == "taxonomy_bootstrap"
+                )
                 unique_entities: List[Tuple[str, str, Optional[dict]]] = []
                 seen: set = set()
                 for rel in domain_rels:
@@ -695,7 +754,9 @@ class GraphQueueManager:
                         if k not in seen:
                             seen.add(k)
                             unique_entities.append((name, etype, rel.get(props_key)))
-                resolved = await self._resolver.resolve_batch(unique_entities, allow_create=False)
+                resolved = await self._resolver.resolve_batch(
+                    unique_entities, allow_create=allow_create
+                )
                 for (name, etype), eid in resolved.items():
                     entity_cache[entity_key(name, etype)] = eid
                 await self._writer.write_relationships(
@@ -827,6 +888,8 @@ class GraphQueueManager:
                     extraction_text TEXT,
                     system_prompt_id TEXT,
                     llm_config      TEXT,
+                    task_kind       TEXT,
+                    chunk_ids       TEXT,
                     status          TEXT NOT NULL DEFAULT 'PENDING',
                     created_at      REAL NOT NULL,
                     processed_at    REAL,
@@ -851,6 +914,8 @@ class GraphQueueManager:
                 ("extraction_text", "TEXT"),
                 ("system_prompt_id", "TEXT"),
                 ("llm_config", "TEXT"),
+                ("task_kind", "TEXT"),
+                ("chunk_ids", "TEXT"),
             ]:
                 if col not in cols:
                     await db.execute(
@@ -873,8 +938,8 @@ class GraphQueueManager:
             async with aiosqlite.connect(self._db_path) as db:
                 await db.execute(
                     """INSERT OR IGNORE INTO graph_tasks
-                       (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, status, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
+                       (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, task_kind, chunk_ids, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
                     (
                         task.task_id,
                         task.turn_id,
@@ -888,6 +953,8 @@ class GraphQueueManager:
                             if task.llm_config is not None
                             else None
                         ),
+                        task.task_kind,
+                        (json.dumps(task.chunk_ids) if task.chunk_ids else None),
                         task.created_at,
                     ),
                 )
@@ -900,12 +967,12 @@ class GraphQueueManager:
     async def _recover_pending_tasks(self) -> None:
         """
         On startup, find PENDING tasks from previous sessions and process them
-        directly (bypass queue � no session needed).
+        directly (bypass queue no session needed).
         """
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 async with db.execute(
-                    "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, created_at "
+                    "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, task_kind, chunk_ids, created_at "
                     "FROM graph_tasks WHERE status='PENDING' ORDER BY created_at ASC"
                 ) as cursor:
                     rows = await cursor.fetchall()
@@ -925,6 +992,7 @@ class GraphQueueManager:
         tasks: List[GraphTask] = []
         for row in rows:
             llm_config = json.loads(row[7]) if row[7] else None
+            chunk_ids = json.loads(row[9]) if row[9] else None
             task = GraphTask(
                 task_id=row[0],
                 turn_id=row[1],
@@ -934,10 +1002,13 @@ class GraphQueueManager:
                 extraction_text=row[5],
                 system_prompt_id=row[6],
                 llm_config=llm_config,
-                created_at=row[8],
+                task_kind=row[8] or _TASK_KIND_RELATIONSHIPS,
+                chunk_ids=chunk_ids,
+                created_at=row[10],
             )
             if (
-                not task.relationships
+                task.task_kind != _TASK_KIND_CHUNK_ENTITIES
+                and not task.relationships
                 and task.extraction_text
                 and task.system_prompt_id
             ):
@@ -951,8 +1022,25 @@ class GraphQueueManager:
             grouped.setdefault(key, []).append(task)
 
         for (conv_id, turn_id), group_tasks in grouped.items():
+            chunk_ids: List[str] = []
+            for task in group_tasks:
+                if task.task_kind == _TASK_KIND_CHUNK_ENTITIES and task.chunk_ids:
+                    chunk_ids.extend(task.chunk_ids)
+            chunk_ids = list(dict.fromkeys(chunk_ids))
+            if chunk_ids:
+                try:
+                    await self._entity_extractor(chunk_ids)
+                except Exception:
+                    logger.exception(
+                        "GraphQueueManager: recovery chunk entity extraction failed for conversation '%s' turn '%s'",
+                        conv_id,
+                        turn_id,
+                    )
+
             all_rels: List[dict] = []
             for t in group_tasks:
+                if t.task_kind == _TASK_KIND_CHUNK_ENTITIES:
+                    continue
                 all_rels.extend(t.relationships or [])
             if not all_rels:
                 await self._mark_processed([t.task_id for t in group_tasks])
@@ -1031,19 +1119,24 @@ def make_extraction_task(
     turn_id: str,
     conversation_id: str,
     source_agent: str,
-    extraction_text: str,
-    system_prompt: str,
+    extraction_text: Optional[str] = None,
+    system_prompt: Optional[str] = None,
     llm_config: Optional[dict] = None,
+    task_kind: str = _TASK_KIND_RELATIONSHIPS,
+    chunk_ids: Optional[List[str]] = None,
 ) -> GraphTask:
     """Convenience constructor for deferred extraction tasks."""
+    prompt_id = _prompt_id(system_prompt) if system_prompt else None
     return GraphTask(
         task_id=str(uuid4()),
         turn_id=turn_id,
         conversation_id=conversation_id,
         source_agent=source_agent,
+        task_kind=task_kind,
+        chunk_ids=chunk_ids,
         relationships=[],
         extraction_text=extraction_text,
-        system_prompt_id=_prompt_id(system_prompt),
+        system_prompt_id=prompt_id,
         llm_config=llm_config,
     )
 

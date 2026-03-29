@@ -46,17 +46,20 @@ class Settings(BaseSettings):
     EXTRACTION_BATCH_SIZE: int = 8
     EXTRACTION_MAX_CONCURRENCY: int = 10
     EXTRACTION_ENABLED: bool = True
-    EXTRACTION_IMMEDIATE: bool = True
+    EXTRACTION_IMMEDIATE: bool = False
     EXTRACTION_LLM_RETRY_ATTEMPTS: int = 3
     EXTRACTION_NEO4J_RETRY_ATTEMPTS: int = 3
+
+    ENTITY_EMBEDDING_BATCH_SIZE: int = 32
+    ENTITY_EMBEDDING_MAX_CONCURRENCY: int = 4
 
     # ── Subgraph / Redis ──────────────────────────────────────────────────────
     REDIS_URL: str = ""
     SUBGRAPH_TTL_SECONDS: int = 3600
 
     # ── In-memory dedup thresholds ────────────────────────────────────────────
-    EXTRACTION_FUZZY_THRESHOLD: float = 80.0
-    EXTRACTION_SEMANTIC_THRESHOLD: float = 0.82
+    EXTRACTION_FUZZY_THRESHOLD: float = 69.0
+    EXTRACTION_SEMANTIC_THRESHOLD: float = 0.8
 
     # ── Portfolio ─────────────────────────────────────────────────────────────
     PORTFOLIO_JSON_PATH: str = "data/portfolio.json"
@@ -68,7 +71,7 @@ class Settings(BaseSettings):
     RETRIEVER_MAX_NEIGHBOR_CANDIDATES: int = 15
 
     # ── Memory retrieval ──────────────────────────────────────────────────────
-    MEMORY_VECTOR_TOP_K: int = 20
+    MEMORY_VECTOR_TOP_K: int = 10
     MEMORY_SIMILARITY_THRESHOLD: float = 0.72
 
     # ── Re-ranking ────────────────────────────────────────────────────────────
@@ -160,5 +163,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
-

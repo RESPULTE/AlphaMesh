@@ -150,6 +150,52 @@ class ChromaDBAdapter:
             metadatas=[metadata],
         )
 
+    async def upsert_entity_embeddings_batch(
+        self,
+        entities: List[Any],
+        embedding_func=None,
+    ) -> None:
+        """Batch upsert entity embeddings into this collection."""
+        if not entities:
+            return
+        embedder = embedding_func or self._embedding_function
+        if embedder is None:
+            raise ValueError("Embedding function is required for entity upsert.")
+
+        chunk_ids: List[str] = []
+        texts: List[str] = []
+        metadatas: List[dict] = []
+
+        for entity in entities:
+            entity_id = getattr(entity, "id", None)
+            name = getattr(entity, "name", None)
+            entity_type = getattr(entity, "entity_type", None)
+            if not entity_id or not name or not entity_type:
+                continue
+            cleaned_name = (name or "").strip()
+            if not cleaned_name:
+                continue
+            description = getattr(entity, "description", None)
+            cleaned_description = (description or "").strip() or cleaned_name
+            text = f"{cleaned_name}. {cleaned_description}"
+            chunk_ids.append(str(entity_id))
+            texts.append(text)
+            metadatas.append(
+                {
+                    "entity_id": entity_id,
+                    "entity_type": entity_type,
+                    "name": cleaned_name,
+                }
+            )
+
+        if not chunk_ids:
+            return
+
+        await self.upsert_chunks(
+            chunk_ids=chunk_ids,
+            texts=texts,
+            metadatas=metadatas,
+        )
     async def query_entity_similar(
         self,
         text: str,
@@ -391,5 +437,6 @@ class ChromaDBAdapter:
         except Exception as exec:
             self._logger.exception("Failed to check ChromaDB for source URL.: %s", exec)
             raise
+
 
 
