@@ -25,9 +25,11 @@ process maintains its own cache (acceptable; market data is public).
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Awaitable, Dict, List, Optional, Tuple
 
+import aiosqlite
 import yfinance as yf
 
 from core.config import settings
@@ -39,6 +41,8 @@ logger = get_logger(__name__)
 # Structure: ticker_key → (written_at_unix, payload)
 # Keys: "quote:{TICKER}" and "intraday:{TICKER}"
 _CACHE: Dict[str, Tuple[float, object]] = {}
+_SQLITE_INITIALIZED = False
+_SQLITE_INIT_LOCK = asyncio.Lock()
 
 
 def _cache_get(key: str, ttl: int) -> Optional[object]:
@@ -56,17 +60,95 @@ def _cache_set(key: str, value: object) -> None:
     _CACHE[key] = (time.time(), value)
 
 
+async def _ensure_sqlite_cache() -> None:
+    global _SQLITE_INITIALIZED
+    if _SQLITE_INITIALIZED:
+        return
+    async with _SQLITE_INIT_LOCK:
+        if _SQLITE_INITIALIZED:
+            return
+        async with aiosqlite.connect(settings.MARKET_CACHE_DB_PATH) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS market_cache (
+                    cache_key  TEXT PRIMARY KEY,
+                    payload    TEXT NOT NULL,
+                    written_at REAL NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_market_cache_written "
+                "ON market_cache (written_at DESC)"
+            )
+            await db.commit()
+        _SQLITE_INITIALIZED = True
+
+
+async def _sqlite_get(key: str, ttl: int) -> Optional[object]:
+    try:
+        await _ensure_sqlite_cache()
+        async with aiosqlite.connect(settings.MARKET_CACHE_DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT payload, written_at FROM market_cache WHERE cache_key = ?",
+                (key,),
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return None
+        written_at = float(row["written_at"])
+        if time.time() - written_at > ttl:
+            return None
+        return json.loads(row["payload"])
+    except Exception as exc:
+        logger.debug("MarketDataService: sqlite cache read failed: %s", exc)
+        return None
+
+
+async def _sqlite_set(key: str, value: object) -> None:
+    try:
+        await _ensure_sqlite_cache()
+        payload = json.dumps(value, default=str)
+        async with aiosqlite.connect(settings.MARKET_CACHE_DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO market_cache (cache_key, payload, written_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT (cache_key) DO UPDATE
+                    SET payload = excluded.payload,
+                        written_at = excluded.written_at
+                """,
+                (key, payload, time.time()),
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.debug("MarketDataService: sqlite cache write failed: %s", exc)
+
+
+def _fire_and_forget(coro: Awaitable[None]) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(coro)
+
+
 def write_quote_to_cache(ticker: str, data: dict) -> None:
     """
     Called by FundamentalAnalysisAgent (or any agent) after fetching price data
     so the API market endpoint does not re-fetch the same ticker immediately.
     """
-    _cache_set(f"quote:{ticker.upper()}", data)
+    key = f"quote:{ticker.upper()}"
+    _cache_set(key, data)
+    _fire_and_forget(_sqlite_set(key, data))
 
 
 def write_intraday_to_cache(ticker: str, data: list) -> None:
     """Write intraday bars produced by the agent into the shared cache."""
-    _cache_set(f"intraday:{ticker.upper()}", data)
+    key = f"intraday:{ticker.upper()}"
+    _cache_set(key, data)
+    _fire_and_forget(_sqlite_set(key, data))
 
 
 # ── Service class (injected as a FastAPI dependency) ──────────────────────────
@@ -86,14 +168,12 @@ class MarketDataService:
         Returns a safe default dict on any fetch failure.
         """
         ticker = ticker.upper()
-        cached = _cache_get(f"quote:{ticker}", settings.MARKET_QUOTE_TTL)
-        if cached is not None:
-            logger.debug("MarketDataService: quote cache hit for %s", ticker)
-            return cached  # type: ignore[return-value]
-
-        data = await asyncio.to_thread(self._fetch_quote_sync, ticker)
-        _cache_set(f"quote:{ticker}", data)
-        return data
+        return await self._get_with_cache(
+            kind="quote",
+            ticker=ticker,
+            ttl=settings.MARKET_QUOTE_TTL,
+            fetcher=self._fetch_quote_sync,
+        )
 
     async def get_intraday(self, ticker: str) -> List[dict]:
         """
@@ -101,13 +181,43 @@ class MarketDataService:
         Returns [] on failure so the frontend can render a graceful empty chart.
         """
         ticker = ticker.upper()
-        cached = _cache_get(f"intraday:{ticker}", settings.MARKET_INTRADAY_TTL)
-        if cached is not None:
-            logger.debug("MarketDataService: intraday cache hit for %s", ticker)
-            return cached  # type: ignore[return-value]
+        return await self._get_with_cache(
+            kind="intraday",
+            ticker=ticker,
+            ttl=settings.MARKET_INTRADAY_TTL,
+            fetcher=self._fetch_intraday_sync,
+        )
 
-        data = await asyncio.to_thread(self._fetch_intraday_sync, ticker)
-        _cache_set(f"intraday:{ticker}", data)
+    async def _get_with_cache(
+        self,
+        *,
+        kind: str,
+        ticker: str,
+        ttl: int,
+        fetcher,
+    ):
+        key = f"{kind}:{ticker}"
+        sqlite_task = asyncio.create_task(_sqlite_get(key, ttl))
+        cached = _cache_get(key, ttl)
+        if cached is not None:
+            logger.debug("MarketDataService: %s memory cache hit for %s", kind, ticker)
+            sqlite_task.cancel()
+            return cached
+
+        sqlite_value = None
+        try:
+            sqlite_value = await sqlite_task
+        except asyncio.CancelledError:
+            sqlite_value = None
+
+        if sqlite_value is not None:
+            logger.debug("MarketDataService: %s sqlite cache hit for %s", kind, ticker)
+            _cache_set(key, sqlite_value)
+            return sqlite_value
+
+        data = await asyncio.to_thread(fetcher, ticker)
+        _cache_set(key, data)
+        await _sqlite_set(key, data)
         return data
 
     # ── Sync helpers (run inside asyncio.to_thread) ───────────────────────────

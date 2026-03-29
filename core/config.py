@@ -154,6 +154,7 @@ class Settings(BaseSettings):
     # Shared in-process cache keyed by ticker; public data, no per-user
     # isolation needed.  The FundamentalAnalysisAgent writes here; the
     # /api/market/{ticker} endpoint reads from the same cache.
+    MARKET_CACHE_DB_PATH: str = "./data/market_cache.db"
     MARKET_QUOTE_TTL: int = 60
     MARKET_INTRADAY_TTL: int = 300
 

@@ -227,9 +227,39 @@ export function useAnalysisStream(query: string | null) {
           }
 
           if (payload.event_type === 'complete' && payload.result) {
-            setData(mapFinalResult(payload.result));
+            const mapped = mapFinalResult(payload.result);
+            setData(mapped);
             setIsStreaming(false);
             closeStream();
+
+            if (mapped.ticker) {
+              Promise.allSettled([
+                fetch(`/api/market/${mapped.ticker}/quote`).then((r) => (r.ok ? r.json() : null)),
+                fetch(`/api/market/${mapped.ticker}/intraday`).then((r) => (r.ok ? r.json() : null)),
+              ]).then((results) => {
+                if (!isMounted) return;
+                const quote = results[0].status === 'fulfilled' ? results[0].value : null;
+                const intraday = results[1].status === 'fulfilled' ? results[1].value : null;
+                if (quote) {
+                  setData((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          ticker: quote.ticker ?? prev.ticker,
+                          companyName: quote.companyName ?? prev.companyName,
+                          currentPrice: quote.currentPrice ?? prev.currentPrice,
+                          priceChange: quote.priceChange ?? prev.priceChange,
+                          priceChangePercent: quote.priceChangePercent ?? prev.priceChangePercent,
+                          marketStatus: quote.marketStatus ?? prev.marketStatus,
+                        }
+                      : prev
+                  );
+                }
+                if (intraday && Array.isArray(intraday)) {
+                  setData((prev) => (prev ? { ...prev, chartData: intraday } : prev));
+                }
+              });
+            }
           }
 
           if (payload.event_type === 'error') {

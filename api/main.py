@@ -2,27 +2,6 @@
 api/main.py
 
 FastAPI application factory for AlphaMesh.
-
-Startup sequence (lifespan)
-────────────────────────────
-1. Initialize backend services (Neo4j, ChromaDB, graph queue) via service_manager.startup().
-2. Initialize the SQLite persistence adapter for conversations.
-3. Wire services into app.state so Depends() providers can inject them.
-4. Register all routers under /api/v1.
-
-Shutdown sequence
-─────────────────
-1. Drain the graph write queue gracefully.
-2. Any other cleanup delegated to service_manager.shutdown().
-
-Run
-───
-    uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
-
-Environment
-───────────
-All configuration is read from the project's .env file via core.config.Settings.
-No additional environment variables are needed for the API layer.
 """
 
 from __future__ import annotations
@@ -48,36 +27,21 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and shutdown of all service singletons."""
-    logger.info("AlphaMesh API: starting up…")
+    logger.info("AlphaMesh API: starting up...")
 
-    # ── Backend services (Neo4j, ChromaDB, graph queue, etc.) ─────────────────
+    # Backend services (Neo4j, ChromaDB, graph queue, etc.)
     from core.services import service_manager
 
     await service_manager.startup()
 
-    # In lifespan, after service_manager.startup():
-    from api.services.session_service import SessionService
-
-    # Add new routers:
-    from api.middleware.error_handling import register_exception_handlers
-    from api.middleware.rate_limiting import RateLimitMiddleware
-    from api.routers import analyze as analyze_router
-    from api.routers import market as market_router
-    from api.routers import sessions as sessions_router
-
-    app.include_router(analyze_router.router, prefix="/api")
-    app.include_router(market_router.router, prefix="/api/market")
-    app.include_router(sessions_router.router, prefix="/api/sessions")
-    app.add_middleware(RateLimitMiddleware)
-    register_exception_handlers(app)
-
-    # ── Conversation persistence ───────────────────────────────────────────────
+    # Conversation persistence
     from core.config import settings
+    from api.services.session_service import SessionService
 
     adapter = SQLiteConversationAdapter(db_path="./data/conversations.db")
     await adapter.initialize()
 
-    # ── API-layer singletons ───────────────────────────────────────────────────
+    # API-layer singletons
     broadcaster = EventBroadcaster()
     store = ConversationStore(adapter=adapter)
     await store.initialize()
@@ -95,8 +59,8 @@ async def lifespan(app: FastAPI):
     logger.info("AlphaMesh API: ready.")
     yield
 
-    # ── Graceful shutdown ──────────────────────────────────────────────────────
-    logger.info("AlphaMesh API: shutting down…")
+    # Graceful shutdown
+    logger.info("AlphaMesh API: shutting down...")
     await service_manager.shutdown()
     logger.info("AlphaMesh API: shutdown complete.")
 
@@ -116,7 +80,11 @@ def create_app() -> FastAPI:
         openapi_url="/api/openapi.json",
     )
 
-    # ── CORS ───────────────────────────────────────────────────────────────────
+    # Middleware must be registered before startup.
+    from api.middleware.rate_limiting import RateLimitMiddleware
+
+    app.add_middleware(RateLimitMiddleware)
+
     # Restrict `allow_origins` to your frontend domain in production.
     app.add_middleware(
         CORSMiddleware,
@@ -126,11 +94,22 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ── Routers ────────────────────────────────────────────────────────────────
+    # Routers and exception handlers must be registered before startup.
+    from api.middleware.error_handling import register_exception_handlers
+    from api.routers import analyze as analyze_router
+    from api.routers import market as market_router
+    from api.routers import sessions as sessions_router
+
+    app.include_router(analyze_router.router, prefix="/api")
+    app.include_router(market_router.router, prefix="/api/market")
+    app.include_router(sessions_router.router, prefix="/api/sessions")
+
     app.include_router(health.router)
     app.include_router(chat.router)
     app.include_router(stream.router)
     app.include_router(conversations.router)
+
+    register_exception_handlers(app)
 
     return app
 

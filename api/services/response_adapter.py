@@ -23,7 +23,8 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from core.agents.models.news_agent_models import AgentSentiment, CitedSource
+from core.agents.models.base_agent_models import AgentSentiment
+from core.agents.models.news_agent_models import CitedSource
 from core.logger import get_logger
 
 logger = get_logger(__name__)

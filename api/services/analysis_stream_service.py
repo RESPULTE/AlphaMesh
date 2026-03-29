@@ -43,7 +43,7 @@ from langchain_core.messages import HumanMessage
 from api.services.market_data_service import MarketDataService
 from api.services.response_adapter import ResponseAdapter
 from api.services.session_service import SessionService
-from core.agents.models.news_agent_models import AgentSentiment
+from core.agents.models.base_agent_models import AgentSentiment
 from core.agents.orchestrator_agent import OrchestratorAgent
 from core.logger import get_logger
 

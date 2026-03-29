@@ -13,7 +13,7 @@ import json
 import re
 from typing import Optional
 
-from core.agents.models.news_agent_models import AgentSentiment
+from core.agents.models.base_agent_models import AgentSentiment
 from core.logger import get_logger
 
 logger = get_logger(__name__)
