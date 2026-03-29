@@ -174,6 +174,7 @@ export function useAnalysisStream(query: string | null) {
   const [data, setData] = useState<PartialAnalysis>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
 
   const stableEmail = useMemo(() => DEFAULT_USER_EMAIL, []);
 
@@ -198,7 +199,8 @@ export function useAnalysisStream(query: string | null) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             message: query,
-            user_email: stableEmail
+            user_email: stableEmail,
+            conversation_id: conversationIdRef.current
           })
         });
 
@@ -208,6 +210,9 @@ export function useAnalysisStream(query: string | null) {
 
         const ack = await res.json();
         if (!isMounted) return;
+        if (ack.conversation_id) {
+          conversationIdRef.current = ack.conversation_id;
+        }
 
         const es = new EventSource(`/api/v1/stream/${ack.request_id}`);
         eventSourceRef.current = es;

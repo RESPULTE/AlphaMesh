@@ -25,7 +25,8 @@ NeighborCandidate / GraphChunkRow
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional, Sequence
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence
 
 from langgraph.graph import END, START, StateGraph
 
@@ -64,6 +65,28 @@ def _parse_neighbor(row: dict) -> Optional[NeighborCandidate]:
     )
 
 
+def _normalize_published_at(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "to_native"):
+        try:
+            return value.to_native()
+        except Exception:
+            pass
+    if hasattr(value, "to_datetime"):
+        try:
+            return value.to_datetime()
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return datetime.fromisoformat(value.isoformat())
+        except Exception:
+            return None
+    return None
+
 def _parse_chunk_row(row: dict) -> Optional[GraphChunkRow]:
     """Normalise a raw Neo4j chunk row.  Returns None if chunk_id is absent."""
     chunk_id = (row.get("chunk_id") or "").strip()
@@ -76,7 +99,7 @@ def _parse_chunk_row(row: dict) -> Optional[GraphChunkRow]:
         document_id=row.get("document_id"),
         article_title=row.get("article_title"),
         source_url=row.get("source_url"),
-        published_at=row.get("published_at"),
+        published_at=_normalize_published_at(row.get("published_at")),
         extraction_status=row.get("extraction_status") or "PENDING",
     )
 
@@ -502,3 +525,4 @@ class DualStoreRetriever:
             len(prefiltered),
         )
         return MemoryContext(chunks=prefiltered, rewritten_queries=rewritten_queries)
+
