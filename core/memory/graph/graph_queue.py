@@ -1006,6 +1006,9 @@ class GraphQueueManager:
                 chunk_ids=chunk_ids,
                 created_at=row[10],
             )
+            tasks.append(task)
+
+        async def _ensure_relationships(task: GraphTask) -> None:
             if (
                 task.task_kind != _TASK_KIND_CHUNK_ENTITIES
                 and not task.relationships
@@ -1013,7 +1016,10 @@ class GraphQueueManager:
                 and task.system_prompt_id
             ):
                 task.relationships = await self._extract_relationships_for_task(task)
-            tasks.append(task)
+
+        rel_jobs = [asyncio.create_task(_ensure_relationships(t)) for t in tasks]
+        if rel_jobs:
+            await asyncio.gather(*rel_jobs, return_exceptions=False)
 
         # Group by conversation_id + turn_id and process each group
         grouped: Dict[Tuple[str, str], List[GraphTask]] = {}
@@ -1021,7 +1027,9 @@ class GraphQueueManager:
             key = (task.conversation_id, task.turn_id)
             grouped.setdefault(key, []).append(task)
 
-        for (conv_id, turn_id), group_tasks in grouped.items():
+        async def _process_group(
+            conv_id: str, turn_id: str, group_tasks: List[GraphTask]
+        ) -> None:
             chunk_ids: List[str] = []
             for task in group_tasks:
                 if task.task_kind == _TASK_KIND_CHUNK_ENTITIES and task.chunk_ids:
@@ -1044,7 +1052,7 @@ class GraphQueueManager:
                 all_rels.extend(t.relationships or [])
             if not all_rels:
                 await self._mark_processed([t.task_id for t in group_tasks])
-                continue
+                return
 
             source = "+".join({t.source_agent for t in group_tasks})
             try:
@@ -1056,6 +1064,13 @@ class GraphQueueManager:
                     conv_id,
                     turn_id,
                 )
+
+        group_jobs = [
+            asyncio.create_task(_process_group(conv_id, turn_id, group_tasks))
+            for (conv_id, turn_id), group_tasks in grouped.items()
+        ]
+        if group_jobs:
+            await asyncio.gather(*group_jobs, return_exceptions=False)
 
     # TTL cleanup
     #
@@ -1139,6 +1154,3 @@ def make_extraction_task(
         system_prompt_id=prompt_id,
         llm_config=llm_config,
     )
-
-
-
