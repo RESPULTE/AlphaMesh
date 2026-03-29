@@ -84,6 +84,7 @@ class Settings(BaseSettings):
 
     # ── NewsAPI ───────────────────────────────────────────────────────────────
     NEWSAPI_KEY: Optional[str] = None
+    NEWS_FETCH_MAX_ARTICLES: int = 8
 
     FINANCIAL_DOMAINS: str = ",".join(
         [

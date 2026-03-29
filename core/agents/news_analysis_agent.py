@@ -378,10 +378,6 @@ class NewsAnalysisAgent(AbstractAgent):
                 q=q,
                 from_date=state.start_date.isoformat(),
                 to_date=state.end_date.isoformat(),
-                language="en",
-                sort_by="relevancy",
-                page=1,
-                page_size=50,
             )
             publish_success("news_agent", f"Fetched {len(articles)} article(s)")
         except Exception as exc:
@@ -678,11 +674,3 @@ class NewsAnalysisAgent(AbstractAgent):
             "relationships_extracted": relationships_extracted,
             "sentiment": sentiment,
         }
-
-
-
-
-
-
-
-

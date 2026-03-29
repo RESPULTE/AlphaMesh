@@ -176,7 +176,7 @@ async def fetch_articles(
     *,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-    page_size: int = 10,
+    page_size: int = settings.NEWS_FETCH_MAX_ARTICLES,
     page: int = 1,
     language: str = "en",
     sort_by: str = "relevancy",
@@ -211,6 +211,8 @@ async def fetch_articles(
     """
     loop = asyncio.get_running_loop()
     client = NewsApiClient(api_key=settings.NEWSAPI_KEY)
+    if page_size > settings.NEWS_FETCH_MAX_ARTICLES:
+        page_size = settings.NEWS_FETCH_MAX_ARTICLES
 
     # NewsAPI is a synchronous library — run in thread pool
     try:
