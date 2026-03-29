@@ -118,6 +118,11 @@ def _constrain_date_range(
         Tuple of (constrained_start, constrained_end) as date objects in YYYY-MM-DD format
     """
     # Use consistent timezone awareness for comparison
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+
     now = datetime.now().date()
 
     api_limit_date = now - timedelta(days=api_limit_days)

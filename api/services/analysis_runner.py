@@ -108,7 +108,7 @@ class AnalysisRunner:
         request_id: str,
         ticker: str,
     ) -> None:
-        market_svc: MarketDataService = service_manager.get_market_data_service()
+        market_svc = service_manager.get_market_data_service()
         try:
             quote, chart = await asyncio.wait_for(
                 asyncio.gather(
