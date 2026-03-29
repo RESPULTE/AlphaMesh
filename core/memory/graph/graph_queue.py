@@ -426,7 +426,7 @@ class ConversationQueue:
 
             # Resolve user-scoped nodes (deterministic, no dedup)
             for name, etype, props in user_nodes_to_resolve:
-                node_id = await self._resolver.resolve_user_node(name, etype, props)
+                node_id = await self._resolver.resolve(name, etype, props)
                 if node_id:
                     user_entity_cache[entity_key(name, etype)] = node_id
 
