@@ -3,7 +3,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 
-from api.deps import get_current_user_from_query, get_session_service
+from api.dependencies import get_current_user_from_query, get_session_service
 from api.services.analysis_stream_service import AnalysisStreamService
 from api.services.session_service import SessionService
 

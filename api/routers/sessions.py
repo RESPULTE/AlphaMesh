@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from api.deps import get_current_user, get_session_service
+from api.dependencies import get_current_user, get_session_service
 from api.services.session_service import SessionService
 
 router = APIRouter(tags=["sessions"])
