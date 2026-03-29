@@ -62,6 +62,7 @@ from core.agents.prompts.fundamental_agent_prompts import (
     _TOOL_PLANNER_SYSTEM,
     _TOOL_PLANNER_USER,
 )
+from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.logger import get_logger
 from core.memory.graph.extraction_prompts import DEFERRED_RELATIONSHIP_SYSTEM_PROMPT
 from core.memory.graph.graph_queue import make_extraction_task
@@ -150,6 +151,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             subgraph_id=final_state.get("subgraph_id"),
             subgraph_task=final_state.get("subgraph_task"),
             relationships_extracted=final_state.get("relationships_extracted", False),
+            sentiment=final_state.get("sentiment"),
         )
 
     # ── Graph wiring ──────────────────────────────────────────────────────────
@@ -632,7 +634,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     HumanMessage(content=analysis_prompt),
                 ]
             )
-            analysis_text = response.content if response else ""
+            raw = response.content if response else ""
+            sentiment = parse_sentiment_block(raw)  # ← parse before stripping
+            analysis_text = strip_sentiment_block(raw)
             success = True
         except Exception as exc:
             logger.error("[analyst] Analysis LLM call failed: %s", exc)
@@ -664,6 +668,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "analysis": analysis_text,
             "relationships_extracted": False,
             "subgraph_id": task_id,
+            "sentiment": sentiment,
         }
 
     def _extract_relevant_rows(

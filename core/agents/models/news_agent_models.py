@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
 from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.agents.models.base_agent_models import BaseAgentOutput
+from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
 from core.memory.graph.models import EntityNode
 from core.memory.retrieval.models import RetrievedChunk
 
@@ -21,19 +20,10 @@ class CitedSource(BaseModel):
     page_content: str = Field(description="The content of the article.")
 
 
-class NewsAgentState(BaseModel):
+class NewsAgentState(BaseAgentInput):
     """State container for the news analysis agent."""
 
     model_config = ConfigDict(extra="ignore")
-
-    # ── Inputs set by the agent's run() method ────────────────────────────────
-    query: str
-    ticker: str
-    # date (not datetime): _constrain_date_range returns date objects.
-    # These are used only as ISO strings in fetch_articles.
-    start_date: date
-    end_date: date
-    conversation_id: Optional[str] = Field(default=None)
 
     # ── Internal pipeline state ───────────────────────────────────────────────
     # memory_task is created in _rewrite_queries_node and awaited in

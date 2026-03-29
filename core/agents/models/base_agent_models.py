@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import date
 from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class AgentSentiment(BaseModel):
+    """Structured sentiment produced by the LLM at the end of each agent's analysis."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    score: int = Field(
+        default=50,
+        ge=0,
+        le=100,
+        description="0 = maximally bearish, 50 = neutral, 100 = maximally bullish.",
+    )
+    label: str = Field(
+        default="NEUTRAL",
+        description="One of: STRONG BUY | BUY | NEUTRAL | SELL | STRONG SELL",
+    )
+    rationale: str = Field(
+        default="",
+        description="1-2 sentence justification grounded in the retrieved evidence.",
+    )
 
 
 class BaseAgentInput(BaseModel):
@@ -28,10 +49,10 @@ class BaseAgentInput(BaseModel):
         default_factory=list,
         description="List of financial metrics to analyze (if applicable).",
     )
-    start_date: Optional[datetime] = Field(
+    start_date: Optional[date] = Field(
         default=None, description="Start date (format: YYYY-MM-DD)."
     )
-    end_date: Optional[datetime] = Field(
+    end_date: Optional[date] = Field(
         default=None, description="End date (format: YYYY-MM-DD)."
     )
 
@@ -39,6 +60,8 @@ class BaseAgentInput(BaseModel):
     # NOTE: Do not exclude from serialization; LangGraph initial state is built
     # from model_dump() and downstream agents need this for graph queue writes.
     conversation_id: Optional[str] = Field(default=None)
+
+    sentiment: Optional[AgentSentiment] = Field(default=None)
 
     granularity: Optional[Literal["yearly", "quarterly"]] = Field(
         default="yearly",
@@ -80,6 +103,7 @@ class BaseAgentOutput(BaseModel, ABC):
             "Populated by each agent's final node before returning."
         ),
     )
+    sentiment: Optional[AgentSentiment] = Field(default=None)
     # subgraph_task removed: SubgraphExtractionService.schedule() manages its
     # own background task internally and returns only the subgraph_id string.
     subgraph_id: Optional[str] = Field(default=None, exclude=True)

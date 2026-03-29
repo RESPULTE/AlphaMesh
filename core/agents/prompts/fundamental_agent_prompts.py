@@ -121,4 +121,27 @@ Write a comprehensive, evidence-based analysis:
   from OperatingCF and CapEx), explain how it was derived.
 - Convert raw large numbers to human-readable form (1.5e9 → '1.5 Billion').
 - Be concise but comprehensive.
+
+═══════════════════════════════════════════════════════════════
+REQUIRED OUTPUT STRUCTURE
+═══════════════════════════════════════════════════════════════
+
+Write your analysis as free-form prose first, then close with a <sentiment> block.
+
+<sentiment>
+{
+  "score": <integer 0-100, where 0 = maximally bearish, 50 = neutral, 100 = maximally bullish>,
+  "label": "<one of: STRONG BUY | BUY | NEUTRAL | SELL | STRONG SELL>",
+  "rationale": "<1-2 sentences grounding the score in specific quantitative evidence from the data>"
+}
+</sentiment>
+
+Scoring rules:
+- Base the score on the QUANTITATIVE EVIDENCE in the DataFrame and tool results.
+- Healthy and accelerating margins, strong FCF, low leverage → higher score.
+- Declining margins, high leverage, negative FCF, DCF below market price → lower score.
+- "STRONG BUY" ≥ 75  |  "BUY" 60-74  |  "NEUTRAL" 40-59  |  "SELL" 25-39  |  "STRONG SELL" < 25
+- If data is insufficient to form a view (e.g. empty DataFrame), set score=50, label="NEUTRAL".
+
+The <sentiment> block MUST be valid JSON.  Do not output anything after </sentiment>.
 """

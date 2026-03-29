@@ -52,6 +52,28 @@ async def lifespan(app: FastAPI):
 
     await service_manager.startup()
 
+    # In lifespan, after service_manager.startup():
+    from api.services.session_service import SessionService
+
+    _session_svc = SessionService()
+    await _session_svc.initialize()
+
+    # Replace CORS allowed_origins:
+    allow_origins = (settings.allowed_origins_list,)
+
+    # Add new routers:
+    from api.middleware.error_handling import register_exception_handlers
+    from api.middleware.rate_limiting import RateLimitMiddleware
+    from api.routers import analyze as analyze_router
+    from api.routers import market as market_router
+    from api.routers import sessions as sessions_router
+
+    app.include_router(analyze_router.router, prefix="/api")
+    app.include_router(market_router.router, prefix="/api/market")
+    app.include_router(sessions_router.router, prefix="/api/sessions")
+    app.add_middleware(RateLimitMiddleware)
+    register_exception_handlers(app)
+
     # ── Conversation persistence ───────────────────────────────────────────────
     from core.config import settings
 

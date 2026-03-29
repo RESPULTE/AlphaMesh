@@ -201,7 +201,19 @@ class OrchestratorAgent:
         )
 
         try:
-            raw = await self._graph.ainvoke(initial_state)
+            raw = await asyncio.wait_for(
+                self._graph.ainvoke(initial_state),
+                timeout=settings.ORCHESTRATOR_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "OrchestratorAgent.run() timed out (%.0fs) for conversation '%s'",
+                settings.ORCHESTRATOR_TIMEOUT_SECONDS,
+                conversation_id,
+            )
+            return FinalResponse(
+                summary="Analysis timed out. Please try a more specific query."
+            )
         except Exception:
             logger.exception("Graph invocation failed")
             return FinalResponse(

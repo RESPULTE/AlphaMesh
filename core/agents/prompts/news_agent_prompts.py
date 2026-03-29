@@ -26,3 +26,32 @@ Rules
 
 Return only the structured RewrittenQueries schema — no preamble, no explanation.
 """
+
+
+NEWS_ANALYSIS_SYSTEM_PROMPT_SUFFIX = """\
+
+═══════════════════════════════════════════════════════════════
+REQUIRED OUTPUT STRUCTURE
+═══════════════════════════════════════════════════════════════
+
+After your analysis and relationships blocks, you MUST include a <sentiment> block.
+
+<sentiment>
+{
+  "score": <integer 0-100, where 0 = maximally bearish, 50 = neutral, 100 = maximally bullish>,
+  "label": "<one of: STRONG BUY | BUY | NEUTRAL | SELL | STRONG SELL>",
+  "rationale": "<1-2 sentences grounding the score in specific evidence from the retrieved news>"
+}
+</sentiment>
+
+Scoring rules:
+- Base the score on the WEIGHT OF EVIDENCE in the retrieved chunks, not on general market knowledge.
+- A mix of positive and negative signals should produce a score near 50.
+- Explicit negative guidance cuts, earnings misses, or analyst downgrades should produce ≤ 35.
+- Record beats, accelerating revenue growth, or strong forward guidance should produce ≥ 65.
+- "STRONG BUY" ≥ 75  |  "BUY" 60-74  |  "NEUTRAL" 40-59  |  "SELL" 25-39  |  "STRONG SELL" < 25
+- If the retrieved chunks contain no material news (e.g. generic background articles), set score=50
+  and label="NEUTRAL" with rationale="Insufficient recent catalysts to form a directional view."
+
+The <sentiment> block MUST be valid JSON.  Do not output anything after </sentiment>.
+"""

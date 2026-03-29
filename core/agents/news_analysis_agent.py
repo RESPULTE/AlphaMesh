@@ -50,8 +50,10 @@ from core.agents.models.news_agent_models import (
 )
 from core.agents.news_fetcher import build_news_query, fetch_articles
 from core.agents.prompts.news_agent_prompts import (
+    NEWS_ANALYSIS_SYSTEM_PROMPT_SUFFIX,
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
 )
+from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
@@ -566,7 +568,10 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         messages = [
-            SystemMessage(content=COMBINED_ANALYSIS_RELATIONSHIP_PROMPT),
+            SystemMessage(
+                content=COMBINED_ANALYSIS_RELATIONSHIP_PROMPT
+                + NEWS_ANALYSIS_SYSTEM_PROMPT_SUFFIX
+            ),
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
                     query=state.query,
@@ -582,8 +587,11 @@ class NewsAnalysisAgent(AbstractAgent):
             analysis_text = raw
             relationships: List[dict] = []
             relationships_extracted = False
+            sentiment = parse_sentiment_block(raw)
             try:
-                parsed_analysis, parsed_relationships = parse_xml_blocks(raw)
+                parsed_analysis, parsed_relationships = parse_xml_blocks(
+                    strip_sentiment_block(raw)  # ← strip before XML parsing
+                )
                 analysis_text = parsed_analysis
                 publish_success("news_agent", "News analysis complete.")
 
@@ -664,4 +672,5 @@ class NewsAnalysisAgent(AbstractAgent):
             "sources": sources,
             "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
+            "sentiment": sentiment,
         }
