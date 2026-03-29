@@ -259,18 +259,3 @@ def build_writeback_system_prompt(
 # ──────────────────────────────────────────────────────────────────────────────
 # Fundamental analysis agent prompts
 # ──────────────────────────────────────────────────────────────────────────────
-
-NEWS_ANALYSIS_USER_PROMPT = """\
-Question: {query}
-
-{entities_section}Context:
-{context}
-
-Provide a concise, evidence-based analysis. When extracting relationships, you may use the known entities list; do not invent new entities.
-""".strip()
-
-LEAN_SUMMARY_SYSTEM_PROMPT = """\
-Extract financial facts. Output 1-2 sentences only.
-Include: company/ticker, metric or topic, value or direction, time period.
-No preamble. No filler. If no financial fact is present, output exactly: NO_FINANCIAL_DATA
-""".strip()

@@ -38,7 +38,7 @@ After your analysis and relationships blocks, you MUST include a <sentiment> blo
 
 <sentiment>
 {
-  "score": <integer 0-100, where 0 = maximally bearish, 50 = neutral, 100 = maximally bullish>,
+  "score": <integer 0 to 100, where 0 = maximally bearish, 50 = neutral, 100 = maximally bullish>,
   "label": "<one of: STRONG BUY | BUY | NEUTRAL | SELL | STRONG SELL>",
   "rationale": "<1-2 sentences grounding the score in specific evidence from the retrieved news>"
 }
@@ -55,3 +55,12 @@ Scoring rules:
 
 The <sentiment> block MUST be valid JSON.  Do not output anything after </sentiment>.
 """
+
+NEWS_ANALYSIS_USER_PROMPT = """\
+Question: {query}
+
+{entities_section}Context:
+{context}
+
+Provide a concise, evidence-based analysis. When extracting relationships, you may use the known entities list; do not invent new entities.
+""".strip()

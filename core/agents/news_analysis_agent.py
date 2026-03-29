@@ -51,12 +51,18 @@ from core.agents.models.news_agent_models import (
 from core.agents.news_fetcher import build_news_query, fetch_articles
 from core.agents.prompts.news_agent_prompts import (
     NEWS_ANALYSIS_SYSTEM_PROMPT_SUFFIX,
+    NEWS_ANALYSIS_USER_PROMPT,
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
 )
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
+from core.memory.graph.extraction_prompts import (
+    COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
+    DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+)
+from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
 from core.memory.graph.utils import parse_xml_blocks
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.services import service_manager
@@ -518,18 +524,6 @@ class NewsAnalysisAgent(AbstractAgent):
 
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Generate a grounded financial analysis from retrieved chunks."""
-        import re as _re
-
-        from core.agents.models.news_agent_models import CitedSource
-        from core.agents.prompts.orchestrator_agent_prompts import (
-            NEWS_ANALYSIS_USER_PROMPT,
-        )
-        from core.memory.graph.extraction_prompts import (
-            COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
-            DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-        )
-        from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
-        from core.memory.retrieval.models import RetrievedChunk
 
         chunks = state.final_chunks
         if not chunks:
