@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from typing import Optional
 from uuid import uuid4
@@ -28,40 +27,6 @@ from core.memory.conversation.store import ConversationStore
 from core.services import service_manager
 
 logger = logging.getLogger(__name__)
-
-_TICKER_RE = re.compile(r"\$?\b[A-Z]{1,5}\b")
-_STOPWORDS = {
-    "THE",
-    "AND",
-    "FOR",
-    "WITH",
-    "FROM",
-    "THIS",
-    "THAT",
-    "YOUR",
-    "WHAT",
-    "WILL",
-    "HAVE",
-    "HOLD",
-    "LONG",
-    "SHORT",
-    "ABOUT",
-    "FROM",
-    "INTO",
-    "OVER",
-}
-
-
-def _extract_ticker_candidate(text: str) -> Optional[str]:
-    if not text:
-        return None
-    candidates = _TICKER_RE.findall(text.upper())
-    for raw in candidates:
-        t = raw.replace("$", "")
-        if t and t not in _STOPWORDS:
-            return t
-    return None
-
 
 def _build_metrics_payload(final_response) -> Optional[DataFramePayload]:
     fundamental_df = getattr(final_response, "fundamental_data", None)
@@ -165,6 +130,7 @@ class AnalysisRunner:
 
         loop = asyncio.get_running_loop()
         t_start = time.monotonic()
+        market_data_emitted = False
 
         # -- 1. Register response group + SSE sink -----------------------------
         response_label = queue.start_response("orchestrator")
@@ -182,13 +148,40 @@ class AnalysisRunner:
         # -- 2. Bind ContextVar so agents publish to the right group ------------
         token = _current_response_label.set(response_label)
 
-        # -- 2a. Start market data fetch (best-effort) --------------------------
-        ticker_candidate = _extract_ticker_candidate(chat_request.message or "")
-        if ticker_candidate:
+        # -- 2a. Market data fetch is driven by validated ticker events ---------
+        def _schedule_market_data(ticker: str) -> None:
+            nonlocal market_data_emitted
+            if market_data_emitted:
+                return
+            market_data_emitted = True
             asyncio.create_task(
-                self._emit_market_data(event_queue, request_id, ticker_candidate),
+                self._emit_market_data(event_queue, request_id, ticker),
                 name=f"market_{request_id[:8]}",
             )
+
+        class _MarketDataSink:
+            def on_event(self, event) -> None:
+                if event.response_id != response_id:
+                    return
+                data = getattr(event, "data", None) or {}
+                if data.get("event_type") != "ticker_resolved":
+                    return
+                ticker = data.get("ticker") or (data.get("tickers") or [None])[0]
+                if not ticker:
+                    return
+                try:
+                    loop.call_soon_threadsafe(_schedule_market_data, str(ticker))
+                except RuntimeError:
+                    _schedule_market_data(str(ticker))
+
+            def on_group_opened(self, group) -> None:
+                pass
+
+            def on_group_closed(self, group) -> None:
+                pass
+
+        market_sink = _MarketDataSink()
+        queue.add_sink(market_sink)
 
         try:
             # -- 3. Prepare conversation ---------------------------------------
@@ -206,7 +199,7 @@ class AnalysisRunner:
             )
 
             final_ticker = (getattr(final_response, "tickers", []) or [None])[0]
-            if final_ticker and final_ticker != ticker_candidate:
+            if final_ticker and not market_data_emitted:
                 await self._emit_market_data(event_queue, request_id, final_ticker)
 
             # -- 5. Persist conversation turn ----------------------------------
@@ -265,6 +258,7 @@ class AnalysisRunner:
         finally:
             # -- Teardown: remove sink, reset ContextVar, close response group --
             queue.remove_sink(sink)
+            queue.remove_sink(market_sink)
             _current_response_label.reset(token)
             # Close the response group without touching _active_group (race-safe)
             if response_group.is_open:

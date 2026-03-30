@@ -39,8 +39,13 @@ class _DataPrepConfig:
     start_dt: datetime
     end_dt: datetime
     form_type: str  # "10-K" | "10-Q"
-    price_interval: str  # "yearly" | "quarterly"
+    price_interval: str  # "daily" | "monthly"
     periods: List  # List[int] for 10-K, List[Tuple[int,int]] for 10-Q
+
+
+def _price_interval_from_span(start: datetime, end: datetime) -> str:
+    span_days = max(0, (end - start).days)
+    return "daily" if span_days <= 31 else "monthly"
 
 
 def _normalize_period_ends(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
@@ -83,6 +88,9 @@ def _resolve_date_range(state: _AgentState) -> _DataPrepConfig:
     """
     granularity: str = getattr(state, "granularity", "yearly") or "yearly"
     end_dt = state.end_date or datetime.now()
+    price_interval = _price_interval_from_span(
+        state.start_date or end_dt, end_dt
+    )
 
     if granularity == "yearly":
         default_start = datetime(end_dt.year - 4, 1, 1)
@@ -99,7 +107,7 @@ def _resolve_date_range(state: _AgentState) -> _DataPrepConfig:
             start_dt=start_dt,
             end_dt=end_dt,
             form_type="10-K",
-            price_interval="yearly",
+            price_interval=price_interval,
             periods=periods,
         )
     else:
@@ -110,7 +118,7 @@ def _resolve_date_range(state: _AgentState) -> _DataPrepConfig:
             start_dt=start_dt,
             end_dt=end_dt,
             form_type="10-Q",
-            price_interval="quarterly",
+            price_interval=price_interval,
             periods=periods,
         )
 
@@ -180,7 +188,13 @@ def _canonical_date_strs(index: Any, granularity: str) -> list:
     for val in index:
         try:
             ts = pd.Timestamp(val)
-            if granularity == "yearly":
+            if granularity == "daily":
+                result.append(ts.normalize().strftime("%Y-%m-%d"))
+            elif granularity == "monthly":
+                result.append(
+                    ts.to_period("M").end_time.normalize().strftime("%Y-%m-%d")
+                )
+            elif granularity == "yearly":
                 result.append(ts.replace(month=12, day=31).strftime("%Y-%m-%d"))
             else:
                 result.append(

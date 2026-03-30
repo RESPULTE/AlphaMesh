@@ -112,7 +112,7 @@ function buildTable(payload?: DataFramePayload | null): AgentAnalysis['tableData
     const rowLabel = payload.index[r];
     const rowValues = payload.data[r]
       .slice(columnStart)
-      .map((val) => (val == null ? '—' : formatValue(val)));
+      .map((val) => (val == null ? 'ï¿½' : formatValue(val)));
     rows.push([rowLabel, ...rowValues]);
   }
   return { title: 'Financial Data', headers, rows };
@@ -245,6 +245,9 @@ export function useAnalysisStream(query: string | null) {
   const [isStreaming, setIsStreaming] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const conversationIdRef = useRef<string | null>(null);
+  const resolvedTickerRef = useRef<string>('');
+  const pendingQuoteRef = useRef<AnalysisResponse | null>(null);
+  const pendingChartRef = useRef<AnalysisResponse['chartData'] | null>(null);
 
   const stableEmail = useMemo(() => DEFAULT_USER_EMAIL, []);
 
@@ -254,6 +257,9 @@ export function useAnalysisStream(query: string | null) {
     let isMounted = true;
     setIsStreaming(true);
     setData(baseResponse());
+    resolvedTickerRef.current = '';
+    pendingQuoteRef.current = null;
+    pendingChartRef.current = null;
 
     const closeStream = () => {
       if (eventSourceRef.current) {
@@ -302,6 +308,24 @@ export function useAnalysisStream(query: string | null) {
           }
 
           if (payload.event_type === 'init') {
+            const resolvedTicker = resolvedTickerRef.current;
+            if (!resolvedTicker) {
+              pendingQuoteRef.current = {
+                ...(pendingQuoteRef.current ?? baseResponse()),
+                ticker: payload.quote.ticker ?? '',
+                companyName: payload.quote.companyName ?? '',
+                currentPrice: payload.quote.currentPrice ?? null,
+                priceChange: payload.quote.priceChange ?? null,
+                priceChangePercent: payload.quote.priceChangePercent ?? null,
+                marketStatus: payload.quote.marketStatus ?? 'MARKET DATA UNAVAILABLE'
+              };
+              return;
+            }
+
+            if ((payload.quote.ticker || '').toUpperCase() !== resolvedTicker) {
+              return;
+            }
+
             setData((prev) => {
               const current = prev ?? baseResponse();
               return {
@@ -318,10 +342,45 @@ export function useAnalysisStream(query: string | null) {
           }
 
           if (payload.event_type === 'chart') {
+            const resolvedTicker = resolvedTickerRef.current;
+            if (!resolvedTicker) {
+              pendingChartRef.current = payload.chart ?? [];
+              return;
+            }
             setData((prev) => (prev ? { ...prev, chartData: payload.chart ?? [] } : prev));
             return;
           }
+          if (payload.event_type === 'ticker_resolved') {
+            const resolved = (payload.ticker || payload.tickers?.[0] || '').toUpperCase();
+            if (resolved) {
+              resolvedTickerRef.current = resolved;
+              const pendingQuote = pendingQuoteRef.current;
+              if (
+                pendingQuote &&
+                (pendingQuote.ticker || '').toUpperCase() === resolved
+              ) {
+                setData((prev) => {
+                  const current = prev ?? baseResponse();
+                  return {
+                    ...current,
+                    ticker: pendingQuote.ticker || current.ticker,
+                    companyName: pendingQuote.companyName || current.companyName,
+                    currentPrice: pendingQuote.currentPrice ?? current.currentPrice,
+                    priceChange: pendingQuote.priceChange ?? current.priceChange,
+                    priceChangePercent:
+                      pendingQuote.priceChangePercent ?? current.priceChangePercent,
+                    marketStatus: pendingQuote.marketStatus || current.marketStatus
+                  };
+                });
+              }
 
+              const pendingChart = pendingChartRef.current;
+              if (pendingChart && pendingChart.length) {
+                setData((prev) => (prev ? { ...prev, chartData: pendingChart } : prev));
+              }
+            }
+            return;
+          }
           if (payload.event_type === 'metrics') {
             setData((prev) => {
               if (!prev) return prev;
@@ -332,6 +391,35 @@ export function useAnalysisStream(query: string | null) {
 
           if (payload.event_type === 'complete' && payload.result) {
             const mapped = mapFinalResult(payload.result);
+            const finalTicker = (payload.result.ticker_results?.[0]?.ticker || '').toUpperCase();
+            resolvedTickerRef.current = finalTicker;
+
+            if (finalTicker) {
+              const pendingQuote = pendingQuoteRef.current;
+              if (
+                pendingQuote &&
+                (pendingQuote.ticker || '').toUpperCase() === finalTicker
+              ) {
+                setData((prev) => {
+                  const current = prev ?? baseResponse();
+                  return {
+                    ...current,
+                    ticker: pendingQuote.ticker || current.ticker,
+                    companyName: pendingQuote.companyName || current.companyName,
+                    currentPrice: pendingQuote.currentPrice ?? current.currentPrice,
+                    priceChange: pendingQuote.priceChange ?? current.priceChange,
+                    priceChangePercent:
+                      pendingQuote.priceChangePercent ?? current.priceChangePercent,
+                    marketStatus: pendingQuote.marketStatus || current.marketStatus
+                  };
+                });
+              }
+
+              const pendingChart = pendingChartRef.current;
+              if (pendingChart && pendingChart.length) {
+                setData((prev) => (prev ? { ...prev, chartData: pendingChart } : prev));
+              }
+            }
             setData((prev) => mergeFinalWithLive(mapped, prev as AnalysisResponse));
             setIsStreaming(false);
             closeStream();

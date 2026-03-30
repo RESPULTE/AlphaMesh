@@ -74,8 +74,8 @@ export interface AnalysisResponse {
  * API Integration Notes
  *
  * Current flow:
- * 1) POST /api/v1/chat  — start analysis, returns request_id
- * 2) GET  /api/v1/stream/{request_id}  — SSE stream
+ * 1) POST /api/v1/chat  ï¿½ start analysis, returns request_id
+ * 2) GET  /api/v1/stream/{request_id}  ï¿½ SSE stream
  *
  * The stream emits `progress`, `init`, `chart`, `metrics`, `complete`, or `error`.
  * We map incremental payloads into the AnalysisResponse shape used by the UI.
@@ -143,4 +143,10 @@ export type StreamEvent =
       event_type: 'metrics';
       request_id: string;
       financial_data: DataFramePayload;
+    }
+  | {
+      event_type: 'ticker_resolved';
+      request_id: string;
+      ticker?: string;
+      tickers?: string[];
     };

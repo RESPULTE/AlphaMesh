@@ -678,11 +678,16 @@ Agents read this via the publish helpers below — they never set it themselves.
 
 
 def _agent_publish(
-    source: str, message: str, level: "EventLevel"
+    source: str,
+    message: str,
+    level: "EventLevel",
+    data: Optional[Dict[str, Any]] = None,
 ) -> None:  # noqa: F821
     """Internal: publish one event using the active response label (if any)."""
     label = _current_response_label.get()
-    get_queue().publish(source, message, level=level, response_label=label)
+    get_queue().publish(
+        source, message, level=level, data=data, response_label=label
+    )
 
 
 def publish_progress(source: str, message: str) -> None:
@@ -703,6 +708,19 @@ def publish_warning(source: str, message: str) -> None:
 def publish_error_event(source: str, message: str) -> None:
     """Publish an ERROR-level event from an agent node."""
     _agent_publish(source, message, EventLevel.ERROR)  # noqa: F821
+
+
+def publish_frontend_event(
+    source: str, event_type: str, payload: Dict[str, Any]
+) -> None:
+    """
+    Publish a structured event intended for the frontend SSE stream.
+
+    The SSESink forwards events with a data["event_type"] field as
+    first-class SSE event types.
+    """
+    data = {"event_type": event_type, **payload}
+    _agent_publish(source, f"frontend_event:{event_type}", EventLevel.INFO, data=data)
 
 
 # ─────────────────────────────────────────────────────────────

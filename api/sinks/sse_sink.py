@@ -57,15 +57,23 @@ class SSESink:
         """Filter to this request's response group, then enqueue for SSE."""
         if event.response_id != self._response_id:
             return
-
-        payload: dict = {
-            "event_type": "progress",
-            "request_id": self._request_id,
-            "source": event.source,
-            "level": event.level.label,
-            "message": event.message,
-            "timestamp": event.timestamp.isoformat(),
-        }
+        data = event.data or {}
+        event_type = data.get("event_type")
+        if event_type:
+            payload = {
+                "event_type": event_type,
+                "request_id": self._request_id,
+                **{k: v for k, v in data.items() if k != "event_type"},
+            }
+        else:
+            payload = {
+                "event_type": "progress",
+                "request_id": self._request_id,
+                "source": event.source,
+                "level": event.level.label,
+                "message": event.message,
+                "timestamp": event.timestamp.isoformat(),
+            }
         # call_soon_threadsafe is safe from both in-loop and thread contexts
         try:
             self._loop.call_soon_threadsafe(self._safe_put, payload)

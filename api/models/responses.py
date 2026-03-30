@@ -165,7 +165,15 @@ class StreamEvent(BaseModel):
       error     — unrecoverable failure; stream ends after this
     """
 
-    event_type: Literal["progress", "complete", "error", "init", "chart", "metrics"]
+    event_type: Literal[
+        "progress",
+        "complete",
+        "error",
+        "init",
+        "chart",
+        "metrics",
+        "ticker_resolved",
+    ]
     request_id: str
 
     # ── present when event_type == "progress" ─────────────────────────────
@@ -188,6 +196,10 @@ class StreamEvent(BaseModel):
 
     # -- present when event_type == "metrics" (fundamentals DataFrame) ---------
     financial_data: Optional[DataFramePayload] = None
+
+    # -- present when event_type == "ticker_resolved" --------------------------
+    ticker: Optional[str] = None
+    tickers: Optional[List[str]] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
