@@ -23,11 +23,12 @@ from api.models.requests import ChatRequest
 from api.models.responses import DataFramePayload, FinalResult, SourceItem, TickerResult
 from api.services.event_broadcaster import EventBroadcaster
 from api.sinks.sse_sink import SSESink
-from core.memory.conversation.store import ConversationStore
+from core.memory.conversation.conversation_service import ConversationStore
 from core.memory.sessions.session_service import SessionService
 from core.services import service_manager
 
 logger = logging.getLogger(__name__)
+
 
 def _build_metrics_payload(final_response) -> Optional[DataFramePayload]:
     fundamental_df = getattr(final_response, "fundamental_data", None)
@@ -204,9 +205,7 @@ class AnalysisRunner:
 
         try:
             # -- 3. Prepare conversation ---------------------------------------
-            await self._store.ensure_conversation(
-                conversation_id, user_id
-            )
+            await self._store.ensure_conversation(conversation_id, user_id)
             await self._session_service.link_conversation(
                 user_id=user_id,
                 session_id=session_id,

@@ -316,7 +316,7 @@ class ServiceManager:
         return self._ticker_validator
 
     def get_conversation_store(self):
-        from core.memory.conversation.store import ConversationStore
+        from core.memory.conversation.conversation_service import ConversationStore
         from core.memory.conversation.sql_store import SQLiteConversationStore
 
         if self._conversation_store is None:

@@ -4,21 +4,20 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from core.memory.stores.contracts.session import SessionPersistenceAdapter
 from core.memory.stores.sqlite_adapter import SQLiteAdapter
 
 
-class SQLiteSessionStore(SessionPersistenceAdapter):
+class SQLiteSessionStore(SQLiteAdapter):
     """Stores login sessions and session-conversation links in SQLite."""
 
     def __init__(self, db_path: str) -> None:
-        self._sql = SQLiteAdapter(db_path)
+        super().__init__(db_path)
         self._initialized = False
 
     async def initialize(self) -> None:
         if self._initialized:
             return
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE TABLE IF NOT EXISTS login_sessions (
                 session_id    TEXT PRIMARY KEY,
@@ -30,7 +29,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
             )
             """
         )
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE TABLE IF NOT EXISTS session_conversations (
                 session_id      TEXT NOT NULL,
@@ -41,13 +40,13 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
             )
             """
         )
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_login_sessions_user_created
             ON login_sessions (user_id, created_at DESC)
             """
         )
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sc_user_conversation
             ON session_conversations (user_id, conversation_id)
@@ -61,7 +60,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
         user_id: str,
         created_at: str,
     ) -> None:
-        await self._sql.execute(
+        await self.execute(
             """
             INSERT INTO login_sessions (session_id, user_id, created_at, last_seen_at, status)
             VALUES (?, ?, ?, ?, 'active')
@@ -75,7 +74,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
         user_id: str,
         last_seen_at: str,
     ) -> bool:
-        rows = await self._sql.execute_with_rowcount(
+        rows = await self.execute_with_rowcount(
             """
             UPDATE login_sessions
             SET last_seen_at = ?, status = 'active'
@@ -91,7 +90,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
         user_id: str,
         ended_at: str,
     ) -> bool:
-        rows = await self._sql.execute_with_rowcount(
+        rows = await self.execute_with_rowcount(
             """
             UPDATE login_sessions
             SET ended_at = ?, status = 'ended'
@@ -108,7 +107,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
         conversation_id: str,
         linked_at: str,
     ) -> None:
-        await self._sql.execute(
+        await self.execute(
             """
             INSERT INTO session_conversations (session_id, conversation_id, user_id, linked_at)
             VALUES (?, ?, ?, ?)
@@ -123,7 +122,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
         user_id: str,
         conversation_id: str,
     ) -> bool:
-        row = await self._sql.fetchone(
+        row = await self.fetchone(
             """
             SELECT 1
             FROM session_conversations
@@ -139,7 +138,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
         user_id: str,
         limit: int = 20,
     ) -> List[dict]:
-        return await self._sql.fetchall(
+        return await self.fetchall(
             """
             SELECT session_id, user_id, created_at, last_seen_at, ended_at, status
             FROM login_sessions
@@ -154,7 +153,7 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
         self,
         user_id: str,
     ) -> Optional[str]:
-        row = await self._sql.fetchone(
+        row = await self.fetchone(
             """
             SELECT session_id
             FROM login_sessions
@@ -165,4 +164,3 @@ class SQLiteSessionStore(SessionPersistenceAdapter):
             (user_id,),
         )
         return str(row["session_id"]) if row else None
-

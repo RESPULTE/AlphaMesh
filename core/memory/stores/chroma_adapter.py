@@ -11,12 +11,11 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from core.logger import get_logger
-from core.memory.stores.contracts.vector import VectorStoreAdapter
 
 _LIST_FIELDS = {"companies_involved", "nodeset_ids"}
 
 
-class ChromaDBAdapter(VectorStoreAdapter):
+class ChromaDBAdapter:
     """Encapsulates local Chroma operations via LangChain's Chroma wrapper."""
 
     def __init__(
@@ -113,7 +112,9 @@ class ChromaDBAdapter(VectorStoreAdapter):
             raise ValueError("Embedding function is required for chunk upsert.")
         try:
             documents = [
-                Document(page_content=text, metadata=self._serialize_metadata(meta), id=id_)
+                Document(
+                    page_content=text, metadata=self._serialize_metadata(meta), id=id_
+                )
                 for id_, text, meta in zip(chunk_ids, texts, metadatas, strict=False)
             ]
             await self.add_documents(documents, chunk_ids)
@@ -197,6 +198,7 @@ class ChromaDBAdapter(VectorStoreAdapter):
             texts=texts,
             metadatas=metadatas,
         )
+
     async def query_entity_similar(
         self,
         text: str,
@@ -384,7 +386,9 @@ class ChromaDBAdapter(VectorStoreAdapter):
         try:
             vectorstore = await self._get_vectorstore()
             existing = await self.get_documents_by_ids(ids)
-            metadata_map = {id_: meta for id_, meta in zip(ids, metadatas, strict=False)}
+            metadata_map = {
+                id_: meta for id_, meta in zip(ids, metadatas, strict=False)
+            }
             updated_docs: List[Document] = []
             for doc in existing:
                 doc_id = self._doc_id(doc)
@@ -438,6 +442,3 @@ class ChromaDBAdapter(VectorStoreAdapter):
         except Exception as exec:
             self._logger.exception("Failed to check ChromaDB for source URL.: %s", exec)
             raise
-
-
-

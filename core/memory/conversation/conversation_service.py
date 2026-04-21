@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from core.memory.stores.contracts.conversation import ConversationPersistenceAdapter
+from core.memory.conversation.sql_store import SQLiteConversationStore
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,8 @@ class ConversationStore:
     I/O, never across agent invocations.
     """
 
-    def __init__(self, adapter: ConversationPersistenceAdapter) -> None:
-        self._adapter = adapter
+    def __init__(self, db: SQLiteConversationStore) -> None:
+        self._sql_db = db
         # conversation_id ? List[dict]  (serialised messages)
         self._cache: Dict[str, List[dict]] = {}
         # conversation_id ? asyncio.Lock
@@ -67,7 +67,7 @@ class ConversationStore:
 
     async def initialize(self) -> None:
         """Delegate schema creation to the persistence adapter."""
-        await self._adapter.initialize()
+        await self._sql_db.initialize()
 
     def _get_lock(self, conversation_id: str) -> asyncio.Lock:
         if conversation_id not in self._locks:
@@ -76,7 +76,7 @@ class ConversationStore:
 
     async def _load_from_adapter(self, conversation_id: str) -> List[dict]:
         """Load messages from the adapter and populate the in-memory cache."""
-        messages = await self._adapter.load_messages(conversation_id)
+        messages = await self._sql_db.load_messages(conversation_id)
         self._cache[conversation_id] = messages
         return messages
 
@@ -92,7 +92,7 @@ class ConversationStore:
         Safe to call multiple times (idempotent).
         """
         async with self._get_lock(conversation_id):
-            await self._adapter.ensure_conversation(conversation_id, user_email)
+            await self._sql_db.ensure_conversation(conversation_id, user_email)
 
     async def add_messages(
         self,
@@ -110,7 +110,7 @@ class ConversationStore:
             for msg in messages:
                 d = _to_dict(msg)
                 self._cache.setdefault(conversation_id, []).append(d)
-                await self._adapter.save_message(
+                await self._sql_db.save_message(
                     conversation_id,
                     role=d["role"],
                     content=d["content"],
@@ -140,6 +140,4 @@ class ConversationStore:
         limit: int = 50,
     ) -> List[dict]:
         """List recent conversations, delegating to the persistence adapter."""
-        return await self._adapter.list_conversations(
-            user_email=user_email, limit=limit
-        )
+        return await self._sql_db.list_conversations(user_email=user_email, limit=limit)

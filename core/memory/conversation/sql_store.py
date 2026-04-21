@@ -6,21 +6,20 @@ import time
 from datetime import datetime
 from typing import List, Optional
 
-from core.memory.stores.contracts.conversation import ConversationPersistenceAdapter
 from core.memory.stores.sqlite_adapter import SQLiteAdapter
 
 
-class SQLiteConversationStore(ConversationPersistenceAdapter):
+class SQLiteConversationStore(SQLiteAdapter):
     """Stores conversations and messages in SQLite."""
 
     def __init__(self, db_path: str) -> None:
-        self._sql = SQLiteAdapter(db_path)
+        super().__init__(db_path)
         self._initialized = False
 
     async def initialize(self) -> None:
         if self._initialized:
             return
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE TABLE IF NOT EXISTS conversations (
                 conversation_id TEXT PRIMARY KEY,
@@ -30,7 +29,7 @@ class SQLiteConversationStore(ConversationPersistenceAdapter):
             )
             """
         )
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +42,7 @@ class SQLiteConversationStore(ConversationPersistenceAdapter):
             )
             """
         )
-        await self._sql.execute(
+        await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages (conversation_id, created_at)"
         )
         self._initialized = True
@@ -54,7 +53,7 @@ class SQLiteConversationStore(ConversationPersistenceAdapter):
         user_email: Optional[str],
     ) -> None:
         now = time.time()
-        await self._sql.execute(
+        await self.execute(
             """
             INSERT INTO conversations (conversation_id, user_email, created_at, last_message_at)
             VALUES (?, ?, ?, ?)
@@ -79,17 +78,17 @@ class SQLiteConversationStore(ConversationPersistenceAdapter):
                 ).timestamp()
             except ValueError:
                 pass
-        await self._sql.execute(
+        await self.execute(
             "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
             (conversation_id, role, content, created_at),
         )
-        await self._sql.execute(
+        await self.execute(
             "UPDATE conversations SET last_message_at = ? WHERE conversation_id = ?",
             (created_at, conversation_id),
         )
 
     async def load_messages(self, conversation_id: str) -> List[dict]:
-        rows = await self._sql.fetchall(
+        rows = await self.fetchall(
             "SELECT role, content, created_at FROM messages "
             "WHERE conversation_id = ? ORDER BY created_at ASC",
             (conversation_id,),
@@ -109,7 +108,7 @@ class SQLiteConversationStore(ConversationPersistenceAdapter):
         limit: int = 50,
     ) -> List[dict]:
         if user_email:
-            rows = await self._sql.fetchall(
+            rows = await self.fetchall(
                 "SELECT c.conversation_id, c.created_at, c.last_message_at, "
                 "COUNT(m.id) AS message_count "
                 "FROM conversations c "
@@ -121,7 +120,7 @@ class SQLiteConversationStore(ConversationPersistenceAdapter):
                 (user_email, limit),
             )
         else:
-            rows = await self._sql.fetchall(
+            rows = await self.fetchall(
                 "SELECT c.conversation_id, c.created_at, c.last_message_at, "
                 "COUNT(m.id) AS message_count "
                 "FROM conversations c "
@@ -140,4 +139,3 @@ class SQLiteConversationStore(ConversationPersistenceAdapter):
             }
             for row in rows
         ]
-

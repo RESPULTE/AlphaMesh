@@ -6,21 +6,20 @@ import json
 import time
 from typing import Any, Dict, List
 
-from core.memory.stores.contracts.graph_tasks import GraphTaskPersistenceAdapter
 from core.memory.stores.sqlite_adapter import SQLiteAdapter
 
 
-class GraphTaskSqlStore(GraphTaskPersistenceAdapter):
+class GraphTaskSqlStore(SQLiteAdapter):
     """Durable storage for queued graph tasks."""
 
     def __init__(self, db_path: str) -> None:
-        self._sql = SQLiteAdapter(db_path)
+        super().__init__(db_path)
         self._initialized = False
 
     async def initialize(self) -> None:
         if self._initialized:
             return
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE TABLE IF NOT EXISTS graph_tasks (
                 task_id         TEXT PRIMARY KEY,
@@ -40,7 +39,7 @@ class GraphTaskSqlStore(GraphTaskPersistenceAdapter):
             )
             """
         )
-        await self._sql.execute(
+        await self.execute(
             """
             CREATE TABLE IF NOT EXISTS graph_prompt_registry (
                 prompt_id   TEXT PRIMARY KEY,
@@ -49,16 +48,16 @@ class GraphTaskSqlStore(GraphTaskPersistenceAdapter):
             )
             """
         )
-        await self._sql.execute(
+        await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_gt_status_created ON graph_tasks(status, created_at)"
         )
-        await self._sql.execute(
+        await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_gt_conversation ON graph_tasks(conversation_id, turn_id)"
         )
         self._initialized = True
 
     async def persist_task(self, task_payload: Dict[str, Any]) -> None:
-        await self._sql.execute(
+        await self.execute(
             """INSERT OR IGNORE INTO graph_tasks
                (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, task_kind, chunk_ids, status, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
@@ -89,13 +88,13 @@ class GraphTaskSqlStore(GraphTaskPersistenceAdapter):
         if not task_ids:
             return
         now = time.time()
-        await self._sql.executemany(
+        await self.executemany(
             "UPDATE graph_tasks SET status='PROCESSED', processed_at=? WHERE task_id=?",
             [(now, task_id) for task_id in task_ids],
         )
 
     async def load_pending_tasks(self) -> List[Dict[str, Any]]:
-        rows = await self._sql.fetchall(
+        rows = await self.fetchall(
             "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, task_kind, chunk_ids, created_at "
             "FROM graph_tasks WHERE status='PENDING' ORDER BY created_at ASC"
         )
@@ -110,33 +109,32 @@ class GraphTaskSqlStore(GraphTaskPersistenceAdapter):
                     "relationships": json.loads(row["relationships"] or "[]"),
                     "extraction_text": row["extraction_text"],
                     "system_prompt_id": row["system_prompt_id"],
-                    "llm_config": json.loads(row["llm_config"])
-                    if row["llm_config"]
-                    else None,
+                    "llm_config": (
+                        json.loads(row["llm_config"]) if row["llm_config"] else None
+                    ),
                     "task_kind": row["task_kind"],
-                    "chunk_ids": json.loads(row["chunk_ids"])
-                    if row["chunk_ids"]
-                    else None,
+                    "chunk_ids": (
+                        json.loads(row["chunk_ids"]) if row["chunk_ids"] else None
+                    ),
                     "created_at": row["created_at"],
                 }
             )
         return tasks
 
     async def save_prompt(self, prompt_id: str, prompt_text: str) -> None:
-        await self._sql.execute(
+        await self.execute(
             "INSERT OR IGNORE INTO graph_prompt_registry (prompt_id, prompt_text, created_at) VALUES (?, ?, ?)",
             (prompt_id, prompt_text, time.time()),
         )
 
     async def load_prompts(self) -> Dict[str, str]:
-        rows = await self._sql.fetchall(
+        rows = await self.fetchall(
             "SELECT prompt_id, prompt_text FROM graph_prompt_registry"
         )
         return {str(row["prompt_id"]): str(row["prompt_text"]) for row in rows}
 
     async def purge_processed_older_than(self, cutoff_epoch: float) -> None:
-        await self._sql.execute(
+        await self.execute(
             "DELETE FROM graph_tasks WHERE status='PROCESSED' AND processed_at < ?",
             (cutoff_epoch,),
         )
-
