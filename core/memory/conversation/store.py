@@ -92,8 +92,6 @@ class ConversationStore:
         Safe to call multiple times (idempotent).
         """
         async with self._get_lock(conversation_id):
-            if conversation_id not in self._cache:
-                self._cache[conversation_id] = []
             await self._adapter.ensure_conversation(conversation_id, user_email)
 
     async def add_messages(
@@ -107,6 +105,8 @@ class ConversationStore:
         Called once per turn: [HumanMessage(user query), AIMessage(synthesis)].
         """
         async with self._get_lock(conversation_id):
+            if conversation_id not in self._cache:
+                await self._load_from_adapter(conversation_id)
             for msg in messages:
                 d = _to_dict(msg)
                 self._cache.setdefault(conversation_id, []).append(d)

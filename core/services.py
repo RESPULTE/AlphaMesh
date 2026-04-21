@@ -335,7 +335,9 @@ class ServiceManager:
 
         if self._conversation_store is None:
             try:
-                adapter = SQLiteConversationAdapter()
+                adapter = SQLiteConversationAdapter(
+                    db_path=settings.CONVERSATIONS_DB_PATH
+                )
                 self._conversation_store = ConversationStore(adapter=adapter)
             except Exception as e:
                 print(f"Error initializing ConversationStore: {e}")
@@ -348,7 +350,7 @@ class ServiceManager:
 
         if self._session_service is None:
             try:
-                adapter = SQLiteSessionAdapter(db_path=settings.SESSIONS_DB_PATH)
+                adapter = SQLiteSessionAdapter(db_path=settings.CONVERSATIONS_DB_PATH)
                 self._session_service = SessionService(adapter=adapter)
             except Exception as e:
                 print(f"Error initializing SessionService: {e}")

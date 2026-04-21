@@ -11,15 +11,16 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from api.dependencies import get_current_user, get_store
+from api.dependencies import get_current_user, get_session_service, get_store
 from api.models.responses import (
     ConversationHistoryResponse,
     ConversationMessage,
     ConversationSummary,
 )
 from core.memory.conversation.store import ConversationStore
+from core.memory.sessions.session_service import SessionService
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 
@@ -53,8 +54,16 @@ async def list_conversations(
 )
 async def get_messages(
     conversation_id: str,
+    user_id: str = Depends(get_current_user),
+    session_svc: SessionService = Depends(get_session_service),
     store: ConversationStore = Depends(get_store),
 ) -> ConversationHistoryResponse:
+    allowed = await session_svc.user_has_conversation(
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    if not allowed:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     messages = await store.get_history(conversation_id)
     return ConversationHistoryResponse(
         conversation_id=conversation_id,

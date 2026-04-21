@@ -11,7 +11,7 @@ which keeps each router independently testable.
 
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException, Query, Request
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from api.auth.adapter import get_auth_adapter
@@ -55,22 +55,16 @@ def get_current_user(
     return email
 
 
-def get_current_user_from_query(
-    token: str = Query(..., description="JWT access token (for SSE endpoints)"),
-) -> str:
+def get_current_user_optional(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> str | None:
     """
-    Extract and validate user identity from the `token` query parameter.
-
-    SSE endpoints (GET /api/analyze) must use this variant because the
-    browser EventSource API does not allow setting custom request headers.
-
-    Returns the user's email string on success.
-    Raises HTTP 401 on missing or invalid token.
+    Best-effort user extraction from Authorization header.
+    Returns None when header is missing or invalid.
     """
-    email = get_auth_adapter().verify_access_token(token)
-    if not email:
-        raise HTTPException(status_code=401, detail="Invalid or expired access token")
-    return email
+    if not creds:
+        return None
+    return get_auth_adapter().verify_access_token(creds.credentials)
 
 
 # -- Service dependencies -----------------------------------------------------

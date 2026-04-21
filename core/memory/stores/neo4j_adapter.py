@@ -272,7 +272,7 @@ class Neo4jAdapter:
 
             if not resolved_source or not resolved_target:
                 self._logger.warning(
-                    "write_relationships: unresolved entity"
+                    "write_relationships: unresolved entity "
                     "from='%s' (%s) resolved=%s | to='%s' (%s) resolved=%s",
                     from_name,
                     from_type,
@@ -650,4 +650,3 @@ class Neo4jAdapter:
                 "user_email": user_email,
             },
         )
-

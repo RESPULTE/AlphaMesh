@@ -7,6 +7,7 @@ SQLite implementations for conversation and session persistence.
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import List, Optional
 
 import aiosqlite
@@ -93,15 +94,22 @@ class SQLiteConversationAdapter(ConversationPersistenceAdapter):
         content: str,
         timestamp: str,
     ) -> None:
-        now = time.time()
+        created_at = time.time()
+        if timestamp:
+            try:
+                created_at = datetime.fromisoformat(
+                    timestamp.replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                pass
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-                (conversation_id, role, content, now),
+                (conversation_id, role, content, created_at),
             )
             await db.execute(
                 "UPDATE conversations SET last_message_at = ? WHERE conversation_id = ?",
-                (now, conversation_id),
+                (created_at, conversation_id),
             )
             await db.commit()
 
@@ -169,11 +177,15 @@ class SQLiteConversationAdapter(ConversationPersistenceAdapter):
 
 class SQLiteSessionAdapter(SessionPersistenceAdapter):
     """
-    Stores analysis session metadata in a local SQLite file.
+    Stores login session metadata and session-conversation links in SQLite.
 
     Schema
     ------
-    sessions (session_id PK, conversation_id, user_email, ticker, query, summary, created_at)
+    login_sessions        (session_id PK, user_id, created_at, last_seen_at, ended_at, status)
+    session_conversations (session_id, conversation_id, user_id, linked_at)
+
+    Legacy compatibility table:
+    sessions (session_id, conversation_id, user_email, ticker, query, summary, created_at)
     """
 
     def __init__(self, db_path: str = _DEFAULT_SESSIONS_DB_PATH) -> None:
@@ -184,6 +196,41 @@ class SQLiteSessionAdapter(SessionPersistenceAdapter):
         if self._initialized:
             return
         async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS login_sessions (
+                    session_id    TEXT PRIMARY KEY,
+                    user_id       TEXT NOT NULL,
+                    created_at    TEXT NOT NULL,
+                    last_seen_at  TEXT NOT NULL,
+                    ended_at      TEXT,
+                    status        TEXT NOT NULL DEFAULT 'active'
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_conversations (
+                    session_id      TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    user_id         TEXT NOT NULL,
+                    linked_at       TEXT NOT NULL,
+                    PRIMARY KEY (session_id, conversation_id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_login_sessions_user_created
+                ON login_sessions (user_id, created_at DESC)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sc_user_conversation
+                ON session_conversations (user_id, conversation_id)
+                """
+            )
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -212,6 +259,106 @@ class SQLiteSessionAdapter(SessionPersistenceAdapter):
             await db.commit()
         self._initialized = True
 
+    async def create_login_session(
+        self,
+        session_id: str,
+        user_id: str,
+        created_at: str,
+    ) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO login_sessions (session_id, user_id, created_at, last_seen_at, status)
+                VALUES (?, ?, ?, ?, 'active')
+                """,
+                (session_id, user_id, created_at, created_at),
+            )
+            await db.commit()
+
+    async def touch_login_session(
+        self,
+        session_id: str,
+        user_id: str,
+        last_seen_at: str,
+    ) -> bool:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                UPDATE login_sessions
+                SET last_seen_at = ?, status = 'active'
+                WHERE session_id = ? AND user_id = ?
+                """,
+                (last_seen_at, session_id, user_id),
+            )
+            await db.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def end_login_session(
+        self,
+        session_id: str,
+        user_id: str,
+        ended_at: str,
+    ) -> bool:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                UPDATE login_sessions
+                SET ended_at = ?, status = 'ended'
+                WHERE session_id = ? AND user_id = ?
+                """,
+                (ended_at, session_id, user_id),
+            )
+            await db.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def link_session_conversation(
+        self,
+        session_id: str,
+        user_id: str,
+        conversation_id: str,
+        linked_at: str,
+    ) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO session_conversations (session_id, conversation_id, user_id, linked_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (session_id, conversation_id) DO UPDATE
+                SET linked_at = excluded.linked_at
+                """,
+                (session_id, conversation_id, user_id, linked_at),
+            )
+            await db.commit()
+
+    async def user_has_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> bool:
+        async with aiosqlite.connect(self._db_path) as db:
+            async with db.execute(
+                """
+                SELECT 1
+                FROM session_conversations
+                WHERE user_id = ? AND conversation_id = ?
+                LIMIT 1
+                """,
+                (user_id, conversation_id),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                async with db.execute(
+                    """
+                    SELECT 1
+                    FROM conversations
+                    WHERE user_email = ? AND conversation_id = ?
+                    LIMIT 1
+                    """,
+                    (user_id, conversation_id),
+                ) as cur:
+                    row = await cur.fetchone()
+        return row is not None
+
     async def save_session(
         self,
         session_id: str,
@@ -222,6 +369,9 @@ class SQLiteSessionAdapter(SessionPersistenceAdapter):
         summary: str,
         created_at: str,
     ) -> None:
+        """
+        Legacy compatibility write path.
+        """
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 """
@@ -243,41 +393,39 @@ class SQLiteSessionAdapter(SessionPersistenceAdapter):
 
     async def list_sessions(
         self,
-        user_email: str,
+        user_id: str,
         limit: int = 20,
     ) -> List[dict]:
         async with aiosqlite.connect(self._db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
-                SELECT session_id, conversation_id, ticker, query, summary, created_at
-                FROM sessions
-                WHERE user_email = ?
+                SELECT session_id, user_id, created_at, last_seen_at, ended_at, status
+                FROM login_sessions
+                WHERE user_id = ?
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (user_email, limit),
+                (user_id, limit),
             ) as cur:
                 rows = await cur.fetchall()
         return [dict(row) for row in rows]
 
-    async def list_sessions_by_ticker(
+    async def get_latest_active_session(
         self,
-        user_email: str,
-        ticker: str,
-        limit: int = 10,
-    ) -> List[dict]:
+        user_id: str,
+    ) -> Optional[str]:
         async with aiosqlite.connect(self._db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
-                SELECT session_id, conversation_id, query, summary, created_at
-                FROM sessions
-                WHERE user_email = ? AND ticker = ?
+                SELECT session_id
+                FROM login_sessions
+                WHERE user_id = ? AND status = 'active'
                 ORDER BY created_at DESC
-                LIMIT ?
+                LIMIT 1
                 """,
-                (user_email, ticker, limit),
+                (user_id,),
             ) as cur:
-                rows = await cur.fetchall()
-        return [dict(row) for row in rows]
+                row = await cur.fetchone()
+        return row["session_id"] if row else None

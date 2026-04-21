@@ -26,10 +26,17 @@ class ChatRequest(BaseModel):
             "Omit (or pass null) to start a fresh conversation."
         ),
     )
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Existing login session id. "
+            "When omitted, server creates or reuses an active session."
+        ),
+    )
     user_email: Optional[str] = Field(
         default=None,
         description=(
-            "Caller's e-mail address.  When supplied, personalised memory "
-            "(investment / learning interests) is loaded and written back."
+            "Deprecated compatibility field. "
+            "Use authenticated token identity instead."
         ),
     )

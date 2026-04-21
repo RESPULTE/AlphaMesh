@@ -146,13 +146,11 @@ class Settings(BaseSettings):
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
     # ── Rate limiting (requests per minute per user) ───────────────────────────
-    RATE_LIMIT_ANALYZE: int = 10  # /api/analyze  (expensive — runs LLM agents)
     RATE_LIMIT_DEFAULT: int = 60  # all other authenticated routes
 
     # ── Session / History persistence ─────────────────────────────────────────
-    # Stored separately from financial_data.db and conversations.db so each
-    # concern has its own migration surface.
-    SESSIONS_DB_PATH: str = "./data/sessions.db"
+    # Conversations, messages, and login sessions share this SQLite DB file.
+    CONVERSATIONS_DB_PATH: str = "./data/conversations.db"
 
     # ── Market data cache TTLs (seconds) ─────────────────────────────────────
     # Shared in-process cache keyed by ticker; public data, no per-user

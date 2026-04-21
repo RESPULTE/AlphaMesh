@@ -110,6 +110,12 @@ export interface FinalResult {
   duration_ms: number;
 }
 
+export interface ChatAck {
+  request_id: string;
+  conversation_id: string;
+  session_id: string;
+}
+
 export type StreamEvent =
   | {
       event_type: 'progress';

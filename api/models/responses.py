@@ -148,6 +148,7 @@ class ChatAck(BaseModel):
 
     request_id: str
     conversation_id: str
+    session_id: str
 
 
 # ─────────────────────────────────────────────────────────────────────────────

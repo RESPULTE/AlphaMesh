@@ -8,8 +8,7 @@ Token-bucket rate limiter per authenticated user.
   slowapi with aioredis) — the middleware interface stays identical.
 • Unauthenticated requests pass through unrestricted; auth failures are
   handled downstream by the dependency layer.
-• The /api/analyze path gets a tighter limit (RATE_LIMIT_ANALYZE, default 10
-  rpm) because each call runs the full LLM agent pipeline.
+• All authenticated routes currently share RATE_LIMIT_DEFAULT.
 """
 
 from __future__ import annotations
@@ -62,11 +61,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             # Unauthenticated requests pass through; auth deps handle rejection
             return await call_next(request)
 
-        limit = (
-            settings.RATE_LIMIT_ANALYZE
-            if "/analyze" in request.url.path
-            else settings.RATE_LIMIT_DEFAULT
-        )
+        limit = settings.RATE_LIMIT_DEFAULT
 
         now = time.time()
         tokens, last = _BUCKETS.get(user, (float(limit), now))

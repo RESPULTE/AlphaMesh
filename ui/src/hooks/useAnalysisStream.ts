@@ -8,6 +8,8 @@ import type {
 } from '../types/api';
 
 const DEFAULT_USER_EMAIL = 'demo@alphamesh.local';
+const STORAGE_CONVERSATION_ID = 'alphamesh.active_conversation_id';
+const STORAGE_SESSION_ID = 'alphamesh.active_session_id';
 
 type PartialAnalysis = Partial<AnalysisResponse> | null;
 
@@ -244,7 +246,16 @@ export function useAnalysisStream(query: string | null) {
   const [data, setData] = useState<PartialAnalysis>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
-  const conversationIdRef = useRef<string | null>(null);
+  const conversationIdRef = useRef<string | null>(
+    typeof window !== 'undefined'
+      ? window.localStorage.getItem(STORAGE_CONVERSATION_ID)
+      : null
+  );
+  const sessionIdRef = useRef<string | null>(
+    typeof window !== 'undefined'
+      ? window.localStorage.getItem(STORAGE_SESSION_ID)
+      : null
+  );
   const resolvedTickerRef = useRef<string>('');
   const pendingQuoteRef = useRef<AnalysisResponse | null>(null);
   const pendingChartRef = useRef<AnalysisResponse['chartData'] | null>(null);
@@ -276,7 +287,8 @@ export function useAnalysisStream(query: string | null) {
           body: JSON.stringify({
             message: query,
             user_email: stableEmail,
-            conversation_id: conversationIdRef.current
+            conversation_id: conversationIdRef.current,
+            session_id: sessionIdRef.current
           })
         });
 
@@ -288,6 +300,15 @@ export function useAnalysisStream(query: string | null) {
         if (!isMounted) return;
         if (ack.conversation_id) {
           conversationIdRef.current = ack.conversation_id;
+          if (typeof window !== 'undefined') {
+            window.localStorage.setItem(STORAGE_CONVERSATION_ID, ack.conversation_id);
+          }
+        }
+        if (ack.session_id) {
+          sessionIdRef.current = ack.session_id;
+          if (typeof window !== 'undefined') {
+            window.localStorage.setItem(STORAGE_SESSION_ID, ack.session_id);
+          }
         }
 
         const es = new EventSource(`/api/v1/stream/${ack.request_id}`);

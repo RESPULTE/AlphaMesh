@@ -80,31 +80,61 @@ class SessionPersistenceAdapter(ABC):
         """Create schema / indices. Idempotent � safe to call multiple times."""
 
     @abstractmethod
-    async def save_session(
+    async def create_login_session(
         self,
         session_id: str,
-        conversation_id: str,
-        user_email: str,
-        ticker: Optional[str],
-        query: str,
-        summary: str,
+        user_id: str,
         created_at: str,
     ) -> None:
-        """Persist a single session record."""
+        """Create a login-scoped session."""
+
+    @abstractmethod
+    async def touch_login_session(
+        self,
+        session_id: str,
+        user_id: str,
+        last_seen_at: str,
+    ) -> bool:
+        """Update last_seen_at for an active session. Returns False if not found."""
+
+    @abstractmethod
+    async def end_login_session(
+        self,
+        session_id: str,
+        user_id: str,
+        ended_at: str,
+    ) -> bool:
+        """Mark a login session ended. Returns False if not found."""
+
+    @abstractmethod
+    async def link_session_conversation(
+        self,
+        session_id: str,
+        user_id: str,
+        conversation_id: str,
+        linked_at: str,
+    ) -> None:
+        """Create a many-to-many link between a login session and a conversation."""
+
+    @abstractmethod
+    async def user_has_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> bool:
+        """Return True when the conversation is linked to the given user."""
 
     @abstractmethod
     async def list_sessions(
         self,
-        user_email: str,
+        user_id: str,
         limit: int = 20,
     ) -> List[dict]:
-        """Return the most recent `limit` sessions for a user, newest first."""
+        """Return most recent login sessions for a user, newest first."""
 
     @abstractmethod
-    async def list_sessions_by_ticker(
+    async def get_latest_active_session(
         self,
-        user_email: str,
-        ticker: str,
-        limit: int = 10,
-    ) -> List[dict]:
-        """Return sessions for a specific ticker, newest first."""
+        user_id: str,
+    ) -> Optional[str]:
+        """Return latest active session id for user, or None."""

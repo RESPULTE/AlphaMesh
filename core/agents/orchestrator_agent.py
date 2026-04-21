@@ -55,6 +55,7 @@ logger = get_logger(__name__)
 
 AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
 _SYNTHESIS_HISTORY_WINDOW: int = 6
+_PLANNER_HISTORY_WINDOW: int = 10
 
 
 class OrchestratorAgent:
@@ -264,14 +265,18 @@ class OrchestratorAgent:
             available_agents_desc=available_agents_desc,
         )
         latest_human = _extract_last_human_message(state.messages)
+        history_window = _last_n_messages(state.messages, _PLANNER_HISTORY_WINDOW)
 
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
+            planner_messages: List[BaseMessage] = [
+                SystemMessage(content=system_content),
+                *history_window,
+            ]
+            if not history_window:
+                planner_messages.append(HumanMessage(content=latest_human))
             plan: OrchestratorPlan = await structured_llm.ainvoke(
-                [
-                    SystemMessage(content=system_content),
-                    HumanMessage(content=latest_human),
-                ]
+                planner_messages
             )
             publish_progress(
                 "orchestrator",

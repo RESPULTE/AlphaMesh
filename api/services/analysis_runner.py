@@ -24,6 +24,7 @@ from api.models.responses import DataFramePayload, FinalResult, SourceItem, Tick
 from api.services.event_broadcaster import EventBroadcaster
 from api.sinks.sse_sink import SSESink
 from core.memory.conversation.store import ConversationStore
+from core.memory.sessions.session_service import SessionService
 from core.services import service_manager
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,20 @@ class AnalysisRunner:
         self,
         broadcaster: EventBroadcaster,
         store: ConversationStore,
+        session_service: SessionService,
     ) -> None:
         self._broadcaster = broadcaster
         self._store = store
+        self._session_service = session_service
 
-    def launch(self, request_id: str, chat_request: ChatRequest) -> str:
+    def launch(
+        self,
+        request_id: str,
+        chat_request: ChatRequest,
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> str:
         """
         Create the asyncio.Queue, then fire-and-forget the analysis task.
         Returns the conversation_id immediately so POST /chat can ACK the client.
@@ -62,7 +72,13 @@ class AnalysisRunner:
         conversation_id = chat_request.conversation_id or str(uuid4())
         self._broadcaster.create(request_id)
         asyncio.create_task(
-            self._run(request_id, conversation_id, chat_request),
+            self._run(
+                request_id,
+                conversation_id,
+                chat_request,
+                user_id=user_id,
+                session_id=session_id,
+            ),
             name=f"analysis_{request_id[:8]}",
         )
         return conversation_id
@@ -113,6 +129,9 @@ class AnalysisRunner:
         request_id: str,
         conversation_id: str,
         chat_request: ChatRequest,
+        *,
+        user_id: str,
+        session_id: str,
     ) -> None:
         """Background task: runs the full agent pipeline for one user turn."""
         # Import here to avoid circular imports at module load time
@@ -186,7 +205,12 @@ class AnalysisRunner:
         try:
             # -- 3. Prepare conversation ---------------------------------------
             await self._store.ensure_conversation(
-                conversation_id, chat_request.user_email
+                conversation_id, user_id
+            )
+            await self._session_service.link_conversation(
+                user_id=user_id,
+                session_id=session_id,
+                conversation_id=conversation_id,
             )
             history = await self._store.get_langchain_messages(conversation_id)
             messages = history + [HumanMessage(content=chat_request.message)]
@@ -195,7 +219,7 @@ class AnalysisRunner:
             final_response = await orchestrator.run(
                 messages=messages,
                 conversation_id=conversation_id,
-                user_email=chat_request.user_email,
+                user_email=user_id,
             )
 
             final_ticker = (getattr(final_response, "tickers", []) or [None])[0]

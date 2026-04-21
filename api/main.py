@@ -32,8 +32,12 @@ async def lifespan(app: FastAPI):
     # API-layer singletons
     broadcaster = EventBroadcaster()
     store = service_manager.get_conversation_store()
-    runner = AnalysisRunner(broadcaster=broadcaster, store=store)
     session_service = service_manager.get_session_service()
+    runner = AnalysisRunner(
+        broadcaster=broadcaster,
+        store=store,
+        session_service=session_service,
+    )
 
     app.state.broadcaster = broadcaster
     app.state.store = store
@@ -80,13 +84,11 @@ def create_app() -> FastAPI:
 
     # Routers and exception handlers must be registered before startup.
     from api.middleware.error_handling import register_exception_handlers
-    from api.routers import analyze as analyze_router
     from api.routers import market as market_router
     from api.routers import sessions as sessions_router
 
-    app.include_router(analyze_router.router, prefix="/api")
     app.include_router(market_router.router, prefix="/api/market")
-    app.include_router(sessions_router.router, prefix="/api/sessions")
+    app.include_router(sessions_router.router)
 
     app.include_router(health.router)
     app.include_router(chat.router)
