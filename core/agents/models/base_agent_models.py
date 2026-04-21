@@ -104,8 +104,6 @@ class BaseAgentOutput(BaseModel, ABC):
         ),
     )
     sentiment: Optional[AgentSentiment] = Field(default=None)
-    # subgraph_task removed: SubgraphExtractionService.schedule() manages its
-    # own background task internally and returns only the subgraph_id string.
     subgraph_id: Optional[str] = Field(default=None, exclude=True)
     relationships_extracted: bool = Field(default=False)
 

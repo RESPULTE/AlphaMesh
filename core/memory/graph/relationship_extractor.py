@@ -4,8 +4,6 @@ core/memory/graph/relationship_extractor.py
 Single responsibility: call the LLM, parse the <relationships> XML block,
 return a list of relationship dicts.
 
-This is extracted from SubgraphExtractionService which previously mixed
-LLM extraction, graph construction, and Neo4j persistence.
 """
 
 from __future__ import annotations

@@ -301,20 +301,6 @@ class ServiceManager:
                 raise
         return self._user_context_service
 
-    def get_subgraph_service(self):
-        from core.memory.graph.subgraph_service import SubgraphExtractionService
-
-        if self._subgraph_service is None:
-            try:
-                self._subgraph_service = SubgraphExtractionService(
-                    queue_manager=self.get_graph_queue_manager(),
-                    extractor=self.get_relationship_extractor(),
-                )
-            except Exception as e:
-                print(f"Error initializing SubgraphExtractionService: {e}")
-                raise
-        return self._subgraph_service
-
     def get_ticker_validator(self):
         from core.agents.ticker_validation import TickerValidator
 
@@ -386,6 +372,3 @@ class ServiceManager:
 
 
 service_manager = ServiceManager()
-
-
-

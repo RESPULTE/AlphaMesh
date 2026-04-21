@@ -4,7 +4,6 @@ core/memory/user_signal_writeback.py
 Unified user signal write-back via GraphQueueManager.enqueue(immediate=True).
 
 Changes from previous version
-- No longer calls SubgraphExtractionService.schedule(bypass_guards=True).
 - Now calls GraphQueueManager.enqueue(immediate=True) directly for entity persistence
   and edge writing.
 - Entity pre-resolution (_build_interest_relationships) now calls
