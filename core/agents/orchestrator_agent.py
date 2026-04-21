@@ -326,6 +326,22 @@ class OrchestratorAgent:
             updated_plan = plan.model_copy(update={"final_answer": clarification})
             return {"plan": updated_plan, "company_context_blocks": {}}
 
+        confirmed_tickers = [
+            t for t, info in results.items() if info.is_valid and info.is_equity
+        ]
+
+        # ── Re-publish ticker_resolved with validated symbols ──────────────────
+        # Defensive: covers the case where _plan_node ran on a different async
+        # context before the sink was registered, or ticker casing differed.
+        if confirmed_tickers:
+            from core.event_queue import publish_frontend_event
+
+            publish_frontend_event(
+                "orchestrator",
+                "ticker_resolved",
+                {"ticker": confirmed_tickers[0], "tickers": confirmed_tickers},
+            )
+
         company_context_blocks: Dict[str, str] = {}
         for t, info in results.items():
             if info.is_valid and info.is_equity:

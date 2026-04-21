@@ -4,7 +4,6 @@ core/memory/user_signal_writeback.py
 Unified user signal write-back via GraphQueueManager.enqueue(immediate=True).
 
 Changes from previous version
-â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 - No longer calls SubgraphExtractionService.schedule(bypass_guards=True).
 - Now calls GraphQueueManager.enqueue(immediate=True) directly for entity persistence
   and edge writing.
@@ -15,7 +14,6 @@ Changes from previous version
   to Neo4jAdapter internally.
 
 Graph schema written here (unchanged)
-â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 NodeSet (USER_{hash})
   â†â”€BELONGS_TO_NODESETâ”€â”€â”€ UserInterestDomain {domain_type, category, user_email}
                                â””â”€HAS_INTEREST_INâ”€â”€> UserInterestEdge {weight, status, ...}
@@ -34,9 +32,6 @@ from core.logger import get_logger
 from core.memory.user_context_service import InterestCacheEntry
 
 logger = get_logger(__name__)
-
-
-# â”€â”€ Payload dataclasses (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 @dataclass
