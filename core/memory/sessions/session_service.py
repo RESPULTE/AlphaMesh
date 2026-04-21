@@ -11,7 +11,7 @@ from typing import List, Optional
 from uuid import uuid4
 
 from core.logger import get_logger
-from core.memory.stores.base import SessionPersistenceAdapter
+from core.memory.stores.contracts.session import SessionPersistenceAdapter
 
 logger = get_logger(__name__)
 
@@ -106,29 +106,3 @@ class SessionService:
 
     async def get_sessions(self, user_id: str, limit: int = 20) -> List[dict]:
         return await self._adapter.list_sessions(user_id=user_id, limit=limit)
-
-    async def save_analysis(
-        self,
-        *,
-        user_email: str,
-        conversation_id: str,
-        query: str,
-        ticker: Optional[str],
-        summary_text: str,
-    ) -> str:
-        """
-        Legacy compatibility API used by older streaming code.
-        """
-        session_id = str(uuid4())
-        save_fn = getattr(self._adapter, "save_session", None)
-        if callable(save_fn):
-            await save_fn(
-                session_id=session_id,
-                conversation_id=conversation_id,
-                user_email=user_email,
-                ticker=ticker.upper() if ticker else None,
-                query=query,
-                summary=(summary_text or "")[:500],
-                created_at=_utc_now(),
-            )
-        return session_id

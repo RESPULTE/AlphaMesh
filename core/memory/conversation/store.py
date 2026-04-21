@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from core.memory.stores.base import ConversationPersistenceAdapter
+from core.memory.stores.contracts.conversation import ConversationPersistenceAdapter
 
 logger = logging.getLogger(__name__)
 

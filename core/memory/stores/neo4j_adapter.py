@@ -22,6 +22,7 @@ from core.memory.graph.utils import (
     normalize_entity_type,
 )
 from core.memory.retrieval.models import RetrievedChunk
+from core.memory.stores.contracts.graph import GraphStoreAdapter
 
 
 class RelationshipType(Enum):
@@ -32,7 +33,7 @@ class RelationshipType(Enum):
     BELONGS_TO_DOCUMENT = "BELONGS_TO_DOCUMENT"
 
 
-class Neo4jAdapter:
+class Neo4jAdapter(GraphStoreAdapter):
     """Encapsulates all Neo4j operations for AlphaMesh."""
 
     def __init__(

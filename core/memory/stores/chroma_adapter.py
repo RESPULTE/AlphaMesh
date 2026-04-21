@@ -11,11 +11,12 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from core.logger import get_logger
+from core.memory.stores.contracts.vector import VectorStoreAdapter
 
 _LIST_FIELDS = {"companies_involved", "nodeset_ids"}
 
 
-class ChromaDBAdapter:
+class ChromaDBAdapter(VectorStoreAdapter):
     """Encapsulates local Chroma operations via LangChain's Chroma wrapper."""
 
     def __init__(

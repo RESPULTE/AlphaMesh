@@ -317,11 +317,11 @@ class ServiceManager:
 
     def get_conversation_store(self):
         from core.memory.conversation.store import ConversationStore
-        from core.memory.stores.sqlite_adapter import SQLiteConversationAdapter
+        from core.memory.conversation.sql_store import SQLiteConversationStore
 
         if self._conversation_store is None:
             try:
-                adapter = SQLiteConversationAdapter(
+                adapter = SQLiteConversationStore(
                     db_path=settings.CONVERSATIONS_DB_PATH
                 )
                 self._conversation_store = ConversationStore(adapter=adapter)
@@ -332,11 +332,11 @@ class ServiceManager:
 
     def get_session_service(self):
         from core.memory.sessions.session_service import SessionService
-        from core.memory.stores.sqlite_adapter import SQLiteSessionAdapter
+        from core.memory.sessions.sql_store import SQLiteSessionStore
 
         if self._session_service is None:
             try:
-                adapter = SQLiteSessionAdapter(db_path=settings.CONVERSATIONS_DB_PATH)
+                adapter = SQLiteSessionStore(db_path=settings.CONVERSATIONS_DB_PATH)
                 self._session_service = SessionService(adapter=adapter)
             except Exception as e:
                 print(f"Error initializing SessionService: {e}")
