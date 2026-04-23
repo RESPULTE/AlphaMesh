@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import pytest
 
 from core.config import settings
+from core.memory.graph.entity_resolver import EntityResolution, ResolvedEdgeBatch
 from core.memory.graph.graph_queue import GraphQueueManager, make_graph_task
 from core.memory.graph.queue.pipeline import GraphWritePipeline
 from core.memory.graph.queue.prompt_registry import PromptRegistry
@@ -18,17 +19,58 @@ from core.memory.graph.utils import entity_key, normalize_entity_name, normalize
 class FakeResolver:
     def __init__(self) -> None:
         self.batch_calls: List[Tuple[List[Tuple[str, str, Optional[dict]]], bool]] = []
+        self.edge_calls: List[Tuple[List[dict], bool]] = []
 
-    async def resolve_batch(
+    async def resolve_entities(
         self,
         entities: List[Tuple[str, str, Optional[dict]]],
         allow_create: bool = True,
-    ) -> Dict[Tuple[str, str], str]:
+    ) -> Dict[Tuple[str, str], EntityResolution]:
         self.batch_calls.append((entities, allow_create))
-        resolved: Dict[Tuple[str, str], str] = {}
+        resolved: Dict[Tuple[str, str], EntityResolution] = {}
         for name, entity_type, _props in entities:
-            resolved[(name, entity_type)] = f"{entity_type}:{name.lower()}"
+            resolved[(name, entity_type)] = EntityResolution(
+                entity_id=f"{entity_type}:{name.lower()}",
+                match_stage="fake",
+            )
         return resolved
+
+    async def resolve_relationship_edges(
+        self,
+        relationships: List[dict],
+        *,
+        allow_create: bool,
+    ) -> ResolvedEdgeBatch:
+        self.edge_calls.append((relationships, allow_create))
+        endpoint_inputs: List[Tuple[str, str, Optional[dict]]] = []
+        for rel in relationships:
+            endpoint_inputs.append(
+                (
+                    str(rel.get("from_name") or ""),
+                    str(rel.get("from_type") or ""),
+                    rel.get("from_node_props"),
+                )
+            )
+            endpoint_inputs.append(
+                (
+                    str(rel.get("to_name") or ""),
+                    str(rel.get("to_type") or ""),
+                    rel.get("to_node_props"),
+                )
+            )
+        endpoint_results = await self.resolve_entities(
+            endpoint_inputs,
+            allow_create=allow_create,
+        )
+        entity_cache: Dict[Tuple[str, str], str] = {}
+        for key, resolution in endpoint_results.items():
+            if resolution.entity_id:
+                entity_cache[key] = resolution.entity_id
+        return ResolvedEdgeBatch(
+            relationships=list(relationships),
+            entity_cache=entity_cache,
+            skipped_relationships=0,
+        )
 
 
 class FakeWriter:

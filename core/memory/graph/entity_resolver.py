@@ -1,30 +1,22 @@
 """
-core/memory/graph/entity_resolver.py
+Entity and relationship endpoint resolution for graph writes.
 
-Centralised entity resolution: canonical ID lookup, fuzzy+semantic dedup,
-Neo4j + Chroma persistence.  Extracted from DualStoreIngestor so a single,
-lock-protected LRU cache is shared across all conversations and users.
-
-Design
-──────
-- resolve()       → single entity, creates Neo4j/Chroma node if new
-- resolve_batch() → concurrent batch, type-scoped dedup, returns id map
-
-Thread-safety
-─────────────
-_cache is protected by _cache_lock.  The lock is only held during cache
-reads/writes — never during I/O (Neo4j, Chroma, embeddings).  This means
-concurrent callers may redundantly resolve the same new entity, but that is
-safe because Neo4j MERGE is idempotent and the cache will converge.
+Resolution order for domain entities:
+1) Neo4j exact (canonical ID, then exact normalized name+type)
+2) Neo4j fuzzy candidates
+3) Local entity vector similarity search
+4) Create a new entity (when allowed)
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 from rapidfuzz import fuzz
 
 from core.config import settings
@@ -36,12 +28,16 @@ from core.memory.graph.utils import (
     normalize_entity_description,
     normalize_entity_name,
     normalize_entity_type,
+    normalize_relationship_type,
 )
 
 logger = get_logger(__name__)
 
 _MAX_CACHE_SIZE = 10_000
-_EVICT_FRACTION = 0.20  # evict oldest 20% when cap reached
+_CACHE_TTL_SECONDS = 3600
+_DEFAULT_STRONG_FUZZY_THRESHOLD = 0.90
+
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 
 _CORP_SUFFIXES = {
     "inc",
@@ -75,397 +71,619 @@ def _normalize_company_alias(name: str) -> str:
     return " ".join(tokens)
 
 
+def _normalize_neo4j_fuzzy_threshold(raw: float) -> float:
+    value = float(raw)
+    if value > 1.0:
+        value = value / 100.0
+    return max(0.0, min(1.0, value))
+
+
+def _normalize_vector_distance_threshold(semantic_threshold: float) -> float:
+    similarity = max(0.0, min(1.0, float(semantic_threshold)))
+    return 1.0 - similarity
+
+
+@dataclass(frozen=True)
+class ResolverThresholds:
+    neo4j_fuzzy_threshold: float
+    rapidfuzz_threshold: float
+    vector_distance_threshold: float
+    strong_fuzzy_threshold: float
+
+
+@dataclass(frozen=True)
+class EntityResolution:
+    entity_id: Optional[str]
+    match_stage: str
+    score: Optional[float] = None
+    created: bool = False
+
+    @property
+    def resolved(self) -> bool:
+        return bool(self.entity_id)
+
+
+@dataclass(frozen=True)
+class ResolvedEdgeBatch:
+    relationships: List[dict]
+    entity_cache: Dict[Tuple[str, str], str]
+    skipped_relationships: int
+
+
 class EntityResolver:
     """
-    Resolves entity names to canonical IDs, creating Entity nodes as needed.
+    Resolves entity endpoints and prepares deduplicated relationship batches.
 
-    Injected dependencies (set at construction, never fetched from service_manager):
-        neo4j_adapter          — for MERGE and existence checks
-        entity_chroma_adapter  — for semantic similarity search + embedding upsert
-        embedding_func         — for embedding new entity names during dedup
-        fuzzy_threshold        — minimum rapidfuzz token_sort_ratio to consider a match
-        semantic_threshold     — minimum cosine similarity to consider a merge
+    Public API:
+    - resolve_entity(...)
+    - resolve_entities(...)
+    - resolve_relationship_edges(...)
     """
 
     def __init__(
         self,
         neo4j_adapter,
         entity_chroma_adapter,
-        embedding_func,
-        fuzzy_threshold: float = settings.EXTRACTION_FUZZY_THRESHOLD,
-        semantic_threshold: float = settings.EXTRACTION_SEMANTIC_THRESHOLD,
+        *,
+        neo4j_fuzzy_threshold: float = settings.EXTRACTION_FUZZY_THRESHOLD,
+        rapidfuzz_threshold: float = settings.EXTRACTION_FUZZY_THRESHOLD,
+        vector_distance_threshold: Optional[float] = None,
+        cache_max_size: int = _MAX_CACHE_SIZE,
+        cache_ttl_seconds: int = _CACHE_TTL_SECONDS,
     ) -> None:
         self._neo4j = neo4j_adapter
         self._chroma = entity_chroma_adapter
-        self._embedding_func = embedding_func
-        self._fuzzy_threshold = fuzzy_threshold
-        self._semantic_threshold = semantic_threshold
+        self._cache_max_size = max(int(cache_max_size), 1)
+        self._cache_ttl_seconds = max(int(cache_ttl_seconds), 1)
 
-        # Global LRU alias cache: (name.lower(), entity_type) → canonical_id
-        self._cache: Dict[Tuple[str, str], str] = {}
+        if vector_distance_threshold is None:
+            vector_distance_threshold = _normalize_vector_distance_threshold(
+                settings.EXTRACTION_SEMANTIC_THRESHOLD
+            )
+
+        self._thresholds = ResolverThresholds(
+            neo4j_fuzzy_threshold=_normalize_neo4j_fuzzy_threshold(
+                neo4j_fuzzy_threshold
+            ),
+            rapidfuzz_threshold=float(rapidfuzz_threshold),
+            vector_distance_threshold=max(0.0, min(1.0, vector_distance_threshold)),
+            strong_fuzzy_threshold=_DEFAULT_STRONG_FUZZY_THRESHOLD,
+        )
+
+        self._cache: "OrderedDict[Tuple[str, str], Tuple[str, float]]" = OrderedDict()
         self._cache_lock = asyncio.Lock()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public: single entity resolution
-    # ──────────────────────────────────────────────────────────────────────────
+        self._inflight_lock_guard = asyncio.Lock()
+        self._inflight_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
 
-    async def resolve(
+    async def resolve_entity(
         self,
+        *,
         name: str,
         entity_type: str,
         props: Optional[Any] = None,
         allow_create: bool = True,
-    ) -> Optional[str]:
-        """
-        Resolve a single domain entity to a canonical ID.
-        Creates the Entity node in Neo4j and Chroma if it does not exist.
-        Returns None if name or entity_type is invalid.
-        """
-        name = normalize_entity_name(name)
-        if not name or not entity_type:
-            return None
+    ) -> EntityResolution:
+        clean_name = normalize_entity_name(name)
+        clean_type = normalize_entity_type(entity_type)
+        if not clean_name or not clean_type:
+            return EntityResolution(entity_id=None, match_stage="invalid")
 
-        etype = normalize_entity_type(entity_type)
-        if not etype:
-            return None
+        cache_key = entity_key(clean_name, clean_type)
+        cached_id = await self._cache_get(cache_key)
+        if cached_id:
+            return EntityResolution(entity_id=cached_id, match_stage="cache")
 
-        cache_key = entity_key(name, etype)
+        lock = await self._get_inflight_lock(cache_key)
+        async with lock:
+            # Check cache again after waiting on the per-key single-flight lock.
+            cached_id = await self._cache_get(cache_key)
+            if cached_id:
+                return EntityResolution(entity_id=cached_id, match_stage="cache")
 
-        async with self._cache_lock:
-            if cache_key in self._cache:
-                return self._cache[cache_key]
+            resolution = await self._resolve_uncached(
+                name=clean_name,
+                entity_type=clean_type,
+                props=props,
+                allow_create=allow_create,
+            )
+            if resolution.entity_id:
+                await self._cache_set(cache_key, resolution.entity_id)
+            return resolution
 
-        entity_id = await self._resolve_internal(
-            name, etype, props, allow_create=allow_create
-        )
-
-        if entity_id:
-            await self._cache_set(cache_key, entity_id)
-
-        return entity_id
-
-    async def resolve_batch(
+    async def resolve_entities(
         self,
-        entities: List[Tuple[str, str, Optional[dict]]],
+        entities: List[Tuple[str, str, Optional[Any]]],
+        *,
         allow_create: bool = True,
-    ) -> Dict[Tuple[str, str], str]:
-        """
-        Resolve multiple (name, entity_type, props) tuples concurrently.
-
-        Dedup is TYPE-SCOPED: fuzzy + semantic matching only runs between
-        entities of the same type.  Returns {(name, entity_type) -> canonical_id}.
-        Empty or invalid entries are silently skipped.
-        """
+    ) -> Dict[Tuple[str, str], EntityResolution]:
         if not entities:
             return {}
 
-        # Deduplicate input list � same (name, type) should not be resolved twice
-        seen: set = set()
-        unique: List[Tuple[str, str, Optional[dict]]] = []
-        for name, etype, props in entities:
-            name = normalize_entity_name(name)
-            etype_norm = normalize_entity_type(etype) if etype else None
-            if not name or not etype_norm:
+        merged_inputs: Dict[Tuple[str, str], dict] = {}
+        for raw_name, raw_type, raw_props in entities:
+            clean_name = normalize_entity_name(raw_name)
+            clean_type = normalize_entity_type(raw_type)
+            if not clean_name or not clean_type:
                 continue
-            key = (name.lower(), etype_norm)
-            if key not in seen:
-                seen.add(key)
-                unique.append((name, etype_norm, props))
+            key = entity_key(clean_name, clean_type)
+            if key not in merged_inputs:
+                merged_inputs[key] = {
+                    "name": clean_name,
+                    "entity_type": clean_type,
+                    "props": self._props_to_dict(raw_props),
+                }
+            else:
+                merged_inputs[key]["props"] = self._merge_props(
+                    merged_inputs[key]["props"],
+                    self._props_to_dict(raw_props),
+                )
 
-        # Check cache first (under one lock acquisition)
-        result: Dict[Tuple[str, str], str] = {}
-        uncached: List[Tuple[str, str, Optional[dict]]] = []
+        if not merged_inputs:
+            return {}
 
-        async with self._cache_lock:
-            for name, etype, props in unique:
-                ck = entity_key(name, etype)
-                if ck in self._cache:
-                    result[(name, etype)] = self._cache[ck]
-                else:
-                    uncached.append((name, etype, props))
-
-        if not uncached:
-            return result
-
-        # Run type-scoped fuzzy+semantic dedup on uncached entities
-        alias_map = await self._type_scoped_dedup(uncached)
-
-        # Resolve concurrently (each resolution is idempotent)
-        async def _resolve_one(name: str, etype: str, props: Optional[dict]) -> None:
-            canonical_name = alias_map.get((name.lower(), etype), name)
-            entity_id = await self._resolve_internal(
-                canonical_name, etype, props, allow_create=allow_create
+        async def _resolve_one(key: Tuple[str, str], payload: dict) -> EntityResolution:
+            return await self.resolve_entity(
+                name=payload["name"],
+                entity_type=payload["entity_type"],
+                props=payload["props"],
+                allow_create=allow_create,
             )
-            if entity_id:
-                result[(name, etype)] = entity_id
-                # Cache both the original name and the canonical alias
-                updates = {entity_key(name, etype): entity_id}
-                if canonical_name != name:
-                    updates[entity_key(canonical_name, etype)] = entity_id
-                await self._cache_set_many(updates)
 
-        await asyncio.gather(*[_resolve_one(n, e, p) for n, e, p in uncached])
-        return result
+        tasks = [_resolve_one(key, payload) for key, payload in merged_inputs.items()]
+        results = await asyncio.gather(*tasks)
+        return {
+            key: result
+            for (key, _payload), result in zip(merged_inputs.items(), results)
+        }
 
-    async def _resolve_internal(
+    async def resolve_relationship_edges(
         self,
+        relationships: List[dict],
+        *,
+        allow_create: bool,
+    ) -> ResolvedEdgeBatch:
+        if not relationships:
+            return ResolvedEdgeBatch(
+                relationships=[], entity_cache={}, skipped_relationships=0
+            )
+
+        normalized_rels: List[dict] = []
+        endpoint_inputs: List[Tuple[str, str, Optional[Any]]] = []
+
+        for rel in relationships:
+            from_name = normalize_entity_name(str(rel.get("from_name") or ""))
+            to_name = normalize_entity_name(str(rel.get("to_name") or ""))
+            from_type = normalize_entity_type(str(rel.get("from_type") or "").strip())
+            to_type = normalize_entity_type(str(rel.get("to_type") or "").strip())
+            if not from_name or not to_name or not from_type or not to_type:
+                continue
+
+            relation_type = normalize_relationship_type(
+                str(rel.get("relation") or rel.get("relation_type") or "RELATED_TO")
+            )
+            confidence = rel.get("confidence", "low")
+            reason = str(rel.get("reason") or "").strip()
+            extra_props = rel.get("extra_props")
+            if not isinstance(extra_props, dict):
+                extra_props = {}
+
+            normalized = {
+                "from_name": from_name,
+                "from_type": from_type,
+                "to_name": to_name,
+                "to_type": to_type,
+                "relation": relation_type,
+                "confidence": confidence,
+                "reason": reason,
+                "extra_props": dict(extra_props),
+            }
+            normalized_rels.append(normalized)
+            endpoint_inputs.append((from_name, from_type, rel.get("from_node_props")))
+            endpoint_inputs.append((to_name, to_type, rel.get("to_node_props")))
+
+        if not normalized_rels:
+            return ResolvedEdgeBatch(
+                relationships=[], entity_cache={}, skipped_relationships=0
+            )
+
+        resolved_endpoints = await self.resolve_entities(
+            endpoint_inputs,
+            allow_create=allow_create,
+        )
+
+        entity_cache: Dict[Tuple[str, str], str] = {}
+        for key, resolution in resolved_endpoints.items():
+            if resolution.entity_id:
+                entity_cache[key] = resolution.entity_id
+
+        merged_edges: Dict[Tuple[str, str, str], dict] = {}
+        skipped = 0
+
+        for rel in normalized_rels:
+            from_key = entity_key(rel["from_name"], rel["from_type"])
+            to_key = entity_key(rel["to_name"], rel["to_type"])
+            source_id = entity_cache.get(from_key)
+            target_id = entity_cache.get(to_key)
+            if not source_id or not target_id:
+                skipped += 1
+                continue
+
+            dedup_key = (source_id, rel["relation"], target_id)
+            if dedup_key not in merged_edges:
+                merged_edges[dedup_key] = {
+                    "from_name": rel["from_name"],
+                    "from_type": rel["from_type"],
+                    "to_name": rel["to_name"],
+                    "to_type": rel["to_type"],
+                    "relation": rel["relation"],
+                    "confidence": rel["confidence"],
+                    "reason": rel["reason"],
+                    "extra_props": dict(rel["extra_props"]),
+                }
+                continue
+
+            existing = merged_edges[dedup_key]
+            existing["confidence"] = self._merge_confidence(
+                existing.get("confidence"),
+                rel.get("confidence"),
+            )
+            if not existing.get("reason") and rel.get("reason"):
+                existing["reason"] = rel["reason"]
+            for prop_key, prop_value in rel["extra_props"].items():
+                if prop_key not in existing["extra_props"]:
+                    existing["extra_props"][prop_key] = prop_value
+
+        return ResolvedEdgeBatch(
+            relationships=list(merged_edges.values()),
+            entity_cache=entity_cache,
+            skipped_relationships=skipped,
+        )
+
+    async def _resolve_uncached(
+        self,
+        *,
         name: str,
         entity_type: str,
-        props: Optional[Any] = None,
-        allow_create: bool = True,
-    ) -> Optional[str]:
-        """
-        Resolve or create one domain entity.  Never touches the cache directly.
-        """
-        entity_id = canonical_entity_id(name, entity_type)
+        props: Optional[Any],
+        allow_create: bool,
+    ) -> EntityResolution:
+        canonical_id = canonical_entity_id(name, entity_type)
 
-        # Fast path: entity already exists by canonical ID
-        if await self._neo4j.entity_exists(entity_id):
-            return entity_id
+        if await self._neo4j.entity_exists(canonical_id):
+            return EntityResolution(
+                entity_id=canonical_id,
+                match_stage="exact_id",
+                score=1.0,
+                created=False,
+            )
 
-        # Semantic similarity fallback (finds renamed/aliased entities)
-        similar_id = await self._find_similar(name, entity_type, entity_id)
-        if similar_id:
-            return similar_id
+        exact_match = await self._find_exact_name_match(
+            name=name, entity_type=entity_type
+        )
+        if exact_match:
+            return EntityResolution(
+                entity_id=exact_match,
+                match_stage="exact_name",
+                score=1.0,
+                created=False,
+            )
+
+        fuzzy_candidates = await self._find_fuzzy_candidates(
+            name=name, entity_type=entity_type
+        )
+        alias_match = self._match_company_alias(
+            name=name,
+            entity_type=entity_type,
+            candidates=fuzzy_candidates,
+        )
+        if alias_match:
+            return EntityResolution(
+                entity_id=alias_match,
+                match_stage="fuzzy_alias",
+                score=1.0,
+                created=False,
+            )
+
+        strongest_fuzzy = self._pick_strongest_fuzzy_candidate(fuzzy_candidates)
+        if (
+            strongest_fuzzy is not None
+            and strongest_fuzzy[1] >= self._thresholds.strong_fuzzy_threshold
+        ):
+            return EntityResolution(
+                entity_id=strongest_fuzzy[0],
+                match_stage="fuzzy",
+                score=strongest_fuzzy[1],
+                created=False,
+            )
+
+        vector_match = await self._find_vector_match(name=name, entity_type=entity_type)
+        if vector_match is not None:
+            return EntityResolution(
+                entity_id=vector_match[0],
+                match_stage="vector",
+                score=1.0 - vector_match[1],
+                created=False,
+            )
 
         if not allow_create:
-            return None
+            return EntityResolution(
+                entity_id=None, match_stage="unresolved", created=False
+            )
 
-        # Create new entity
-        node = self._build_entity_node(name, entity_type, entity_id, props)
+        node = self._build_entity_node(
+            name=name,
+            entity_type=entity_type,
+            entity_id=canonical_id,
+            props=props,
+        )
         await self._persist_entity(node)
-        return entity_id
+        return EntityResolution(
+            entity_id=canonical_id,
+            match_stage="created",
+            score=None,
+            created=True,
+        )
 
-    async def _find_similar(
-        self, name: str, entity_type: str, exclude_id: str
+    async def _find_exact_name_match(
+        self, *, name: str, entity_type: str
     ) -> Optional[str]:
-        """Check Neo4j fuzzy candidates, then Chroma semantic similarity."""
-        fuzzy_candidates: List[dict] = []
-        candidate_ids: Optional[set] = None
-
+        if not hasattr(self._neo4j, "find_entity_by_name"):
+            return None
         try:
-            fuzzy_candidates = await self._neo4j.find_fuzzy_entity_candidates(
+            record = await self._neo4j.find_entity_by_name(
                 entity_type=entity_type,
                 name=name,
-                exclude_id=exclude_id,
-                threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-                limit=settings.MEMORY_VECTOR_TOP_K,
-            )
-            candidate_ids = (
-                {c.get("id") for c in fuzzy_candidates if c.get("id")}
-                if fuzzy_candidates
-                else None
             )
         except Exception:
             logger.exception(
-                "_find_similar: fuzzy candidate query failed for '%s'", name
+                "resolve_entity: exact name lookup failed for '%s' (%s)",
+                name,
+                entity_type,
             )
-            candidate_ids = None
-
-        if fuzzy_candidates and entity_type == "Company":
-            normalized = _normalize_company_alias(name)
-            if normalized:
-                for cand in fuzzy_candidates:
-                    cand_name = cand.get("name") or ""
-                    if _normalize_company_alias(cand_name) == normalized:
-                        return str(cand.get("id"))
-
-        if self._chroma is not None:
-            description = normalize_entity_description(None, name)
-            text = f"{name}. {description}"
-            try:
-                results = await self._chroma.query_entity_similar(
-                    text=text,
-                    entity_type=entity_type,
-                    n_results=settings.MEMORY_VECTOR_TOP_K,
-                )
-            except Exception:
-                logger.exception(
-                    "_find_similar: entity embedding search failed for '%s'", name
-                )
-                results = []
-
-            for doc, distance in results:
-                candidate_id = doc.id or (doc.metadata or {}).get("entity_id")
-                if not candidate_id or distance is None:
-                    continue
-                if candidate_ids is not None and candidate_id not in candidate_ids:
-                    continue
-                if (1.0 - float(distance)) >= self._semantic_threshold:
-                    if await self._neo4j.entity_exists(str(candidate_id)):
-                        return str(candidate_id)
-
-        # Fallback: accept very strong fuzzy match even if embeddings are weak
-        if fuzzy_candidates:
-            for cand in fuzzy_candidates:
-                sim = cand.get("similarity")
-                if isinstance(sim, (int, float)) and sim >= 0.90:
-                    return str(cand.get("id"))
-
+            return None
+        if not isinstance(record, dict):
+            return None
+        entity_id = record.get("id")
+        if entity_id:
+            return str(entity_id)
         return None
 
+    async def _find_fuzzy_candidates(
+        self, *, name: str, entity_type: str
+    ) -> List[dict]:
+        try:
+            candidates = await self._neo4j.find_fuzzy_entity_candidates(
+                entity_type=entity_type,
+                name=name,
+                threshold=self._thresholds.neo4j_fuzzy_threshold,
+                limit=settings.MEMORY_VECTOR_TOP_K,
+            )
+            filtered: List[dict] = []
+            for candidate in candidates:
+                candidate_name = str(candidate.get("name") or "")
+                if (
+                    fuzz.token_sort_ratio(name, candidate_name)
+                    >= self._thresholds.rapidfuzz_threshold
+                ):
+                    filtered.append(candidate)
+            return filtered
+        except Exception:
+            logger.exception(
+                "resolve_entity: fuzzy lookup failed for '%s' (%s)",
+                name,
+                entity_type,
+            )
+            return []
+
+    @staticmethod
+    def _match_company_alias(
+        *,
+        name: str,
+        entity_type: str,
+        candidates: List[dict],
+    ) -> Optional[str]:
+        if entity_type != "Company" or not candidates:
+            return None
+        normalized = _normalize_company_alias(name)
+        if not normalized:
+            return None
+        for candidate in candidates:
+            candidate_id = candidate.get("id")
+            candidate_name = str(candidate.get("name") or "")
+            if candidate_id and _normalize_company_alias(candidate_name) == normalized:
+                return str(candidate_id)
+        return None
+
+    @staticmethod
+    def _pick_strongest_fuzzy_candidate(
+        candidates: List[dict],
+    ) -> Optional[Tuple[str, float]]:
+        best_id: Optional[str] = None
+        best_score: float = -1.0
+        for candidate in candidates:
+            candidate_id = candidate.get("id")
+            similarity = candidate.get("similarity")
+            if not candidate_id:
+                continue
+            if not isinstance(similarity, (int, float)):
+                continue
+            score = float(similarity)
+            if score > best_score:
+                best_score = score
+                best_id = str(candidate_id)
+        if best_id is None:
+            return None
+        return best_id, best_score
+
+    async def _find_vector_match(
+        self,
+        *,
+        name: str,
+        entity_type: str,
+    ) -> Optional[Tuple[str, float]]:
+        if self._chroma is None:
+            return None
+
+        text = f"{name}. {normalize_entity_description(None, name)}"
+        try:
+            results = await self._chroma.query_entity_similar(
+                text=text,
+                entity_type=entity_type,
+                n_results=settings.MEMORY_VECTOR_TOP_K,
+            )
+        except Exception:
+            logger.exception(
+                "resolve_entity: vector lookup failed for '%s' (%s)",
+                name,
+                entity_type,
+            )
+            return None
+
+        best_candidate_id: Optional[str] = None
+        best_distance: Optional[float] = None
+        for doc, score in results:
+            candidate_id = doc.id or (doc.metadata or {}).get("entity_id")
+            distance = self._score_to_distance(score)
+            if not candidate_id or distance is None:
+                continue
+            if distance > self._thresholds.vector_distance_threshold:
+                continue
+            if best_distance is None or distance < best_distance:
+                best_candidate_id = str(candidate_id)
+                best_distance = distance
+
+        if best_candidate_id is None or best_distance is None:
+            return None
+        if not await self._neo4j.entity_exists(best_candidate_id):
+            return None
+        return best_candidate_id, best_distance
+
+    @staticmethod
+    def _score_to_distance(score: Optional[float]) -> Optional[float]:
+        if score is None:
+            return None
+        if not isinstance(score, (int, float)):
+            return None
+        numeric = float(score)
+        if numeric < 0:
+            return None
+        if numeric <= 1.0:
+            # Chroma relevance scores are usually in [0,1] with higher=better.
+            return 1.0 - numeric
+        # Some backends return distance where lower=better.
+        return numeric
+
     async def _persist_entity(self, node: EntityNode) -> None:
-        """Write entity to Neo4j and optionally Chroma."""
         await self._neo4j.merge_entity_node(node)
-        if self._chroma is not None:
-            try:
-                await self._chroma.upsert_entity_embedding(
-                    entity_id=node.id,
-                    name=node.name,
-                    description=node.description,
-                    entity_type=node.entity_type,
-                )
-            except Exception:
-                logger.exception(
-                    "_persist_entity: Chroma upsert failed for '%s'", node.name
-                )
+        if self._chroma is None:
+            return
+        try:
+            await self._chroma.upsert_entity_embedding(
+                entity_id=node.id,
+                name=node.name,
+                description=node.description,
+                entity_type=node.entity_type,
+            )
+        except Exception:
+            logger.exception(
+                "resolve_entity: vector upsert failed for '%s' (%s)",
+                node.name,
+                node.entity_type,
+            )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Internal: type-scoped fuzzy + semantic dedup
-    # ──────────────────────────────────────────────────────────────────────────
-    async def _embed_documents_batched(
-        self,
-        names: List[str],
-    ) -> Dict[str, np.ndarray]:
-        if not names or self._embedding_func is None:
+    async def _cache_get(self, key: Tuple[str, str]) -> Optional[str]:
+        now = time.time()
+        async with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            entity_id, written_at = entry
+            if now - written_at > self._cache_ttl_seconds:
+                self._cache.pop(key, None)
+                return None
+            self._cache.move_to_end(key)
+            return entity_id
+
+    async def _cache_set(self, key: Tuple[str, str], entity_id: str) -> None:
+        async with self._cache_lock:
+            self._cache[key] = (entity_id, time.time())
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_max_size:
+                self._cache.popitem(last=False)
+
+    async def _get_inflight_lock(self, key: Tuple[str, str]) -> asyncio.Lock:
+        async with self._inflight_lock_guard:
+            lock = self._inflight_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._inflight_locks[key] = lock
+            return lock
+
+    @staticmethod
+    def _props_to_dict(props: Optional[Any]) -> dict:
+        if isinstance(props, dict):
+            return dict(props)
+        if props is None:
             return {}
-        batch_size = max(settings.ENTITY_EMBEDDING_BATCH_SIZE, 1)
-        max_concurrency = max(settings.ENTITY_EMBEDDING_MAX_CONCURRENCY, 1)
-        semaphore = asyncio.Semaphore(max_concurrency)
+        output: dict = {}
+        for field in ("description", "ticker", "nodeset_ids"):
+            value = getattr(props, field, None)
+            if value is not None:
+                output[field] = value
+        return output
 
-        async def _embed_batch(batch: List[str]) -> List[List[float]]:
-            async with semaphore:
-                return await asyncio.to_thread(
-                    self._embedding_func.embed_documents, batch
-                )
+    @staticmethod
+    def _merge_props(existing: dict, incoming: dict) -> dict:
+        if not incoming:
+            return dict(existing)
+        merged = dict(existing)
 
-        batches = [names[i : i + batch_size] for i in range(0, len(names), batch_size)]
-        results = await asyncio.gather(
-            *[_embed_batch(b) for b in batches], return_exceptions=True
-        )
+        incoming_desc = str(incoming.get("description") or "").strip()
+        existing_desc = str(merged.get("description") or "").strip()
+        if incoming_desc and len(incoming_desc) > len(existing_desc):
+            merged["description"] = incoming_desc
 
-        emb_map: Dict[str, np.ndarray] = {}
-        for batch, result in zip(batches, results):
-            if isinstance(result, Exception):
-                logger.exception(
-                    "_type_scoped_dedup: embedding batch failed", exc_info=result
-                )
-                continue
-            for name, vec in zip(batch, result, strict=False):
-                emb_map[name] = np.array(vec)
+        if not merged.get("ticker") and incoming.get("ticker"):
+            merged["ticker"] = incoming["ticker"]
 
-        return emb_map
+        existing_nodeset_ids = list(merged.get("nodeset_ids") or [])
+        for nodeset_id in list(incoming.get("nodeset_ids") or []):
+            if nodeset_id not in existing_nodeset_ids:
+                existing_nodeset_ids.append(nodeset_id)
+        if existing_nodeset_ids:
+            merged["nodeset_ids"] = existing_nodeset_ids
 
-    async def _type_scoped_dedup(
-        self,
-        entities: List[Tuple[str, str, Optional[dict]]],
-    ) -> Dict[Tuple[str, str], str]:
-        """
-        Build an alias_map: (name.lower(), entity_type) → canonical_name.
+        return merged
 
-        Only entities of the SAME entity_type are compared against each other.
-        Uses rapidfuzz fuzzy matching first (cheap), then cosine similarity
-        on embeddings (expensive, only for unresolved candidates).
+    @staticmethod
+    def _merge_confidence(existing: Any, incoming: Any) -> Any:
+        existing_numeric = EntityResolver._try_float(existing)
+        incoming_numeric = EntityResolver._try_float(incoming)
+        if existing_numeric is not None and incoming_numeric is not None:
+            return max(existing_numeric, incoming_numeric)
+        if existing_numeric is not None:
+            return existing
+        if incoming_numeric is not None:
+            return incoming
 
-        Returns a dict mapping (name.lower(), type) → canonical_name.
-        Entities that are their own canonical form are not in the dict
-        (callers should default to the original name if key missing).
-        """
-        # Group by entity_type
-        by_type: Dict[str, List[str]] = {}
-        for name, etype, _ in entities:
-            by_type.setdefault(etype, []).append(name)
+        existing_text = str(existing or "low").strip().lower()
+        incoming_text = str(incoming or "low").strip().lower()
+        if _CONFIDENCE_RANK.get(incoming_text, 0) > _CONFIDENCE_RANK.get(
+            existing_text, 0
+        ):
+            return incoming
+        return existing
 
-        alias_map: Dict[Tuple[str, str], str] = {}
-
-        for etype, names in by_type.items():
-            # Build canonicals list: first name of each cluster is canonical
-            canonicals: List[str] = []
-            for name in names:
-                key = (name.lower(), etype)
-                # Fuzzy match against existing canonicals of this type
-                matched = next(
-                    (
-                        c
-                        for c in canonicals
-                        if fuzz.token_sort_ratio(name, c) >= self._fuzzy_threshold
-                    ),
-                    None,
-                )
-                if matched:
-                    alias_map[key] = matched
-                else:
-                    canonicals.append(name)
-                    # key maps to itself implicitly (no entry needed)
-
-            # Semantic pass: re-check unresolved names against canonicals
-            unresolved_keys = [
-                (name, etype)
-                for name in names
-                if (name.lower(), etype) not in alias_map
-                and sum(1 for c in canonicals if c != name) > 0
-            ]
-            if not unresolved_keys or self._embedding_func is None:
-                continue
-
-            unresolved_names = [name for name, _ in unresolved_keys]
-            all_names = list(dict.fromkeys(unresolved_names + canonicals))
-            emb_map = await self._embed_documents_batched(all_names)
-            if not emb_map:
-                continue
-            for name, _ in unresolved_keys:
-                key = (name.lower(), etype)
-                if key in alias_map:
-                    continue
-                vec = emb_map.get(name)
-                if vec is None:
-                    continue
-                for canon in canonicals:
-                    if canon == name:
-                        continue
-                    canon_vec = emb_map.get(canon)
-                    if canon_vec is None:
-                        continue
-                    denom = np.linalg.norm(vec) * np.linalg.norm(canon_vec)
-                    if (
-                        denom > 0
-                        and np.dot(vec, canon_vec) / denom >= self._semantic_threshold
-                    ):
-                        alias_map[key] = canon
-                        break
-
-        return alias_map
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Internal: cache helpers
-    # ──────────────────────────────────────────────────────────────────────────
-
-    async def _cache_set(self, key: Tuple[str, str], value: str) -> None:
-        async with self._cache_lock:
-            self._cache[key] = value
-            if len(self._cache) >= _MAX_CACHE_SIZE:
-                self._evict()
-
-    async def _cache_set_many(self, updates: Dict[Tuple[str, str], str]) -> None:
-        async with self._cache_lock:
-            self._cache.update(updates)
-            if len(self._cache) >= _MAX_CACHE_SIZE:
-                self._evict()
-
-    def _evict(self) -> None:
-        """Evict oldest 20% of entries (FIFO — Python dict preserves insertion order)."""
-        evict_count = int(_MAX_CACHE_SIZE * _EVICT_FRACTION)
-        keys_to_evict = list(self._cache.keys())[:evict_count]
-        for k in keys_to_evict:
-            del self._cache[k]
-        logger.debug("EntityResolver: evicted %d cache entries", evict_count)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Internal: entity node builder
-    # ──────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _try_float(value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
 
     @staticmethod
     def _build_entity_node(
+        *,
         name: str,
         entity_type: str,
         entity_id: str,

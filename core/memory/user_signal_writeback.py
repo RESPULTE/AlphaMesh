@@ -7,7 +7,8 @@ Changes from previous version
 - Now calls GraphQueueManager.enqueue(immediate=True) directly for entity persistence
   and edge writing.
 - Entity pre-resolution (_build_interest_relationships) now calls
-  EntityResolver.resolve() directly instead of DualStoreIngestor.resolve_entity_id().
+  EntityResolver.resolve_entity() directly instead of
+  DualStoreIngestor.resolve_entity_id().
 - The _build_relationship_props helper is removed â€” Neo4jAdapter owns that now.
   Relationship dicts are passed as-is to enqueue(immediate=True) which delegates
   to Neo4jAdapter internally.
@@ -123,7 +124,7 @@ async def _build_interest_relationships(
     Pre-resolve all domain entity IDs, then build the full relationship list.
 
     Changes from previous version:
-    - Uses entity_resolver.resolve() instead of ingestor.resolve_entity_id().
+    - Uses entity_resolver.resolve_entity() instead of ingestor.resolve_entity_id().
     - The entity_cache dict is local to this call (not shared with the queue).
     """
     from core.memory.graph.utils import generate_uuid5
@@ -199,10 +200,12 @@ async def _build_interest_relationships(
             # Use EntityResolver instead of ingestor.resolve_entity_id
             resolved_id = entity_cache.get((entity.entity_name, entity.entity_type))
             if resolved_id is None:
-                resolved_id = await entity_resolver.resolve(
-                    entity.entity_name, entity.entity_type
+                resolution = await entity_resolver.resolve_entity(
+                    name=entity.entity_name,
+                    entity_type=entity.entity_type,
                 )
-                if resolved_id:
+                if resolution.entity_id:
+                    resolved_id = resolution.entity_id
                     entity_cache[(entity.entity_name, entity.entity_type)] = resolved_id
             if not resolved_id:
                 continue
@@ -265,10 +268,12 @@ async def _build_interest_relationships(
         for entity in signal.target_entities:
             resolved_id = entity_cache.get((entity.entity_name, entity.entity_type))
             if resolved_id is None:
-                resolved_id = await entity_resolver.resolve(
-                    entity.entity_name, entity.entity_type
+                resolution = await entity_resolver.resolve_entity(
+                    name=entity.entity_name,
+                    entity_type=entity.entity_type,
                 )
-                if resolved_id:
+                if resolution.entity_id:
+                    resolved_id = resolution.entity_id
                     entity_cache[(entity.entity_name, entity.entity_type)] = resolved_id
             if not resolved_id:
                 continue

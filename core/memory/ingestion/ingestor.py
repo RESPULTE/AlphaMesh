@@ -421,12 +421,15 @@ class DualStoreIngestor:
                 local_key = entity.local_id or canonical_id
 
                 # Use EntityResolver for persistence (replaces direct _resolve_entity calls)
-                resolved_id = await self._entity_resolver.resolve(
-                    entity.name, entity.entity_type, props=entity
+                resolution = await self._entity_resolver.resolve_entity(
+                    name=entity.name,
+                    entity_type=entity.entity_type,
+                    props=entity,
                 )
-                if not resolved_id:
+                if not resolution.entity_id:
                     chunk_failed = True
                     break
+                resolved_id = resolution.entity_id
 
                 entity.id = resolved_id
                 local_id_map[local_key] = entity
@@ -478,36 +481,6 @@ class DualStoreIngestor:
 
             if chunk_failed:
                 continue
-
-            # Batch entity embedding upsert for new entities
-            if self._entity_chroma_adapter is not None:
-                new_entities = [
-                    e for e in chunk_entities.values() if e.id not in deduped_entities
-                ]
-                if new_entities:
-                    try:
-                        batch_size = max(settings.ENTITY_EMBEDDING_BATCH_SIZE, 1)
-                        max_concurrency = max(
-                            settings.ENTITY_EMBEDDING_MAX_CONCURRENCY, 1
-                        )
-                        semaphore = asyncio.Semaphore(max_concurrency)
-
-                        async def _upsert_batch(batch: List[EntityNode]) -> None:
-                            async with semaphore:
-                                await self._entity_chroma_adapter.upsert_entity_embeddings_batch(
-                                    batch
-                                )
-
-                        batches = [
-                            new_entities[i : i + batch_size]
-                            for i in range(0, len(new_entities), batch_size)
-                        ]
-                        await asyncio.gather(*[_upsert_batch(b) for b in batches])
-                    except Exception:
-                        self._logger.exception(
-                            "Failed to batch-upsert entity embeddings for chunk %s",
-                            result.chunk_id,
-                        )
 
             if not await self._upsert_with_retry(
                 lambda cid=result.chunk_id: (

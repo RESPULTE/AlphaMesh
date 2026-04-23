@@ -90,6 +90,38 @@ class Neo4jAdapter:
         records = await self._execute_read(cypher, {"id": entity_id})
         return bool(records)
 
+    async def find_entity_by_name(self, entity_type: str, name: str) -> Optional[dict]:
+        """
+        Return an exact normalized name match for a type, if present.
+
+        Normalization is done in Cypher via lower+trim so callers can pass
+        user-provided values without pre-processing concerns.
+        """
+        if not entity_type or not name:
+            return None
+        cypher = (
+            "MATCH (e:Entity) "
+            "WHERE e.entity_type = $entity_type "
+            "AND e.name IS NOT NULL "
+            "AND toLower(trim(e.name)) = toLower(trim($name)) "
+            "RETURN e.id AS id, e.name AS name "
+            "LIMIT 1"
+        )
+        records = await self._execute_read(
+            cypher,
+            {
+                "entity_type": entity_type,
+                "name": name,
+            },
+        )
+        if not records:
+            return None
+        record = records[0]
+        entity_id = record.get("id")
+        if not entity_id:
+            return None
+        return {"id": entity_id, "name": record.get("name")}
+
     async def find_fuzzy_entity_candidates(
         self,
         entity_type: str,

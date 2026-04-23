@@ -137,15 +137,25 @@ class GraphWritePipeline:
             else:
                 domain_rels.append(rel)
 
-        domain_entity_cache = await self._resolve_domain_entity_cache(
-            relationships=domain_rels,
-            allow_create=allow_create,
-        )
+        domain_entity_cache: Dict[Tuple[str, str], str] = {}
+        resolved_domain_relationships: List[dict] = []
+        if domain_rels:
+            resolved_batch = await self._resolver.resolve_relationship_edges(
+                domain_rels,
+                allow_create=allow_create,
+            )
+            domain_entity_cache = dict(resolved_batch.entity_cache)
+            resolved_domain_relationships = list(resolved_batch.relationships)
+            if resolved_batch.skipped_relationships:
+                logger.debug(
+                    "GraphWritePipeline: skipped %d unresolved domain relationship(s)",
+                    resolved_batch.skipped_relationships,
+                )
 
         domain_written = 0
-        if domain_rels:
+        if resolved_domain_relationships:
             domain_written = await self._writer.write_relationships(
-                domain_rels,
+                resolved_domain_relationships,
                 conversation_id,
                 source_agent,
                 domain_entity_cache,
@@ -224,12 +234,13 @@ class GraphWritePipeline:
         if not unique_entities:
             return cache
 
-        resolved = await self._resolver.resolve_batch(
+        resolved = await self._resolver.resolve_entities(
             unique_entities,
             allow_create=allow_create,
         )
-        for (entity_name, entity_type), entity_id in resolved.items():
-            cache[entity_key(entity_name, entity_type)] = entity_id
+        for (entity_name, entity_type), resolution in resolved.items():
+            if resolution.entity_id:
+                cache[entity_key(entity_name, entity_type)] = resolution.entity_id
         return cache
 
     async def _upsert_user_scoped_nodes(

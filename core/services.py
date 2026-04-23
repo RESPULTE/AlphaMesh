@@ -159,9 +159,8 @@ class ServiceManager:
                 self._entity_resolver = EntityResolver(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     entity_chroma_adapter=self.get_entity_chroma_adapter(),
-                    embedding_func=self.get_embedding_func(),
-                    fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
-                    semantic_threshold=settings.EXTRACTION_SEMANTIC_THRESHOLD,
+                    neo4j_fuzzy_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
+                    rapidfuzz_threshold=settings.EXTRACTION_FUZZY_THRESHOLD,
                 )
             except Exception as e:
                 print(f"Error initializing EntityResolver: {e}")
