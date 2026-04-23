@@ -61,11 +61,8 @@ _EXTRACTABLE_ENTITY_TYPES = [
 
 def _build_batch_extraction_schema_for_prompt() -> str:
     schema = BatchExtractionResult.model_json_schema()
-    rendered_schema = json.dumps(
-        schema, indent=2, ensure_ascii=True, sort_keys=True
-    )
+    rendered_schema = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
     return rendered_schema.replace("{", "{{").replace("}", "}}")
-
 
 
 def _build_relationships_block(*, include_context_only_rule: bool = False) -> str:
@@ -91,23 +88,22 @@ def _build_relationships_block(*, include_context_only_rule: bool = False) -> st
 # Module-Level Constants
 # ---------------------------
 
-CHUNK_EXTRACTION_PROMPT =  (
-        "You are an information extraction system. Extract entities and relationships from each "
-        "news chunk provided. Only use information explicitly stated in each chunk. "
-        "Do not infer relationships across multiple articles or chunks. "
-        f"Allowed entity types: {", ".join(_EXTRACTABLE_ENTITY_TYPES)}. "
-        "Sector, Industry, Market and FinancialConceptCategory entities are managed by the taxonomy pipeline and must NOT "
-        "be extracted from text. Each entity must include a short, single-sentence description "
-        f"drawn only from the chunk text. FinancialConcept entities MUST include concept_categories with 1-3 entries chosen only from: {_pipe_join(list(FINANCIAL_CONCEPT_CATEGORIES.keys()))}. "
-        f"Extracted relationships MUST use relationship_type values from: {"|".join(_RELATIONSHIP_TYPE_CHOICES)}. "
-        "Return a JSON object matching the BatchExtractionResult schema. "
-        "Each entity must include a temporary local_id used by relationships; "
-        "relationships must reference entities by local_id. "
-        "Each result must echo the chunk_id exactly as provided. "
-        "JSON Schema:\n"
-        f"{ _build_batch_extraction_schema_for_prompt()}"
-    )
-
+CHUNK_EXTRACTION_PROMPT = f"""\
+        You are an information extraction system. Extract entities and relationships from each 
+        news chunk provided. Only use information explicitly stated in each chunk. 
+        Do not infer relationships across multiple articles or chunks. 
+        Allowed entity types: {", ".join(_EXTRACTABLE_ENTITY_TYPES)}. 
+        Sector, Industry, Market and FinancialConceptCategory entities are managed by the taxonomy pipeline and must NOT 
+        be extracted from text. Each entity must include a short, single-sentence description 
+        drawn only from the chunk text. FinancialConcept entities MUST include concept_categories with 1-3 entries chosen only from: {_pipe_join(list(FINANCIAL_CONCEPT_CATEGORIES.keys()))}. 
+        Extracted relationships MUST use relationship_type values from: {"|".join(_RELATIONSHIP_TYPE_CHOICES)}. 
+        Return a JSON object matching the BatchExtractionResult schema. 
+        Each entity must include a temporary local_id used by relationships; 
+        relationships must reference entities by local_id. 
+        Each result must echo the chunk_id exactly as provided. 
+        JSON Schema:\n
+        { _build_batch_extraction_schema_for_prompt()}
+""".strip()
 
 
 COMBINED_ANALYSIS_RELATIONSHIP_PROMPT = f"""\
