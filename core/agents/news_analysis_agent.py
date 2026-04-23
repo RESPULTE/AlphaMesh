@@ -635,7 +635,7 @@ class NewsAnalysisAgent(AbstractAgent):
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
                     query=state.query,
-                    entities_section=company_context_section + entities_section,
+                    entities_section=company_context_section,
                     context=context_block,
                 )
             ),

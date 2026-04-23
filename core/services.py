@@ -168,7 +168,7 @@ class ServiceManager:
         return self._entity_resolver
 
     def get_relationship_extractor(self):
-        from core.memory.graph.relationship_extractor import RelationshipExtractor
+        from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
 
         if self._relationship_extractor is None:
             self._relationship_extractor = RelationshipExtractor()

@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 64
 
     # ── Extraction ────────────────────────────────────────────────────────────
-    EXTRACTION_BATCH_SIZE: int = 8
+    EXTRACTION_BATCH_SIZE: int = 20
     EXTRACTION_MAX_CONCURRENCY: int = 10
     EXTRACTION_ENABLED: bool = True
     EXTRACTION_IMMEDIATE: bool = False

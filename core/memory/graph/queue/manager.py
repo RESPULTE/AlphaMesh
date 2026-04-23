@@ -14,13 +14,13 @@ from core.memory.graph.queue.policies import (
     resolve_allow_create,
 )
 from core.memory.graph.queue.prompt_registry import PromptRegistry
+from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
 from core.memory.graph.queue.types import (
     TASK_KIND_CHUNK_ENTITIES,
     GraphTask,
     graph_task_from_payload,
 )
 from core.memory.graph.queue.worker import ConversationQueueWorker
-from core.memory.graph.relationship_extractor import RelationshipExtractor
 from core.memory.graph.sql_store import GraphTaskSqlStore
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 

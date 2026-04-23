@@ -29,7 +29,9 @@ class PromptRegistry:
         try:
             await self._store.save_prompt(prompt_id=prompt_id, prompt_text=prompt_text)
         except Exception:
-            logger.exception("PromptRegistry: failed to persist prompt_id '%s'", prompt_id)
+            logger.exception(
+                "PromptRegistry: failed to persist prompt_id '%s'", prompt_id
+            )
         return prompt_id
 
     def get(self, prompt_id: str) -> Optional[str]:

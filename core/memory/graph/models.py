@@ -57,6 +57,8 @@ ALLOWED_ENTITY_TYPES = {
     "Market",
 }
 
+_EXTRACTABLE_ENTITY_TYPES = {"Company", "FinancialEvent", "FinancialConcept"}
+
 # ── ALLOWED_RELATIONSHIP_TYPES: add BELONGS_TO ───────────────────────────────
 ALLOWED_RELATIONSHIP_TYPES = [
     "AFFECTS",

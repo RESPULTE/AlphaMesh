@@ -21,25 +21,25 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, Optional, Tuple, get_args, get_origin
+from typing import Dict, List, Optional, Tuple
 
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel
 
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.models import (
+    _EXTRACTABLE_ENTITY_TYPES,
+    ALLOWED_RELATIONSHIP_TYPES,
     FINANCIAL_CONCEPT_CATEGORIES,
     BatchExtractionResult,
-    ChunkExtractedRelationship,
     ChunkExtractionResult,
     DocumentMetadata,
     DocumentNode,
     EntityNode,
 )
 from core.memory.graph.nodeset_manager import NodeSetManager
-from core.memory.graph.utils import canonical_entity_id, normalize_relationship_type
+from core.memory.graph.utils import canonical_entity_id
 from core.memory.ingestion.chunker import ArticleChunker
 from core.memory.retrieval.models import RetrievedChunk
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
@@ -56,41 +56,10 @@ CHUNK_EXTRACTION_USER_TEMPLATE = (
 )
 
 
-def _get_model_field_choices(model_cls: type[BaseModel], field_name: str) -> List[str]:
-    """Read allowed values for a field from the Pydantic model definition."""
-    field_info = model_cls.model_fields.get(field_name)
-    if field_info is None:
-        return []
-
-    if get_origin(field_info.annotation) is Literal:
-        return [str(choice) for choice in get_args(field_info.annotation)]
-
-    field_schema = (
-        model_cls.model_json_schema().get("properties", {}).get(field_name, {})
-    )
-    enum_values = field_schema.get("enum", []) if isinstance(field_schema, dict) else []
-    return [str(value) for value in enum_values]
-
-
-def _pipe_join(values: List[str]) -> str:
-    return "|".join(values)
-
-
 def _build_batch_extraction_schema_for_prompt() -> str:
     schema = BatchExtractionResult.model_json_schema()
     rendered_schema = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
     return rendered_schema.replace("{", "{{").replace("}", "}}")
-
-
-_ENTITY_TYPE_CHOICES = _get_model_field_choices(EntityNode, "entity_type")
-_RELATIONSHIP_TYPE_CHOICES = _get_model_field_choices(
-    ChunkExtractedRelationship, "relationship_type"
-)
-_EXTRACTABLE_ENTITY_TYPES = [
-    entity_type
-    for entity_type in ("Company", "FinancialEvent", "FinancialConcept")
-    if entity_type in _ENTITY_TYPE_CHOICES
-]
 
 
 EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT = f"""\
@@ -100,8 +69,11 @@ EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT = f"""\
         Allowed entity types: {", ".join(_EXTRACTABLE_ENTITY_TYPES)}.
         Sector, Industry, Market and FinancialConceptCategory entities are managed by the taxonomy pipeline and must NOT
         be extracted from text. Each entity must include a short, single-sentence description
-        drawn only from the chunk text. FinancialConcept entities MUST include concept_categories with 1-3 entries chosen only from: {_pipe_join(list(FINANCIAL_CONCEPT_CATEGORIES.keys()))}.
-        Extracted relationships MUST use relationship_type values from: {"|".join(_RELATIONSHIP_TYPE_CHOICES)}.
+        drawn only from the chunk text. 
+        FinancialConcept entities must be insightful and provide useful learning experience for the user or context for future analysis. 
+        They should NOT be generic definitions easily found in a textbook. 
+        Each FinancialConcept must include 1 to 3 (at max) concept_categories chosen from: {", ".join(FINANCIAL_CONCEPT_CATEGORIES.keys())}.
+        Extracted relationships MUST use relationship_type values from: {", ".join(ALLOWED_RELATIONSHIP_TYPES)}.
         Return a JSON object matching the BatchExtractionResult schema.
         Each entity must include a temporary local_id used by relationships;
         relationships must reference entities by local_id.
@@ -507,34 +479,34 @@ class DualStoreIngestor:
             if chunk_failed:
                 continue
 
-            for rel in result.relationships:
-                src = local_id_map.get(rel.source_entity_local_id)
-                tgt = local_id_map.get(rel.target_entity_local_id)
-                if not src or not tgt:
-                    self._logger.warning(
-                        "Skipping relationship with unresolved entities: %s -> %s",
-                        rel.source_entity_local_id,
-                        rel.target_entity_local_id,
-                    )
-                    continue
-                rel_type = normalize_relationship_type(rel.relationship_type)
-                if not await self._upsert_with_retry(
-                    lambda s=src, t=tgt, rt=rel_type, c=rel.confidence: (
-                        self._neo4j_adapter.merge_relationship(
-                            s.id,
-                            t.id,
-                            rt,
-                            {
-                                "relationship_type": rt,
-                                "source_chunk_id": result.chunk_id,
-                                "confidence": c,
-                            },
-                        )
-                    ),
-                    result.chunk_id,
-                ):
-                    chunk_failed = True
-                    break
+            # for rel in result.relationships:
+            #     src = local_id_map.get(rel.source_entity_local_id)
+            #     tgt = local_id_map.get(rel.target_entity_local_id)
+            #     if not src or not tgt:
+            #         self._logger.warning(
+            #             "Skipping relationship with unresolved entities: %s -> %s",
+            #             rel.source_entity_local_id,
+            #             rel.target_entity_local_id,
+            #         )
+            #         continue
+            #     rel_type = normalize_relationship_type(rel.relationship_type)
+            #     if not await self._upsert_with_retry(
+            #         lambda s=src, t=tgt, rt=rel_type, c=rel.confidence: (
+            #             self._neo4j_adapter.merge_relationship(
+            #                 s.id,
+            #                 t.id,
+            #                 rt,
+            #                 {
+            #                     "relationship_type": rt,
+            #                     "source_chunk_id": result.chunk_id,
+            #                     "confidence": c,
+            #                 },
+            #             )
+            #         ),
+            #         result.chunk_id,
+            #     ):
+            #         chunk_failed = True
+            #         break
 
             if chunk_failed:
                 continue
