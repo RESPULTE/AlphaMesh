@@ -1,9 +1,9 @@
 """
-core/memory/conversation/store.py
+api/services/conversation_service.py
 
 Two-tier conversation storage:
-  Tier 1 � in-memory dict (O(1) reads, no I/O)
-  Tier 2 � pluggable persistence adapter (SQLite by default)
+  Tier 1 - in-memory dict (O(1) reads, no I/O)
+  Tier 2 - pluggable persistence adapter (SQLite by default)
 
 Write-through: every mutation is written to both tiers atomically.
 Read-through:  if a conversation is not in memory, it is loaded from the
@@ -19,12 +19,9 @@ from typing import Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from core.memory.conversation.sql_store import SQLiteConversationStore
+from api.services.conversation_sql_store import SQLiteConversationStore
 
 logger = logging.getLogger(__name__)
-
-
-# -- Serialisation helpers ----------------------------------------------------
 
 
 def _to_dict(msg: BaseMessage) -> dict:
@@ -60,9 +57,9 @@ class ConversationStore:
 
     def __init__(self, db: SQLiteConversationStore) -> None:
         self._sql_db = db
-        # conversation_id ? List[dict]  (serialised messages)
+        # conversation_id -> List[dict] (serialized messages)
         self._cache: Dict[str, List[dict]] = {}
-        # conversation_id ? asyncio.Lock
+        # conversation_id -> asyncio.Lock
         self._locks: Dict[str, asyncio.Lock] = {}
 
     async def initialize(self) -> None:
@@ -79,8 +76,6 @@ class ConversationStore:
         messages = await self._sql_db.load_messages(conversation_id)
         self._cache[conversation_id] = messages
         return messages
-
-    # -- Public API -----------------------------------------------------------
 
     async def ensure_conversation(
         self,

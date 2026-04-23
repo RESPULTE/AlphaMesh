@@ -22,10 +22,12 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from langchain_core.prompts import ChatPromptTemplate
+
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
-from core.memory.graph.extraction_prompts import build_extraction_prompt
+from core.memory.graph.extraction_prompts import CHUNK_EXTRACTION_PROMPT
 from core.memory.graph.models import (
     FINANCIAL_CONCEPT_CATEGORIES,
     BatchExtractionResult,
@@ -44,6 +46,22 @@ from core.memory.stores.neo4j_adapter import Neo4jAdapter
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 
 logger = get_logger(__name__)
+
+CHUNK_EXTRACTION_USER_TEMPLATE = (
+    "Extract entities and relationships from the following news chunks. "
+    "Each chunk is labeled with [CHUNK_ID: ...].\n\n"
+    "{chunk_blocks}\n\n"
+)
+
+
+def build_extraction_prompt() -> ChatPromptTemplate:
+    """Build the chat prompt template for chunk extraction."""
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", CHUNK_EXTRACTION_PROMPT),
+            ("user", CHUNK_EXTRACTION_USER_TEMPLATE),
+        ]
+    )
 
 
 class DualStoreIngestor:

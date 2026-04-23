@@ -34,7 +34,6 @@ class ServiceManager:
         self._user_context_service = None
         self._subgraph_service = None
         self._ticker_validator = None
-        self._conversation_store = None
         self._market_data_service = None
 
     def get_agent(self, temperature=0.0):
@@ -314,19 +313,6 @@ class ServiceManager:
                 raise
         return self._ticker_validator
 
-    def get_conversation_store(self):
-        from core.memory.conversation.conversation_service import ConversationStore
-        from core.memory.conversation.sql_store import SQLiteConversationStore
-
-        if self._conversation_store is None:
-            try:
-                db = SQLiteConversationStore(db_path=settings.CONVERSATIONS_DB_PATH)
-                self._conversation_store = ConversationStore(db=db)
-            except Exception as e:
-                print(f"Error initializing ConversationStore: {e}")
-                raise
-        return self._conversation_store
-
     def get_market_data_service(self):
         from core.market_data_service import MarketDataService
 
@@ -346,7 +332,6 @@ class ServiceManager:
         """
         await self.get_nodeset_manager().initialize_default_nodesets()
         await self.get_graph_queue_manager().start()
-        await self.get_conversation_store().initialize()
 
     async def shutdown(self) -> None:
         """Run at application teardown to drain graph queues gracefully."""
