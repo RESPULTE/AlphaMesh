@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from langchain_core.documents import Document
 from pydantic import BaseModel, ConfigDict, Field
@@ -159,7 +159,6 @@ class RetrievedChunk(BaseModel):
 class MemoryContext(BaseModel):
     chunks: List[RetrievedChunk]
     rewritten_queries: RewrittenQueries
-    entity_tuples: List[Tuple[str, str]] = Field(default_factory=list)
 
 
 @dataclass

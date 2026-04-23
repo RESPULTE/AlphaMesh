@@ -630,29 +630,7 @@ class DualStoreRetriever:
             domain="comprehensive",
         )
 
-        entity_tuples: List[tuple[str, str]] = []
-        chunk_ids = [chunk.chunk_id for chunk in prefiltered if chunk.chunk_id]
-        if chunk_ids:
-            try:
-                rows = await self._neo4j_adapter.get_entities_for_chunks(chunk_ids)
-                seen: Set[tuple[str, str]] = set()
-                for row in rows:
-                    parsed = _normalize_entity_tuple(
-                        row.get("entity_name"),
-                        row.get("entity_type"),
-                    )
-                    if parsed is None or parsed in seen:
-                        continue
-                    seen.add(parsed)
-                    entity_tuples.append(parsed)
-            except Exception as exc:
-                self._logger.error(
-                    "Comprehensive retrieve: failed to fetch entity tuples: %s",
-                    exc,
-                )
-
         return MemoryContext(
             chunks=prefiltered,
             rewritten_queries=rewritten_queries,
-            entity_tuples=entity_tuples,
         )

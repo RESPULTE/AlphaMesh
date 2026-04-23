@@ -531,9 +531,6 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         merged_entity_tuples: List[Tuple[str, str]] = []
-        if memory_context is not None and memory_context.entity_tuples:
-            merged_entity_tuples.extend(memory_context.entity_tuples)
-
         final_ranked_chunk_ids = list(
             dict.fromkeys(chunk.chunk_id for chunk in final_ranked if chunk.chunk_id)
         )
