@@ -9,7 +9,6 @@ Design
 ──────
 - resolve()       → single entity, creates Neo4j/Chroma node if new
 - resolve_batch() → concurrent batch, type-scoped dedup, returns id map
-- resolve_user_node() → deterministic user-scoped nodes (no dedup, no cache)
 
 Thread-safety
 ─────────────

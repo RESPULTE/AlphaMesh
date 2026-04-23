@@ -232,16 +232,10 @@ class ServiceManager:
 
         if self._retriever is None:
             try:
-                trace_sink = None
-                if settings.RETRIEVAL_TRACE_ENABLED:
-                    trace_sink = NetworkXRetrievalTraceSink(
-                        max_runs=settings.RETRIEVAL_TRACE_MAX_RUNS
-                    )
                 self._retriever = DualStoreRetriever(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
                     prefilter=self.get_prefilter(),
-                    trace_sink=trace_sink,
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreRetriever: {e}")

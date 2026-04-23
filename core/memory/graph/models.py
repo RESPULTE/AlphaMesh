@@ -126,6 +126,7 @@ _USER_SCOPED_TYPES = frozenset(
     {
         "UserInterestDomain",
         "UserInterestEdge",
+        "TurnNode",
     }
 )
 
