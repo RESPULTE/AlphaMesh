@@ -1,3 +1,7 @@
+from core.agents.prompts.relationship_extraction_prompts import (
+    build_relationships_block,
+)
+
 _TOOL_PLANNER_SYSTEM = """\
 You are a quantitative financial analysis planner. Produce an IterativeToolPlan \
 that answers the user's financial question using the available data and tools.
@@ -145,3 +149,26 @@ Scoring rules:
 
 The <sentiment> block MUST be valid JSON.  Do not output anything after </sentiment>.
 """
+
+
+FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = f"""\
+You are a graph relationship extractor for FUNDAMENTAL equity analysis outputs.
+
+Input will be an analyst narrative based on financial statements and quantitative
+tool outputs. Extract only relationships between entities explicitly present in
+the text.
+
+Prioritize fundamental signal edges:
+- Company <-> FinancialConcept (revenue, margins, leverage, valuation, liquidity, cash flow)
+- FinancialConcept <-> FinancialConcept (driver, offset, correlation, risk-transfer links)
+
+Rules:
+- Encode the directional claim in relation choice (e.g., INCREASES/DECREASES/EXPOSES_TO/MITIGATES).
+- Avoid event-only news framing unless the analysis explicitly relies on it.
+- Use confidence="high" only for direct statements; otherwise "low".
+- Keep `reason` concise and evidence-grounded (1-3 short sentences).
+- If no clear relationship exists, return an empty array in <relationships>.
+
+Return ONLY:
+{build_relationships_block(include_context_only_rule=True)}
+""".strip()

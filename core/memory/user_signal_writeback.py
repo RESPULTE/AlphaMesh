@@ -1,16 +1,16 @@
 ﻿"""
 core/memory/user_signal_writeback.py
 
-Unified user signal write-back via GraphQueueManager.enqueue(immediate=True).
+Unified user signal write-back via GraphQueueManager.enqueue(task).
 
 Changes from previous version
-- Now calls GraphQueueManager.enqueue(immediate=True) directly for entity persistence
-  and edge writing.
+- Calls GraphQueueManager.enqueue(task) for entity persistence and edge writing,
+  with runtime behavior carried on GraphTask fields.
 - Entity pre-resolution (_build_interest_relationships) now calls
   EntityResolver.resolve_entity() directly instead of
   DualStoreIngestor.resolve_entity_id().
 - The _build_relationship_props helper is removed â€” Neo4jAdapter owns that now.
-  Relationship dicts are passed as-is to enqueue(immediate=True) which delegates
+  Relationship dicts are passed as-is to enqueue(task) which delegates
   to Neo4jAdapter internally.
 
 Graph schema written here (unchanged)

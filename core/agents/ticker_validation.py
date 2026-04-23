@@ -23,6 +23,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from uuid import uuid4
@@ -38,6 +39,44 @@ logger = get_logger(__name__)
 
 MAX_TICKERS = 3
 _EQUITY_QUOTE_TYPES = frozenset({"EQUITY", "STOCK"})
+_CORP_SUFFIXES = {
+    "inc",
+    "incorporated",
+    "corp",
+    "corporation",
+    "co",
+    "company",
+    "ltd",
+    "limited",
+    "plc",
+    "llc",
+    "sa",
+    "ag",
+    "nv",
+    "bv",
+    "gmbh",
+}
+
+
+def _strip_corporate_suffix(name: str) -> str:
+    """
+    Remove trailing corporate suffix tokens while preserving base-name casing.
+    """
+    value = str(name or "").strip()
+    if not value:
+        return ""
+
+    tokens = [token for token in re.split(r"\s+", value) if token]
+    if not tokens:
+        return ""
+
+    def _canonical_token(token: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", token.lower())
+
+    while tokens and _canonical_token(tokens[-1]) in _CORP_SUFFIXES:
+        tokens.pop()
+
+    return " ".join(tokens).strip(" ,.-")
 
 
 # Data model
@@ -227,14 +266,13 @@ class TickerValidator:
             self._logger.debug("Lookup fallback failed for '%s': %s", query, exc)
         return []
 
-    # â”€â”€ Taxonomy upsert (runs as background asyncio task) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
     async def _upsert_company_taxonomy(self, info) -> None:
         """
         For a newly discovered company, write the full taxonomy chain
-        (Market â†’ Sector â†’ Industry â†’ Company) via GraphQueueManager.enqueue(immediate=True).
+        (Market â†’ Sector â†’ Industry â†’ Company) via GraphQueueManager.enqueue(task).
 
-        Replaces the old schedule(bypass_guards=True) call.
+        Replaces the old schedule(bypass_guards=True) call and carries runtime
+        behavior through GraphTask fields.
         """
         try:
             from core.memory.graph.models import ALL_MAIN_SECTORS
@@ -248,6 +286,11 @@ class TickerValidator:
             }
             industry_props = {"description": f"Industry segment: {info.industry}."}
             company_props = {"description": info.description, "ticker": info.ticker}
+            original_company_name = str(info.long_name or "").strip()
+            normalized_company_name = (
+                _strip_corporate_suffix(original_company_name)
+                or original_company_name
+            )
 
             relationships = []
 
@@ -281,17 +324,17 @@ class TickerValidator:
                     }
                 )
 
-            if info.long_name:
+            if normalized_company_name:
                 if info.industry:
                     relationships.append(
                         {
-                            "from_name": info.long_name,
+                            "from_name": normalized_company_name,
                             "from_type": "Company",
                             "relation": "BELONGS_TO",
                             "to_name": info.industry,
                             "to_type": "Industry",
                             "confidence": "high",
-                            "reason": f"{info.long_name} ({info.ticker}) operates in the {info.industry} industry.",
+                            "reason": f"{normalized_company_name} ({info.ticker}) operates in the {info.industry} industry.",
                             "from_node_props": company_props,
                             "to_node_props": industry_props,
                         }
@@ -299,13 +342,13 @@ class TickerValidator:
                 elif info.sector:
                     relationships.append(
                         {
-                            "from_name": info.long_name,
+                            "from_name": normalized_company_name,
                             "from_type": "Company",
                             "relation": "BELONGS_TO",
                             "to_name": info.sector,
                             "to_type": "Sector",
                             "confidence": "high",
-                            "reason": f"{info.long_name} ({info.ticker}) operates in the {info.sector} sector.",
+                            "reason": f"{normalized_company_name} ({info.ticker}) operates in the {info.sector} sector.",
                             "from_node_props": company_props,
                             "to_node_props": sector_props,
                         }
@@ -318,17 +361,15 @@ class TickerValidator:
                 )
                 return
 
-            # Use enqueue(immediate=True) â€” taxonomy writes are self-contained, no batching needed
+            # Taxonomy writes are self-contained, so process this task immediately.
             task = make_graph_task(
                 turn_id=str(uuid4()),
                 conversation_id="taxonomy_bootstrap",
                 source_agent="taxonomy_bootstrap",
                 relationships=relationships,
-            )
-            await service_manager.get_graph_queue_manager().enqueue(
-                task,
                 immediate=True,
             )
+            await service_manager.get_graph_queue_manager().enqueue(task)
 
             logger.info(
                 "_upsert_company_taxonomy: scheduled %d BELONGS_TO edge(s) for '%s'",

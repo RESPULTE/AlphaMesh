@@ -58,13 +58,13 @@ from core.agents.models.fundamental_agent_models import (
     _AgentState,
 )
 from core.agents.prompts.fundamental_agent_prompts import (
+    FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     _ANALYST_SYSTEM,
     _TOOL_PLANNER_SYSTEM,
     _TOOL_PLANNER_USER,
 )
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.logger import get_logger
-from core.memory.graph.extraction_prompts import DEFERRED_RELATIONSHIP_SYSTEM_PROMPT
 from core.memory.graph.graph_queue import make_extraction_task
 from core.services import service_manager
 
@@ -651,13 +651,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     conversation_id=state.conversation_id,
                     source_agent=self.name(),
                     extraction_text=analysis_text,
-                    system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                    system_prompt=FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
                     llm_config={"temperature": 0.7},
                 )
-                task_id = await service_manager.get_graph_queue_manager().enqueue(
-                    task,
-                    system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-                )
+                task_id = await service_manager.get_graph_queue_manager().enqueue(task)
             except Exception:
                 logger.exception(
                     "_analyst_node: failed to enqueue deferred relationship extraction"

@@ -21,10 +21,12 @@ class GraphTask:
     turn_id: str
     conversation_id: str
     source_agent: str
+    immediate: bool = False
     task_kind: str = TASK_KIND_RELATIONSHIPS
     chunk_ids: Optional[List[str]] = None
     relationships: List[dict] = field(default_factory=list)
     extraction_text: Optional[str] = None
+    system_prompt: Optional[str] = None
     system_prompt_id: Optional[str] = None
     llm_config: Optional[dict] = None
     allow_create: Optional[bool] = None
@@ -81,6 +83,7 @@ def make_graph_task(
     conversation_id: str,
     source_agent: str,
     relationships: List[dict],
+    immediate: bool = False,
     allow_create: Optional[bool] = None,
 ) -> GraphTask:
     return GraphTask(
@@ -88,6 +91,7 @@ def make_graph_task(
         turn_id=turn_id,
         conversation_id=conversation_id,
         source_agent=source_agent,
+        immediate=immediate,
         relationships=relationships,
         allow_create=allow_create,
     )
@@ -100,6 +104,7 @@ def make_extraction_task(
     extraction_text: Optional[str] = None,
     system_prompt: Optional[str] = None,
     llm_config: Optional[dict] = None,
+    immediate: bool = False,
     task_kind: str = TASK_KIND_RELATIONSHIPS,
     chunk_ids: Optional[List[str]] = None,
     allow_create: Optional[bool] = None,
@@ -110,10 +115,12 @@ def make_extraction_task(
         turn_id=turn_id,
         conversation_id=conversation_id,
         source_agent=source_agent,
+        immediate=immediate,
         task_kind=task_kind,
         chunk_ids=chunk_ids,
         relationships=[],
         extraction_text=extraction_text,
+        system_prompt=system_prompt,
         system_prompt_id=prompt_id,
         llm_config=llm_config,
         allow_create=allow_create,

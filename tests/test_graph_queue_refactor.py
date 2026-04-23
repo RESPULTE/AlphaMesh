@@ -178,8 +178,9 @@ def test_enqueue_immediate_uses_source_based_allow_create(
                         "to_type": "Sector",
                     }
                 ],
+                immediate=True,
             )
-            task_id = await manager.enqueue(task, immediate=True)
+            task_id = await manager.enqueue(task)
             assert task_id == task.task_id
             assert resolver.batch_calls
             assert resolver.batch_calls[0][1] is True

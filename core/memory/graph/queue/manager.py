@@ -88,25 +88,17 @@ class GraphQueueManager:
     async def enqueue(
         self,
         task: GraphTask,
-        immediate: bool = False,
-        extraction_text: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-        llm_config: Optional[dict] = None,
-        allow_create: Optional[bool] = None,
     ) -> str:
-        if extraction_text is not None:
-            task.extraction_text = extraction_text
-        if llm_config is not None:
-            task.llm_config = llm_config
-
         is_chunk_entities = task.task_kind == TASK_KIND_CHUNK_ENTITIES
-        if system_prompt is not None and not is_chunk_entities:
-            task.system_prompt_id = await self._prompt_registry.register(system_prompt)
+        if task.system_prompt is not None and not is_chunk_entities:
+            task.system_prompt_id = await self._prompt_registry.register(
+                task.system_prompt
+            )
 
         task.allow_create = resolve_allow_create(
             source_agent=task.source_agent,
             task_allow_create=task.allow_create,
-            explicit_allow_create=allow_create,
+            explicit_allow_create=None,
             default_allow_create_sources=self._allow_create_sources,
         )
 
@@ -155,7 +147,7 @@ class GraphQueueManager:
 
         await self._store.persist_task(task.to_payload())
 
-        if immediate:
+        if task.immediate:
             success = await self._process_task_immediate(
                 task, has_extraction=has_extraction
             )

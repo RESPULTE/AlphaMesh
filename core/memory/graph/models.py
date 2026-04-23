@@ -77,7 +77,7 @@ ALLOWED_RELATIONSHIP_TYPES = [
 ]
 
 # ── RelationshipType literal: add BELONGS_TO ─────────────────────────────────
-RelationshipType = Literal[
+GlobalRelationshipType = Literal[
     "AFFECTS",
     "CAUSED_BY",
     "INCREASES",
@@ -255,14 +255,14 @@ class UserLearningInterestNode(BaseModel):
     target_entity_ids: List[str] = Field(default_factory=list)
 
 
-class ExtractedRelationship(BaseModel):
+class ChunkExtractedRelationship(BaseModel):
     """Intermediate relationship model returned by the extraction call."""
 
     model_config = ConfigDict(extra="ignore")
 
     source_entity_local_id: str
     target_entity_local_id: str
-    relationship_type: RelationshipType
+    relationship_type: GlobalRelationshipType
     confidence: float
 
 
@@ -275,7 +275,7 @@ class ChunkExtractionResult(BaseModel):
         default="", description="ignored by input, used for traceability in output"
     )
     entities: List[EntityNode] = Field(default_factory=list)
-    relationships: List[ExtractedRelationship] = Field(default_factory=list)
+    relationships: List[ChunkExtractedRelationship] = Field(default_factory=list)
 
 
 class BatchExtractionResult(BaseModel):

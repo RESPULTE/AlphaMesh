@@ -50,18 +50,15 @@ from core.agents.models.news_agent_models import (
 )
 from core.agents.news_fetcher import build_news_query, fetch_articles
 from core.agents.prompts.news_agent_prompts import (
-    NEWS_ANALYSIS_SYSTEM_PROMPT_SUFFIX,
+    NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT,
     NEWS_ANALYSIS_USER_PROMPT,
+    NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
 )
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
-from core.memory.graph.extraction_prompts import (
-    COMBINED_ANALYSIS_RELATIONSHIP_PROMPT,
-    DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-)
 from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
 from core.memory.graph.utils import parse_xml_blocks
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
@@ -518,12 +515,11 @@ class NewsAnalysisAgent(AbstractAgent):
                     source_agent=self.name(),
                     extraction_text=None,
                     system_prompt=None,
+                    immediate=settings.EXTRACTION_IMMEDIATE,
                     task_kind="chunk_entities",
                     chunk_ids=pending_chunk_ids,
                 )
-                await service_manager.get_graph_queue_manager().enqueue(
-                    task, immediate=settings.EXTRACTION_IMMEDIATE
-                )
+                await service_manager.get_graph_queue_manager().enqueue(task)
             except Exception:
                 logger.exception(
                     "_rendezvous_node: failed to enqueue chunk entity extraction"
@@ -573,10 +569,7 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         messages = [
-            SystemMessage(
-                content=COMBINED_ANALYSIS_RELATIONSHIP_PROMPT
-                + NEWS_ANALYSIS_SYSTEM_PROMPT_SUFFIX
-            ),
+            SystemMessage(content=NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT),
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
                     query=state.query,
@@ -644,6 +637,7 @@ class NewsAnalysisAgent(AbstractAgent):
         if state.conversation_id:
             turn_id = getattr(state, "turn_id", None) or state.conversation_id
             try:
+                # extracted relationship successfully - store the relationships only
                 if relationships_extracted and relationships:
                     task = make_graph_task(
                         turn_id=turn_id,
@@ -654,20 +648,21 @@ class NewsAnalysisAgent(AbstractAgent):
                     task_id = await service_manager.get_graph_queue_manager().enqueue(
                         task
                     )
+
+                # extraction failed, need to reextract relationships from the analysis text
                 elif analysis_text:
                     task = make_extraction_task(
                         turn_id=turn_id,
                         conversation_id=state.conversation_id,
                         source_agent=self.name(),
                         extraction_text=analysis_text,
-                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                        system_prompt=NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
                         llm_config={
                             "temperature": getattr(self._llm, "temperature", 0.7)
                         },
                     )
                     task_id = await service_manager.get_graph_queue_manager().enqueue(
-                        task,
-                        system_prompt=DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                        task
                     )
             except Exception:
                 logger.exception("_analyse_news_node: failed to enqueue graph task")
