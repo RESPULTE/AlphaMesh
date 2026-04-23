@@ -34,6 +34,17 @@ from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
 
+def _normalize_entity_tuple(
+    name: Any,
+    entity_type: Any,
+) -> Optional[tuple[str, str]]:
+    normalized_name = str(name or "").strip()
+    normalized_type = str(entity_type or "").strip()
+    if not normalized_name or not normalized_type:
+        return None
+    return normalized_name, normalized_type
+
+
 def _parse_neighbor(row: dict) -> Optional[NeighborCandidate]:
     """Normalize a raw Neo4j neighbor row."""
     sid = (row.get("source_entity_id") or "").strip()
@@ -618,4 +629,30 @@ class DualStoreRetriever:
             run_id=parent_run_id,
             domain="comprehensive",
         )
-        return MemoryContext(chunks=prefiltered, rewritten_queries=rewritten_queries)
+
+        entity_tuples: List[tuple[str, str]] = []
+        chunk_ids = [chunk.chunk_id for chunk in prefiltered if chunk.chunk_id]
+        if chunk_ids:
+            try:
+                rows = await self._neo4j_adapter.get_entities_for_chunks(chunk_ids)
+                seen: Set[tuple[str, str]] = set()
+                for row in rows:
+                    parsed = _normalize_entity_tuple(
+                        row.get("entity_name"),
+                        row.get("entity_type"),
+                    )
+                    if parsed is None or parsed in seen:
+                        continue
+                    seen.add(parsed)
+                    entity_tuples.append(parsed)
+            except Exception as exc:
+                self._logger.error(
+                    "Comprehensive retrieve: failed to fetch entity tuples: %s",
+                    exc,
+                )
+
+        return MemoryContext(
+            chunks=prefiltered,
+            rewritten_queries=rewritten_queries,
+            entity_tuples=entity_tuples,
+        )

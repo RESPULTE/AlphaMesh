@@ -6,10 +6,7 @@ from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.models import _USER_SCOPED_TYPES
 from core.memory.graph.queue.prompt_registry import PromptRegistry
-from core.memory.graph.queue.types import (
-    GraphTask,
-    TASK_KIND_CHUNK_ENTITIES,
-)
+from core.memory.graph.queue.types import TASK_KIND_CHUNK_ENTITIES, GraphTask
 from core.memory.graph.relationship_extractor import RelationshipExtractor
 from core.memory.graph.utils import (
     entity_key,
@@ -234,7 +231,7 @@ class GraphWritePipeline:
         if not unique_entities:
             return cache
 
-        resolved = await self._resolver.resolve_entities(
+        resolved = await self._resolver.resolve_batch(
             unique_entities,
             allow_create=allow_create,
         )

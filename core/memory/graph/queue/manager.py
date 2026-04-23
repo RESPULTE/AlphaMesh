@@ -15,8 +15,8 @@ from core.memory.graph.queue.policies import (
 )
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.types import (
-    GraphTask,
     TASK_KIND_CHUNK_ENTITIES,
+    GraphTask,
     graph_task_from_payload,
 )
 from core.memory.graph.queue.worker import ConversationQueueWorker
@@ -41,21 +41,16 @@ class GraphQueueManager:
         llm_provider: Callable[[Optional[dict]], Any],
         db_path: str = settings.GRAPH_QUEUE_DB_PATH,
     ) -> None:
-        self._resolver = entity_resolver
-        self._writer = graph_writer
-        self._extractor = relationship_extractor
         self._entity_extractor = entity_extractor
-        self._llm_provider = llm_provider
-        self._db_path = db_path
 
-        self._store = GraphTaskSqlStore(db_path=self._db_path)
+        self._store = GraphTaskSqlStore(db_path=db_path)
         self._prompt_registry = PromptRegistry(store=self._store)
         self._pipeline = GraphWritePipeline(
-            entity_resolver=self._resolver,
-            graph_writer=self._writer,
-            relationship_extractor=self._extractor,
-            entity_extractor=self._entity_extractor,
-            llm_provider=self._llm_provider,
+            entity_resolver=entity_resolver,
+            graph_writer=graph_writer,
+            relationship_extractor=relationship_extractor,
+            entity_extractor=entity_extractor,
+            llm_provider=llm_provider,
             prompt_registry=self._prompt_registry,
         )
 
@@ -147,20 +142,16 @@ class GraphQueueManager:
 
         await self._store.persist_task(task.to_payload())
 
-        if task.immediate:
-            success = await self._process_task_immediate(
-                task, has_extraction=has_extraction
-            )
-            if success:
-                await self._store.mark_processed([task.task_id])
-            return task.task_id
+        # if task.immediate:
+        #     success = await self._process_task_immediate(
+        #         task, has_extraction=has_extraction
+        #     )
+        #     if success:
+        #         await self._store.mark_processed([task.task_id])
+        #     return task.task_id
 
         worker = await self._get_or_create_worker(task.conversation_id, lazy=True)
-        try:
-            await worker.put(task)
-        except RuntimeError:
-            worker = await self._get_or_create_worker(task.conversation_id, lazy=True)
-            await worker.put(task)
+        await worker.put(task)
 
         return task.task_id
 
@@ -202,37 +193,6 @@ class GraphQueueManager:
             await self.close_session(conversation_id)
 
         logger.info("GraphQueueManager: shutdown complete")
-
-    async def _process_task_immediate(
-        self, task: GraphTask, has_extraction: bool = False
-    ) -> bool:
-        try:
-            if task.task_kind == TASK_KIND_CHUNK_ENTITIES:
-                if task.chunk_ids:
-                    await self._entity_extractor(task.chunk_ids)
-                return True
-
-            relationships = list(task.relationships or [])
-            if not relationships and has_extraction:
-                relationships = await self._pipeline.extract_relationships_for_task(task)
-                if relationships:
-                    task.relationships = relationships
-            if not relationships:
-                return True
-
-            await self._pipeline.process_relationships(
-                relationships=relationships,
-                conversation_id=task.conversation_id,
-                source_agent=task.source_agent,
-                allow_create=bool(task.allow_create),
-            )
-            return True
-        except Exception:
-            logger.exception(
-                "GraphQueueManager.enqueue(immediate=True): failed for task '%s'",
-                task.task_id,
-            )
-            return False
 
     def _create_worker(self, conversation_id: str) -> ConversationQueueWorker:
         return ConversationQueueWorker(

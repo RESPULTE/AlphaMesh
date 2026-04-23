@@ -35,14 +35,14 @@ import asyncio
 import re as _re
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Type
+from typing import Any, Dict, List, Tuple, Type
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.agents.base_agent import AbstractAgent
-from core.agents.models.base_agent_models import BaseAgentInput
+from core.agents.models.base_agent_models import AgentSentiment, BaseAgentInput
 from core.agents.models.news_agent_models import (
     CitedSource,
     NewsAgentOutput,
@@ -55,18 +55,21 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
 )
-from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
-from core.memory.graph.graph_queue import make_extraction_task, make_graph_task
-from core.memory.graph.utils import parse_xml_blocks
+from core.memory.graph.graph_queue import make_extraction_task
 from core.memory.retrieval.models import MemoryContext, RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
 logger = get_logger(__name__)
-_ENTITY_CACHE: Dict[str, Dict[str, dict]] = {}
+_ENTITY_CACHE: Dict[str, Dict[Tuple[str, str], Tuple[str, str]]] = {}
 _ENTITY_CACHE_TS: Dict[str, float] = {}
+
+
+class NewsAnalysisStructuredOutput(BaseModel):
+    analysis: str
+    sentiment: AgentSentiment = Field(default_factory=AgentSentiment)
 
 
 def _get_default_date_range(
@@ -135,7 +138,32 @@ def _constrain_date_range(
     return start_date_only, end_date_only
 
 
-def _get_cached_entities(conversation_id: str) -> List[dict]:
+def _normalize_entity_tuple(
+    name: Any,
+    entity_type: Any,
+) -> Tuple[str, str] | None:
+    normalized_name = str(name or "").strip()
+    normalized_type = str(entity_type or "").strip()
+    if not normalized_name or not normalized_type:
+        return None
+    return normalized_name, normalized_type
+
+
+def _coerce_entity_tuple(entity: Any) -> Tuple[str, str] | None:
+    if isinstance(entity, dict):
+        return _normalize_entity_tuple(
+            entity.get("name") or entity.get("entity_name"),
+            entity.get("entity_type"),
+        )
+    if isinstance(entity, (tuple, list)) and len(entity) >= 2:
+        return _normalize_entity_tuple(entity[0], entity[1])
+    return _normalize_entity_tuple(
+        getattr(entity, "name", None),
+        getattr(entity, "entity_type", None),
+    )
+
+
+def _get_cached_entities(conversation_id: str) -> List[Tuple[str, str]]:
     if not conversation_id:
         return []
     now = time.time()
@@ -144,24 +172,29 @@ def _get_cached_entities(conversation_id: str) -> List[dict]:
         _ENTITY_CACHE.pop(conversation_id, None)
         _ENTITY_CACHE_TS.pop(conversation_id, None)
         return []
-    return list(_ENTITY_CACHE.get(conversation_id, {}).values())
+    cache = _ENTITY_CACHE.setdefault(conversation_id, {})
+    normalized_cache: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for raw in list(cache.values()):
+        normalized = _coerce_entity_tuple(raw)
+        if normalized is None:
+            continue
+        normalized_cache[normalized] = normalized
+    _ENTITY_CACHE[conversation_id] = normalized_cache
+    return list(normalized_cache.values())
 
 
-def _merge_cached_entities(conversation_id: str, entities: List[dict]) -> None:
+def _merge_cached_entities(
+    conversation_id: str,
+    entities: List[Any],
+) -> None:
     if not conversation_id:
         return
     cache = _ENTITY_CACHE.setdefault(conversation_id, {})
     for entity in entities:
-        entity_id = getattr(entity, "id", None)
-        entity_name = getattr(entity, "name", None)
-        entity_type = getattr(entity, "entity_type", None)
-        if not entity_id or not entity_name or not entity_type:
+        normalized = _coerce_entity_tuple(entity)
+        if normalized is None:
             continue
-        cache[entity_id] = {
-            "id": entity_id,
-            "name": entity_name,
-            "entity_type": entity_type,
-        }
+        cache[normalized] = normalized
     _ENTITY_CACHE_TS[conversation_id] = time.time()
 
 
@@ -408,8 +441,10 @@ class NewsAnalysisAgent(AbstractAgent):
         against the query before reranking. The in-memory return value is
         intentionally ignored for this reason.
 
-        The two queries are fired in parallel � they are independent and each
+        The two queries are fired in parallel - they are independent and each
         involves an embedding round-trip.
+        existing_chunk_ids are intentionally queried as well because those
+        chunks may not appear in comprehensive_retrieve() top-k results.
         """
         if not state.raw_articles:
             return {"chunk_ids": [], "retrieved_chunks": []}
@@ -485,9 +520,7 @@ class NewsAnalysisAgent(AbstractAgent):
         if memory_context is not None:
             final_chunks = final_chunks + memory_context.chunks
 
-        total = len(final_chunks) + (
-            len(memory_context.chunks) if memory_context else 0
-        )
+        total = len(final_chunks)
         publish_progress("news_agent", f"Reranking {total} candidate chunk(s)…")
 
         # TwoStageReranker: composite prefilter → Jina cross-encoder.
@@ -496,6 +529,35 @@ class NewsAnalysisAgent(AbstractAgent):
         final_ranked = await service_manager.get_reranker().rank(
             state.query, final_chunks
         )
+
+        merged_entity_tuples: List[Tuple[str, str]] = []
+        if memory_context is not None and memory_context.entity_tuples:
+            merged_entity_tuples.extend(memory_context.entity_tuples)
+
+        final_ranked_chunk_ids = list(
+            dict.fromkeys(chunk.chunk_id for chunk in final_ranked if chunk.chunk_id)
+        )
+        if final_ranked_chunk_ids:
+            try:
+                rows = (
+                    await service_manager.get_neo4j_adapter().get_entities_for_chunks(
+                        final_ranked_chunk_ids
+                    )
+                )
+                for row in rows:
+                    parsed = _normalize_entity_tuple(
+                        row.get("entity_name"),
+                        row.get("entity_type"),
+                    )
+                    if parsed is not None:
+                        merged_entity_tuples.append(parsed)
+            except Exception:
+                logger.exception(
+                    "_rendezvous_node: failed to fetch entity tuples for final-ranked chunks"
+                )
+
+        if state.conversation_id and merged_entity_tuples:
+            _merge_cached_entities(state.conversation_id, merged_entity_tuples)
 
         # Extract entities only from the reranked set — chunks that actually
         # contributed to this query. Fire-and-forget: extraction enriches the
@@ -556,7 +618,7 @@ class NewsAnalysisAgent(AbstractAgent):
         entities_section = ""
         if cached_entities:
             entity_lines = [
-                f"  - {e['name']} ({e['entity_type']})" for e in cached_entities
+                f"  - {name} ({entity_type})" for name, entity_type in cached_entities
             ]
             entities_section = (
                 "Known entities from prior turns:\n" + "\n".join(entity_lines) + "\n\n"
@@ -579,34 +641,24 @@ class NewsAnalysisAgent(AbstractAgent):
             ),
         ]
 
+        relationships_extracted = False
+        sentiment = None
         try:
-            response = await self._llm.ainvoke(messages)
-            raw = response.content if response else ""
-            analysis_text = raw
-            relationships: List[dict] = []
-            relationships_extracted = False
-            sentiment = parse_sentiment_block(raw)
-            try:
-                parsed_analysis, parsed_relationships = parse_xml_blocks(
-                    strip_sentiment_block(raw)  # ← strip before XML parsing
+            structured_llm = self._llm.with_structured_output(
+                NewsAnalysisStructuredOutput
+            )
+            response = await structured_llm.ainvoke(messages)
+            analysis_text = (response.analysis or "").strip()
+            sentiment = response.sentiment
+            if not analysis_text:
+                analysis_text = (
+                    "Analysis could not be generated due to an internal error."
                 )
-                analysis_text = parsed_analysis
+            else:
                 publish_success("news_agent", "News analysis complete.")
-
-                if parsed_relationships is not None:
-                    relationships = parsed_relationships
-                    relationships_extracted = True
-            except Exception:
-                logger.error("_analyse_news_node: parse failed; deferring extraction")
-
         except Exception as exc:
             logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
-            relationships = []
-            relationships_extracted = False
-
-        if conversation_id and relationships:
-            _merge_cached_entities(conversation_id, relationships)
 
         # Citation filtering (unchanged)
         cited_ids = set(int(m) for m in _re.findall(r"\[(\d+)\]", analysis_text))
@@ -634,36 +686,18 @@ class NewsAnalysisAgent(AbstractAgent):
         ]
 
         task_id = None
-        if state.conversation_id:
+        if state.conversation_id and analysis_text:
             turn_id = getattr(state, "turn_id", None) or state.conversation_id
             try:
-                # extracted relationship successfully - store the relationships only
-                if relationships_extracted and relationships:
-                    task = make_graph_task(
-                        turn_id=turn_id,
-                        conversation_id=state.conversation_id,
-                        source_agent=self.name(),
-                        relationships=relationships,
-                    )
-                    task_id = await service_manager.get_graph_queue_manager().enqueue(
-                        task
-                    )
-
-                # extraction failed, need to reextract relationships from the analysis text
-                elif analysis_text:
-                    task = make_extraction_task(
-                        turn_id=turn_id,
-                        conversation_id=state.conversation_id,
-                        source_agent=self.name(),
-                        extraction_text=analysis_text,
-                        system_prompt=NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-                        llm_config={
-                            "temperature": getattr(self._llm, "temperature", 0.7)
-                        },
-                    )
-                    task_id = await service_manager.get_graph_queue_manager().enqueue(
-                        task
-                    )
+                task = make_extraction_task(
+                    turn_id=turn_id,
+                    conversation_id=state.conversation_id,
+                    source_agent=self.name(),
+                    extraction_text=analysis_text,
+                    system_prompt=NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                    llm_config={"temperature": getattr(self._llm, "temperature", 0.7)},
+                )
+                task_id = await service_manager.get_graph_queue_manager().enqueue(task)
             except Exception:
                 logger.exception("_analyse_news_node: failed to enqueue graph task")
 
