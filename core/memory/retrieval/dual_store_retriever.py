@@ -28,7 +28,6 @@ from core.memory.retrieval.tracing import (
     NullRetrievalTraceSink,
     PrefilterTraceContext,
     RetrievalTraceEvent,
-    RetrievalTraceSink,
 )
 from core.memory.retrieval.traversal_policy import TraversalPolicy
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
@@ -112,14 +111,11 @@ class DualStoreRetriever:
         neo4j_adapter: Neo4jAdapter,
         chroma_adapter: ChromaDBAdapter,
         prefilter: CompositePrefilter,
-        trace_sink: Optional[RetrievalTraceSink] = None,
     ) -> None:
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
         self._prefilter = prefilter
-        if trace_sink is not None:
-            self._trace_sink: RetrievalTraceSink = trace_sink
-        elif settings.RETRIEVAL_TRACE_ENABLED:
+        if settings.RETRIEVAL_TRACE_ENABLED:
             self._trace_sink = NetworkXRetrievalTraceSink(
                 max_runs=settings.RETRIEVAL_TRACE_MAX_RUNS
             )
@@ -141,7 +137,9 @@ class DualStoreRetriever:
 
     @staticmethod
     def _safe_slug(value: str) -> str:
-        cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+        cleaned = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value
+        )
         return cleaned.strip("_") or "trace"
 
     def _maybe_auto_export_trace_graph(self, *, run_id: str, domain: str) -> None:
@@ -151,11 +149,6 @@ class DualStoreRetriever:
         This is intentionally best-effort and non-blocking for retrieval.
         """
         if not settings.RETRIEVAL_TRACE_AUTO_EXPORT:
-            return
-
-        if not hasattr(self._trace_sink, "export_html") or not hasattr(
-            self._trace_sink, "export_graphml"
-        ):
             return
 
         output_dir = Path(settings.RETRIEVAL_TRACE_AUTO_EXPORT_DIR)
