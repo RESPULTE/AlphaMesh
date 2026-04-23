@@ -46,9 +46,13 @@ async def test_ingest_articles_skips_existing(mock_adapters):
     ]
 
     articles = [{"url": "https://example.com"}]
-    chunk_ids, _chunks = await ingestor.ingest_articles(articles)
+    chunk_ids, existing_chunk_ids, involved_chunks = await ingestor.ingest_articles(
+        articles
+    )
 
-    assert chunk_ids == ["c1"]
+    assert chunk_ids == []
+    assert existing_chunk_ids == ["c1"]
+    assert len(involved_chunks) == 1
     chunker.chunk_article.assert_not_called()
     neo4j.merge_document_node.assert_not_called()
 
@@ -85,14 +89,17 @@ async def test_ingest_articles_processes_new(mock_adapters):
     ]
 
     articles = [{"url": "https://example.com/2"}]
-    chunk_ids, _chunks = await ingestor.ingest_articles(articles)
+    chunk_ids, existing_chunk_ids, involved_chunks = await ingestor.ingest_articles(
+        articles
+    )
 
     assert chunk_ids == ["c1"]
+    assert existing_chunk_ids == []
+    assert len(involved_chunks) == 1
 
     neo4j.merge_document_node.assert_called_once()
     neo4j.merge_chunk_node.assert_called_once()
     chroma.upsert_chunks.assert_called_once()
-    chroma.get_documents_by_ids.assert_called_once()
     nodeset_manager.get_global_financial_events_id.assert_called()
 
 

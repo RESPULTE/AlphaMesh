@@ -257,19 +257,8 @@ class UserLearningInterestNode(BaseModel):
     target_entity_ids: List[str] = Field(default_factory=list)
 
 
-class ChunkExtractedRelationship(BaseModel):
-    """Intermediate relationship model returned by the extraction call."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    source_entity_local_id: str
-    target_entity_local_id: str
-    relationship_type: GlobalRelationshipType
-    confidence: float
-
-
-class ChunkExtractionResult(BaseModel):
-    """Structured extraction output for a single chunk."""
+class ChunkEntityExtractionResult(BaseModel):
+    """Structured entity extraction output for a single chunk."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -277,12 +266,11 @@ class ChunkExtractionResult(BaseModel):
         default="", description="ignored by input, used for traceability in output"
     )
     entities: List[EntityNode] = Field(default_factory=list)
-    relationships: List[ChunkExtractedRelationship] = Field(default_factory=list)
 
 
-class BatchExtractionResult(BaseModel):
-    """Structured extraction output for a batch of chunks."""
+class BatchEntityExtractionResult(BaseModel):
+    """Structured entity extraction output for a batch of chunks."""
 
     model_config = ConfigDict(extra="ignore")
 
-    results: List[ChunkExtractionResult] = Field(default_factory=list)
+    results: List[ChunkEntityExtractionResult] = Field(default_factory=list)

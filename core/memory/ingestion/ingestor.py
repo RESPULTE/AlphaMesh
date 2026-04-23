@@ -30,10 +30,9 @@ from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.models import (
     _EXTRACTABLE_ENTITY_TYPES,
-    ALLOWED_RELATIONSHIP_TYPES,
+    BatchEntityExtractionResult,
+    ChunkEntityExtractionResult,
     FINANCIAL_CONCEPT_CATEGORIES,
-    BatchExtractionResult,
-    ChunkExtractionResult,
     DocumentMetadata,
     DocumentNode,
     EntityNode,
@@ -50,22 +49,21 @@ EXTRACTION_SEMAPHORE = asyncio.Semaphore(settings.EXTRACTION_MAX_CONCURRENCY)
 logger = get_logger(__name__)
 
 CHUNK_EXTRACTION_USER_TEMPLATE = (
-    "Extract entities and relationships from the following news chunks. "
+    "Extract entities from the following news chunks. "
     "Each chunk is labeled with [CHUNK_ID: ...].\n\n"
     "{chunk_blocks}\n\n"
 )
 
 
 def _build_batch_extraction_schema_for_prompt() -> str:
-    schema = BatchExtractionResult.model_json_schema()
+    schema = BatchEntityExtractionResult.model_json_schema()
     rendered_schema = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
     return rendered_schema.replace("{", "{{").replace("}", "}}")
 
 
 EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT = f"""\
-        You are an information extraction system. Extract entities and relationships from each
+        You are an information extraction system. Extract entities from each
         news chunk provided. Only use information explicitly stated in each chunk.
-        Do not infer relationships across multiple articles or chunks.
         Allowed entity types: {", ".join(_EXTRACTABLE_ENTITY_TYPES)}.
         Sector, Industry, Market and FinancialConceptCategory entities are managed by the taxonomy pipeline and must NOT
         be extracted from text. Each entity must include a short, single-sentence description
@@ -73,10 +71,7 @@ EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT = f"""\
         FinancialConcept entities must be insightful and provide useful learning experience for the user or context for future analysis. 
         They should NOT be generic definitions easily found in a textbook. 
         Each FinancialConcept must include 1 to 3 (at max) concept_categories chosen from: {", ".join(FINANCIAL_CONCEPT_CATEGORIES.keys())}.
-        Extracted relationships MUST use relationship_type values from: {", ".join(ALLOWED_RELATIONSHIP_TYPES)}.
-        Return a JSON object matching the BatchExtractionResult schema.
-        Each entity must include a temporary local_id used by relationships;
-        relationships must reference entities by local_id.
+        Return a JSON object matching the BatchEntityExtractionResult schema.
         Each result must echo the chunk_id exactly as provided.
         JSON Schema:\n
         {_build_batch_extraction_schema_for_prompt()}
@@ -418,10 +413,7 @@ class DualStoreIngestor:
         for doc in chunk_docs:
             cid = doc.id or (doc.metadata or {}).get("chunk_id")
             if cid:
-                chunk_lookup[cid] = {
-                    "text": doc.page_content or "",
-                    "metadata": doc.metadata or {},
-                }
+                chunk_lookup[cid] = {"text": doc.page_content or ""}
 
         chunks_to_process = [
             {"chunk_id": cid, **chunk_lookup[cid]}
@@ -433,10 +425,10 @@ class DualStoreIngestor:
 
         prompt = build_extraction_prompt()
         extraction_chain = prompt | self._llm.with_structured_output(
-            BatchExtractionResult
+            BatchEntityExtractionResult
         )
 
-        async def _extract_batch(chunks: List[dict]) -> BatchExtractionResult:
+        async def _extract_batch(chunks: List[dict]) -> BatchEntityExtractionResult:
             chunk_blocks = "\n\n".join(
                 f"[CHUNK_ID:{c['chunk_id']}|{c['text']}]" for c in chunks
             )
@@ -450,7 +442,7 @@ class DualStoreIngestor:
         ]
         batch_results = await asyncio.gather(*[_extract_batch(b) for b in batches])
 
-        results: List[ChunkExtractionResult] = [
+        results: List[ChunkEntityExtractionResult] = [
             r
             for batch in batch_results
             for r in batch.results
@@ -461,14 +453,11 @@ class DualStoreIngestor:
 
         for result in results:
             chunk_failed = False
-            local_id_map: Dict[str, EntityNode] = {}
             chunk_entities: Dict[str, EntityNode] = {}
 
             for entity in result.entities:
                 if not entity.description:
                     entity.description = entity.name
-                canonical_id = canonical_entity_id(entity.name, entity.entity_type)
-                local_key = entity.local_id or canonical_id
 
                 # Inject the GlobalFinancialEvents nodeset ID into FinancialEvent
                 # entities *before* resolution so that newly created entity nodes
@@ -491,7 +480,6 @@ class DualStoreIngestor:
                 resolved_id = resolution.entity_id
 
                 entity.id = resolved_id
-                local_id_map[local_key] = entity
                 chunk_entities[resolved_id] = entity
 
                 if not await self._upsert_with_retry(
@@ -510,38 +498,6 @@ class DualStoreIngestor:
                 await self._link_financial_event_to_nodeset(
                     entity, financial_events_nodeset_id
                 )
-
-            if chunk_failed:
-                continue
-
-            # for rel in result.relationships:
-            #     src = local_id_map.get(rel.source_entity_local_id)
-            #     tgt = local_id_map.get(rel.target_entity_local_id)
-            #     if not src or not tgt:
-            #         self._logger.warning(
-            #             "Skipping relationship with unresolved entities: %s -> %s",
-            #             rel.source_entity_local_id,
-            #             rel.target_entity_local_id,
-            #         )
-            #         continue
-            #     rel_type = normalize_relationship_type(rel.relationship_type)
-            #     if not await self._upsert_with_retry(
-            #         lambda s=src, t=tgt, rt=rel_type, c=rel.confidence: (
-            #             self._neo4j_adapter.merge_relationship(
-            #                 s.id,
-            #                 t.id,
-            #                 rt,
-            #                 {
-            #                     "relationship_type": rt,
-            #                     "source_chunk_id": result.chunk_id,
-            #                     "confidence": c,
-            #                 },
-            #             )
-            #         ),
-            #         result.chunk_id,
-            #     ):
-            #         chunk_failed = True
-            #         break
 
             if chunk_failed:
                 continue
