@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.dependencies import get_current_user, get_session_service
-from core.memory.sessions.session_service import SessionService
+from api.services.session_service import SessionService
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 

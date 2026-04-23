@@ -20,7 +20,7 @@ from api.dependencies import (
 from api.models.requests import ChatRequest
 from api.models.responses import ChatAck
 from api.services.analysis_runner import AnalysisRunner
-from core.memory.sessions.session_service import SessionService
+from api.services.session_service import SessionService
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 

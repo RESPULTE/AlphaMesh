@@ -22,9 +22,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 from api.models.requests import ChatRequest
 from api.models.responses import DataFramePayload, FinalResult, SourceItem, TickerResult
 from api.services.event_broadcaster import EventBroadcaster
+from api.services.session_service import SessionService
 from api.sinks.sse_sink import SSESink
 from core.memory.conversation.conversation_service import ConversationStore
-from core.memory.sessions.session_service import SessionService
 from core.services import service_manager
 
 logger = logging.getLogger(__name__)

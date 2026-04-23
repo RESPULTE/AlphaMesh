@@ -19,8 +19,8 @@ from api.models.responses import (
     ConversationMessage,
     ConversationSummary,
 )
+from api.services.session_service import SessionService
 from core.memory.conversation.conversation_service import ConversationStore
-from core.memory.sessions.session_service import SessionService
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 

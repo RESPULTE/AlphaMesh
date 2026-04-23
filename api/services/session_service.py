@@ -1,5 +1,5 @@
 """
-core/memory/sessions/session_service.py
+api/services/session_service.py
 
 Login-session lifecycle and session-conversation linking.
 """
@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import uuid4
 
+from api.services.sql_store import SQLiteSessionStore
 from core.logger import get_logger
-from core.memory.sessions.sql_store import SQLiteSessionStore
 
 logger = get_logger(__name__)
 

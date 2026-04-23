@@ -17,9 +17,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from api.auth.adapter import get_auth_adapter
 from api.services.analysis_runner import AnalysisRunner
 from api.services.event_broadcaster import EventBroadcaster
+from api.services.session_service import SessionService
 from core.market_data_service import MarketDataService
 from core.memory.conversation.conversation_service import ConversationStore
-from core.memory.sessions.session_service import SessionService
 from core.services import service_manager
 
 bearer = HTTPBearer(auto_error=False)

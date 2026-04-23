@@ -1,4 +1,4 @@
-"""SQLite session persistence store."""
+"""SQLite session persistence store for API login sessions."""
 
 from __future__ import annotations
 
