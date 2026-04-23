@@ -103,7 +103,7 @@ class ServiceManager:
                     database=settings.NEO4J_DATABASE,
                 )
             except Exception as e:
-                print(f"Error initializing Neo4j adapter: {e}")
+                print(f"Error initializing Neo4j db: {e}")
                 raise
         return self._neo4j_adapter
 
@@ -118,7 +118,7 @@ class ServiceManager:
                     embedding_function=self.get_embedding_func(),
                 )
             except Exception as e:
-                print(f"Error initializing ChromaDB adapter: {e}")
+                print(f"Error initializing ChromaDB db: {e}")
                 raise
         return self._chroma_adapter
 
@@ -133,7 +133,7 @@ class ServiceManager:
                     embedding_function=self.get_embedding_func(),
                 )
             except Exception as e:
-                print(f"Error initializing Entity ChromaDB adapter: {e}")
+                print(f"Error initializing Entity ChromaDB db: {e}")
                 raise
         return self._entity_chroma_adapter
 
@@ -321,10 +321,8 @@ class ServiceManager:
 
         if self._conversation_store is None:
             try:
-                adapter = SQLiteConversationStore(
-                    db_path=settings.CONVERSATIONS_DB_PATH
-                )
-                self._conversation_store = ConversationStore(adapter=adapter)
+                db = SQLiteConversationStore(db_path=settings.CONVERSATIONS_DB_PATH)
+                self._conversation_store = ConversationStore(db=db)
             except Exception as e:
                 print(f"Error initializing ConversationStore: {e}")
                 raise
@@ -336,8 +334,8 @@ class ServiceManager:
 
         if self._session_service is None:
             try:
-                adapter = SQLiteSessionStore(db_path=settings.CONVERSATIONS_DB_PATH)
-                self._session_service = SessionService(adapter=adapter)
+                db = SQLiteSessionStore(db_path=settings.CONVERSATIONS_DB_PATH)
+                self._session_service = SessionService(db=db)
             except Exception as e:
                 print(f"Error initializing SessionService: {e}")
                 raise

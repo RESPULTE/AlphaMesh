@@ -28,8 +28,8 @@ class SessionService:
     A conversation may be linked to many sessions (same user only).
     """
 
-    def __init__(self, adapter: SQLiteSessionStore) -> None:
-        self._sql_db = adapter
+    def __init__(self, db: SQLiteSessionStore) -> None:
+        self._sql_db = db
 
     async def initialize(self) -> None:
         await self._sql_db.initialize()

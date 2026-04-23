@@ -76,7 +76,7 @@ ALLOWED_RELATIONSHIP_TYPES = [
     "INVALIDATED_BY",
 ]
 
-    # ── RelationshipType literal: add BELONGS_TO ─────────────────────────────────
+# ── RelationshipType literal: add BELONGS_TO ─────────────────────────────────
 RelationshipType = Literal[
     "AFFECTS",
     "CAUSED_BY",
@@ -126,7 +126,6 @@ _USER_SCOPED_TYPES = frozenset(
     {
         "UserInterestDomain",
         "UserInterestEdge",
-        "TurnNode",
     }
 )
 
@@ -163,17 +162,17 @@ class UserInterestEdge(BaseModel):
     last_updated_at: datetime
 
 
-class TurnNode(BaseModel):
-    """
-    Represents a single conversation turn for full provenance tracking.
-    UserInterestEdge nodes link to TurnNodes via SOURCED_FROM / INVALIDATED_BY.
-    """
+# class TurnNode(BaseModel):
+#     """
+#     Represents a single conversation turn for full provenance tracking.
+#     UserInterestEdge nodes link to TurnNodes via SOURCED_FROM / INVALIDATED_BY.
+#     """
 
-    model_config = ConfigDict(extra="ignore")
-    id: str  # turn_id (uuid4 per OrchestratorAgent.run() call)
-    conversation_id: str
-    user_message_excerpt: str  # first 200 chars of user message
-    created_at: datetime
+#     model_config = ConfigDict(extra="ignore")
+#     id: str  # turn_id (uuid4 per OrchestratorAgent.run() call)
+#     conversation_id: str
+#     user_message_excerpt: str  # first 200 chars of user message
+#     created_at: datetime
 
 
 class DocumentMetadata(BaseModel):
