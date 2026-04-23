@@ -128,9 +128,12 @@ class NodeSetManager:
         return chunk_metadata
 
     async def get_global_financial_events_id(self) -> str:
-        """Get or create the GlobalFinancialEvents NodeSet ID."""
-        description = "Global anchor NodeSet for financial news ingestion."
-        return await self.get_or_create("GlobalFinancialEvents", description)
+        """Get or create the Global Financial Events NodeSet ID."""
+        description = GLOBAL_ENTITY_NODESETS.get(
+            "Global Financial Events",
+            "A global anchor nodeset containing broad FinancialEvent entities.",
+        )
+        return await self.get_or_create("Global Financial Events", description)
 
     async def get_global_financial_wisdom_id(self) -> str:
         """Get or create the Global Financial Wisdom NodeSet ID."""

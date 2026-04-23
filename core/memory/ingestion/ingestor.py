@@ -371,6 +371,22 @@ class DualStoreIngestor:
                     category,
                 )
 
+    async def _link_financial_event_to_nodeset(
+        self, entity: EntityNode, nodeset_id: str
+    ) -> None:
+        """Assign a FinancialEvent entity to the GlobalFinancialEvents NodeSet."""
+        if entity.entity_type != "FinancialEvent":
+            return
+        try:
+            await self._nodeset_manager.assign_to_node(
+                entity.id, "Entity", nodeset_id
+            )
+        except Exception:
+            self._logger.exception(
+                "Failed to link FinancialEvent '%s' to GlobalFinancialEvents nodeset",
+                entity.name,
+            )
+
     # Private: entity extraction pipeline
 
     async def _extract_entities_for_chunks(
@@ -378,6 +394,11 @@ class DualStoreIngestor:
     ) -> List[EntityNode]:
         if not chunk_ids:
             return []
+
+        # Fetch once — NodeSetManager caches after the first DB call.
+        financial_events_nodeset_id = (
+            await self._nodeset_manager.get_global_financial_events_id()
+        )
 
         if force:
             pending_chunk_ids = list(chunk_ids)
@@ -449,6 +470,15 @@ class DualStoreIngestor:
                 canonical_id = canonical_entity_id(entity.name, entity.entity_type)
                 local_key = entity.local_id or canonical_id
 
+                # Inject the GlobalFinancialEvents nodeset ID into FinancialEvent
+                # entities *before* resolution so that newly created entity nodes
+                # have nodeset_ids populated in their stored properties.
+                if entity.entity_type == "FinancialEvent":
+                    if financial_events_nodeset_id not in entity.nodeset_ids:
+                        entity.nodeset_ids = list(entity.nodeset_ids) + [
+                            financial_events_nodeset_id
+                        ]
+
                 # Use EntityResolver for persistence (replaces direct _resolve_entity calls)
                 resolution = await self._entity_resolver.resolve_entity(
                     name=entity.name,
@@ -475,6 +505,11 @@ class DualStoreIngestor:
                     chunk_failed = True
                     break
                 await self._link_financial_concept_categories(entity)
+                # Link FinancialEvent entities to the GlobalFinancialEvents nodeset.
+                # Uses MERGE so it is idempotent for both new and existing entities.
+                await self._link_financial_event_to_nodeset(
+                    entity, financial_events_nodeset_id
+                )
 
             if chunk_failed:
                 continue
