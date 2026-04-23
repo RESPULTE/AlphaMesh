@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     RETRIEVER_SEED_TOP_K: int = 10
     RETRIEVER_MAX_PARALLEL_NODES: int = 3
     RETRIEVER_MAX_NEIGHBOR_CANDIDATES: int = 15
+    RETRIEVAL_TRACE_ENABLED: bool = False
+    RETRIEVAL_TRACE_MAX_RUNS: int = 20
+    RETRIEVAL_TRACE_AUTO_EXPORT: bool = False
+    RETRIEVAL_TRACE_AUTO_EXPORT_DIR: str = "./data/retrieval_trace_artifacts"
 
     # ── Memory retrieval ──────────────────────────────────────────────────────
     MEMORY_VECTOR_TOP_K: int = 10

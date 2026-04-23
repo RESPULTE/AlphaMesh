@@ -32,6 +32,9 @@ class RetrieverState(TypedDict):
     current_frontier: List[str]
     iteration: int
     should_continue: bool
+    run_id: str
+    parent_run_id: Optional[str]
+    domain: str
 
 
 class RewrittenQueries(BaseModel):
@@ -191,3 +194,4 @@ class GraphChunkRow:
     source_url: Optional[str] = None
     published_at: Optional[Any] = None
     extraction_status: str = "PENDING"
+    supporting_entity_id: Optional[str] = None

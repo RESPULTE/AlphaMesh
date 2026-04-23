@@ -440,7 +440,8 @@ class Neo4jAdapter:
             "c.chunk_index AS chunk_index, "
             "c.document_id AS document_id, "
             "c.published_at AS published_at, "
-            "c.extraction_status AS extraction_status"
+            "c.extraction_status AS extraction_status, "
+            "e.id AS supporting_entity_id"
         )
         records = await self._execute_read(
             cypher,

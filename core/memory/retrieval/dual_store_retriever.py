@@ -1,32 +1,14 @@
 """
-core/memory/retrieval/dual_store_retriever.py
-
-LangGraph-powered dual-store retriever: vector seed + iterative graph traversal,
-fanned out across rewritten domain queries and reranked.
-
-Design
-──────
-DualStoreRetriever
-    Public entrypoints: retrieve() and comprehensive_retrieve().
-    Builds and drives a LangGraph workflow; delegates all policy decisions to
-    TraversalPolicy so orchestration and scoring concerns never mix.
-
-TraversalPolicy
-    Encapsulates neighbor scoring, frontier selection, and stopping logic.
-    Fully extractable for unit testing without touching the LangGraph wiring.
-    Scoring uses a three-factor composite:
-        structural_weight × hop_decay × (1 + query_relevance_bonus)
-
-NeighborCandidate / GraphChunkRow
-    Typed dataclasses that normalise raw Neo4j dict rows at the adapter
-    boundary, eliminating scattered string-key access inside node logic.
+LangGraph-powered dual-store retriever: vector seed + iterative graph traversal.
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
@@ -41,17 +23,20 @@ from core.memory.retrieval.models import (
     RewrittenQueries,
 )
 from core.memory.retrieval.reranker import CompositePrefilter
+from core.memory.retrieval.tracing import (
+    NetworkXRetrievalTraceSink,
+    NullRetrievalTraceSink,
+    PrefilterTraceContext,
+    RetrievalTraceEvent,
+    RetrievalTraceSink,
+)
 from core.memory.retrieval.traversal_policy import TraversalPolicy
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Row normalisers  (dict → typed model, adapter boundary)
-# ─────────────────────────────────────────────────────────────────────────────
-
 
 def _parse_neighbor(row: dict) -> Optional[NeighborCandidate]:
-    """Normalise a raw Neo4j neighbor row.  Returns None if mandatory IDs are absent."""
+    """Normalize a raw Neo4j neighbor row."""
     sid = (row.get("source_entity_id") or "").strip()
     nid = (row.get("neighbor_entity_id") or "").strip()
     if not sid or not nid:
@@ -87,8 +72,9 @@ def _normalize_published_at(value: Any) -> Optional[datetime]:
             return None
     return None
 
+
 def _parse_chunk_row(row: dict) -> Optional[GraphChunkRow]:
-    """Normalise a raw Neo4j chunk row.  Returns None if chunk_id is absent."""
+    """Normalize a raw Neo4j chunk row."""
     chunk_id = (row.get("chunk_id") or "").strip()
     if not chunk_id:
         return None
@@ -101,16 +87,12 @@ def _parse_chunk_row(row: dict) -> Optional[GraphChunkRow]:
         source_url=row.get("source_url"),
         published_at=_normalize_published_at(row.get("published_at")),
         extraction_status=row.get("extraction_status") or "PENDING",
+        supporting_entity_id=(row.get("supporting_entity_id") or "").strip() or None,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utility helpers (module-level, stateless)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def _extend_unique(existing: List[str], new_items: Sequence[str]) -> List[str]:
-    """Append items from new_items that are not already in existing, preserving order."""
+    """Append items from new_items that are not already in existing."""
     seen = set(existing)
     updated = list(existing)
     for item in new_items:
@@ -120,30 +102,9 @@ def _extend_unique(existing: List[str], new_items: Sequence[str]) -> List[str]:
     return updated
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DualStoreRetriever
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class DualStoreRetriever:
     """
     Retrieve chunks by seeding vector search then expanding through the graph.
-
-    Graph topology
-    ──────────────
-    START
-      → vector_seed              (Chroma similarity search)
-      → extract_seed_entities    (Neo4j entity lookup for seed chunks)
-      → select_neighbor_frontier (TraversalPolicy: score + select next frontier)
-      → fetch_frontier_chunks    (Neo4j: chunks for frontier entities)
-      → [conditional routing]
-            ├─ select_neighbor_frontier  (if should_continue)
-            └─ END
-
-    Public API
-    ──────────
-    retrieve(query)                           → List[RetrievedChunk]
-    comprehensive_retrieve(rewritten_queries) → MemoryContext
     """
 
     def __init__(
@@ -151,10 +112,20 @@ class DualStoreRetriever:
         neo4j_adapter: Neo4jAdapter,
         chroma_adapter: ChromaDBAdapter,
         prefilter: CompositePrefilter,
+        trace_sink: Optional[RetrievalTraceSink] = None,
     ) -> None:
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
         self._prefilter = prefilter
+        if trace_sink is not None:
+            self._trace_sink: RetrievalTraceSink = trace_sink
+        elif settings.RETRIEVAL_TRACE_ENABLED:
+            self._trace_sink = NetworkXRetrievalTraceSink(
+                max_runs=settings.RETRIEVAL_TRACE_MAX_RUNS
+            )
+        else:
+            self._trace_sink = NullRetrievalTraceSink()
+
         self._logger = get_logger(__name__)
 
         self._max_iterations = settings.RETRIEVER_MAX_ITERATIONS
@@ -168,7 +139,69 @@ class DualStoreRetriever:
 
         self._graph = self._build_graph()
 
-    # ── Graph wiring ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _safe_slug(value: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+        return cleaned.strip("_") or "trace"
+
+    def _maybe_auto_export_trace_graph(self, *, run_id: str, domain: str) -> None:
+        """
+        Optionally auto-export retrieval trace artifacts based on settings.
+
+        This is intentionally best-effort and non-blocking for retrieval.
+        """
+        if not settings.RETRIEVAL_TRACE_AUTO_EXPORT:
+            return
+
+        if not hasattr(self._trace_sink, "export_html") or not hasattr(
+            self._trace_sink, "export_graphml"
+        ):
+            return
+
+        output_dir = Path(settings.RETRIEVAL_TRACE_AUTO_EXPORT_DIR)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe_domain = self._safe_slug(domain)
+        filename_base = f"{safe_domain}_{run_id}"
+        html_path = output_dir / f"{filename_base}.html"
+        graphml_path = output_dir / f"{filename_base}.graphml"
+
+        try:
+            self._trace_sink.export_html(run_id, str(html_path))  # type: ignore[attr-defined]
+            self._trace_sink.export_graphml(run_id, str(graphml_path))  # type: ignore[attr-defined]
+        except Exception:
+            self._logger.warning(
+                "Auto-export of retrieval trace failed for run_id=%s domain=%s",
+                run_id,
+                domain,
+                exc_info=True,
+            )
+
+    def _trace_event(
+        self,
+        *,
+        state: RetrieverState,
+        stage: str,
+        hop: int,
+        layer: int,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Emit retrieval trace event, never raising into retrieval flow."""
+        try:
+            self._trace_sink.record(
+                RetrievalTraceEvent(
+                    run_id=state["run_id"],
+                    parent_run_id=state["parent_run_id"],
+                    domain=state["domain"],
+                    stage=stage,
+                    hop=hop,
+                    layer=layer,
+                    payload=payload,
+                )
+            )
+        except Exception:
+            self._logger.warning("Trace sink emission failed", exc_info=True)
+
+    # -- Graph wiring --------------------------------------------------------
 
     def _build_graph(self):
         workflow = StateGraph(RetrieverState)
@@ -196,24 +229,16 @@ class DualStoreRetriever:
 
         return workflow.compile()
 
-    # ── Routing ───────────────────────────────────────────────────────────────
+    # -- Routing -------------------------------------------------------------
 
     def _should_continue_routing(self, state: RetrieverState) -> str:
-        """Route back to frontier selection or terminate the traversal."""
         if self._policy.should_continue(state):
             return "select_neighbor_frontier"
         return END
 
-    # ── Nodes ─────────────────────────────────────────────────────────────────
+    # -- Nodes ---------------------------------------------------------------
 
     async def _vector_seed_node(self, state: RetrieverState) -> dict:
-        """
-        Seed retrieval via Chroma vector similarity search.
-
-        Initialises accumulated_chunks and visited_chunk_ids.  The iteration
-        counter starts at 0 — it only advances when a non-empty graph frontier
-        is actually expanded in fetch_frontier_chunks.
-        """
         query = state["query"]
         try:
             results = await self._chroma_adapter.query(
@@ -237,6 +262,20 @@ class DualStoreRetriever:
             retrieved.append(chunk)
             visited_chunk_ids.append(chunk.chunk_id)
 
+        self._trace_event(
+            state=state,
+            stage="vector_seed",
+            hop=0,
+            layer=0,
+            payload={
+                "query": query,
+                "chunks": [
+                    {"chunk_id": chunk.chunk_id, "score": chunk.score}
+                    for chunk in retrieved
+                ],
+            },
+        )
+
         self._logger.info(
             "Vector seed: %d chunks for query='%.60s'", len(retrieved), query
         )
@@ -247,10 +286,6 @@ class DualStoreRetriever:
         }
 
     async def _extract_seed_entities_node(self, state: RetrieverState) -> dict:
-        """
-        Look up entities linked to seed chunks in Neo4j and set the initial
-        graph frontier.  Failures degrade gracefully to an empty frontier.
-        """
         chunk_ids = [c.chunk_id for c in state["accumulated_chunks"]]
         try:
             entity_rows = await self._neo4j_adapter.get_entities_for_chunks(chunk_ids)
@@ -261,12 +296,32 @@ class DualStoreRetriever:
             entity_rows = []
 
         entity_ids: List[str] = []
-        seen: set = set()
+        seen: Set[str] = set()
+        trace_links: List[Dict[str, Any]] = []
         for row in entity_rows:
-            eid = row.get("entity_id")
-            if eid and eid not in seen:
+            eid = str(row.get("entity_id") or "").strip()
+            if not eid:
+                continue
+            if eid not in seen:
                 seen.add(eid)
                 entity_ids.append(eid)
+
+            trace_links.append(
+                {
+                    "entity_id": eid,
+                    "entity_name": row.get("entity_name") or "",
+                    "entity_type": row.get("entity_type") or "",
+                    "source_chunk_id": row.get("source_chunk_id") or "",
+                }
+            )
+
+        self._trace_event(
+            state=state,
+            stage="seed_entities",
+            hop=0,
+            layer=0,
+            payload={"links": trace_links},
+        )
 
         self._logger.info(
             "Seed entities: %d from %d chunks", len(entity_ids), len(chunk_ids)
@@ -277,23 +332,11 @@ class DualStoreRetriever:
         }
 
     async def _select_neighbor_frontier_node(self, state: RetrieverState) -> dict:
-        """
-        Fetch neighbors of the current frontier, score them via TraversalPolicy,
-        and select the next set of entities to expand.
-
-        Selection is fully deterministic (no LLM).  The scoring model is:
-            structural_weight × hop_decay × (1 + query_relevance_bonus)
-
-        Sets should_continue=False if no valid neighbors remain, which causes
-        the routing function to terminate the traversal immediately.
-        """
         frontier = state["current_frontier"]
         if not frontier:
             return {"current_frontier": [], "should_continue": False}
 
-        # hop_depth is 1-based: on the first pass iteration=0 so hop_depth=1.
         hop_depth = state["iteration"] + 1
-
         try:
             raw_rows = await self._neo4j_adapter.get_entity_neighbors(
                 frontier, state["visited_entity_ids"]
@@ -307,29 +350,53 @@ class DualStoreRetriever:
             )
             return {"current_frontier": [], "should_continue": False}
 
-        # Normalise raw dicts → typed NeighborCandidate at the adapter boundary.
         candidates: List[NeighborCandidate] = [
             parsed for row in raw_rows if (parsed := _parse_neighbor(row)) is not None
         ]
-
         capped = self._policy.cap_per_source(candidates)
         if not capped:
             self._logger.info(
-                "Hop %d: no valid neighbor candidates — stopping.", hop_depth
+                "Hop %d: no valid neighbor candidates - stopping.", hop_depth
             )
             return {"current_frontier": [], "should_continue": False}
 
         selected = self._policy.select_frontier(capped, state["query"], hop_depth)
         if not selected:
             self._logger.info(
-                "Hop %d: frontier selection returned empty — stopping.", hop_depth
+                "Hop %d: frontier selection returned empty - stopping.", hop_depth
             )
             return {"current_frontier": [], "should_continue": False}
 
-        updated_visited = _extend_unique(state["visited_entity_ids"], selected)
+        selected_set = set(selected)
+        scored_candidates = []
+        for candidate in capped:
+            score = self._policy.score_neighbor(candidate, state["query"], hop_depth)
+            scored_candidates.append(
+                {
+                    "source_entity_id": candidate.source_entity_id,
+                    "neighbor_entity_id": candidate.neighbor_entity_id,
+                    "neighbor_name": candidate.neighbor_name,
+                    "neighbor_type": candidate.neighbor_type,
+                    "relationship_type": candidate.relationship_type,
+                    "score": score,
+                    "selected": candidate.neighbor_entity_id in selected_set,
+                }
+            )
+        self._trace_event(
+            state=state,
+            stage="neighbor_expansion",
+            hop=hop_depth,
+            layer=hop_depth,
+            payload={
+                "frontier": list(frontier),
+                "candidates": scored_candidates,
+                "selected_frontier": list(selected),
+            },
+        )
 
+        updated_visited = _extend_unique(state["visited_entity_ids"], selected)
         self._logger.info(
-            "Frontier hop %d: %d raw → %d capped → %d selected",
+            "Frontier hop %d: %d raw -> %d capped -> %d selected",
             hop_depth,
             len(candidates),
             len(capped),
@@ -342,29 +409,11 @@ class DualStoreRetriever:
         }
 
     async def _fetch_frontier_chunks_node(self, state: RetrieverState) -> dict:
-        """
-        Retrieve Neo4j chunks for the current frontier entities and accumulate them.
-
-        Provenance metadata written to each chunk:
-            hop_depth             — 1-based expansion round when this chunk was found.
-                                    The reranker uses this as graph_depth for its
-                                    depth_bonus, so deeper expansions are penalised.
-            supporting_entity_ids — frontier entities that led to this chunk,
-                                    enabling future explainability / path tracing.
-            extraction_status     — propagated from Neo4j so only genuinely PENDING
-                                    chunks are re-queued for entity extraction.
-
-        iteration increments ONLY when the frontier is non-empty.  On an empty
-        frontier the node returns immediately without touching iteration, so the
-        routing function terminates the traversal cleanly without burning budget.
-        """
         frontier = state["current_frontier"]
         if not frontier:
-            # Empty frontier — routing will terminate; do not advance iteration.
             return {}
 
-        hop_depth = state["iteration"] + 1  # 1-based, consistent with select node
-
+        hop_depth = state["iteration"] + 1
         try:
             rows = await self._neo4j_adapter.get_chunks_for_entities(
                 frontier, state["visited_chunk_ids"]
@@ -376,21 +425,26 @@ class DualStoreRetriever:
                 len(frontier),
                 exc,
             )
-            # Advance iteration so we don't retry the same broken frontier endlessly.
             return {"iteration": state["iteration"] + 1}
 
-        new_chunks: List[RetrievedChunk] = []
+        new_chunks_by_id: Dict[str, RetrievedChunk] = {}
         new_chunk_ids: List[str] = []
-        visited_set = set(state["visited_chunk_ids"])
+        previously_visited_chunk_ids = set(state["visited_chunk_ids"])
+        trace_links: Set[tuple[str, str]] = set()
 
         for row in rows:
             parsed = _parse_chunk_row(row)
-            if parsed is None or parsed.chunk_id in visited_set:
+            if parsed is None:
                 continue
-            visited_set.add(parsed.chunk_id)
-            new_chunk_ids.append(parsed.chunk_id)
-            new_chunks.append(
-                RetrievedChunk(
+            if parsed.chunk_id in previously_visited_chunk_ids:
+                # Chunk already accumulated in previous iterations/runs for this
+                # state, so skip creation and provenance expansion.
+                continue
+
+            support_id = parsed.supporting_entity_id or ""
+            chunk = new_chunks_by_id.get(parsed.chunk_id)
+            if chunk is None:
+                chunk = RetrievedChunk(
                     chunk_id=parsed.chunk_id,
                     text=parsed.chunk_text,
                     score=None,
@@ -408,14 +462,39 @@ class DualStoreRetriever:
                         "article_title": parsed.article_title,
                         "source_url": parsed.source_url,
                         "published_at": parsed.published_at,
-                        # Provenance: which entities caused this chunk to be retrieved.
-                        "supporting_entity_ids": list(frontier),
+                        "supporting_entity_ids": [],
                     },
                 )
-            )
+                new_chunks_by_id[parsed.chunk_id] = chunk
+                new_chunk_ids.append(parsed.chunk_id)
 
+            if support_id:
+                support_ids = chunk.metadata.setdefault("supporting_entity_ids", [])
+                if support_id not in support_ids:
+                    support_ids.append(support_id)
+                trace_links.add((support_id, parsed.chunk_id))
+
+        new_chunks = list(new_chunks_by_id.values())
         accumulated = state["accumulated_chunks"] + new_chunks
         updated_chunk_ids = _extend_unique(state["visited_chunk_ids"], new_chunk_ids)
+
+        self._trace_event(
+            state=state,
+            stage="frontier_chunks",
+            hop=hop_depth,
+            layer=hop_depth,
+            payload={
+                "frontier": list(frontier),
+                "links": [
+                    {
+                        "supporting_entity_id": supporting_entity_id,
+                        "chunk_id": chunk_id,
+                    }
+                    for supporting_entity_id, chunk_id in sorted(trace_links)
+                ],
+                "new_chunk_ids": list(new_chunk_ids),
+            },
+        )
 
         self._logger.info(
             "Fetch hop %d: %d new chunks from %d entities (total=%d)",
@@ -430,16 +509,20 @@ class DualStoreRetriever:
             "iteration": state["iteration"] + 1,
         }
 
-    # ── Public entrypoints ────────────────────────────────────────────────────
+    # -- Public API ----------------------------------------------------------
 
-    async def retrieve(self, query: str) -> List[RetrievedChunk]:
+    async def retrieve(
+        self,
+        query: str,
+        *,
+        run_id: str | None = None,
+        domain: str = "single",
+        parent_run_id: str | None = None,
+    ) -> List[RetrievedChunk]:
         """
-        Run the full vector-seed + graph-expansion workflow for a single query.
-
-        Returns the accumulated list of RetrievedChunk objects (vector seeds +
-        all graph-expanded chunks).  No reranking is applied here; reranking
-        happens in comprehensive_retrieve after cross-domain deduplication.
+        Run full vector-seed + graph-expansion workflow for a single query.
         """
+        retrieval_run_id = run_id or str(uuid4())
         initial_state: RetrieverState = {
             "query": query,
             "accumulated_chunks": [],
@@ -447,33 +530,20 @@ class DualStoreRetriever:
             "visited_chunk_ids": [],
             "current_frontier": [],
             "iteration": 0,
-            # False is the safer sentinel: should_continue is always written by
-            # select_neighbor_frontier before the routing check fires, but
-            # defaulting to False prevents accidental infinite loops if the graph
-            # topology is ever changed and the check fires earlier than expected.
             "should_continue": False,
+            "run_id": retrieval_run_id,
+            "parent_run_id": parent_run_id,
+            "domain": domain,
         }
         final_state = await self._graph.ainvoke(initial_state)
+        self._maybe_auto_export_trace_graph(run_id=retrieval_run_id, domain=domain)
         return final_state["accumulated_chunks"]
 
     async def comprehensive_retrieve(
         self, rewritten_queries: RewrittenQueries
     ) -> MemoryContext:
         """
-        Fan out retrieval across all active domain queries, deduplicate, and rerank.
-
-        Deduplication strategy
-        ──────────────────────
-        Chunks are deduplicated by chunk_id before being passed to the reranker.
-        When the same chunk is found in multiple domain traversals, the copy with
-        the highest embedding_score is kept.  This means:
-        - The reranker receives a clean, non-redundant input.
-        - The reranker's composite_score is computed from the best available
-          embedding signal for that chunk across all domains.
-
-        This is strictly better than relying solely on the reranker's internal
-        dedup (which silently discards the lower-scoring duplicate rather than
-        selecting the best one).
+        Fan out retrieval across active domain queries, deduplicate, prefilter.
         """
         domain_map = {
             "company": rewritten_queries.company_query,
@@ -490,13 +560,30 @@ class DualStoreRetriever:
         if not active_queries:
             return MemoryContext(chunks=[], rewritten_queries=rewritten_queries)
 
-        # Concurrent retrieval — one full graph traversal per domain.
-        tasks = [self.retrieve(query) for query in active_queries.values()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        parent_run_id = str(uuid4())
+        task_items: List[tuple[str, asyncio.Task[List[RetrievedChunk]]]] = []
+        for domain, query in active_queries.items():
+            domain_run_id = str(uuid4())
+            task_items.append(
+                (
+                    domain,
+                    asyncio.create_task(
+                        self.retrieve(
+                            query,
+                            run_id=domain_run_id,
+                            domain=domain,
+                            parent_run_id=parent_run_id,
+                        )
+                    ),
+                )
+            )
 
-        # Normalise + deduplicate by chunk_id before reranking.
+        results = await asyncio.gather(
+            *(task for _, task in task_items), return_exceptions=True
+        )
+
         chunk_map: Dict[str, RetrievedChunk] = {}
-        for (domain, _), result in zip(active_queries.items(), results):
+        for (domain, _task), result in zip(task_items, results):
             if isinstance(result, Exception):
                 self._logger.error(
                     "Memory retrieval failed for domain '%s': %s", domain, result
@@ -516,7 +603,17 @@ class DualStoreRetriever:
                     chunk_map[normalized.chunk_id] = normalized
 
         pre_rerank_count = len(chunk_map)
-        prefiltered = self._prefilter.score(list(chunk_map.values()))
+        prefiltered = self._prefilter.score(
+            list(chunk_map.values()),
+            trace_context=PrefilterTraceContext(
+                run_id=parent_run_id,
+                parent_run_id=None,
+                domain="comprehensive",
+                sink=self._trace_sink,
+                hop=0,
+                layer=0,
+            ),
+        )
 
         self._logger.info(
             "Comprehensive retrieve: domains=%s unique_chunks=%d prefiltered=%d",
@@ -524,5 +621,8 @@ class DualStoreRetriever:
             pre_rerank_count,
             len(prefiltered),
         )
+        self._maybe_auto_export_trace_graph(
+            run_id=parent_run_id,
+            domain="comprehensive",
+        )
         return MemoryContext(chunks=prefiltered, rewritten_queries=rewritten_queries)
-

@@ -27,6 +27,7 @@ from typing import Dict, List, Optional
 import httpx
 
 from core.memory.retrieval.models import RetrievedChunk
+from core.memory.retrieval.tracing import PrefilterTraceContext, RetrievalTraceEvent
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,12 @@ class CompositePrefilter:
         self._beta = beta
         self._prefilter_k = prefilter_k
 
-    def score(self, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+    def score(
+        self,
+        chunks: List[RetrievedChunk],
+        *,
+        trace_context: Optional[PrefilterTraceContext] = None,
+    ) -> List[RetrievedChunk]:
         """Deduplicate, apply composite score, and return top prefilter_k chunks."""
         # Deduplicate by chunk_id, keeping the best embedding signal per chunk.
         deduped: Dict[str, RetrievedChunk] = {}
@@ -73,7 +79,44 @@ class CompositePrefilter:
             key=lambda c: c.composite_score,
             reverse=True,
         )
-        return ranked[: self._prefilter_k]
+        selected = ranked[: self._prefilter_k]
+
+        if trace_context is not None:
+            ranked_payload = []
+            selected_ids = {chunk.chunk_id for chunk in selected}
+            for idx, chunk in enumerate(ranked, start=1):
+                ranked_payload.append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "source": chunk.source,
+                        "domain": chunk.domain or "",
+                        "embedding_score": chunk.embedding_score,
+                        "graph_depth": chunk.graph_depth,
+                        "composite_score": chunk.composite_score,
+                        "rank": idx,
+                        "selected": chunk.chunk_id in selected_ids,
+                    }
+                )
+            try:
+                trace_context.sink.record(
+                    RetrievalTraceEvent(
+                        run_id=trace_context.run_id,
+                        parent_run_id=trace_context.parent_run_id,
+                        domain=trace_context.domain,
+                        stage="prefilter_output",
+                        hop=trace_context.hop,
+                        layer=trace_context.layer,
+                        payload={
+                            "total_candidates": len(ranked),
+                            "selected_count": len(selected),
+                            "ranked_chunks": ranked_payload,
+                        },
+                    )
+                )
+            except Exception:
+                logger.warning("Prefilter trace emission failed", exc_info=True)
+
+        return selected
 
 
 class TwoStageReranker:
