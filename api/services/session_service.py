@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import uuid4
 
-from api.services.sql_store import SQLiteSessionStore
+from api.services.session_sql_store import SQLiteSessionStore
 from core.logger import get_logger
 
 logger = get_logger(__name__)
