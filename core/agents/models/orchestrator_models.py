@@ -152,6 +152,8 @@ class OrchestratorState(BaseModel):
 
     # Populated synchronously in run() from the UserContextService cache.
     user_context_block: str = ""
+    # Portfolio snapshot loaded once in run() from per-user JSON holdings.
+    portfolio_block: str = "[]"
 
     # Keyed by ticker symbol; values are formatted context blocks from yfinance.
     # Built by _validate_and_enrich_node and read by _execute_node.

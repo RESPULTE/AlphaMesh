@@ -14,6 +14,8 @@ Everything else is unchanged from the previous version.
 
 import asyncio
 import json
+import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -58,6 +60,41 @@ _SYNTHESIS_HISTORY_WINDOW: int = 6
 _PLANNER_HISTORY_WINDOW: int = 10
 
 
+def _sanitize_portfolio_user_email(user_email: str) -> str:
+    value = (user_email or "").strip().lower()
+    safe = re.sub(r"[^a-z0-9._-]+", "_", value).strip("._-")
+    if not safe:
+        raise ValueError("Invalid user_email")
+    return safe
+
+
+def _get_user_portfolio_path(base_path: str, user_email: str) -> Path:
+    base = Path(base_path)
+    safe_user = _sanitize_portfolio_user_email(user_email)
+    return base.parent / f"{base.stem}_{safe_user}.json"
+
+
+def get_portfolio_for_user(base_path: str, user_email: Optional[str]) -> List[dict]:
+    if not user_email:
+        return []
+    try:
+        path = _get_user_portfolio_path(base_path, user_email)
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        logger.warning("Portfolio file not found for user '%s' at %s", user_email, path)
+        return []
+    except ValueError:
+        logger.warning(
+            "Invalid portfolio user_email for path resolution: %s", user_email
+        )
+        return []
+    except Exception:
+        logger.exception("Failed to load portfolio for user '%s'", user_email)
+        return []
+
+
 class OrchestratorAgent:
     def __init__(self):
         self._llm = service_manager.get_agent(temperature=0)
@@ -68,19 +105,6 @@ class OrchestratorAgent:
 
     def name(self) -> str:
         return "Orchestrator Agent"
-
-    @staticmethod
-    def get_portfolio(path: str) -> List[dict]:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, list) else []
-        except FileNotFoundError:
-            logger.warning("Portfolio file not found at %s", path)
-            return []
-        except Exception:
-            logger.exception("Failed to load portfolio from %s", path)
-            return []
 
     # ── Graph wiring ──────────────────────────────────────────────────────────
 
@@ -161,6 +185,9 @@ class OrchestratorAgent:
                     "run: failed to read user context from cache for %s", user_email
                 )
 
+        portfolio = get_portfolio_for_user(settings.PORTFOLIO_JSON_PATH, user_email)
+        portfolio_block = json.dumps(portfolio, indent=2) if portfolio else "[]"
+
         turn_id = str(uuid4())
         logger.info("run: turn_id=%s", turn_id)
 
@@ -180,6 +207,7 @@ class OrchestratorAgent:
             conversation_id=conversation_id,
             user_email=user_email,
             user_context_block=user_context_block,
+            portfolio_block=portfolio_block,
             turn_id=turn_id,
         )
 
@@ -264,6 +292,12 @@ class OrchestratorAgent:
         system_content = ORCHESTRATOR_PLANNER_SYSTEM_PROMPT.format(
             available_agents_desc=available_agents_desc,
         )
+        context_content = (
+            "USER CONTEXT (if available):\n"
+            f"{state.user_context_block}\n\n"
+            "PORTFOLIO HOLDINGS:\n"
+            f"{state.portfolio_block}"
+        )
         latest_human = _extract_last_human_message(state.messages)
         history_window = _last_n_messages(state.messages, _PLANNER_HISTORY_WINDOW)
 
@@ -271,13 +305,12 @@ class OrchestratorAgent:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
             planner_messages: List[BaseMessage] = [
                 SystemMessage(content=system_content),
+                SystemMessage(content=context_content),
                 *history_window,
             ]
             if not history_window:
                 planner_messages.append(HumanMessage(content=latest_human))
-            plan: OrchestratorPlan = await structured_llm.ainvoke(
-                planner_messages
-            )
+            plan: OrchestratorPlan = await structured_llm.ainvoke(planner_messages)
             publish_progress(
                 "orchestrator",
                 f"Routing → agents={plan.target_agents or []}, needs_memory={plan.needs_memory}",
@@ -430,8 +463,7 @@ class OrchestratorAgent:
             if name == "news_agent":
                 news_sources = getattr(output, "sources", []) or []
 
-        portfolio = self.get_portfolio(settings.PORTFOLIO_JSON_PATH)
-        portfolio_block = json.dumps(portfolio, indent=2) if portfolio else "[]"
+        portfolio_block = state.portfolio_block or "[]"
         multi_agent = len(state.agent_outputs) > 1
 
         history_window = _last_n_messages(state.messages, _SYNTHESIS_HISTORY_WINDOW)
