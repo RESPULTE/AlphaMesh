@@ -22,8 +22,13 @@ Usage (standalone / testing):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from urllib.error import URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import trafilatura
 from newsapi import NewsApiClient
@@ -167,7 +172,133 @@ async def _scrape_url(
 
 
 # ---------------------------------------------------------------------------
-# 3. Main public function
+# 3. Tavily web search
+# ---------------------------------------------------------------------------
+
+
+def _normalise_published_at(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        raw = value.strip()
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            return raw
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _extract_domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _call_tavily_search(
+    payload: Dict[str, Any],
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    req = Request(
+        settings.TAVILY_SEARCH_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout_seconds) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body)
+
+
+def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
+    url = str(result.get("url") or "").strip()
+    title = str(result.get("title") or "").strip() or "Untitled"
+    snippet = str(result.get("content") or "").strip()
+    raw_content = result.get("raw_content")
+    if isinstance(raw_content, dict):
+        raw_content = json.dumps(raw_content, ensure_ascii=True)
+    content = str(raw_content or snippet).strip()
+    published_at = _normalise_published_at(
+        result.get("published_date") or result.get("published_at")
+    )
+    source_name = _extract_domain(url) or "web"
+
+    return {
+        "title": title,
+        "description": snippet[:500],
+        "content": content or snippet,
+        "url": url,
+        "urlToImage": None,
+        "publishedAt": published_at,
+        "source": {"id": None, "name": source_name},
+        "content_source": "tavily",
+    }
+
+
+async def fetch_articles_from_tavily(
+    query: str,
+    *,
+    max_results: int = settings.TAVILY_SEARCH_MAX_RESULTS,
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+    topic: str = settings.TAVILY_TOPIC,
+    search_depth: str = settings.TAVILY_SEARCH_DEPTH,
+    include_raw_content: bool = True,
+) -> List[dict]:
+    """
+    Search the web using Tavily and normalize results to NewsAPI-like articles.
+
+    Returns article dicts compatible with the existing chunker/ingestor:
+    title, description, content, url, publishedAt, source.
+    """
+    if not settings.TAVILY_API_KEY:
+        logger.warning("TAVILY_API_KEY not configured. Skipping Tavily web search.")
+        return []
+
+    max_results = max(1, min(int(max_results or 1), 20))
+    payload: Dict[str, Any] = {
+        "api_key": settings.TAVILY_API_KEY,
+        "query": query,
+        "topic": topic,
+        "search_depth": search_depth,
+        "max_results": max_results,
+        "include_raw_content": include_raw_content,
+    }
+    if include_domains:
+        payload["include_domains"] = include_domains
+    if exclude_domains:
+        payload["exclude_domains"] = exclude_domains
+
+    try:
+        response: Dict[str, Any] = await asyncio.to_thread(
+            _call_tavily_search,
+            payload,
+            settings._SCRAPE_TIMEOUT,
+        )
+    except URLError as exc:
+        logger.error("Tavily request failed for query '%s': %s", query, exc)
+        return []
+    except Exception as exc:
+        logger.error("Unexpected Tavily failure for query '%s': %s", query, exc)
+        return []
+
+    results = response.get("results") or []
+    articles = [
+        _normalise_tavily_result_to_article(r)
+        for r in results
+        if isinstance(r, dict) and r.get("url")
+    ]
+    logger.info(
+        "Tavily returned %d normalized articles for query '%s'.",
+        len(articles),
+        query,
+    )
+    return [a for a in articles if a.get("content") or a.get("description")]
+
+
+# ---------------------------------------------------------------------------
+# 4. Main public function
 # ---------------------------------------------------------------------------
 
 

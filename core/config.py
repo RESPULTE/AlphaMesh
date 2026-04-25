@@ -90,6 +90,15 @@ class Settings(BaseSettings):
     # ── NewsAPI ───────────────────────────────────────────────────────────────
     NEWSAPI_KEY: Optional[str] = None
     NEWS_FETCH_MAX_ARTICLES: int = 8
+    TAVILY_API_KEY: Optional[str] = None
+    TAVILY_SEARCH_API_URL: str = "https://api.tavily.com/search"
+    TAVILY_SEARCH_MAX_RESULTS: int = 5
+    TAVILY_SEARCH_DEPTH: str = "basic"
+    TAVILY_TOPIC: str = "news"
+
+    NEWS_AGENT_MAX_RESEARCH_ITERATIONS: int = 3
+    NEWS_AGENT_MIN_SOURCES_FOR_SUFFICIENCY: int = 4
+    NEWS_AGENT_MIN_CHUNKS_FOR_SUFFICIENCY: int = 8
 
     FINANCIAL_DOMAINS: str = ",".join(
         [

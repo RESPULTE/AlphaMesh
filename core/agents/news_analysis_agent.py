@@ -1,32 +1,12 @@
 """
 core/agents/news_analysis_agent.py
 
-News analysis agent with dual-store ingestion and chunk-level extraction.
-
-Changes
--------
-- Added `_rewrite_queries_node` as the first node in the LangGraph workflow.
-  This node makes a lightweight structured-output LLM call to expand the
-  orchestrator's already-tailored query into three domain-specific retrieval
-  strings (company / sector / market) and immediately fires the memory
-  retrieval as a background asyncio task stored on the state.
-  The task is awaited later in `_rendezvous_node`, exactly as before.
-
-- `run()` no longer reads `input_data.memory_task` � the news agent now
-  self-manages its memory retrieval lifecycle entirely.  BaseAgentInput no
-  longer carries a `memory_task` field.
-
-- `_fetch_news_node` and `_ingest_articles_node` run concurrently with the
-  memory retrieval task thanks to the background task created in
-  `_rewrite_queries_node`.
-
-- `_ingest_articles_node` now fires both Chroma retrieval queries (new chunks
-  and existing chunks) in parallel via asyncio.gather, eliminating a
-  sequential round-trip.
+News analysis agent with iterative research planning, dual-store ingestion,
+and chunk-level extraction.
 
 Graph topology:
-  rewrite_queries ? fetch_news ? ingest_articles ? rendezvous ? analyse_news
-                 ? (memory_task fires in background) ?
+  rewrite_queries -> plan_research -> (fetch_news -> ingest_articles)* -> rendezvous -> analyse_news
+  with memory retrieval fired in the background from rewrite_queries.
 """
 
 from __future__ import annotations
@@ -47,13 +27,20 @@ from core.agents.models.news_agent_models import (
     CitedSource,
     NewsAgentOutput,
     NewsAgentState,
+    ResearchStepLog,
+    ResearchStepPlan,
 )
-from core.agents.news_fetcher import build_news_query, fetch_articles
+from core.agents.news_fetcher import (
+    build_news_query,
+    fetch_articles,
+    fetch_articles_from_tavily,
+)
 from core.agents.prompts.news_agent_prompts import (
     NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT,
     NEWS_ANALYSIS_USER_PROMPT,
     NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
+    NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT,
 )
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
@@ -285,6 +272,7 @@ class NewsAnalysisAgent(AbstractAgent):
             end_date=end_date,
             conversation_id=input_data.conversation_id,
             company_context=input_data.company_context,
+            max_research_iterations=settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS,
         )
 
         state_payload = initial_state.model_dump()
@@ -298,23 +286,40 @@ class NewsAnalysisAgent(AbstractAgent):
     # -- Graph construction ----------------------------------------------------
 
     def _build_graph(self):
-        """Compile the linear LangGraph workflow."""
+        """Compile the iterative LangGraph workflow."""
         workflow = StateGraph(NewsAgentState, output_schema=NewsAgentOutput)
 
         workflow.add_node("rewrite_queries", self._rewrite_queries_node)
+        workflow.add_node("plan_research", self._plan_research_node)
         workflow.add_node("fetch_news", self._fetch_news_node)
         workflow.add_node("ingest_articles", self._ingest_articles_node)
         workflow.add_node("rendezvous", self._rendezvous_node)
         workflow.add_node("analyse_news", self._analyse_news_node)
 
         workflow.add_edge(START, "rewrite_queries")
-        workflow.add_edge("rewrite_queries", "fetch_news")
+        workflow.add_edge("rewrite_queries", "plan_research")
+        workflow.add_conditional_edges(
+            "plan_research",
+            self._route_after_research_plan,
+            {"fetch_news": "fetch_news", "rendezvous": "rendezvous"},
+        )
         workflow.add_edge("fetch_news", "ingest_articles")
-        workflow.add_edge("ingest_articles", "rendezvous")
+        workflow.add_edge("ingest_articles", "plan_research")
         workflow.add_edge("rendezvous", "analyse_news")
         workflow.add_edge("analyse_news", END)
 
         return workflow.compile()
+
+    @staticmethod
+    def _route_after_research_plan(state: NewsAgentState) -> str:
+        plan = state.research_plan
+        if plan is None:
+            return "rendezvous"
+        if state.research_iteration >= state.max_research_iterations:
+            return "rendezvous"
+        if plan.action == "proceed":
+            return "rendezvous"
+        return "fetch_news"
 
     # -- Node: rewrite_queries -------------------------------------------------
 
@@ -382,89 +387,234 @@ class NewsAnalysisAgent(AbstractAgent):
 
         return {"memory_task": memory_task}
 
+    # -- Node: plan_research --------------------------------------------------
+
+    @staticmethod
+    def _count_unique_source_urls(articles: List[dict]) -> int:
+        urls = {
+            str(article.get("url") or "").strip()
+            for article in articles
+            if str(article.get("url") or "").strip()
+        }
+        return len(urls)
+
+    @staticmethod
+    def _history_block(logs: List[ResearchStepLog], limit: int = 6) -> str:
+        if not logs:
+            return "(none)"
+        lines: List[str] = []
+        for row in logs[-limit:]:
+            lines.append(
+                f"- iter={row.iteration} action={row.action} query='{row.query}' "
+                f"fetched={row.fetched_articles} newly_added={row.newly_added_articles}"
+            )
+        return "\n".join(lines)
+
+    async def _plan_research_node(self, state: NewsAgentState) -> dict:
+        unique_sources = self._count_unique_source_urls(state.raw_articles)
+        chunk_count = len(state.retrieved_chunks)
+        threshold_met = (
+            unique_sources >= settings.NEWS_AGENT_MIN_SOURCES_FOR_SUFFICIENCY
+            and chunk_count >= settings.NEWS_AGENT_MIN_CHUNKS_FOR_SUFFICIENCY
+        )
+        at_limit = state.research_iteration >= state.max_research_iterations
+
+        if at_limit or threshold_met:
+            if at_limit:
+                reason = (
+                    f"Reached research iteration limit ({state.max_research_iterations})."
+                )
+            else:
+                reason = (
+                    "Sufficiency threshold reached "
+                    f"(sources={unique_sources}, chunks={chunk_count})."
+                )
+            plan = ResearchStepPlan(
+                action="proceed",
+                query="",
+                rationale=reason,
+                max_results=1,
+            )
+            publish_progress("news_agent", f"Research planning: {reason}")
+            return {"research_plan": plan, "is_information_sufficient": True}
+
+        planner_prompt = (
+            f"Query: {state.query}\n"
+            f"Ticker: {state.ticker or 'N/A'}\n"
+            f"Iteration: {state.research_iteration} / {state.max_research_iterations}\n"
+            f"Current unique sources: {unique_sources}\n"
+            f"Current chunk count: {chunk_count}\n"
+            f"Sufficiency thresholds: "
+            f"sources>={settings.NEWS_AGENT_MIN_SOURCES_FOR_SUFFICIENCY}, "
+            f"chunks>={settings.NEWS_AGENT_MIN_CHUNKS_FOR_SUFFICIENCY}\n"
+            f"Recent research history:\n{self._history_block(state.research_logs)}\n\n"
+            "Return only ResearchStepPlan."
+        )
+        publish_progress("news_agent", "Planning next research step...")
+        try:
+            structured_llm = self._llm.with_structured_output(ResearchStepPlan)
+            plan = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT),
+                    HumanMessage(content=planner_prompt),
+                ]
+            )
+        except Exception:
+            logger.exception("_plan_research_node: planner call failed; using fallback")
+            if state.research_iteration == 0:
+                plan = ResearchStepPlan(
+                    action="newsapi",
+                    query=state.query,
+                    rationale="Fallback to NewsAPI on planner failure.",
+                    max_results=settings.NEWS_FETCH_MAX_ARTICLES,
+                )
+            elif settings.TAVILY_API_KEY:
+                plan = ResearchStepPlan(
+                    action="web_search",
+                    query=state.query,
+                    rationale="Fallback targeted web search after planner failure.",
+                    max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
+                )
+            else:
+                plan = ResearchStepPlan(
+                    action="proceed",
+                    query="",
+                    rationale="Planner failure and no Tavily key configured.",
+                    max_results=1,
+                )
+
+        if not plan.query and plan.action != "proceed":
+            plan.query = state.query
+        if plan.action == "web_search" and not settings.TAVILY_API_KEY:
+            plan = ResearchStepPlan(
+                action="newsapi",
+                query=plan.query or state.query,
+                rationale=(
+                    "Tavily key not configured; falling back to NewsAPI for this step."
+                ),
+                max_results=plan.max_results,
+            )
+        if plan.action == "newsapi":
+            plan.max_results = max(
+                1, min(plan.max_results, settings.NEWS_FETCH_MAX_ARTICLES)
+            )
+        else:
+            plan.max_results = max(1, min(plan.max_results, 20))
+
+        return {
+            "research_plan": plan,
+            "is_information_sufficient": plan.action == "proceed",
+        }
+
     # -- Node: fetch_news ------------------------------------------------------
 
     async def _fetch_news_node(self, state: NewsAgentState) -> dict:
-        """
-        Fetch news articles from NewsAPI and enrich them with full content
-        scraped by trafilatura.
+        """Execute the planner-selected research tool and deduplicate by URL."""
+        plan = state.research_plan
+        if plan is None or plan.action == "proceed":
+            return {
+                "latest_articles": [],
+                "research_iteration": state.research_iteration,
+                "research_logs": state.research_logs,
+            }
 
-        � build_news_query() constructs a boolean NewsAPI query that combines
-          the ticker symbol with optional company name / keywords.
-        � Results are filtered to a curated list of trusted financial domains.
-        � trafilatura replaces the truncated NewsAPI `content` field (~200 chars)
-          with the full article body.
-        � Falls back gracefully to the NewsAPI snippet when scraping fails.
-        """
         logger.info(
-            "_fetch_news_node: fetching news for ticker='%s' (%s ? %s)",
-            state.ticker,
-            state.start_date,
-            state.end_date,
+            "_fetch_news_node: action=%s iteration=%d query='%.120s'",
+            plan.action,
+            state.research_iteration,
+            plan.query,
         )
+        query_text = (plan.query or state.query).strip()
+        articles: List[dict] = []
 
-        publish_progress("news_agent", f"Fetching recent news for '{state.ticker}'…")
-
-        q = build_news_query(ticker=state.ticker)
-        logger.info("NewsAPI query: %s", q)
-
-        try:
-            articles = await fetch_articles(
-                q=q,
-                from_date=state.start_date.isoformat(),
-                to_date=state.end_date.isoformat(),
+        if plan.action == "newsapi":
+            publish_progress(
+                "news_agent",
+                f"Research iter {state.research_iteration + 1}: fetching from NewsAPI...",
             )
-            publish_success("news_agent", f"Fetched {len(articles)} article(s)")
-        except Exception as exc:
-            logger.error("News fetch pipeline failed: %s", exc)
-            raise
+            if not query_text:
+                query_text = build_news_query(ticker=state.ticker)
+            elif state.ticker:
+                query_text = f"({state.ticker}) AND ({query_text})"
+            try:
+                articles = await fetch_articles(
+                    q=query_text,
+                    from_date=state.start_date.isoformat(),
+                    to_date=state.end_date.isoformat(),
+                    page_size=plan.max_results,
+                )
+            except Exception:
+                logger.exception("_fetch_news_node: NewsAPI fetch failed")
+                articles = []
+        elif plan.action == "web_search":
+            publish_progress(
+                "news_agent",
+                f"Research iter {state.research_iteration + 1}: targeted Tavily web search...",
+            )
+            articles = await fetch_articles_from_tavily(
+                query=query_text,
+                max_results=plan.max_results,
+                include_domains=plan.include_domains,
+                exclude_domains=plan.exclude_domains,
+            )
 
-        logger.info(
-            "Fetched %d articles for ticker '%s' (%s ? %s).",
-            len(articles),
-            state.ticker,
-            state.start_date,
-            state.end_date,
+        seen_urls = set(state.seen_urls or [])
+        latest_articles: List[dict] = []
+        for article in articles:
+            url = str(article.get("url") or "").strip()
+            if not url:
+                continue
+            if url in seen_urls:
+                continue
+            latest_articles.append(article)
+            seen_urls.add(url)
+
+        log_row = ResearchStepLog(
+            iteration=state.research_iteration + 1,
+            action=plan.action,
+            query=query_text,
+            rationale=plan.rationale,
+            fetched_articles=len(articles),
+            newly_added_articles=len(latest_articles),
         )
-        return {"raw_articles": articles}
+        publish_success(
+            "news_agent",
+            f"Research iter {state.research_iteration + 1}: "
+            f"{plan.action} fetched={len(articles)} new={len(latest_articles)}",
+        )
+
+        return {
+            "latest_articles": latest_articles,
+            "raw_articles": list(state.raw_articles) + latest_articles,
+            "seen_urls": list(seen_urls),
+            "research_logs": list(state.research_logs) + [log_row],
+            "research_iteration": state.research_iteration + 1,
+        }
 
     # -- Node: ingest_articles -------------------------------------------------
 
     async def _ingest_articles_node(self, state: NewsAgentState) -> dict:
-        """
-        Ingest articles into Neo4j and ChromaDB, then retrieve the most
-        relevant chunks for the current query via scored similarity search.
-
-        ingest_articles() returns involved_chunks in memory (no round-trip),
-        but those chunks carry no relevance scores. Two parallel ChromaDB
-        similarity queries are still needed to score new and existing chunks
-        against the query before reranking. The in-memory return value is
-        intentionally ignored for this reason.
-
-        The two queries are fired in parallel - they are independent and each
-        involves an embedding round-trip.
-        existing_chunk_ids are intentionally queried as well because those
-        chunks may not appear in comprehensive_retrieve() top-k results.
-        """
-        if not state.raw_articles:
-            return {"chunk_ids": [], "retrieved_chunks": []}
+        """Ingest this iteration's articles and append scored chunks."""
+        if not state.latest_articles:
+            logger.info("_ingest_articles_node: no new articles in this iteration")
+            return {"retrieved_chunks": state.retrieved_chunks}
 
         publish_progress(
             "news_agent",
-            f"Ingesting {len(state.raw_articles)} article(s) into dual-store memory…",
+            f"Ingesting {len(state.latest_articles)} new article(s) into memory...",
         )
 
         try:
             new_chunk_ids, existing_chunk_ids, _ = (
-                await service_manager.get_ingestor().ingest_articles(state.raw_articles)
+                await service_manager.get_ingestor().ingest_articles(state.latest_articles)
             )
             publish_success(
                 "news_agent",
-                f"Ingestion done — {len(new_chunk_ids)} new chunks, {len(existing_chunk_ids)} existing",
+                f"Ingestion done: {len(new_chunk_ids)} new chunks, {len(existing_chunk_ids)} existing",
             )
-        except Exception as exc:
-            logger.error("Ingestion failed: %s", exc)
-            raise
+        except Exception:
+            logger.exception("_ingest_articles_node: ingestion failed")
+            return {"retrieved_chunks": state.retrieved_chunks}
 
         query = state.query
 
@@ -487,20 +637,20 @@ class NewsAnalysisAgent(AbstractAgent):
             _query(new_chunk_ids, "new"),
             _query(existing_chunk_ids, "existing"),
         )
-        retrieved_chunks = new_chunks + existing_chunks
+        merged_chunks = list(state.retrieved_chunks)
+        chunk_map: Dict[str, RetrievedChunk] = {
+            chunk.chunk_id: chunk for chunk in merged_chunks if chunk.chunk_id
+        }
+        for chunk in new_chunks + existing_chunks:
+            if chunk.chunk_id and chunk.chunk_id not in chunk_map:
+                chunk_map[chunk.chunk_id] = chunk
+                merged_chunks.append(chunk)
 
         logger.info(
-            "Ingested articles into memory. #New: %s, #Existing: %s",
-            len(new_chunk_ids),
-            len(existing_chunk_ids),
+            "_ingest_articles_node: cumulative retrieved chunks=%d",
+            len(merged_chunks),
         )
-        # chunk_ids retained in state for schema compatibility but no longer
-        # consumed downstream � entity extraction uses final_ranked IDs in
-        # _rendezvous_node instead.
-        return {
-            "chunk_ids": new_chunk_ids + existing_chunk_ids,
-            "retrieved_chunks": retrieved_chunks,
-        }
+        return {"retrieved_chunks": merged_chunks}
 
     # -- Node: rendezvous ------------------------------------------------------
 
@@ -626,13 +776,14 @@ class NewsAnalysisAgent(AbstractAgent):
             if state.company_context
             else ""
         )
+        context_prefix = f"{company_context_section}{entities_section}"
 
         messages = [
             SystemMessage(content=NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT),
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
                     query=state.query,
-                    entities_section=company_context_section,
+                    entities_section=context_prefix,
                     context=context_block,
                 )
             ),
