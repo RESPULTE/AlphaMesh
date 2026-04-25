@@ -101,6 +101,8 @@ export interface AnalysisResponse {
   priceChangePercent: number | null;
   marketStatus: string;
   chartData: ChartDataPoint[];
+  fundamentalData?: DataFramePayload | null;
+  fundamentalsVisualization?: FundamentalsVisualizationPayload | null;
   agents: AgentAnalysis[];
   summary: SummaryOfFindings;
 }
@@ -122,6 +124,36 @@ export interface DataFramePayload {
   data: Array<Array<number | null>>;
 }
 
+export type FundamentalsChartType =
+  | 'line'
+  | 'bar'
+  | 'area'
+  | 'scatter'
+  | 'stacked_bar'
+  | 'stacked_area'
+  | 'pie';
+
+export type FundamentalsDataMode = 'timeseries' | 'snapshot';
+
+export interface FundamentalsChartSpecPayload {
+  chart_type: FundamentalsChartType;
+  data_mode: FundamentalsDataMode;
+  snapshot_period: string;
+  title: string;
+  row_labels: string[];
+  group_rows: boolean;
+  rationale: string;
+}
+
+export interface FundamentalsVisualizationPayload {
+  charts: FundamentalsChartSpecPayload[];
+  raw_row_labels: string[];
+  raw_data?: DataFramePayload | null;
+  reviewer_notes: string;
+  task_completed: boolean;
+  task_completion_reason: string;
+}
+
 export interface SourceItem {
   source_id: number;
   title: string;
@@ -133,6 +165,7 @@ export interface TickerResult {
   ticker: string;
   analysis_text: string;
   financial_data?: DataFramePayload | null;
+  fundamentals_visualization?: FundamentalsVisualizationPayload | null;
   sources: SourceItem[];
 }
 
@@ -184,6 +217,11 @@ export type StreamEvent =
       event_type: 'metrics';
       request_id: string;
       financial_data: DataFramePayload;
+    }
+  | {
+      event_type: 'fundamentals_visualization';
+      request_id: string;
+      fundamentals_visualization: FundamentalsVisualizationPayload;
     }
   | {
       event_type: 'ticker_resolved';

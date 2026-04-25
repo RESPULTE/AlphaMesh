@@ -171,7 +171,10 @@ Rules:
 - Prefer rows that directly answer the user query.
 - Charts may be grouped (multiple rows in one chart) only if comparison is meaningful.
 - Do not repeat the same row across multiple charts.
-- Use chart types only from: line, bar, area, scatter.
+- Use chart types only from: line, bar, area, scatter, stacked_bar, stacked_area, pie.
+- Every chart MUST set `data_mode` as either `timeseries` or `snapshot`.
+- `pie` charts are snapshot-only (`data_mode` must be `snapshot`).
+- For snapshot charts, set `snapshot_period` (use `latest` unless there is a strong reason not to).
 - Keep reasoning concise and evidence-based.
 """
 

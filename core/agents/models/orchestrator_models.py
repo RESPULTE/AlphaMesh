@@ -5,6 +5,7 @@ from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
+from core.agents.models.fundamental_agent_models import VisualizationPlan
 from core.agents.models.news_agent_models import CitedSource
 
 
@@ -161,6 +162,12 @@ class OrchestratorState(BaseModel):
 
     summary: str = ""
     fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)
+    fundamentals_visualization: Optional[VisualizationPlan] = Field(default=None)
+    fundamentals_raw_display_data: Optional[pd.DataFrame] = Field(
+        default=None, exclude=True
+    )
+    fundamentals_task_completed: bool = Field(default=True)
+    fundamentals_task_completion_reason: str = Field(default="")
     sources: List[CitedSource] = Field(default_factory=list)
 
     turn_id: str = Field(
@@ -182,6 +189,12 @@ class FinalResponse(BaseModel):
 
     summary: str = ""
     fundamental_data: Optional[pd.DataFrame] = Field(default=None, exclude=True)
+    fundamentals_visualization: Optional[VisualizationPlan] = Field(default=None)
+    fundamentals_raw_display_data: Optional[pd.DataFrame] = Field(
+        default=None, exclude=True
+    )
+    fundamentals_task_completed: bool = Field(default=True)
+    fundamentals_task_completion_reason: str = Field(default="")
     sources: List[CitedSource] = Field(default_factory=list)
     agent_analyses: Dict[str, str] = Field(default_factory=dict)
     tickers: List[str] = Field(

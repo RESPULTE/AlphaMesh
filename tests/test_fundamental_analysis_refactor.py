@@ -195,3 +195,51 @@ def test_completion_review_enforces_visualisation_thresholds(
     assert len(viz_plan.charts[0].row_labels) == 1
     assert len(viz_plan.raw_row_labels) == 2
     assert len(result["raw_display_data"]) == 2
+
+
+def test_completion_review_normalises_chart_types_and_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    llm = _FakeLLM(
+        payload={
+            "task_completed": True,
+            "task_completion_reason": "Complete.",
+            "charts": [
+                {
+                    "chart_type": "pie",
+                    "data_mode": "timeseries",
+                    "title": "Composition",
+                    "row_labels": ["Revenues", "NetIncomeLoss"],
+                    "group_rows": True,
+                },
+                {
+                    "chart_type": "unknown_chart",
+                    "data_mode": "snapshot",
+                    "title": "Fallback",
+                    "row_labels": ["GrossProfit"],
+                    "group_rows": True,
+                },
+            ],
+            "raw_row_labels": ["Revenues"],
+        }
+    )
+    monkeypatch.setattr(module.service_manager, "get_agent", lambda temperature=0: llm)
+
+    state = _AgentState(
+        query="Chart normalisation behavior",
+        ticker="AAPL",
+        financial_data=_sample_df(),
+        tool_plan=IterativeToolPlan(batches=[], data_summary=""),
+        iteration_count=1,
+    )
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    result = asyncio.run(agent._completion_review_node(state))
+
+    charts = result["visualization_plan"].charts
+    assert len(charts) == 2
+    assert charts[0].chart_type == "pie"
+    assert charts[0].data_mode == "snapshot"
+    assert charts[1].chart_type == "bar"
+    assert charts[1].data_mode == "snapshot"

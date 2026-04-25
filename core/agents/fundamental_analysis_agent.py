@@ -80,6 +80,16 @@ logger = get_logger(__name__)
 
 # ── Iteration ceiling (guards the fallback re-planning loop only) ─────────────
 MAX_TOOL_ITERATIONS: int = 5
+_SUPPORTED_CHART_TYPES: Set[str] = {
+    "line",
+    "bar",
+    "area",
+    "scatter",
+    "stacked_bar",
+    "stacked_area",
+    "pie",
+}
+_SNAPSHOT_UNSUPPORTED_TYPES: Set[str] = {"line", "area", "scatter", "stacked_area"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -771,11 +781,38 @@ class FundamentalAnalysisAgent(AbstractAgent):
         )
 
     @staticmethod
-    def _normalise_chart_type(chart_type: str) -> str:
-        allowed = {"line", "bar", "area", "scatter"}
-        if chart_type in allowed:
-            return chart_type
-        return "line"
+    def _normalise_data_mode(data_mode: str) -> str:
+        normalised = (data_mode or "").strip().lower()
+        if normalised in {"timeseries", "snapshot"}:
+            return normalised
+        return "timeseries"
+
+    @staticmethod
+    def _normalise_snapshot_period(snapshot_period: str) -> str:
+        value = (snapshot_period or "").strip()
+        return value or "latest"
+
+    @classmethod
+    def _normalise_chart_spec(cls, chart: ChartSpec) -> Tuple[str, str, str]:
+        data_mode = cls._normalise_data_mode(chart.data_mode)
+        requested_type = (chart.chart_type or "").strip().lower()
+
+        # Contract fallback for unsupported chart_type.
+        if requested_type not in _SUPPORTED_CHART_TYPES:
+            requested_type = "bar" if data_mode == "snapshot" else "line"
+
+        chart_type = requested_type
+
+        # Contract: pie is snapshot-only.
+        if chart_type == "pie":
+            data_mode = "snapshot"
+
+        # Snapshot mode should default to bar-family renderers.
+        if data_mode == "snapshot" and chart_type in _SNAPSHOT_UNSUPPORTED_TYPES:
+            chart_type = "bar"
+
+        snapshot_period = cls._normalise_snapshot_period(chart.snapshot_period)
+        return chart_type, data_mode, snapshot_period
 
     @staticmethod
     def _dedupe_preserve_order(values: List[str]) -> List[str]:
@@ -802,6 +839,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         sanitized_charts: List[ChartSpec] = []
 
         for chart in decision.charts:
+            chart_type, data_mode, snapshot_period = self._normalise_chart_spec(chart)
             candidate_rows = self._dedupe_preserve_order(
                 [
                     r
@@ -816,7 +854,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
             if chart.group_rows:
                 sanitized_charts.append(
                     ChartSpec(
-                        chart_type=self._normalise_chart_type(chart.chart_type),
+                        chart_type=chart_type,
+                        data_mode=data_mode,
+                        snapshot_period=snapshot_period,
                         title=(chart.title or "Financial Trend").strip(),
                         row_labels=candidate_rows,
                         group_rows=True,
@@ -829,7 +869,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
             for row_label in candidate_rows:
                 sanitized_charts.append(
                     ChartSpec(
-                        chart_type=self._normalise_chart_type(chart.chart_type),
+                        chart_type=chart_type,
+                        data_mode=data_mode,
+                        snapshot_period=snapshot_period,
                         title=(chart.title or row_label).strip(),
                         row_labels=[row_label],
                         group_rows=False,
@@ -848,6 +890,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 sanitized_charts = [
                     ChartSpec(
                         chart_type="line",
+                        data_mode="timeseries",
+                        snapshot_period="latest",
                         title="Key Financial Trends",
                         row_labels=fallback_rows,
                         group_rows=True,

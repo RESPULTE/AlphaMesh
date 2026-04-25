@@ -147,7 +147,23 @@ class ChartSpec(BaseModel):
 
     chart_type: str = Field(
         default="line",
-        description="One of: line, bar, area, scatter.",
+        description=(
+            "One of: line, bar, area, scatter, stacked_bar, stacked_area, pie."
+        ),
+    )
+    data_mode: str = Field(
+        default="timeseries",
+        description=(
+            "timeseries for multi-period trends; snapshot for single-period "
+            "composition/point-in-time comparisons."
+        ),
+    )
+    snapshot_period: str = Field(
+        default="latest",
+        description=(
+            "Period selector for snapshot views (default 'latest'). Ignored for "
+            "timeseries."
+        ),
     )
     title: str = Field(default="")
     row_labels: List[str] = Field(default_factory=list)

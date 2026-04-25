@@ -1,16 +1,44 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAnalysisStream } from '../hooks/useAnalysisStream';
-import { LineChart as RechartsLineChart, Line, ResponsiveContainer, YAxis } from 'recharts';
+import {
+  Area,
+  AreaChart as RechartsAreaChart,
+  Bar,
+  BarChart as RechartsBarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Line,
+  LineChart as RechartsLineChart,
+  Pie,
+  PieChart as RechartsPieChart,
+  ResponsiveContainer,
+  Scatter,
+  ScatterChart as RechartsScatterChart,
+  Tooltip,
+  XAxis,
+  YAxis
+} from 'recharts';
 import { Star, TrendingUp, ArrowRight, Download, Sparkles, User, FileText, BarChart2, CheckCircle2, Building2, ArrowLeft, X, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react';
 import clsx from 'clsx';
 import Markdown from 'react-markdown';
 import { AgentAnalysis } from '../types/api';
+import {
+  buildChartSelectorOptions,
+  normaliseChartSpec,
+  shouldFallbackPieToBar,
+  toScatterDataset,
+  toSnapshotDataset,
+  toTimeseriesDataset
+} from './charting/fundamentalsChartUtils';
 
 interface AnalysisDashboardProps {
   query: string;
   onBack?: () => void;
 }
+
+const CHART_COLORS = ['#007a01', '#2b9f30', '#6ecf72', '#87d98a', '#b6e8b9', '#d1f2d3'];
 
 function AgentModal({ agent, onClose }: { agent: AgentAnalysis; onClose: () => void }) {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -169,6 +197,242 @@ function AgentModal({ agent, onClose }: { agent: AgentAnalysis; onClose: () => v
 export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardProps) {
   const { data, isStreaming } = useAnalysisStream(query);
   const [selectedAgent, setSelectedAgent] = useState<AgentAnalysis | null>(null);
+  const [selectedChartId, setSelectedChartId] = useState<string>('market-price');
+  const chartData = data?.chartData ?? [];
+  const fundamentalsVisualization = data?.fundamentalsVisualization ?? null;
+
+  const priceText = data?.currentPrice != null ? data.currentPrice.toFixed(2) : '--';
+  const changeText =
+    data?.priceChange != null && data?.priceChangePercent != null
+      ? `+${data.priceChange.toFixed(2)} (${data.priceChangePercent.toFixed(2)}%)`
+      : '—';
+
+  const chartOptions = useMemo(
+    () => buildChartSelectorOptions(chartData, fundamentalsVisualization),
+    [chartData, fundamentalsVisualization]
+  );
+
+  useEffect(() => {
+    if (!chartOptions.some((option) => option.id === selectedChartId)) {
+      setSelectedChartId(chartOptions[0]?.id ?? 'market-price');
+    }
+  }, [chartOptions, selectedChartId]);
+
+  const selectedChart =
+    chartOptions.find((option) => option.id === selectedChartId) ?? chartOptions[0];
+
+  const renderSelectedChart = () => {
+    if (!selectedChart || selectedChart.kind === 'market') {
+      if (chartData.length > 0) {
+        return (
+          <ResponsiveContainer width="100%" height="100%">
+            <RechartsLineChart data={chartData}>
+              <defs>
+                <linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#006e01" stopOpacity={0.15} />
+                  <stop offset="100%" stopColor="#006e01" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <YAxis domain={['dataMin - 5', 'dataMax + 5']} hide />
+              <Line
+                type="monotone"
+                dataKey="price"
+                stroke="#006e01"
+                strokeWidth={5}
+                dot={false}
+                isAnimationActive={true}
+                animationDuration={1500}
+              />
+            </RechartsLineChart>
+          </ResponsiveContainer>
+        );
+      }
+      return (
+        <div className="w-full h-full flex items-center justify-center">
+          <motion.div
+            animate={{ opacity: [0.5, 1, 0.5] }}
+            transition={{ repeat: Infinity, duration: 1.5 }}
+            className="text-on-surface-variant/50 font-medium"
+          >
+            {isStreaming ? 'Loading Chart Data...' : 'Market data unavailable'}
+          </motion.div>
+        </div>
+      );
+    }
+
+    const chartSpec = normaliseChartSpec(selectedChart.spec!);
+    const financialData = data?.fundamentalData;
+    if (!financialData) {
+      return (
+        <div className="w-full h-full flex items-center justify-center text-on-surface-variant/60 font-medium">
+          Fundamental chart data unavailable.
+        </div>
+      );
+    }
+
+    if (chartSpec.data_mode === 'snapshot') {
+      const snapshot = toSnapshotDataset(
+        financialData,
+        chartSpec.row_labels,
+        chartSpec.snapshot_period
+      );
+
+      if (!snapshot.points.length) {
+        return (
+          <div className="w-full h-full flex items-center justify-center text-on-surface-variant/60 font-medium">
+            No snapshot values available for this chart.
+          </div>
+        );
+      }
+
+      const renderPie =
+        chartSpec.chart_type === 'pie' && !shouldFallbackPieToBar(snapshot.points);
+
+      if (renderPie) {
+        return (
+          <ResponsiveContainer width="100%" height="100%">
+            <RechartsPieChart>
+              <Tooltip />
+              <Legend />
+              <Pie data={snapshot.points} dataKey="value" nameKey="name" outerRadius={110} label>
+                {snapshot.points.map((point, index) => (
+                  <Cell key={`${point.name}-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                ))}
+              </Pie>
+            </RechartsPieChart>
+          </ResponsiveContainer>
+        );
+      }
+
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <RechartsBarChart data={snapshot.points} margin={{ top: 16, right: 24, left: 8, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#d9d9d9" />
+            <XAxis dataKey="name" tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <YAxis tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <Tooltip />
+            <Bar dataKey="value" fill="#007a01" radius={[6, 6, 0, 0]} />
+          </RechartsBarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    if (chartSpec.chart_type === 'scatter') {
+      const scatterPoints = toScatterDataset(financialData, chartSpec.row_labels);
+      if (!scatterPoints.length) {
+        return (
+          <div className="w-full h-full flex items-center justify-center text-on-surface-variant/60 font-medium">
+            No scatter points available for this chart.
+          </div>
+        );
+      }
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <RechartsScatterChart margin={{ top: 16, right: 24, left: 8, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#d9d9d9" />
+            <XAxis dataKey="x" tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <YAxis dataKey="y" tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <Tooltip cursor={{ strokeDasharray: '3 3' }} />
+            <Scatter data={scatterPoints} fill="#007a01" />
+          </RechartsScatterChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    const timeseries = toTimeseriesDataset(financialData, chartSpec.row_labels);
+    if (!timeseries.points.length || !timeseries.series.length) {
+      return (
+        <div className="w-full h-full flex items-center justify-center text-on-surface-variant/60 font-medium">
+          No time-series values available for this chart.
+        </div>
+      );
+    }
+
+    const seriesEls = timeseries.series.map((series, index) => {
+      const color = CHART_COLORS[index % CHART_COLORS.length];
+      if (chartSpec.chart_type === 'area' || chartSpec.chart_type === 'stacked_area') {
+        return (
+          <Area
+            key={series.key}
+            type="monotone"
+            dataKey={series.key}
+            name={series.label}
+            stroke={color}
+            fill={color}
+            fillOpacity={0.2}
+            strokeWidth={2}
+            stackId={chartSpec.chart_type === 'stacked_area' ? 'stack' : undefined}
+          />
+        );
+      }
+      if (chartSpec.chart_type === 'bar' || chartSpec.chart_type === 'stacked_bar') {
+        return (
+          <Bar
+            key={series.key}
+            dataKey={series.key}
+            name={series.label}
+            fill={color}
+            radius={[4, 4, 0, 0]}
+            stackId={chartSpec.chart_type === 'stacked_bar' ? 'stack' : undefined}
+          />
+        );
+      }
+      return (
+        <Line
+          key={series.key}
+          type="monotone"
+          dataKey={series.key}
+          name={series.label}
+          stroke={color}
+          strokeWidth={2.5}
+          dot={false}
+        />
+      );
+    });
+
+    if (chartSpec.chart_type === 'area' || chartSpec.chart_type === 'stacked_area') {
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <RechartsAreaChart data={timeseries.points} margin={{ top: 16, right: 24, left: 8, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#d9d9d9" />
+            <XAxis dataKey="period" tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <YAxis tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <Tooltip />
+            <Legend />
+            {seriesEls}
+          </RechartsAreaChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    if (chartSpec.chart_type === 'bar' || chartSpec.chart_type === 'stacked_bar') {
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <RechartsBarChart data={timeseries.points} margin={{ top: 16, right: 24, left: 8, bottom: 8 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#d9d9d9" />
+            <XAxis dataKey="period" tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <YAxis tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+            <Tooltip />
+            <Legend />
+            {seriesEls}
+          </RechartsBarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <RechartsLineChart data={timeseries.points}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#d9d9d9" />
+          <XAxis dataKey="period" tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+          <YAxis tick={{ fill: '#4a4a4a', fontSize: 12 }} />
+          <Tooltip />
+          <Legend />
+          {seriesEls}
+        </RechartsLineChart>
+      </ResponsiveContainer>
+    );
+  };
 
   if (!data) {
     return (
@@ -182,12 +446,6 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
       </div>
     );
   }
-
-  const priceText = data.currentPrice != null ? data.currentPrice.toFixed(2) : '--';
-  const changeText =
-    data.priceChange != null && data.priceChangePercent != null
-      ? `+${data.priceChange.toFixed(2)} (${data.priceChangePercent.toFixed(2)}%)`
-      : '—';
 
   return (
     <motion.main
@@ -268,39 +526,27 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
           <div className="lg:col-span-8 space-y-6 md:space-y-10">
             {/* Chart Area */}
             <section>
+              <div className="mb-3 md:mb-4 flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+                <div className="text-[9px] md:text-[10px] font-black font-label tracking-[0.2em] text-on-surface-variant uppercase">
+                  Chart View
+                </div>
+                <div className="relative">
+                  <select
+                    value={selectedChart?.id ?? 'market-price'}
+                    onChange={(event) => setSelectedChartId(event.target.value)}
+                    className="appearance-none bg-surface-container-low border border-outline-variant/30 text-on-surface text-xs md:text-sm font-semibold rounded-xl px-4 py-2 pr-10 max-w-[360px] w-full md:w-auto focus:outline-none focus:ring-2 focus:ring-primary/30"
+                  >
+                    {chartOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown className="w-4 h-4 text-on-surface-variant absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                </div>
+              </div>
               <div className="relative h-[250px] md:h-[360px] w-full bg-surface/80 rounded-2xl md:rounded-[2.5rem] overflow-hidden group border border-outline-variant/20">
-                {data.chartData && data.chartData.length > 0 ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <RechartsLineChart data={data.chartData}>
-                      <defs>
-                        <linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#006e01" stopOpacity={0.15} />
-                          <stop offset="100%" stopColor="#006e01" stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <YAxis domain={['dataMin - 5', 'dataMax + 5']} hide />
-                      <Line
-                        type="monotone"
-                        dataKey="price"
-                        stroke="#006e01"
-                        strokeWidth={5}
-                        dot={false}
-                        isAnimationActive={true}
-                        animationDuration={1500}
-                      />
-                    </RechartsLineChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <motion.div
-                      animate={{ opacity: [0.5, 1, 0.5] }}
-                      transition={{ repeat: Infinity, duration: 1.5 }}
-                      className="text-on-surface-variant/50 font-medium"
-                    >
-                      {isStreaming ? 'Loading Chart Data...' : 'Market data unavailable'}
-                    </motion.div>
-                  </div>
-                )}
+                {renderSelectedChart()}
               </div>
             </section>
 
@@ -532,3 +778,5 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
     </motion.main>
   );
 }
+
+

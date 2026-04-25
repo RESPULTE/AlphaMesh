@@ -88,6 +88,42 @@ class SourceItem(BaseModel):
     page_content: str = Field(description="Aggregated chunk text from this article.")
 
 
+class FundamentalsChartSpecPayload(BaseModel):
+    """Frontend-safe chart spec emitted by fundamentals completion review."""
+
+    chart_type: Literal[
+        "line",
+        "bar",
+        "area",
+        "scatter",
+        "stacked_bar",
+        "stacked_area",
+        "pie",
+    ] = "line"
+    data_mode: Literal["timeseries", "snapshot"] = "timeseries"
+    snapshot_period: str = "latest"
+    title: str = ""
+    row_labels: List[str] = Field(default_factory=list)
+    group_rows: bool = True
+    rationale: str = ""
+
+
+class FundamentalsVisualizationPayload(BaseModel):
+    """
+    Visualization metadata and curated raw rows for frontend rendering.
+
+    `raw_data` is optional and can be used for direct numeric display while
+    `financial_data` remains unchanged for backward compatibility.
+    """
+
+    charts: List[FundamentalsChartSpecPayload] = Field(default_factory=list)
+    raw_row_labels: List[str] = Field(default_factory=list)
+    raw_data: Optional[DataFramePayload] = None
+    reviewer_notes: str = ""
+    task_completed: bool = True
+    task_completion_reason: str = ""
+
+
 class TickerResult(BaseModel):
     """
     All output specific to a single ticker symbol.
@@ -101,6 +137,10 @@ class TickerResult(BaseModel):
     financial_data: Optional[DataFramePayload] = Field(
         default=None,
         description="Serialised financial DataFrame; null when no EDGAR data was fetched.",
+    )
+    fundamentals_visualization: Optional[FundamentalsVisualizationPayload] = Field(
+        default=None,
+        description="Frontend-safe chart and raw-row selection from fundamentals review.",
     )
     sources: List[SourceItem] = Field(
         default_factory=list,
@@ -174,6 +214,7 @@ class StreamEvent(BaseModel):
         "chart",
         "metrics",
         "ticker_resolved",
+        "fundamentals_visualization",
     ]
     request_id: str
 
@@ -197,6 +238,9 @@ class StreamEvent(BaseModel):
 
     # -- present when event_type == "metrics" (fundamentals DataFrame) ---------
     financial_data: Optional[DataFramePayload] = None
+
+    # -- present when event_type == "fundamentals_visualization" ---------------
+    fundamentals_visualization: Optional[FundamentalsVisualizationPayload] = None
 
     # -- present when event_type == "ticker_resolved" --------------------------
     ticker: Optional[str] = None

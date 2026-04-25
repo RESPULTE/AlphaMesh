@@ -4,6 +4,7 @@ import type {
   AnalysisResponse,
   DataFramePayload,
   FinalResult,
+  FundamentalsVisualizationPayload,
   StreamEvent
 } from '../types/api';
 
@@ -56,6 +57,8 @@ function baseResponse(): AnalysisResponse {
     priceChangePercent: null,
     marketStatus: 'MARKET DATA UNAVAILABLE',
     chartData: [],
+    fundamentalData: null,
+    fundamentalsVisualization: null,
     agents: placeholderAgents(),
     summary: emptySummary()
   };
@@ -159,7 +162,51 @@ function updateFundamentalAgent(prev: AnalysisResponse, payload: DataFramePayloa
     };
   }
 
-  return { ...prev, agents };
+  return { ...prev, agents, fundamentalData: payload };
+}
+
+function mergeVisualizationPayload(
+  prev: FundamentalsVisualizationPayload | null | undefined,
+  next: FundamentalsVisualizationPayload | null | undefined
+): FundamentalsVisualizationPayload | null {
+  if (!prev && !next) return null;
+  if (!prev) return next ?? null;
+  if (!next) return prev;
+  return {
+    charts: next.charts?.length ? next.charts : prev.charts,
+    raw_row_labels: next.raw_row_labels?.length ? next.raw_row_labels : prev.raw_row_labels,
+    raw_data: next.raw_data ?? prev.raw_data,
+    reviewer_notes: next.reviewer_notes || prev.reviewer_notes,
+    task_completed: next.task_completed ?? prev.task_completed,
+    task_completion_reason: next.task_completion_reason || prev.task_completion_reason
+  };
+}
+
+function updateFundamentalVisualization(
+  prev: AnalysisResponse,
+  payload: FundamentalsVisualizationPayload
+): AnalysisResponse {
+  const mergedVisualization = mergeVisualizationPayload(prev.fundamentalsVisualization, payload);
+  const tablePayload = payload.raw_data ?? prev.fundamentalData;
+  const metrics = buildMetrics(tablePayload);
+  const tableData = buildTable(tablePayload);
+  const agents = prev.agents.length ? [...prev.agents] : placeholderAgents();
+  const idx = agents.findIndex((agent) => agent.id === 'fundamental');
+
+  if (idx >= 0) {
+    agents[idx] = {
+      ...agents[idx],
+      metrics: metrics ?? agents[idx].metrics,
+      tableData: tableData ?? agents[idx].tableData
+    };
+  }
+
+  return {
+    ...prev,
+    fundamentalsVisualization: mergedVisualization,
+    fundamentalData: tablePayload ?? prev.fundamentalData,
+    agents
+  };
 }
 
 function mapFinalResult(result: FinalResult): AnalysisResponse {
@@ -168,6 +215,8 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
   if (tickerResult) {
     response.ticker = tickerResult.ticker || '';
     response.companyName = tickerResult.ticker || '';
+    response.fundamentalData = tickerResult.financial_data ?? null;
+    response.fundamentalsVisualization = tickerResult.fundamentals_visualization ?? null;
   }
 
   const agentAnalyses = result.agent_analyses || {};
@@ -238,6 +287,11 @@ function mergeFinalWithLive(next: AnalysisResponse, prev?: AnalysisResponse | nu
     priceChangePercent: next.priceChangePercent ?? prev.priceChangePercent,
     marketStatus: next.marketStatus || prev.marketStatus,
     chartData: next.chartData.length ? next.chartData : prev.chartData,
+    fundamentalData: next.fundamentalData ?? prev.fundamentalData ?? null,
+    fundamentalsVisualization: mergeVisualizationPayload(
+      prev.fundamentalsVisualization,
+      next.fundamentalsVisualization
+    ),
     agents: next.agents.length ? next.agents : prev.agents
   };
 }
@@ -259,6 +313,7 @@ export function useAnalysisStream(query: string | null) {
   const resolvedTickerRef = useRef<string>('');
   const pendingQuoteRef = useRef<AnalysisResponse | null>(null);
   const pendingChartRef = useRef<AnalysisResponse['chartData'] | null>(null);
+  const pendingFundamentalsVisualizationRef = useRef<FundamentalsVisualizationPayload | null>(null);
 
   const stableEmail = useMemo(() => DEFAULT_USER_EMAIL, []);
 
@@ -271,6 +326,7 @@ export function useAnalysisStream(query: string | null) {
     resolvedTickerRef.current = '';
     pendingQuoteRef.current = null;
     pendingChartRef.current = null;
+    pendingFundamentalsVisualizationRef.current = null;
 
     const closeStream = () => {
       if (eventSourceRef.current) {
@@ -410,10 +466,33 @@ export function useAnalysisStream(query: string | null) {
             return;
           }
 
+          if (payload.event_type === 'fundamentals_visualization') {
+            pendingFundamentalsVisualizationRef.current = payload.fundamentals_visualization;
+            setData((prev) => {
+              if (!prev) return prev;
+              return updateFundamentalVisualization(
+                prev as AnalysisResponse,
+                payload.fundamentals_visualization
+              );
+            });
+            return;
+          }
+
           if (payload.event_type === 'complete' && payload.result) {
             const mapped = mapFinalResult(payload.result);
             const finalTicker = (payload.result.ticker_results?.[0]?.ticker || '').toUpperCase();
             resolvedTickerRef.current = finalTicker;
+            const incrementalVisualization = pendingFundamentalsVisualizationRef.current;
+            const finalVisualization =
+              payload.result.ticker_results?.[0]?.fundamentals_visualization ??
+              incrementalVisualization;
+            mapped.fundamentalsVisualization = mergeVisualizationPayload(
+              mapped.fundamentalsVisualization,
+              finalVisualization
+            );
+            if (!mapped.fundamentalData && finalVisualization?.raw_data) {
+              mapped.fundamentalData = finalVisualization.raw_data;
+            }
 
             if (finalTicker) {
               const pendingQuote = pendingQuoteRef.current;
@@ -441,7 +520,13 @@ export function useAnalysisStream(query: string | null) {
                 setData((prev) => (prev ? { ...prev, chartData: pendingChart } : prev));
               }
             }
-            setData((prev) => mergeFinalWithLive(mapped, prev as AnalysisResponse));
+            setData((prev) => {
+              const merged = mergeFinalWithLive(mapped, prev as AnalysisResponse);
+              if (finalVisualization) {
+                return updateFundamentalVisualization(merged, finalVisualization);
+              }
+              return merged;
+            });
             setIsStreaming(false);
             closeStream();
           }

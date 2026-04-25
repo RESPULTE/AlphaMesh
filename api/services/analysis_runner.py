@@ -20,7 +20,14 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, HumanMessage
 
 from api.models.requests import ChatRequest
-from api.models.responses import DataFramePayload, FinalResult, SourceItem, TickerResult
+from api.models.responses import (
+    DataFramePayload,
+    FinalResult,
+    FundamentalsChartSpecPayload,
+    FundamentalsVisualizationPayload,
+    SourceItem,
+    TickerResult,
+)
 from api.services.conversation_service import ConversationStore
 from api.services.event_broadcaster import EventBroadcaster
 from api.services.session_service import SessionService
@@ -28,6 +35,16 @@ from api.sinks.sse_sink import SSESink
 from core.services import service_manager
 
 logger = logging.getLogger(__name__)
+_SUPPORTED_CHART_TYPES = {
+    "line",
+    "bar",
+    "area",
+    "scatter",
+    "stacked_bar",
+    "stacked_area",
+    "pie",
+}
+_SNAPSHOT_UNSUPPORTED_TYPES = {"line", "area", "scatter", "stacked_area"}
 
 
 def _build_metrics_payload(final_response) -> Optional[DataFramePayload]:
@@ -41,6 +58,90 @@ def _build_metrics_payload(final_response) -> Optional[DataFramePayload]:
             "_build_metrics_payload: DataFrame serialisation failed; skipping."
         )
         return None
+
+
+def _normalise_chart_type(chart_type: str, data_mode: str) -> str:
+    normalised_type = (chart_type or "").strip().lower()
+    if normalised_type not in _SUPPORTED_CHART_TYPES:
+        return "bar" if data_mode == "snapshot" else "line"
+    if normalised_type == "pie":
+        return "pie"
+    if data_mode == "snapshot" and normalised_type in _SNAPSHOT_UNSUPPORTED_TYPES:
+        return "bar"
+    return normalised_type
+
+
+def _normalise_data_mode(data_mode: str) -> str:
+    normalised = (data_mode or "").strip().lower()
+    if normalised in {"timeseries", "snapshot"}:
+        return normalised
+    return "timeseries"
+
+
+def _build_fundamentals_visualization_payload(
+    final_response,
+) -> Optional[FundamentalsVisualizationPayload]:
+    viz_plan = getattr(final_response, "fundamentals_visualization", None)
+    if viz_plan is None:
+        return None
+
+    charts: list[FundamentalsChartSpecPayload] = []
+    for chart in getattr(viz_plan, "charts", []) or []:
+        raw_mode = _normalise_data_mode(getattr(chart, "data_mode", "timeseries"))
+        chart_type = _normalise_chart_type(getattr(chart, "chart_type", "line"), raw_mode)
+        data_mode = "snapshot" if chart_type == "pie" else raw_mode
+        if data_mode == "snapshot" and chart_type in _SNAPSHOT_UNSUPPORTED_TYPES:
+            chart_type = "bar"
+
+        row_labels = [
+            row for row in (getattr(chart, "row_labels", []) or []) if isinstance(row, str)
+        ]
+        if not row_labels:
+            continue
+
+        charts.append(
+            FundamentalsChartSpecPayload(
+                chart_type=chart_type,
+                data_mode=data_mode,
+                snapshot_period=(getattr(chart, "snapshot_period", "latest") or "latest"),
+                title=(getattr(chart, "title", "") or "").strip(),
+                row_labels=row_labels,
+                group_rows=bool(getattr(chart, "group_rows", True)),
+                rationale=getattr(chart, "rationale", "") or "",
+            )
+        )
+
+    raw_data_payload: Optional[DataFramePayload] = None
+    raw_df = getattr(final_response, "fundamentals_raw_display_data", None)
+    if raw_df is not None and not getattr(raw_df, "empty", True):
+        try:
+            raw_data_payload = DataFramePayload.from_dataframe(raw_df)
+        except Exception:
+            logger.warning(
+                "_build_fundamentals_visualization_payload: raw_data serialisation failed."
+            )
+
+    raw_row_labels = [
+        row
+        for row in (getattr(viz_plan, "raw_row_labels", []) or [])
+        if isinstance(row, str)
+    ]
+
+    payload = FundamentalsVisualizationPayload(
+        charts=charts,
+        raw_row_labels=raw_row_labels,
+        raw_data=raw_data_payload,
+        reviewer_notes=getattr(viz_plan, "reviewer_notes", "") or "",
+        task_completed=bool(getattr(final_response, "fundamentals_task_completed", True)),
+        task_completion_reason=getattr(
+            final_response, "fundamentals_task_completion_reason", ""
+        )
+        or "",
+    )
+
+    if not payload.charts and not payload.raw_row_labels and payload.raw_data is None:
+        return None
+    return payload
 
 
 class AnalysisRunner:
@@ -235,6 +336,18 @@ class AnalysisRunner:
             )
 
             # -- 6. Emit metrics payload (if available) ------------------------
+            visualization_payload = _build_fundamentals_visualization_payload(
+                final_response
+            )
+            if visualization_payload is not None:
+                await event_queue.put(
+                    {
+                        "event_type": "fundamentals_visualization",
+                        "request_id": request_id,
+                        "fundamentals_visualization": visualization_payload.model_dump(),
+                    }
+                )
+
             metrics_payload = _build_metrics_payload(final_response)
             if metrics_payload is not None:
                 await event_queue.put(
@@ -252,6 +365,7 @@ class AnalysisRunner:
                 conversation_id=conversation_id,
                 final_response=final_response,
                 duration_ms=duration_ms,
+                fundamentals_visualization_payload=visualization_payload,
             )
 
             # -- 8. Deliver completion event -----------------------------------
@@ -299,6 +413,7 @@ def _build_final_result(
     conversation_id: str,
     final_response,  # core.agents.models.orchestrator_models.FinalResponse
     duration_ms: float,
+    fundamentals_visualization_payload: Optional[FundamentalsVisualizationPayload] = None,
 ) -> FinalResult:
     """
     Map OrchestratorAgent's FinalResponse ? API-layer FinalResult.
@@ -341,6 +456,11 @@ def _build_final_result(
         ticker=tickers[0] if tickers else "",
         analysis_text=primary_analysis,
         financial_data=financial_payload,
+        fundamentals_visualization=(
+            fundamentals_visualization_payload
+            if fundamentals_visualization_payload is not None
+            else _build_fundamentals_visualization_payload(final_response)
+        ),
         sources=sources,
     )
 

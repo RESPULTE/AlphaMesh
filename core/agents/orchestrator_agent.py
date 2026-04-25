@@ -255,14 +255,34 @@ class OrchestratorAgent:
             return FinalResponse(
                 summary=raw.get("summary") or "",
                 fundamental_data=raw.get("fundamental_data"),
+                fundamentals_visualization=raw.get("fundamentals_visualization"),
+                fundamentals_raw_display_data=raw.get("fundamentals_raw_display_data"),
+                fundamentals_task_completed=raw.get("fundamentals_task_completed", True),
+                fundamentals_task_completion_reason=raw.get(
+                    "fundamentals_task_completion_reason", ""
+                ),
                 sources=raw.get("sources") or [],
                 agent_analyses=raw.get("agent_analyses") or {},
+                tickers=raw.get("tickers") or [],
             )
         return FinalResponse(
             summary=getattr(raw, "summary", "") or "",
             fundamental_data=getattr(raw, "fundamental_data", None),
+            fundamentals_visualization=getattr(
+                raw, "fundamentals_visualization", None
+            ),
+            fundamentals_raw_display_data=getattr(
+                raw, "fundamentals_raw_display_data", None
+            ),
+            fundamentals_task_completed=getattr(
+                raw, "fundamentals_task_completed", True
+            ),
+            fundamentals_task_completion_reason=getattr(
+                raw, "fundamentals_task_completion_reason", ""
+            ),
             sources=getattr(raw, "sources", []) or [],
             agent_analyses=getattr(raw, "agent_analyses", {}) or {},
+            tickers=getattr(raw, "tickers", []) or [],
         )
 
     # ── Prompt builders ───────────────────────────────────────────────────────
@@ -330,7 +350,15 @@ class OrchestratorAgent:
 
     async def _direct_answer_node(self, state: OrchestratorState) -> Dict[str, Any]:
         answer = (state.plan.final_answer or "").strip() if state.plan else ""
-        return {"summary": answer, "sources": [], "fundamental_data": None}
+        return {
+            "summary": answer,
+            "sources": [],
+            "fundamental_data": None,
+            "fundamentals_visualization": None,
+            "fundamentals_raw_display_data": None,
+            "fundamentals_task_completed": True,
+            "fundamentals_task_completion_reason": "",
+        }
 
     async def _validate_and_enrich_node(
         self, state: OrchestratorState
@@ -449,6 +477,10 @@ class OrchestratorAgent:
     async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
         context_parts: List[str] = []
         fundamental_df = None
+        fundamentals_visualization = None
+        fundamentals_raw_display_data = None
+        fundamentals_task_completed = True
+        fundamentals_task_completion_reason = ""
         news_sources: List[CitedSource] = []
 
         for name, output in state.agent_outputs.items():
@@ -460,6 +492,14 @@ class OrchestratorAgent:
                 )
             if name == "fundamentals_agent":
                 fundamental_df = getattr(output, "financial_data", None)
+                fundamentals_visualization = getattr(output, "visualization_plan", None)
+                fundamentals_raw_display_data = getattr(output, "raw_display_data", None)
+                fundamentals_task_completed = bool(
+                    getattr(output, "task_completed", True)
+                )
+                fundamentals_task_completion_reason = (
+                    getattr(output, "task_completion_reason", "") or ""
+                )
             if name == "news_agent":
                 news_sources = getattr(output, "sources", []) or []
 
@@ -544,6 +584,10 @@ class OrchestratorAgent:
         return {
             "summary": analysis_text,
             "fundamental_data": fundamental_df,
+            "fundamentals_visualization": fundamentals_visualization,
+            "fundamentals_raw_display_data": fundamentals_raw_display_data,
+            "fundamentals_task_completed": fundamentals_task_completed,
+            "fundamentals_task_completion_reason": fundamentals_task_completion_reason,
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,
             "tickers": state.plan.tickers if state.plan else [],
