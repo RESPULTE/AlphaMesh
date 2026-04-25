@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.models import _USER_SCOPED_TYPES
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
+from core.memory.graph.queue.task_utils import (
+    has_extractable_payload,
+    is_chunk_entities_task,
+)
 from core.memory.graph.queue.types import TASK_KIND_CHUNK_ENTITIES, GraphTask
 from core.memory.graph.utils import (
     entity_key,
@@ -42,9 +46,7 @@ class GraphWritePipeline:
         self._prompt_registry = prompt_registry
 
     async def extract_relationships_for_task(self, task: GraphTask) -> List[dict]:
-        if task.task_kind == TASK_KIND_CHUNK_ENTITIES:
-            return []
-        if not task.extraction_text or not task.system_prompt_id:
+        if is_chunk_entities_task(task) or not has_extractable_payload(task):
             return []
         prompt = self._prompt_registry.get(task.system_prompt_id)
         if not prompt:
@@ -59,7 +61,6 @@ class GraphWritePipeline:
                 text=task.extraction_text,
                 llm=llm,
                 system_prompt=prompt,
-                max_attempts=1,
             )
             return list(relationships or [])
         except Exception:
@@ -74,10 +75,7 @@ class GraphWritePipeline:
 
         await self._process_chunk_entity_tasks(tasks)
 
-        prepared_groups: Dict[bool, List[Tuple[GraphTask, List[dict]]]] = {
-            True: [],
-            False: [],
-        }
+        prepared_groups: Dict[Tuple[str, bool], List[Tuple[GraphTask, List[dict]]]] = {}
         for task in tasks:
             if task.task_kind == TASK_KIND_CHUNK_ENTITIES:
                 continue
@@ -87,21 +85,24 @@ class GraphWritePipeline:
                 if relationships:
                     task.relationships = relationships
             if relationships:
-                prepared_groups[bool(task.allow_create)].append((task, relationships))
+                allow_create = self._normalize_allow_create(
+                    task.allow_create,
+                    task.task_id,
+                )
+                group_key = (task.conversation_id, allow_create)
+                prepared_groups.setdefault(group_key, []).append((task, relationships))
 
         total_domain = 0
         total_user = 0
-        for allow_create, group in prepared_groups.items():
+        for (conversation_id, allow_create), group in prepared_groups.items():
             if not group:
                 continue
             merged_relationships: List[dict] = []
-            source_agents: List[str] = []
             for task, relationships in group:
                 merged_relationships.extend(relationships)
-                if task.source_agent not in source_agents:
-                    source_agents.append(task.source_agent)
-            source_agent_label = "+".join(source_agents)
-            conversation_id = group[0][0].conversation_id
+            source_agent_label = "+".join(
+                dict.fromkeys(task.source_agent for task, _relationships in group)
+            )
             domain_count, user_count = await self.process_relationships(
                 relationships=merged_relationships,
                 conversation_id=conversation_id,
@@ -208,8 +209,11 @@ class GraphWritePipeline:
         seen = set(cache.keys())
 
         for rel in relationships:
-            for name_key, type_key, props_key in _NODE_ENDPOINT_FIELDS:
-                raw_type = str(rel.get(type_key) or "").strip()
+            for (
+                entity_name,
+                raw_type,
+                raw_props,
+            ) in self._iter_relationship_endpoints(rel):
                 if not raw_type or raw_type in _USER_SCOPED_TYPES:
                     continue
 
@@ -217,7 +221,6 @@ class GraphWritePipeline:
                 if not entity_type:
                     continue
 
-                entity_name = normalize_entity_name(str(rel.get(name_key) or ""))
                 if not entity_name:
                     continue
 
@@ -226,12 +229,12 @@ class GraphWritePipeline:
                     continue
 
                 seen.add(key)
-                unique_entities.append((entity_name, entity_type, rel.get(props_key)))
+                unique_entities.append((entity_name, entity_type, raw_props))
 
         if not unique_entities:
             return cache
 
-        resolved = await self._resolver.resolve_batch(
+        resolved = await self._resolver.resolve_entities(
             unique_entities,
             allow_create=allow_create,
         )
@@ -247,12 +250,14 @@ class GraphWritePipeline:
         seen: set[Tuple[str, str]] = set()
 
         for rel in relationships:
-            for name_key, type_key, props_key in _NODE_ENDPOINT_FIELDS:
-                node_type = str(rel.get(type_key) or "").strip()
+            for (
+                node_name,
+                node_type,
+                raw_props,
+            ) in self._iter_relationship_endpoints(rel):
                 if node_type not in _USER_SCOPED_TYPES:
                     continue
 
-                node_name = normalize_entity_name(str(rel.get(name_key) or ""))
                 if not node_name:
                     continue
 
@@ -261,34 +266,71 @@ class GraphWritePipeline:
                     continue
                 seen.add(cache_key)
 
-                raw_props = rel.get(props_key)
                 node_props = dict(raw_props) if isinstance(raw_props, dict) else {}
                 node_id = str(node_props.get("id") or node_name).strip()
                 if not node_id:
                     continue
 
-                if node_type == "UserInterestDomain":
-                    domain_props = {**node_props, "id": node_id}
-                    await self._writer.merge_user_interest_domain(node_id, domain_props)
-                elif node_type == "UserInterestEdge":
-                    operation = str(node_props.get("operation") or "reinforce").strip()
-                    if operation not in {"reinforce", "invalidate"}:
-                        operation = "reinforce"
-                    try:
-                        weight_delta = float(node_props.get("weight_delta", 0.0))
-                    except (TypeError, ValueError):
-                        weight_delta = 0.0
-                    edge_props = {**node_props, "id": node_id}
-                    await self._writer.merge_user_interest_edge(
-                        edge_id=node_id,
-                        props=edge_props,
-                        operation=operation,
-                        weight_delta=weight_delta,
-                    )
-                elif node_type == "TurnNode":
-                    turn_props = {**node_props, "id": node_id}
-                    await self._writer.merge_turn_node(node_id, turn_props)
+                await self._merge_user_scoped_node(
+                    node_type=node_type,
+                    node_id=node_id,
+                    node_props=node_props,
+                )
 
                 cache[cache_key] = node_id
 
         return cache
+
+    def _iter_relationship_endpoints(
+        self, relationship: dict
+    ) -> Iterator[Tuple[str, str, Optional[dict]]]:
+        for name_key, type_key, props_key in _NODE_ENDPOINT_FIELDS:
+            node_name = normalize_entity_name(str(relationship.get(name_key) or ""))
+            node_type = str(relationship.get(type_key) or "").strip()
+            yield node_name, node_type, relationship.get(props_key)
+
+    async def _merge_user_scoped_node(
+        self,
+        *,
+        node_type: str,
+        node_id: str,
+        node_props: dict,
+    ) -> None:
+        merged_props = {**node_props, "id": node_id}
+        if node_type == "UserInterestDomain":
+            await self._writer.merge_user_interest_domain(node_id, merged_props)
+            return
+        if node_type == "UserInterestEdge":
+            operation, weight_delta = self._normalize_user_interest_edge_update(
+                node_props
+            )
+            await self._writer.merge_user_interest_edge(
+                edge_id=node_id,
+                props=merged_props,
+                operation=operation,
+                weight_delta=weight_delta,
+            )
+            return
+        if node_type == "TurnNode":
+            await self._writer.merge_turn_node(node_id, merged_props)
+
+    @staticmethod
+    def _normalize_user_interest_edge_update(node_props: dict) -> Tuple[str, float]:
+        operation = str(node_props.get("operation") or "reinforce").strip()
+        if operation not in {"reinforce", "invalidate"}:
+            operation = "reinforce"
+        try:
+            weight_delta = float(node_props.get("weight_delta", 0.0))
+        except (TypeError, ValueError):
+            weight_delta = 0.0
+        return operation, weight_delta
+
+    @staticmethod
+    def _normalize_allow_create(allow_create: Optional[bool], task_id: str) -> bool:
+        if allow_create is None:
+            logger.warning(
+                "GraphWritePipeline: missing allow_create on task '%s'; defaulting to False",
+                task_id,
+            )
+            return False
+        return bool(allow_create)

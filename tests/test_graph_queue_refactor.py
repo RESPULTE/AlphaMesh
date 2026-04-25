@@ -9,7 +9,12 @@ import pytest
 
 from core.config import settings
 from core.memory.graph.entity_resolver import EntityResolution, ResolvedEdgeBatch
-from core.memory.graph.graph_queue import GraphQueueManager, make_graph_task
+from core.memory.graph.graph_queue import (
+    TASK_KIND_CHUNK_ENTITIES,
+    GraphQueueManager,
+    make_extraction_task,
+    make_graph_task,
+)
 from core.memory.graph.queue.pipeline import GraphWritePipeline
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.sql_store import GraphTaskSqlStore
@@ -131,12 +136,12 @@ class FakeWriter:
 class FakeRelationshipExtractor:
     async def extract(
         self,
+        *,
         text: str,
         llm,
         system_prompt: str,
-        max_attempts: int = 1,
     ) -> List[dict]:
-        _ = (text, llm, system_prompt, max_attempts)
+        _ = (text, llm, system_prompt)
         return []
 
 
@@ -182,6 +187,7 @@ def test_enqueue_immediate_uses_source_based_allow_create(
             )
             task_id = await manager.enqueue(task)
             assert task_id == task.task_id
+            await manager.close_session(task.conversation_id)
             assert resolver.batch_calls
             assert resolver.batch_calls[0][1] is True
 
@@ -284,5 +290,106 @@ def test_ttl_eviction_closes_idle_live_workers(
             assert "conv-idle" not in manager._queues
         finally:
             await manager.shutdown()
+
+    asyncio.run(_run())
+
+
+def test_enqueue_skips_invalid_chunk_and_empty_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(settings, "GRAPH_ALLOW_CREATE_SOURCES", "")
+    manager = GraphQueueManager(
+        entity_resolver=FakeResolver(),
+        graph_writer=FakeWriter(),
+        relationship_extractor=FakeRelationshipExtractor(),
+        entity_extractor=fake_entity_extractor,
+        llm_provider=fake_llm_provider,
+        db_path=str(tmp_path / "graph_tasks.db"),
+    )
+
+    async def _run() -> None:
+        await manager.start()
+        try:
+            invalid_chunk_task = make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                chunk_ids=[],
+            )
+            empty_relationship_task = make_graph_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                relationships=[],
+            )
+            missing_prompt_task = make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                extraction_text="extract me",
+                system_prompt=None,
+            )
+
+            await manager.enqueue(invalid_chunk_task)
+            await manager.enqueue(empty_relationship_task)
+            await manager.enqueue(missing_prompt_task)
+
+            rows = await manager._store.fetchall("SELECT task_id FROM graph_tasks")
+            assert not rows
+        finally:
+            await manager.shutdown()
+
+    asyncio.run(_run())
+
+
+def test_recover_pending_tasks_applies_allow_create_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(settings, "GRAPH_ALLOW_CREATE_SOURCES", "taxonomy_bootstrap")
+
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    manager = GraphQueueManager(
+        entity_resolver=resolver,
+        graph_writer=writer,
+        relationship_extractor=FakeRelationshipExtractor(),
+        entity_extractor=fake_entity_extractor,
+        llm_provider=fake_llm_provider,
+        db_path=str(tmp_path / "graph_tasks.db"),
+    )
+
+    recovered_allow_create: List[Optional[bool]] = []
+
+    async def _run() -> None:
+        await manager._store.initialize()
+
+        task = make_graph_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="taxonomy_bootstrap",
+            relationships=[
+                {
+                    "from_name": "Apple",
+                    "from_type": "Company",
+                    "relation": "BELONGS_TO",
+                    "to_name": "Technology",
+                    "to_type": "Sector",
+                }
+            ],
+            allow_create=None,
+        )
+        await manager._store.persist_task(task.to_payload())
+
+        async def _capture_process(tasks: List[object]) -> Dict[str, int]:
+            recovered_allow_create.extend(
+                getattr(candidate, "allow_create", None) for candidate in tasks
+            )
+            return {"domain_edges": 0, "user_edges": 0}
+
+        manager._pipeline.process_tasks = _capture_process  # type: ignore[method-assign]
+        await manager._recover_pending_tasks()
+
+        assert recovered_allow_create == [True]
 
     asyncio.run(_run())

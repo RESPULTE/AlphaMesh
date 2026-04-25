@@ -15,11 +15,14 @@ from core.memory.graph.queue.policies import (
 )
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
-from core.memory.graph.queue.types import (
-    TASK_KIND_CHUNK_ENTITIES,
-    GraphTask,
-    graph_task_from_payload,
+from core.memory.graph.queue.task_utils import (
+    has_chunk_ids,
+    has_extraction_text,
+    has_extractable_payload,
+    has_inline_relationships,
+    is_chunk_entities_task,
 )
+from core.memory.graph.queue.types import GraphTask, graph_task_from_payload
 from core.memory.graph.queue.worker import ConversationQueueWorker
 from core.memory.graph.sql_store import GraphTaskSqlStore
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
@@ -41,8 +44,6 @@ class GraphQueueManager:
         llm_provider: Callable[[Optional[dict]], Any],
         db_path: str = settings.GRAPH_QUEUE_DB_PATH,
     ) -> None:
-        self._entity_extractor = entity_extractor
-
         self._store = GraphTaskSqlStore(db_path=db_path)
         self._prompt_registry = PromptRegistry(store=self._store)
         self._pipeline = GraphWritePipeline(
@@ -64,13 +65,9 @@ class GraphQueueManager:
         self._started = False
 
     async def open_session(self, conversation_id: str) -> None:
-        async with self._queues_lock:
-            if conversation_id in self._queues:
-                return
-            worker = self._create_worker(conversation_id)
-            worker.start()
-            self._queues[conversation_id] = worker
-        logger.info("GraphQueueManager: opened session '%s'", conversation_id)
+        _worker, created = await self._ensure_worker(conversation_id, lazy=False)
+        if created:
+            logger.info("GraphQueueManager: opened session '%s'", conversation_id)
 
     async def close_session(self, conversation_id: str) -> None:
         async with self._queues_lock:
@@ -84,73 +81,12 @@ class GraphQueueManager:
         self,
         task: GraphTask,
     ) -> str:
-        is_chunk_entities = task.task_kind == TASK_KIND_CHUNK_ENTITIES
-        if task.system_prompt is not None and not is_chunk_entities:
-            task.system_prompt_id = await self._prompt_registry.register(
-                task.system_prompt
-            )
-
-        task.allow_create = resolve_allow_create(
-            source_agent=task.source_agent,
-            task_allow_create=task.allow_create,
-            explicit_allow_create=None,
-            default_allow_create_sources=self._allow_create_sources,
-        )
-
-        has_chunk_entities = bool(task.chunk_ids) if is_chunk_entities else False
-        has_relationships = bool(task.relationships) if not is_chunk_entities else False
-        has_extraction = (
-            bool(task.extraction_text and task.system_prompt_id)
-            if not is_chunk_entities
-            else False
-        )
-
-        if is_chunk_entities and not has_chunk_entities:
-            logger.warning(
-                "GraphQueueManager.enqueue: missing chunk_ids for '%s'",
-                task.task_id,
-            )
+        if not await self._prepare_task(task):
             return task.task_id
-
-        if not has_relationships and not has_extraction and not has_chunk_entities:
-            logger.debug(
-                "GraphQueueManager.enqueue: skipping empty task from '%s'",
-                task.source_agent,
-            )
-            return task.task_id
-
-        if (
-            (not is_chunk_entities)
-            and task.extraction_text
-            and not task.system_prompt_id
-        ):
-            logger.warning(
-                "GraphQueueManager.enqueue: missing system_prompt_id for task '%s'",
-                task.task_id,
-            )
-            return task.task_id
-
-        if (
-            (not is_chunk_entities)
-            and task.system_prompt_id
-            and not self._prompt_registry.get(task.system_prompt_id)
-        ):
-            logger.warning(
-                "GraphQueueManager.enqueue: prompt_id '%s' not registered; extraction may fail",
-                task.system_prompt_id,
-            )
 
         await self._store.persist_task(task.to_payload())
 
-        # if task.immediate:
-        #     success = await self._process_task_immediate(
-        #         task, has_extraction=has_extraction
-        #     )
-        #     if success:
-        #         await self._store.mark_processed([task.task_id])
-        #     return task.task_id
-
-        worker = await self._get_or_create_worker(task.conversation_id, lazy=True)
+        worker, _created = await self._ensure_worker(task.conversation_id, lazy=True)
         await worker.put(task)
 
         return task.task_id
@@ -169,7 +105,6 @@ class GraphQueueManager:
     async def start(self) -> None:
         if self._started:
             return
-        self._started = True
 
         await self._store.initialize()
         await self._prompt_registry.load()
@@ -178,13 +113,16 @@ class GraphQueueManager:
         self._cleanup_task = asyncio.create_task(
             self._ttl_cleanup_loop(), name="graph_queue_ttl_cleanup"
         )
+        self._started = True
         logger.info("GraphQueueManager: started")
 
     async def shutdown(self) -> None:
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
+        cleanup_task = self._cleanup_task
+        self._cleanup_task = None
+        if cleanup_task:
+            cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._cleanup_task
+                await cleanup_task
 
         async with self._queues_lock:
             conversation_ids = list(self._queues.keys())
@@ -192,6 +130,7 @@ class GraphQueueManager:
         for conversation_id in conversation_ids:
             await self.close_session(conversation_id)
 
+        self._started = False
         logger.info("GraphQueueManager: shutdown complete")
 
     def _create_worker(self, conversation_id: str) -> ConversationQueueWorker:
@@ -201,13 +140,13 @@ class GraphQueueManager:
             idle_timeout_seconds=_TTL_SECONDS,
         )
 
-    async def _get_or_create_worker(
+    async def _ensure_worker(
         self, conversation_id: str, lazy: bool
-    ) -> ConversationQueueWorker:
+    ) -> Tuple[ConversationQueueWorker, bool]:
         async with self._queues_lock:
             worker = self._queues.get(conversation_id)
             if worker is not None:
-                return worker
+                return worker, False
             if lazy:
                 logger.warning(
                     "GraphQueueManager.enqueue: no open session for '%s', creating lazily",
@@ -216,7 +155,7 @@ class GraphQueueManager:
             worker = self._create_worker(conversation_id)
             worker.start()
             self._queues[conversation_id] = worker
-            return worker
+            return worker, True
 
     async def _process_worker_batch(self, tasks: List[GraphTask], turn_id: str) -> None:
         task_ids = [task.task_id for task in tasks]
@@ -253,12 +192,7 @@ class GraphQueueManager:
 
         tasks: List[GraphTask] = [graph_task_from_payload(row) for row in rows]
         for task in tasks:
-            task.allow_create = resolve_allow_create(
-                source_agent=task.source_agent,
-                task_allow_create=task.allow_create,
-                explicit_allow_create=None,
-                default_allow_create_sources=self._allow_create_sources,
-            )
+            self._apply_allow_create_policy(task)
 
         grouped: Dict[Tuple[str, str], List[GraphTask]] = {}
         for task in tasks:
@@ -293,3 +227,62 @@ class GraphQueueManager:
             await self._store.purge_processed_older_than(cutoff)
         except Exception:
             logger.exception("GraphQueueManager: failed to purge old processed tasks")
+
+    def _apply_allow_create_policy(self, task: GraphTask) -> None:
+        task.allow_create = resolve_allow_create(
+            source_agent=task.source_agent,
+            task_allow_create=task.allow_create,
+            explicit_allow_create=None,
+            default_allow_create_sources=self._allow_create_sources,
+        )
+
+    async def _prepare_task(self, task: GraphTask) -> bool:
+        is_chunk_entities = is_chunk_entities_task(task)
+
+        if task.system_prompt is not None and not is_chunk_entities:
+            task.system_prompt_id = await self._prompt_registry.register(
+                task.system_prompt
+            )
+
+        self._apply_allow_create_policy(task)
+
+        if is_chunk_entities and not has_chunk_ids(task):
+            logger.warning(
+                "GraphQueueManager.enqueue: missing chunk_ids for '%s'",
+                task.task_id,
+            )
+            return False
+
+        if (
+            (not is_chunk_entities)
+            and has_extraction_text(task)
+            and not task.system_prompt_id
+        ):
+            logger.warning(
+                "GraphQueueManager.enqueue: missing system_prompt_id for task '%s'",
+                task.task_id,
+            )
+            return False
+
+        has_work = (
+            has_chunk_ids(task)
+            if is_chunk_entities
+            else has_inline_relationships(task) or has_extractable_payload(task)
+        )
+        if not has_work:
+            logger.debug(
+                "GraphQueueManager.enqueue: skipping empty task from '%s'",
+                task.source_agent,
+            )
+            return False
+
+        if (
+            (not is_chunk_entities)
+            and task.system_prompt_id
+            and not self._prompt_registry.get(task.system_prompt_id)
+        ):
+            logger.warning(
+                "GraphQueueManager.enqueue: prompt_id '%s' not registered; extraction may fail",
+                task.system_prompt_id,
+            )
+        return True
