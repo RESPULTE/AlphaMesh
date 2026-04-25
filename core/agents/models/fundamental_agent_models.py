@@ -118,6 +118,66 @@ class IterativeToolPlan(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2.  Completion Review + Visualisation Models
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ExecutorToolLog(BaseModel):
+    """Per-tool execution audit details captured by the executor node."""
+
+    tool_name: str
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    success: bool = True
+    error: Optional[str] = None
+    summary: str = ""
+    reasoning: Optional[str] = None
+    output_row_labels: List[str] = Field(default_factory=list)
+
+
+class ExecutorBatchLog(BaseModel):
+    """Batch-level execution audit details captured by the executor node."""
+
+    batch_index: int
+    batch_reasoning: str = ""
+    calls: List[ExecutorToolLog] = Field(default_factory=list)
+
+
+class ChartSpec(BaseModel):
+    """Chart instruction payload produced by the completion-review node."""
+
+    chart_type: str = Field(
+        default="line",
+        description="One of: line, bar, area, scatter.",
+    )
+    title: str = Field(default="")
+    row_labels: List[str] = Field(default_factory=list)
+    group_rows: bool = Field(default=True)
+    rationale: str = Field(default="")
+
+
+class CompletionReviewDecision(BaseModel):
+    """
+    Structured LLM output for post-execution completion checking and
+    visualisation planning.
+    """
+
+    task_completed: bool = Field(default=True)
+    task_completion_reason: str = Field(default="")
+    replan_guidance: str = Field(default="")
+    reviewer_notes: str = Field(default="")
+    charts: List[ChartSpec] = Field(default_factory=list)
+    raw_row_labels: List[str] = Field(default_factory=list)
+
+
+class VisualizationPlan(BaseModel):
+    """Sanitised chart + raw-data plan suitable for downstream API use."""
+
+    charts: List[ChartSpec] = Field(default_factory=list)
+    raw_row_labels: List[str] = Field(default_factory=list)
+    reviewer_notes: str = Field(default="")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3.  Agent Output
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -132,6 +192,11 @@ class FundamentalAnalysisOutput(BaseAgentOutput):
     entities_enriched: List[str] = Field(default_factory=list)
     subgraph_id: Optional[str] = Field(default=None)
     relationships_extracted: bool = Field(default=False)
+    executor_logs: List[ExecutorBatchLog] = Field(default_factory=list)
+    task_completed: bool = Field(default=True)
+    task_completion_reason: str = Field(default="")
+    visualization_plan: Optional[VisualizationPlan] = Field(default=None)
+    raw_display_data: Optional[pd.DataFrame] = Field(default=None)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -195,13 +260,24 @@ class _AgentState(BaseAgentInput):
     # Labels of rows that were computed (not fetched from EDGAR)
     computed_row_labels: List[str] = Field(default_factory=list)
 
+    # Batch-level executor audit logs used by completion review.
+    executor_logs: List[ExecutorBatchLog] = Field(default_factory=list)
+
     # Set True when a failure triggers re-planning so the planner prompt
     # can acknowledge the context
     replanning_due_to_failure: bool = Field(default=False)
+    completion_replan_guidance: str = Field(default="")
+    completion_review_replan_used: bool = Field(default=False)
+    completion_review_should_replan: bool = Field(default=False)
+    last_batch_failed: bool = Field(default=False)
 
     # Populated by analyst
     analysis: str = Field(default="")
     relationships_extracted: bool = Field(default=False)
     subgraph_id: Optional[str] = Field(default=None)
+    task_completed: bool = Field(default=True)
+    task_completion_reason: str = Field(default="")
+    visualization_plan: Optional[VisualizationPlan] = Field(default=None)
+    raw_display_data: Optional[pd.DataFrame] = Field(default=None)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

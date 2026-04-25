@@ -131,6 +131,10 @@ class Settings(BaseSettings):
     # Hard ceiling on a single analysis run; prevents hung SSE connections.
     ORCHESTRATOR_TIMEOUT_SECONDS: float = 120.0
 
+    # ── Fundamental visualisation planning ───────────────────────────────────
+    FUNDAMENTAL_VIZ_MAX_ROWS_PER_CHART: int = 6
+    FUNDAMENTAL_RAW_DISPLAY_MAX_ROWS: int = 12
+
     # =========================================================================
     # API Layer settings  (consumed by api/ only; still one .env file)
     # =========================================================================

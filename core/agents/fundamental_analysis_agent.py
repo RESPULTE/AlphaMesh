@@ -33,7 +33,7 @@ Everything else is unchanged.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Type
+from typing import Any, Dict, List, Set, Tuple, Type
 
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -51,18 +51,26 @@ from core.agents.financial_db import FinancialDatabase
 from core.agents.financial_tools import TOOL_REGISTRY, ToolResult, get_tool_descriptions
 from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.fundamental_agent_models import (
+    ChartSpec,
+    CompletionReviewDecision,
+    ExecutorBatchLog,
+    ExecutorToolLog,
     FundamentalAnalysisOutput,
     IterativeToolPlan,
     ToolCallBatch,
     ToolCallSpec,
+    VisualizationPlan,
     _AgentState,
 )
 from core.agents.prompts.fundamental_agent_prompts import (
     FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     _ANALYST_SYSTEM,
+    _COMPLETION_REVIEW_SYSTEM,
+    _COMPLETION_REVIEW_USER,
     _TOOL_PLANNER_SYSTEM,
     _TOOL_PLANNER_USER,
 )
+from core.config import settings
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.logger import get_logger
 from core.memory.graph.graph_queue import make_extraction_task
@@ -152,6 +160,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
             subgraph_task=final_state.get("subgraph_task"),
             relationships_extracted=final_state.get("relationships_extracted", False),
             sentiment=final_state.get("sentiment"),
+            executor_logs=final_state.get("executor_logs", []),
+            task_completed=final_state.get("task_completed", True),
+            task_completion_reason=final_state.get("task_completion_reason", ""),
+            visualization_plan=final_state.get("visualization_plan"),
+            raw_display_data=final_state.get("raw_display_data"),
         )
 
     # ── Graph wiring ──────────────────────────────────────────────────────────
@@ -162,6 +175,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         workflow.add_node("data_prep", self._data_prep_node)
         workflow.add_node("tool_planner", self._tool_planner_node)
         workflow.add_node("tool_executor", self._tool_executor_node)
+        workflow.add_node("completion_review", self._completion_review_node)
         workflow.add_node("analyst", self._analyst_node)
 
         workflow.add_edge(START, "data_prep")
@@ -175,7 +189,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
             {
                 "next_batch": "tool_executor",  # advance to next batch, no LLM
                 "replan": "tool_planner",  # failure fallback — LLM re-plan
-                "done": "analyst",
+                "done": "completion_review",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "completion_review",
+            self._post_review_route,
+            {
+                "replan": "tool_planner",
+                "analyst": "analyst",
             },
         )
 
@@ -189,7 +212,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         """
         Three-way routing after each tool_executor pass:
 
-        1. Hard ceiling: force analyst if we've hit MAX_TOOL_ITERATIONS.
+        1. Hard ceiling: force completion review if we've hit MAX_TOOL_ITERATIONS.
            (Prevents runaway loops even in the re-planning fallback path.)
 
         2. Failure in the current batch AND budget remaining → replan.
@@ -198,7 +221,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         3. More pre-planned batches remain AND no failure → next_batch.
            The executor advances directly without touching the LLM.
 
-        4. No more batches and no failure → done (analyst).
+        4. No more batches and no failure → done (completion review).
         """
         if state.iteration_count >= MAX_TOOL_ITERATIONS:
             logger.warning(
@@ -241,6 +264,12 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return "next_batch"
 
         return "done"
+
+    @staticmethod
+    def _post_review_route(state: _AgentState) -> str:
+        if state.completion_review_should_replan:
+            return "replan"
+        return "analyst"
 
     # ── Node: data_prep ───────────────────────────────────────────────────────
 
@@ -322,7 +351,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
         logger.info(
             "[Node] tool_planner — %s%s",
             state.query,
-            " [RE-PLANNING after failure]" if state.replanning_due_to_failure else "",
+            (
+                " [RE-PLANNING]"
+                if (state.last_batch_failed or state.completion_replan_guidance)
+                else ""
+            ),
         )
 
         if not state.available_concepts:
@@ -334,6 +367,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 ),
                 "current_batch_index": 0,
                 "replanning_due_to_failure": False,
+                "completion_replan_guidance": "",
+                "completion_review_should_replan": False,
+                "last_batch_failed": False,
             }
 
         # ── Concepts block ─────────────────────────────────────────────────────
@@ -357,12 +393,19 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         # ── Replanning note for failure context ───────────────────────────────
         replanning_note = ""
-        if state.replanning_due_to_failure:
-            replanning_note = (
+        if state.last_batch_failed:
+            replanning_note += (
                 "NOTE: You are RE-PLANNING because one or more tools failed "
                 "in the previous batch (see results above). "
                 "Emit only the REMAINING work — do not re-emit calls that "
                 "already succeeded."
+            )
+        if state.completion_replan_guidance:
+            if replanning_note:
+                replanning_note += "\n\n"
+            replanning_note += (
+                "NOTE: Completion review flagged the task as incomplete. "
+                f"Guidance: {state.completion_replan_guidance}"
             )
 
         user_msg = _TOOL_PLANNER_USER.format(
@@ -401,6 +444,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 ),
                 "current_batch_index": 0,
                 "replanning_due_to_failure": False,
+                "completion_review_should_replan": False,
+                "completion_replan_guidance": "",
+                "last_batch_failed": False,
             }
 
         logger.info(
@@ -422,6 +468,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "tool_plan": tool_plan,
             "current_batch_index": 0,  # always reset on a new plan
             "replanning_due_to_failure": False,
+            "completion_review_should_replan": False,
+            "completion_replan_guidance": "",
+            "last_batch_failed": False,
         }
 
     # ── Node: tool_executor ───────────────────────────────────────────────────
@@ -446,6 +495,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return {
                 "iteration_count": state.iteration_count + 1,
                 "current_batch_index": batch_index + 1,
+                "last_batch_failed": False,
             }
 
         batch: ToolCallBatch | None = plan.get_batch(batch_index)
@@ -457,6 +507,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return {
                 "iteration_count": state.iteration_count + 1,
                 "current_batch_index": batch_index + 1,
+                "last_batch_failed": False,
             }
 
         logger.info(
@@ -491,6 +542,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         batch_results: List[ToolResult] = await asyncio.gather(
             *[_run_one(s) for s in batch.calls]
         )
+        batch_failed = any(not result.success for result in batch_results)
 
         # ── Merge added_rows back into the DataFrame ──────────────────────────
         newly_added_labels: List[str] = []
@@ -527,6 +579,25 @@ class FundamentalAnalysisAgent(AbstractAgent):
         updated_computed = list(
             set(state.computed_row_labels) | set(newly_added_labels)
         )
+        executor_calls = [
+            ExecutorToolLog(
+                tool_name=spec.tool_name,
+                parameters=spec.parameters,
+                success=result.success,
+                error=result.error,
+                summary=result.summary or "",
+                reasoning=result.reasoning,
+                output_row_labels=(
+                    list(result.added_rows.keys()) if result.added_rows else []
+                ),
+            )
+            for spec, result in zip(batch.calls, batch_results)
+        ]
+        batch_log = ExecutorBatchLog(
+            batch_index=batch_index,
+            batch_reasoning=batch.batch_reasoning or "",
+            calls=executor_calls,
+        )
 
         return {
             "financial_data": df,
@@ -535,6 +606,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "current_batch_index": batch_index + 1,
             "available_concepts": updated_concepts,
             "computed_row_labels": updated_computed,
+            "executor_logs": list(state.executor_logs) + [batch_log],
+            "last_batch_failed": batch_failed,
         }
 
     async def _persist_computed_rows(
@@ -570,6 +643,244 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 "[persist] Saved %d computed rows for %s.", len(records), ticker
             )
 
+    async def _completion_review_node(self, state: _AgentState) -> Dict:
+        """
+        Post-execution reviewer node.
+
+        Runs once after the executor exhausts current batches and performs:
+        1) completion checking against executor logs + resulting DataFrame
+        2) chart/raw-row selection for downstream frontend visualisation
+        """
+        df = state.financial_data if state.financial_data is not None else pd.DataFrame()
+        max_rows_per_chart = max(1, int(settings.FUNDAMENTAL_VIZ_MAX_ROWS_PER_CHART))
+        max_raw_rows = max(1, int(settings.FUNDAMENTAL_RAW_DISPLAY_MAX_ROWS))
+
+        if df.empty:
+            logger.warning("[completion_review] No financial data available.")
+            return {
+                "task_completed": False,
+                "task_completion_reason": "No financial data available to evaluate completion.",
+                "visualization_plan": VisualizationPlan(charts=[], raw_row_labels=[]),
+                "raw_display_data": pd.DataFrame(),
+                "completion_review_should_replan": False,
+                "completion_replan_guidance": "",
+                "last_batch_failed": False,
+            }
+
+        available_rows: List[str] = list(df.index)
+        available_rows_block = "\n".join(f"  • {row}" for row in available_rows[:300])
+        if len(available_rows) > 300:
+            available_rows_block += f"\n  … and {len(available_rows) - 300} more"
+
+        data_preview = df.to_string(max_rows=max(20, max_raw_rows), float_format="%.4g")
+        user_msg = _COMPLETION_REVIEW_USER.format(
+            query=state.query,
+            ticker=state.ticker or "N/A",
+            iteration_count=state.iteration_count,
+            max_iterations=MAX_TOOL_ITERATIONS,
+            completion_replan_used=state.completion_review_replan_used,
+            max_rows_per_chart=max_rows_per_chart,
+            max_raw_rows=max_raw_rows,
+            executor_logs=self._executor_logs_to_text(state.executor_logs),
+            tool_results=self._tool_results_to_text(state.tool_results),
+            n_rows=len(available_rows),
+            available_rows=available_rows_block or "  (none)",
+            data_preview=data_preview,
+        )
+
+        structured_llm = service_manager.get_agent(
+            temperature=0
+        ).with_structured_output(CompletionReviewDecision)
+
+        try:
+            decision: CompletionReviewDecision = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=_COMPLETION_REVIEW_SYSTEM),
+                    HumanMessage(content=user_msg),
+                ]
+            )
+        except Exception as exc:
+            logger.error("[completion_review] LLM call failed: %s", exc)
+            decision = CompletionReviewDecision(
+                task_completed=True,
+                task_completion_reason=(
+                    "Completion review unavailable due to internal LLM error; "
+                    "proceeding with existing results."
+                ),
+                reviewer_notes="Completion review fallback path used.",
+            )
+
+        visualization_plan, raw_display_df = self._sanitize_visualization_plan(
+            state=state,
+            financial_data=df,
+            decision=decision,
+            max_rows_per_chart=max_rows_per_chart,
+            max_raw_rows=max_raw_rows,
+        )
+
+        should_replan = (
+            not decision.task_completed
+            and not state.completion_review_replan_used
+            and state.iteration_count < MAX_TOOL_ITERATIONS
+        )
+        if should_replan:
+            logger.info("[completion_review] Task incomplete, scheduling one replan pass.")
+
+        return {
+            "task_completed": decision.task_completed,
+            "task_completion_reason": decision.task_completion_reason,
+            "visualization_plan": visualization_plan,
+            "raw_display_data": raw_display_df,
+            "completion_review_should_replan": should_replan,
+            "completion_review_replan_used": (
+                state.completion_review_replan_used or should_replan
+            ),
+            "completion_replan_guidance": (
+                (decision.replan_guidance or decision.task_completion_reason).strip()
+                if should_replan
+                else ""
+            ),
+            "last_batch_failed": False,
+        }
+
+    @staticmethod
+    def _executor_logs_to_text(logs: List[ExecutorBatchLog]) -> str:
+        if not logs:
+            return "(none)"
+        lines: List[str] = []
+        for batch in logs[-20:]:
+            lines.append(
+                f"Batch {batch.batch_index} | reasoning: {batch.batch_reasoning or '(none)'}"
+            )
+            for call in batch.calls:
+                status = "SUCCESS" if call.success else f"FAILURE ({call.error or ''})"
+                lines.append(
+                    f"  - {call.tool_name} | {status} | params={call.parameters} | "
+                    f"rows={call.output_row_labels} | summary={call.summary}"
+                )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _tool_results_to_text(results: List[ToolResult]) -> str:
+        if not results:
+            return "(none)"
+        return "\n".join(
+            f"[{r.tool_name}] {'SUCCESS' if r.success else 'FAILURE'} | "
+            f"summary={r.summary or ''} | error={r.error or ''}"
+            for r in results[-100:]
+        )
+
+    @staticmethod
+    def _normalise_chart_type(chart_type: str) -> str:
+        allowed = {"line", "bar", "area", "scatter"}
+        if chart_type in allowed:
+            return chart_type
+        return "line"
+
+    @staticmethod
+    def _dedupe_preserve_order(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
+
+    def _sanitize_visualization_plan(
+        self,
+        state: _AgentState,
+        financial_data: pd.DataFrame,
+        decision: CompletionReviewDecision,
+        max_rows_per_chart: int,
+        max_raw_rows: int,
+    ) -> Tuple[VisualizationPlan, pd.DataFrame]:
+        available_index: List[str] = list(financial_data.index)
+        available_set: Set[str] = set(available_index)
+        used_chart_rows: Set[str] = set()
+        sanitized_charts: List[ChartSpec] = []
+
+        for chart in decision.charts:
+            candidate_rows = self._dedupe_preserve_order(
+                [
+                    r
+                    for r in (chart.row_labels or [])
+                    if isinstance(r, str) and r in available_set and r not in used_chart_rows
+                ]
+            )
+            if not candidate_rows:
+                continue
+            candidate_rows = candidate_rows[:max_rows_per_chart]
+
+            if chart.group_rows:
+                sanitized_charts.append(
+                    ChartSpec(
+                        chart_type=self._normalise_chart_type(chart.chart_type),
+                        title=(chart.title or "Financial Trend").strip(),
+                        row_labels=candidate_rows,
+                        group_rows=True,
+                        rationale=chart.rationale,
+                    )
+                )
+                used_chart_rows.update(candidate_rows)
+                continue
+
+            for row_label in candidate_rows:
+                sanitized_charts.append(
+                    ChartSpec(
+                        chart_type=self._normalise_chart_type(chart.chart_type),
+                        title=(chart.title or row_label).strip(),
+                        row_labels=[row_label],
+                        group_rows=False,
+                        rationale=chart.rationale,
+                    )
+                )
+                used_chart_rows.add(row_label)
+
+        if not sanitized_charts:
+            fallback_df = self._extract_relevant_rows(state, financial_data)
+            fallback_rows = [row for row in fallback_df.index if row in available_set]
+            fallback_rows = fallback_rows[:max_rows_per_chart]
+            if not fallback_rows and available_index:
+                fallback_rows = available_index[:max_rows_per_chart]
+            if fallback_rows:
+                sanitized_charts = [
+                    ChartSpec(
+                        chart_type="line",
+                        title="Key Financial Trends",
+                        row_labels=fallback_rows,
+                        group_rows=True,
+                        rationale="Fallback visualisation because no valid chart rows were selected.",
+                    )
+                ]
+                used_chart_rows.update(fallback_rows)
+
+        raw_row_labels = self._dedupe_preserve_order(
+            [
+                r
+                for r in (decision.raw_row_labels or [])
+                if isinstance(r, str) and r in available_set
+            ]
+        )
+        if not raw_row_labels:
+            fallback_raw_df = self._extract_relevant_rows(state, financial_data)
+            raw_row_labels = [row for row in fallback_raw_df.index if row in available_set]
+        raw_row_labels = raw_row_labels[:max_raw_rows]
+
+        raw_display_df = (
+            financial_data.loc[raw_row_labels]
+            if raw_row_labels
+            else pd.DataFrame(columns=financial_data.columns)
+        )
+
+        visualization_plan = VisualizationPlan(
+            charts=sanitized_charts,
+            raw_row_labels=raw_row_labels,
+            reviewer_notes=decision.reviewer_notes,
+        )
+        return visualization_plan, raw_display_df
+
     # ── Node: analyst ─────────────────────────────────────────────────────────
 
     async def _analyst_node(self, state: _AgentState) -> Dict:
@@ -591,6 +902,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 "analysis": "No financial data was available for this query.",
                 "relationships_extracted": False,
                 "subgraph_id": None,
+                "task_completed": state.task_completed,
+                "task_completion_reason": state.task_completion_reason,
+                "visualization_plan": state.visualization_plan,
+                "raw_display_data": state.raw_display_data,
             }
 
         tool_summary = ""
@@ -627,6 +942,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             f"Tool Results:\n{tool_summary or 'None'}"
         )
         success = False
+        sentiment = None
         try:
             response = await service_manager.get_agent(temperature=0.7).ainvoke(
                 [
@@ -666,6 +982,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "relationships_extracted": False,
             "subgraph_id": task_id,
             "sentiment": sentiment,
+            "task_completed": state.task_completed,
+            "task_completion_reason": state.task_completion_reason,
+            "visualization_plan": state.visualization_plan,
+            "raw_display_data": state.raw_display_data,
         }
 
     def _extract_relevant_rows(

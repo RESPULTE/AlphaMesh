@@ -95,6 +95,8 @@ User Query: {query}
 Ticker: {ticker}
 Date Range: {start_date} to {end_date}
 Current Iteration: {iteration} of {max_iterations}
+Replanning Context:
+{replanning_note}
 
 Available Concepts ({n_concepts} total — includes raw EDGAR data AND any \
 derived metrics from previous iterations):
@@ -148,6 +150,62 @@ Scoring rules:
 - If data is insufficient to form a view (e.g. empty DataFrame), set score=50, label="NEUTRAL".
 
 The <sentiment> block MUST be valid JSON.  Do not output anything after </sentiment>.
+"""
+
+
+_COMPLETION_REVIEW_SYSTEM = """\
+You are a quantitative execution reviewer for a financial analysis agent.
+
+You will receive:
+- The original user query.
+- Executor audit logs (planned calls, params, success/failure, summaries).
+- Tool results.
+- The final financial DataFrame preview and full available row labels.
+
+Your responsibilities in ONE structured response:
+1) Decide whether the task is complete.
+2) If incomplete, provide concise replan guidance for the planner.
+3) Propose chart instructions and raw data rows to display to the end user.
+
+Rules:
+- Prefer rows that directly answer the user query.
+- Charts may be grouped (multiple rows in one chart) only if comparison is meaningful.
+- Do not repeat the same row across multiple charts.
+- Use chart types only from: line, bar, area, scatter.
+- Keep reasoning concise and evidence-based.
+"""
+
+
+_COMPLETION_REVIEW_USER = """\
+User Query:
+{query}
+
+Ticker:
+{ticker}
+
+Execution Iterations:
+{iteration_count}/{max_iterations}
+
+Completion replan already used:
+{completion_replan_used}
+
+Per-chart max rows:
+{max_rows_per_chart}
+
+Raw display max rows:
+{max_raw_rows}
+
+Executor Logs:
+{executor_logs}
+
+Tool Results:
+{tool_results}
+
+Available DataFrame Rows ({n_rows}):
+{available_rows}
+
+Financial Data Preview:
+{data_preview}
 """
 
 
