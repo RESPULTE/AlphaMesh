@@ -49,6 +49,41 @@ export interface ChartDataPoint {
   price: number;
 }
 
+export type PortfolioAssetType = 'equity' | 'etf';
+
+export interface PortfolioHolding {
+  ticker: string;
+  company_name: string;
+  exchange?: string | null;
+  asset_type: PortfolioAssetType;
+  shares: number;
+}
+
+export interface PortfolioResponse {
+  user_email: string;
+  holdings: PortfolioHolding[];
+}
+
+export interface UpsertPortfolioHoldingRequest {
+  user_email: string;
+  ticker: string;
+  company_name: string;
+  exchange?: string | null;
+  asset_type: PortfolioAssetType;
+  shares: number;
+}
+
+export interface TickerSearchResult {
+  ticker: string;
+  company_name: string;
+  exchange?: string | null;
+  asset_type: PortfolioAssetType;
+}
+
+export interface TickerSearchResponse {
+  results: TickerSearchResult[];
+}
+
 export interface MarketQuote {
   ticker: string;
   companyName: string;

@@ -18,6 +18,7 @@ from api.auth.adapter import get_auth_adapter
 from api.services.analysis_runner import AnalysisRunner
 from api.services.conversation_service import ConversationStore
 from api.services.event_broadcaster import EventBroadcaster
+from api.services.portfolio_json_store import PortfolioJsonStore
 from api.services.session_service import SessionService
 from core.market_data_service import MarketDataService
 from core.services import service_manager
@@ -78,3 +79,8 @@ def get_market_data_service() -> MarketDataService:
 def get_session_service(request: Request) -> SessionService:
     """Provide the SessionService singleton (initialised during lifespan startup)."""
     return request.app.state.session_service
+
+
+def get_portfolio_store(request: Request) -> PortfolioJsonStore:
+    """Provide the per-user JSON portfolio store singleton."""
+    return request.app.state.portfolio_store

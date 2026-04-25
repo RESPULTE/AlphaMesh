@@ -17,6 +17,7 @@ from api.services.analysis_runner import AnalysisRunner
 from api.services.conversation_service import ConversationStore
 from api.services.conversation_sql_store import SQLiteConversationStore
 from api.services.event_broadcaster import EventBroadcaster
+from api.services.portfolio_json_store import PortfolioJsonStore
 from api.services.session_service import SessionService
 from api.services.session_sql_store import SQLiteSessionStore
 from core.config import settings
@@ -54,6 +55,9 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     app.state.runner = runner
     app.state.session_service = session_service
+    app.state.portfolio_store = PortfolioJsonStore(
+        base_path=settings.PORTFOLIO_JSON_PATH
+    )
 
     logger.info("AlphaMesh API: ready.")
     yield
@@ -96,9 +100,11 @@ def create_app() -> FastAPI:
     # Routers and exception handlers must be registered before startup.
     from api.middleware.error_handling import register_exception_handlers
     from api.routers import market as market_router
+    from api.routers import portfolio as portfolio_router
     from api.routers import sessions as sessions_router
 
     app.include_router(market_router.router, prefix="/api/market")
+    app.include_router(portfolio_router.router)
     app.include_router(sessions_router.router)
 
     app.include_router(health.router)
