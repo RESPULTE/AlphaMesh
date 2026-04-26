@@ -14,8 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.routers import chat, conversations, health, stream
 from api.services.analysis_runner import AnalysisRunner
+from api.services.conversation_jsonl_store import JsonlConversationStore
 from api.services.conversation_service import ConversationStore
-from api.services.conversation_sql_store import SQLiteConversationStore
 from api.services.event_broadcaster import EventBroadcaster
 from api.services.portfolio_json_store import PortfolioJsonStore
 from api.services.session_service import SessionService
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
     # API-layer singletons
     broadcaster = EventBroadcaster()
     store = ConversationStore(
-        db=SQLiteConversationStore(db_path=settings.CONVERSATIONS_DB_PATH)
+        db=JsonlConversationStore(base_path=settings.CHATLOGS_JSONL_DIR)
     )
     await store.initialize()
     session_service = SessionService(

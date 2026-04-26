@@ -270,4 +270,24 @@ class ConversationHistoryResponse(BaseModel):
     messages: List[ConversationMessage]
 
 
+class ConversationTurn(BaseModel):
+    turn_id: str
+    request_id: str
+    conversation_id: str
+    user_email: str
+    session_id: str
+    created_at: str
+    duration_ms: float
+    user_message: str
+    assistant_synthesis: str
+    agent_analyses: Dict[str, str] = Field(default_factory=dict)
+    ticker_results: List[TickerResult] = Field(default_factory=list)
+    tickers: List[str] = Field(default_factory=list)
+
+
+class ConversationTurnsResponse(BaseModel):
+    conversation_id: str
+    turns: List[ConversationTurn] = Field(default_factory=list)
+
+
 

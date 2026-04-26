@@ -3,7 +3,7 @@ api/services/conversation_service.py
 
 Two-tier conversation storage:
   Tier 1 - in-memory dict (O(1) reads, no I/O)
-  Tier 2 - pluggable persistence adapter (SQLite by default)
+  Tier 2 - pluggable persistence adapter (JSONL by default)
 
 Write-through: every mutation is written to both tiers atomically.
 Read-through:  if a conversation is not in memory, it is loaded from the
@@ -19,20 +19,13 @@ from typing import Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from api.services.conversation_sql_store import SQLiteConversationStore
+from api.services.conversation_jsonl_store import JsonlConversationStore
 
 logger = logging.getLogger(__name__)
 
 
-def _to_dict(msg: BaseMessage) -> dict:
-    """Convert a LangChain BaseMessage to a plain dict for storage."""
-    role = "user" if isinstance(msg, HumanMessage) else "assistant"
-    content = msg.content if isinstance(msg.content, str) else str(msg.content)
-    return {
-        "role": role,
-        "content": content,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _from_dict(d: dict) -> BaseMessage:
@@ -55,27 +48,74 @@ class ConversationStore:
     I/O, never across agent invocations.
     """
 
-    def __init__(self, db: SQLiteConversationStore) -> None:
-        self._sql_db = db
+    def __init__(self, db: JsonlConversationStore) -> None:
+        self._db = db
         # conversation_id -> List[dict] (serialized messages)
-        self._cache: Dict[str, List[dict]] = {}
+        self._message_cache: Dict[str, List[dict]] = {}
+        # conversation_id -> List[dict] (rich turn records)
+        self._turn_cache: Dict[str, List[dict]] = {}
+        # conversation_id -> user_email owner
+        self._owners: Dict[str, str] = {}
         # conversation_id -> asyncio.Lock
         self._locks: Dict[str, asyncio.Lock] = {}
 
     async def initialize(self) -> None:
         """Delegate schema creation to the persistence adapter."""
-        await self._sql_db.initialize()
+        await self._db.initialize()
 
     def _get_lock(self, conversation_id: str) -> asyncio.Lock:
         if conversation_id not in self._locks:
             self._locks[conversation_id] = asyncio.Lock()
         return self._locks[conversation_id]
 
-    async def _load_from_adapter(self, conversation_id: str) -> List[dict]:
-        """Load messages from the adapter and populate the in-memory cache."""
-        messages = await self._sql_db.load_messages(conversation_id)
-        self._cache[conversation_id] = messages
+    def _resolve_owner(self, conversation_id: str, user_email: Optional[str]) -> str:
+        if user_email:
+            self._owners[conversation_id] = user_email
+            return user_email
+        cached_owner = self._owners.get(conversation_id)
+        if cached_owner:
+            return cached_owner
+        raise ValueError(
+            f"user_email is required when conversation '{conversation_id}' is not cached"
+        )
+
+    @staticmethod
+    def _messages_from_turns(turns: List[dict]) -> List[dict]:
+        messages: List[dict] = []
+        for turn in turns:
+            timestamp = str(turn.get("created_at") or _utc_now_iso())
+            user_message = str(turn.get("user_message") or "")
+            assistant_text = str(turn.get("assistant_synthesis") or "")
+
+            if user_message:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": user_message,
+                        "timestamp": timestamp,
+                    }
+                )
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "timestamp": timestamp,
+                }
+            )
         return messages
+
+    async def _load_from_adapter(
+        self,
+        conversation_id: str,
+        user_email: Optional[str] = None,
+    ) -> List[dict]:
+        """Load turns from adapter and populate in-memory turn/message caches."""
+        owner = self._resolve_owner(conversation_id, user_email)
+        turns = await self._db.load_turns(conversation_id=conversation_id, user_email=owner)
+        self._turn_cache[conversation_id] = turns
+        self._message_cache[conversation_id] = self._messages_from_turns(turns)
+        return turns
 
     async def ensure_conversation(
         self,
@@ -86,48 +126,72 @@ class ConversationStore:
         Guarantee that a conversation record exists (in memory + adapter).
         Safe to call multiple times (idempotent).
         """
+        if not user_email:
+            raise ValueError("user_email is required to ensure a conversation")
         async with self._get_lock(conversation_id):
-            await self._sql_db.ensure_conversation(conversation_id, user_email)
+            self._owners[conversation_id] = user_email
+            await self._db.ensure_conversation(conversation_id, user_email)
 
-    async def add_messages(
+    async def append_turn(
         self,
         conversation_id: str,
-        messages: List[BaseMessage],
+        user_email: str,
+        turn: dict,
     ) -> None:
         """
-        Append one or more LangChain messages (write-through).
+        Append one rich turn record and update projected message history.
 
-        Called once per turn: [HumanMessage(user query), AIMessage(synthesis)].
+        Called once per turn from AnalysisRunner after final result is built.
         """
         async with self._get_lock(conversation_id):
-            if conversation_id not in self._cache:
-                await self._load_from_adapter(conversation_id)
-            for msg in messages:
-                d = _to_dict(msg)
-                self._cache.setdefault(conversation_id, []).append(d)
-                await self._sql_db.save_message(
-                    conversation_id,
-                    role=d["role"],
-                    content=d["content"],
-                    timestamp=d["timestamp"],
-                )
+            self._owners[conversation_id] = user_email
+            if conversation_id not in self._turn_cache:
+                await self._load_from_adapter(conversation_id, user_email=user_email)
+            self._turn_cache.setdefault(conversation_id, []).append(dict(turn))
+            self._message_cache[conversation_id] = self._messages_from_turns(
+                self._turn_cache[conversation_id]
+            )
+            await self._db.append_turn(
+                conversation_id=conversation_id,
+                user_email=user_email,
+                turn=turn,
+            )
 
-    async def get_langchain_messages(self, conversation_id: str) -> List[BaseMessage]:
+    async def get_langchain_messages(
+        self,
+        conversation_id: str,
+        user_email: Optional[str] = None,
+    ) -> List[BaseMessage]:
         """
         Return the full message history as LangChain BaseMessage objects.
         Populates the in-memory cache from the adapter on first access.
         """
         async with self._get_lock(conversation_id):
-            if conversation_id not in self._cache:
-                await self._load_from_adapter(conversation_id)
-        return [_from_dict(d) for d in self._cache.get(conversation_id, [])]
+            if conversation_id not in self._message_cache:
+                await self._load_from_adapter(conversation_id, user_email=user_email)
+        return [_from_dict(d) for d in self._message_cache.get(conversation_id, [])]
 
-    async def get_history(self, conversation_id: str) -> List[dict]:
+    async def get_history(
+        self,
+        conversation_id: str,
+        user_email: Optional[str] = None,
+    ) -> List[dict]:
         """Return the full message history as plain dicts."""
         async with self._get_lock(conversation_id):
-            if conversation_id not in self._cache:
-                await self._load_from_adapter(conversation_id)
-        return list(self._cache.get(conversation_id, []))
+            if conversation_id not in self._message_cache:
+                await self._load_from_adapter(conversation_id, user_email=user_email)
+        return list(self._message_cache.get(conversation_id, []))
+
+    async def get_turns(
+        self,
+        conversation_id: str,
+        user_email: Optional[str] = None,
+    ) -> List[dict]:
+        """Return full structured turn history for a conversation."""
+        async with self._get_lock(conversation_id):
+            if conversation_id not in self._turn_cache:
+                await self._load_from_adapter(conversation_id, user_email=user_email)
+        return list(self._turn_cache.get(conversation_id, []))
 
     async def list_conversations(
         self,
@@ -135,4 +199,6 @@ class ConversationStore:
         limit: int = 50,
     ) -> List[dict]:
         """List recent conversations, delegating to the persistence adapter."""
-        return await self._sql_db.list_conversations(user_email=user_email, limit=limit)
+        if not user_email:
+            return []
+        return await self._db.list_conversations(user_email=user_email, limit=limit)

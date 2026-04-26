@@ -14,10 +14,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 
 from api.models.requests import ChatRequest
 from api.models.responses import (
@@ -312,7 +313,10 @@ class AnalysisRunner:
                 session_id=session_id,
                 conversation_id=conversation_id,
             )
-            history = await self._store.get_langchain_messages(conversation_id)
+            history = await self._store.get_langchain_messages(
+                conversation_id,
+                user_email=user_id,
+            )
             messages = history + [HumanMessage(content=chat_request.message)]
 
             # -- 4. Run the orchestrator ---------------------------------------
@@ -326,16 +330,7 @@ class AnalysisRunner:
             if final_ticker and not market_data_emitted:
                 await self._emit_market_data(event_queue, request_id, final_ticker)
 
-            # -- 5. Persist conversation turn ----------------------------------
-            await self._store.add_messages(
-                conversation_id,
-                [
-                    HumanMessage(content=chat_request.message),
-                    AIMessage(content=final_response.summary or ""),
-                ],
-            )
-
-            # -- 6. Emit metrics payload (if available) ------------------------
+            # -- 5. Emit metrics payload (if available) ------------------------
             visualization_payload = _build_fundamentals_visualization_payload(
                 final_response
             )
@@ -358,7 +353,7 @@ class AnalysisRunner:
                     }
                 )
 
-            # -- 7. Build wire-format result -----------------------------------
+            # -- 6. Build wire-format result -----------------------------------
             duration_ms = (time.monotonic() - t_start) * 1000
             final_result = _build_final_result(
                 request_id=request_id,
@@ -366,6 +361,21 @@ class AnalysisRunner:
                 final_response=final_response,
                 duration_ms=duration_ms,
                 fundamentals_visualization_payload=visualization_payload,
+            )
+
+            # -- 7. Persist rich conversation turn -----------------------------
+            turn_payload = _build_turn_payload(
+                request_id=request_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                session_id=session_id,
+                user_message=chat_request.message,
+                final_result=final_result,
+            )
+            await self._store.append_turn(
+                conversation_id=conversation_id,
+                user_email=user_id,
+                turn=turn_payload,
             )
 
             # -- 8. Deliver completion event -----------------------------------
@@ -472,3 +482,33 @@ def _build_final_result(
         agent_analyses=agent_analyses,
         duration_ms=round(duration_ms, 1),
     )
+
+
+def _build_turn_payload(
+    *,
+    request_id: str,
+    conversation_id: str,
+    user_id: str,
+    session_id: str,
+    user_message: str,
+    final_result: FinalResult,
+) -> dict:
+    """Build one persisted rich turn record from final response payload."""
+    created_at = datetime.now(timezone.utc).isoformat()
+    turn_id = f"{conversation_id}:{request_id}"
+    tickers = [r.ticker for r in final_result.ticker_results if r.ticker]
+
+    return {
+        "turn_id": turn_id,
+        "request_id": request_id,
+        "conversation_id": conversation_id,
+        "user_email": user_id,
+        "session_id": session_id,
+        "created_at": created_at,
+        "duration_ms": final_result.duration_ms,
+        "user_message": user_message,
+        "assistant_synthesis": final_result.synthesis,
+        "agent_analyses": final_result.agent_analyses,
+        "ticker_results": [r.model_dump() for r in final_result.ticker_results],
+        "tickers": tickers,
+    }

@@ -168,8 +168,10 @@ class Settings(BaseSettings):
     RATE_LIMIT_DEFAULT: int = 60  # all other authenticated routes
 
     # ── Session / History persistence ─────────────────────────────────────────
-    # Conversations, messages, and login sessions share this SQLite DB file.
+    # Login sessions remain in SQLite; rich conversation turns are JSONL files.
     CONVERSATIONS_DB_PATH: str = "./data/conversations.db"
+    CHATLOGS_JSONL_DIR: str = "./data/chatlogs"
+    DEV_ALLOW_USER_EMAIL_FALLBACK: bool = True
 
     # ── Market data cache TTLs (seconds) ─────────────────────────────────────
     # Shared in-process cache keyed by ticker; public data, no per-user

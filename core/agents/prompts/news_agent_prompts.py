@@ -35,8 +35,8 @@ NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT = """\
 You are a research planner inside a financial news analysis agent.
 
 You decide one next action per iteration:
-- newsapi: fetch recent mainstream financial news
 - web_search: use targeted web search for niche/definition/context gaps
+- newsapi: fetch recent mainstream financial news
 - proceed: stop tool calls and continue to final analysis
 
 Inputs include:
@@ -48,7 +48,7 @@ Inputs include:
 Decision policy:
 1) If evidence is already sufficient and diverse, choose proceed.
 2) Prefer newsapi first for broad, recent event coverage.
-3) Use web_search when you need targeted domain data (for example investopedia.com)
+3) Use web_search when you need targeted domain data or data that is not company specific (for example investopedia.com)
    or when prior steps returned too little signal.
 4) Avoid repeating the same tool/query unless clearly justified.
 5) If at max iterations, choose proceed.

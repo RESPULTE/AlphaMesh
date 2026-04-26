@@ -184,6 +184,44 @@ export interface ChatAck {
   session_id: string;
 }
 
+export interface ConversationSummary {
+  conversation_id: string;
+  created_at: string;
+  last_message_at: string;
+  message_count: number;
+}
+
+export interface ConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+}
+
+export interface ConversationHistoryResponse {
+  conversation_id: string;
+  messages: ConversationMessage[];
+}
+
+export interface ConversationTurn {
+  turn_id: string;
+  request_id: string;
+  conversation_id: string;
+  user_email: string;
+  session_id: string;
+  created_at: string;
+  duration_ms: number;
+  user_message: string;
+  assistant_synthesis: string;
+  agent_analyses: Record<string, string>;
+  ticker_results: TickerResult[];
+  tickers: string[];
+}
+
+export interface ConversationTurnsResponse {
+  conversation_id: string;
+  turns: ConversationTurn[];
+}
+
 export type StreamEvent =
   | {
       event_type: 'progress';

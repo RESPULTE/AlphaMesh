@@ -20,7 +20,7 @@ async def test_full_orchestrator_pipeline_live() -> None:
     agent = OrchestratorAgent()
     messages = [
         HumanMessage(
-            content="what is the definition of a good portfolio according to investopedia"
+            content="what is portfolio strategy used by warren buffet. search the web for asnwer"
         )
     ]
 

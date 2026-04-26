@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AgentAnalysis,
   AnalysisResponse,
+  ConversationSummary,
   DataFramePayload,
   FinalResult,
   FundamentalsVisualizationPayload,
@@ -337,6 +338,26 @@ export function useAnalysisStream(query: string | null) {
 
     const start = async () => {
       try {
+        if (!conversationIdRef.current) {
+          try {
+            const latestRes = await fetch(
+              `/api/v1/conversations?limit=1&user_email=${encodeURIComponent(stableEmail)}`
+            );
+            if (latestRes.ok) {
+              const rows = (await latestRes.json()) as ConversationSummary[];
+              const latestConversationId = rows?.[0]?.conversation_id;
+              if (latestConversationId) {
+                conversationIdRef.current = latestConversationId;
+                if (typeof window !== 'undefined') {
+                  window.localStorage.setItem(STORAGE_CONVERSATION_ID, latestConversationId);
+                }
+              }
+            }
+          } catch {
+            // best-effort only; fallback is creating a new conversation on POST /chat
+          }
+        }
+
         const res = await fetch('/api/v1/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
