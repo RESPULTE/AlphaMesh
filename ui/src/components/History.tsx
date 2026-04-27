@@ -1,12 +1,15 @@
 import { motion, AnimatePresence } from 'motion/react';
-import { ChevronDown, ChevronRight, MessageSquare } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { ChevronDown, MessageSquare, ChevronRight } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import type { ConversationSummary, ConversationTurn, ConversationTurnsResponse } from '../types/api';
 import AnalysisDashboard from './AnalysisDashboard';
+import ConversationThread from './ConversationThread';
 
 interface HistoryProps {
   query?: string | null;
   onClearQuery?: () => void;
+  /** When set, auto-expand and load this conversation on mount */
+  initialExpandedId?: string | null;
 }
 
 const DEV_USER_EMAIL = 'demo@alphamesh.local';
@@ -24,7 +27,7 @@ function truncateConversationId(conversationId: string): string {
   return `${conversationId.slice(0, 8)}...${conversationId.slice(-6)}`;
 }
 
-export default function History({ query, onClearQuery }: HistoryProps) {
+export default function History({ query, onClearQuery, initialExpandedId }: HistoryProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationTurns, setConversationTurns] = useState<Record<string, ConversationTurn[]>>({});
@@ -33,6 +36,9 @@ export default function History({ query, onClearQuery }: HistoryProps) {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(
     typeof window !== 'undefined' ? window.localStorage.getItem(STORAGE_CONVERSATION_ID) : null
   );
+
+  // Ref to auto-scroll to the expanded conversation
+  const expandedRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (query) return;
@@ -63,6 +69,22 @@ export default function History({ query, onClearQuery }: HistoryProps) {
     if (typeof window === 'undefined') return;
     setActiveConversationId(window.localStorage.getItem(STORAGE_CONVERSATION_ID));
   }, [query]);
+
+  // Auto-expand a conversation when initialExpandedId is set
+  useEffect(() => {
+    if (initialExpandedId && initialExpandedId !== expandedId) {
+      setExpandedId(initialExpandedId);
+      loadTurns(initialExpandedId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialExpandedId]);
+
+  // Scroll the auto-expanded conversation into view
+  useEffect(() => {
+    if (expandedId && expandedRef.current) {
+      expandedRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [expandedId, conversations]);
 
   const loadTurns = async (conversationId: string) => {
     if (conversationTurns[conversationId]) return;
@@ -131,28 +153,39 @@ export default function History({ query, onClearQuery }: HistoryProps) {
       <div className="space-y-4 md:space-y-6">
         {conversations.map((conversation) => {
           const turns = conversationTurns[conversation.conversation_id] || [];
-          const latestTurn = turns.length ? turns[turns.length - 1] : null;
           const isExpanded = expandedId === conversation.conversation_id;
           const isActive = activeConversationId === conversation.conversation_id;
+
+          // Derive a human-readable title from the last turn's user message
+          const lastTurn = turns.length ? turns[turns.length - 1] : null;
+          const firstTurn = turns.length ? turns[0] : null;
+          const displayLabel = firstTurn?.user_message
+            ? firstTurn.user_message.length > 72
+              ? `${firstTurn.user_message.slice(0, 72)}…`
+              : firstTurn.user_message
+            : truncateConversationId(conversation.conversation_id);
+
           return (
             <section
               key={conversation.conversation_id}
+              ref={isExpanded ? (el) => { expandedRef.current = el; } : undefined}
               className="bg-surface-container-lowest rounded-xl overflow-hidden shadow-[0_20px_40px_rgba(26,28,28,0.06)] group"
             >
+              {/* ── Conversation header ─────────────────────────────────── */}
               <div
                 onClick={() => handleToggle(conversation.conversation_id)}
                 className="p-5 md:p-8 flex items-center justify-between cursor-pointer hover:bg-surface-container-low transition-colors"
               >
-                <div className="flex items-center gap-4 md:gap-6">
+                <div className="flex items-center gap-4 md:gap-6 min-w-0">
                   <div className="w-12 h-12 md:w-16 md:h-16 bg-surface-container rounded-full flex items-center justify-center shrink-0">
                     <MessageSquare className="w-6 h-6 md:w-8 md:h-8 text-primary" />
                   </div>
-                  <div>
-                    <h2 className="font-headline text-xl md:text-2xl font-bold tracking-tight text-on-surface">
-                      {truncateConversationId(conversation.conversation_id)}
+                  <div className="min-w-0">
+                    <h2 className="font-headline text-base md:text-xl font-bold tracking-tight text-on-surface line-clamp-1">
+                      {displayLabel}
                     </h2>
-                    <p className="text-outline text-xs md:text-sm">
-                      {conversation.message_count} messages • Last analyzed {formatTimestamp(conversation.last_message_at)}
+                    <p className="text-outline text-xs md:text-sm mt-0.5">
+                      {conversation.message_count} messages · Last active {formatTimestamp(conversation.last_message_at)}
                     </p>
                     {isActive ? (
                       <p className="text-primary text-xs font-semibold mt-1">Active conversation</p>
@@ -160,79 +193,64 @@ export default function History({ query, onClearQuery }: HistoryProps) {
                   </div>
                 </div>
                 <ChevronDown
-                  className={`w-5 h-5 md:w-6 md:h-6 text-outline transition-transform duration-300 ${
+                  className={`w-5 h-5 md:w-6 md:h-6 text-outline transition-transform duration-300 shrink-0 ml-4 ${
                     isExpanded ? 'rotate-180' : ''
                   }`}
                 />
               </div>
 
+              {/* ── Expanded thread ─────────────────────────────────────── */}
               <AnimatePresence>
                 {isExpanded ? (
                   <motion.div
                     initial={{ height: 0, opacity: 0 }}
                     animate={{ height: 'auto', opacity: 1 }}
                     exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.25, ease: 'easeInOut' }}
+                    transition={{ duration: 0.3, ease: 'easeInOut' }}
                     className="border-t border-outline-variant/10"
                   >
-                    <div className="p-5 md:p-8 bg-surface-container-lowest/50">
-                      {loadingTurnsFor === conversation.conversation_id ? (
-                        <div className="text-sm text-on-surface-variant mb-4">Loading turns...</div>
-                      ) : null}
-
-                      {latestTurn ? (
-                        <div className="mb-6 p-4 rounded-xl bg-surface-container border border-outline-variant/10">
-                          <h3 className="text-xs font-bold tracking-widest text-on-surface-variant/60 uppercase mb-2 font-label">
-                            Latest Synthesis
-                          </h3>
-                          <p className="text-sm text-on-surface">{latestTurn.assistant_synthesis || 'No synthesis text'}</p>
-                        </div>
-                      ) : null}
-
-                      <h3 className="text-xs font-bold tracking-widest text-on-surface-variant/60 uppercase mb-4 font-label">
-                        Turns
-                      </h3>
-                      <div className="bg-surface-container rounded-xl overflow-hidden border border-outline-variant/10">
-                        <div className="max-h-[280px] overflow-y-auto custom-scrollbar">
-                          {turns.length === 0 ? (
-                            <div className="p-4 text-sm text-on-surface-variant">No turns found.</div>
-                          ) : (
-                            turns
-                              .slice()
-                              .reverse()
-                              .map((turn) => (
-                                <div
-                                  key={turn.turn_id}
-                                  className="flex items-center justify-between p-4 border-b border-outline-variant/10 last:border-b-0"
-                                >
-                                  <div className="flex items-center gap-3">
-                                    <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
-                                      <MessageSquare className="w-4 h-4 text-primary" />
-                                    </div>
-                                    <div>
-                                      <h4 className="font-medium text-on-surface text-sm line-clamp-1">
-                                        {turn.user_message}
-                                      </h4>
-                                      <p className="text-xs text-on-surface-variant mt-0.5">
-                                        {formatTimestamp(turn.created_at)}
-                                      </p>
-                                    </div>
-                                  </div>
-                                  <button
-                                    onClick={() =>
-                                      continueConversation(conversation.conversation_id)
-                                    }
-                                    className="flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80 transition-colors px-3 py-1.5 rounded-lg hover:bg-primary/10"
-                                  >
-                                    Continue
-                                    <ChevronRight className="w-4 h-4" />
-                                  </button>
-                                </div>
-                              ))
-                          )}
-                        </div>
+                    {/* Loading state */}
+                    {loadingTurnsFor === conversation.conversation_id && (
+                      <div className="flex items-center justify-center gap-3 py-10 text-sm text-on-surface-variant">
+                        <motion.div
+                          animate={{ rotate: 360 }}
+                          transition={{ repeat: Infinity, duration: 1.2, ease: 'linear' }}
+                          className="w-5 h-5 border-2 border-primary/20 border-t-primary rounded-full"
+                        />
+                        Loading conversation...
                       </div>
-                    </div>
+                    )}
+
+                    {/* Thread + footer */}
+                    {!loadingTurnsFor && (
+                      <>
+                        {/* Last-seen synthesis pill */}
+                        {lastTurn && turns.length > 1 && (
+                          <div className="px-5 md:px-8 pt-5 pb-0">
+                            <div className="text-[9px] font-black tracking-widest text-on-surface-variant/50 uppercase mb-2 font-label">
+                              {turns.length} turns in this conversation
+                            </div>
+                          </div>
+                        )}
+
+                        {/* ── Chat thread ─────────────────────────────── */}
+                        <ConversationThread turns={turns} />
+
+                        {/* Footer actions */}
+                        <div className="border-t border-outline-variant/10 px-5 md:px-8 py-4 flex items-center justify-between bg-surface-container-lowest/60">
+                          <span className="text-xs text-on-surface-variant/60 font-medium">
+                            Conversation {truncateConversationId(conversation.conversation_id)}
+                          </span>
+                          <button
+                            onClick={() => continueConversation(conversation.conversation_id)}
+                            className="flex items-center gap-1.5 text-xs font-bold text-primary hover:text-primary/80 transition-colors px-4 py-2 rounded-lg hover:bg-primary/10"
+                          >
+                            Continue conversation
+                            <ChevronRight className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </motion.div>
                 ) : null}
               </AnimatePresence>

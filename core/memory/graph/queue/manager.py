@@ -17,8 +17,8 @@ from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
 from core.memory.graph.queue.task_utils import (
     has_chunk_ids,
-    has_extraction_text,
     has_extractable_payload,
+    has_extraction_text,
     has_inline_relationships,
     is_chunk_entities_task,
 )
