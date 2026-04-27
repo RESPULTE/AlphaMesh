@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
-import { User, Sparkles, Clock, TrendingUp } from 'lucide-react';
+import { User, Sparkles, Clock, TrendingUp, ChevronRight } from 'lucide-react';
 import Markdown from 'react-markdown';
 import type { ConversationTurn } from '../types/api';
 
@@ -8,6 +8,10 @@ interface ConversationThreadProps {
   turns: ConversationTurn[];
   /** If true the container fills available height; otherwise uses a capped max-height */
   fullHeight?: boolean;
+  /** Limit preview to N turns and show a "view full" overlay below */
+  maxTurns?: number;
+  /** Called when the user clicks the "view full chatlog" overlay */
+  onViewFull?: () => void;
 }
 
 function formatTimestamp(value: string): string {
@@ -31,7 +35,11 @@ function formatDuration(ms: number): string {
 export default function ConversationThread({
   turns,
   fullHeight = false,
+  maxTurns,
+  onViewFull,
 }: ConversationThreadProps) {
+  const isPreview = typeof maxTurns === 'number' && turns.length > maxTurns;
+  const visibleTurns = isPreview ? turns.slice(0, maxTurns) : turns;
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -49,11 +57,12 @@ export default function ConversationThread({
 
   return (
     <div
-      className={`overflow-y-auto custom-scrollbar space-y-8 p-4 md:p-6 ${
-        fullHeight ? 'flex-1' : 'max-h-[70vh]'
+      className={`relative ${
+        fullHeight ? 'flex-1 overflow-y-auto' : isPreview ? 'overflow-hidden' : 'overflow-y-auto max-h-[70vh]'
       }`}
     >
-      {turns.map((turn, index) => (
+      <div className={`custom-scrollbar space-y-8 p-4 md:p-6 ${isPreview ? '' : ''}`}>
+      {visibleTurns.map((turn, index) => (
         <motion.div
           key={turn.turn_id}
           initial={{ opacity: 0, y: 12 }}
@@ -143,6 +152,23 @@ export default function ConversationThread({
 
       {/* Scroll anchor */}
       <div ref={bottomRef} className="h-1" />
+      </div>
+
+      {/* ── Blurred preview overlay ──────────────────────────────────── */}
+      {isPreview && (
+        <button
+          onClick={onViewFull}
+          className="absolute inset-x-0 bottom-0 h-48 flex flex-col items-center justify-end pb-6 cursor-pointer group"
+          style={{ background: 'linear-gradient(to top, var(--surface-container-lowest, #1a1c1b) 20%, transparent)' }}
+        >
+          <div className="backdrop-blur-sm bg-surface-container-low/60 border border-outline-variant/20 rounded-full px-5 py-2.5 flex items-center gap-2 shadow-lg group-hover:bg-surface-container-high/70 transition-all">
+            <span className="text-sm font-bold text-on-surface">
+              View full chatlog ({turns.length} turns)
+            </span>
+            <ChevronRight className="w-4 h-4 text-primary" />
+          </div>
+        </button>
+      )}
     </div>
   );
 }

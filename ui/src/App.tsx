@@ -60,6 +60,8 @@ export default function App() {
               query={analysisQuery}
               onClearQuery={() => setAnalysisQuery(null)}
               initialExpandedId={openConversationId}
+              onAnalyze={handleAnalyze}
+              isStreaming={isStreaming}
             />
           )}
         </AnimatePresence>

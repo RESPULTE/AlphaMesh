@@ -1,8 +1,6 @@
 """
 core/agents/orchestrator_agent.py
 
-Changes from previous version
-â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 1. run() now calls graph_queue_manager.open_session() before graph.ainvoke()
    and graph_queue_manager.flush_turn() + close_session() after it returns.
    This is the single addition required for the graph queue lifecycle.
