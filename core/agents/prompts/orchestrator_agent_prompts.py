@@ -75,6 +75,11 @@ Each signal MUST include a `confidence` score (0.0â€“1.0):
                              the legacy `ticker` field.
 `ticker`                   â€” leave null; the orchestrator derives it from tickers[0].
 `start_date` / `end_date`  â€” only when the user explicitly specifies a time range; else null.
+
+â•â• D6 â€” AGENT MEMORY CONTINUITY â•â•
+You may receive a separate "Agent memory contexts from prior turns" system message.
+Use it to preserve continuity when selecting `target_agents` and writing `per_agent_queries`.
+Do not copy memory text verbatim into outputs; use it only as routing/planning context.
 """
 
 SYNTHESISER_PROMPT = """\

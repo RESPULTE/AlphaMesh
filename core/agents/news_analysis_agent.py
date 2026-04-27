@@ -43,6 +43,7 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
     NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT,
 )
+from core.agents.utils import extract_first_sentence, trim_text
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
@@ -261,20 +262,14 @@ class NewsAnalysisAgent(AbstractAgent):
         return NewsAgentOutput
 
     @staticmethod
-    def _first_sentence(value: str) -> str:
-        text = (value or "").strip()
-        if not text:
-            return ""
-        match = _re.search(r"(.+?[.!?])(?:\s|$)", text, _re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return text[:220]
-
-    @staticmethod
-    def _render_memory_summary(memory_summary: Dict[str, Any]) -> str:
+    def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
         if not memory_summary:
             return ""
-        actions = memory_summary.get("research_actions") or memory_summary.get("tools_used") or []
+        actions = (
+            memory_summary.get("research_actions")
+            or memory_summary.get("tools_used")
+            or []
+        )
         if not isinstance(actions, list):
             actions = []
         sentiment = memory_summary.get("sentiment") or {}
@@ -282,7 +277,7 @@ class NewsAnalysisAgent(AbstractAgent):
         if isinstance(sentiment, dict):
             sentiment_label = str(sentiment.get("label") or "").strip()
         source_count = int(memory_summary.get("source_count") or 0)
-        catalyst = str(memory_summary.get("main_catalyst") or "").strip()
+        catalyst = trim_text(memory_summary.get("main_catalyst") or "", max_chars=200)
         return (
             f"actions={','.join(str(a) for a in actions[:4]) or 'none'}; "
             f"sources={source_count}; "
@@ -328,7 +323,7 @@ class NewsAnalysisAgent(AbstractAgent):
         output = NewsAgentOutput(**final_state)
 
         if conversation_id:
-            rendered_summary = self._render_memory_summary(output.memory_summary)
+            rendered_summary = self.render_memory_summary(output.memory_summary)
             if rendered_summary:
                 self._memory_context_by_conversation[conversation_id] = rendered_summary
 
@@ -936,7 +931,7 @@ class NewsAnalysisAgent(AbstractAgent):
             "source_count": len(sources),
             "top_references": top_references,
             "sentiment": sentiment.model_dump() if sentiment is not None else {},
-            "main_catalyst": self._first_sentence(analysis_text),
+            "main_catalyst": extract_first_sentence(analysis_text),
         }
 
         return {

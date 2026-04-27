@@ -72,6 +72,7 @@ from core.agents.prompts.fundamental_agent_prompts import (
     _TOOL_PLANNER_SYSTEM,
     _TOOL_PLANNER_USER,
 )
+from core.agents.utils import extract_first_sentence, trim_text
 from core.config import settings
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.logger import get_logger
@@ -151,27 +152,17 @@ class FundamentalAnalysisAgent(AbstractAgent):
         return FundamentalAnalysisOutput
 
     @staticmethod
-    def _first_sentence(value: str) -> str:
-        text = (value or "").strip()
-        if not text:
-            return ""
-        match = re.search(r"(.+?[.!?])(?:\s|$)", text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return text[:220]
-
-    @staticmethod
-    def _render_memory_summary(memory_summary: Dict[str, Any]) -> str:
+    def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
         if not memory_summary:
             return ""
         tools = memory_summary.get("tools_used") or []
         if not isinstance(tools, list):
             tools = []
-        key_rows = memory_summary.get("key_rows") or []
+        key_rows = memory_summary.get("key_rows") or memory_summary.get("computed_rows") or []
         if not isinstance(key_rows, list):
             key_rows = []
         completed = bool(memory_summary.get("task_completed", True))
-        conclusion = str(memory_summary.get("main_conclusion") or "").strip()
+        conclusion = trim_text(memory_summary.get("main_conclusion") or "", max_chars=220)
         return (
             f"tools={','.join(str(t) for t in tools[:5]) or 'none'}; "
             f"rows={','.join(str(r) for r in key_rows[:6]) or 'none'}; "
@@ -225,7 +216,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         )
 
         if conversation_id:
-            rendered_summary = self._render_memory_summary(output.memory_summary)
+            rendered_summary = self.render_memory_summary(output.memory_summary)
             if rendered_summary:
                 self._memory_context_by_conversation[conversation_id] = rendered_summary
 
@@ -1109,7 +1100,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "computed_rows": [str(row) for row in (state.computed_row_labels or [])[:8]],
             "task_completed": bool(state.task_completed),
             "task_completion_reason": state.task_completion_reason or "",
-            "main_conclusion": self._first_sentence(analysis_text),
+            "main_conclusion": extract_first_sentence(analysis_text),
         }
 
         return {

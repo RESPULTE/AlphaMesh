@@ -122,6 +122,9 @@ def test_plan_node_receives_portfolio_context_message() -> None:
         messages=[HumanMessage(content="Should I add more AAPL?")],
         user_context_block="USER CONTEXT: interested in large-cap tech",
         portfolio_block='[{"ticker":"AAPL","shares":25}]',
+        agent_memory_contexts={
+            "news_agent": "- [2026-04-26T00:01:00+00:00] actions=newsapi; sources=3"
+        },
     )
 
     payload = asyncio.run(agent._plan_node(state))
@@ -131,6 +134,12 @@ def test_plan_node_receives_portfolio_context_message() -> None:
         isinstance(message, SystemMessage)
         and "PORTFOLIO HOLDINGS" in str(message.content)
         and "AAPL" in str(message.content)
+        for message in captured["messages"]
+    )
+    assert any(
+        isinstance(message, SystemMessage)
+        and "Agent memory contexts from prior turns" in str(message.content)
+        and "news_agent" in str(message.content)
         for message in captured["messages"]
     )
 

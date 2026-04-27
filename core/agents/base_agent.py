@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Type, get_args, get_origin
+from typing import Any, Dict, Type, get_args, get_origin
 
 from pydantic import BaseModel, Field
 
@@ -86,3 +86,15 @@ class AbstractAgent(ABC):
             lines.append(f"- {name}: {type_str}{default_str} — {desc}")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
+        """
+        Render a compact single-line summary used to feed this agent's prior-turn
+        memory back into future orchestrator planning/execution.
+
+        Sub-agents should override this to keep formatting logic domain-local.
+        """
+        if not memory_summary:
+            return ""
+        return str(memory_summary)

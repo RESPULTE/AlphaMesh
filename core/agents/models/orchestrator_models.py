@@ -29,9 +29,9 @@ class InvestmentSignalDetection(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Inference certainty (0.0–1.0). "
-            "1.0 = explicit stance verb; 0.7–0.9 = strong implicit; "
-            "0.4–0.6 = inferred; omit signal entirely if below 0.4."
+            "Inference certainty (0.0â€“1.0). "
+            "1.0 = explicit stance verb; 0.7â€“0.9 = strong implicit; "
+            "0.4â€“0.6 = inferred; omit signal entirely if below 0.4."
         ),
     )
 
@@ -45,22 +45,10 @@ class LearningSignalDetection(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Inference certainty (0.0–1.0). "
-            "1.0 = explicit learning request; 0.7–0.9 = strong implicit; "
-            "0.4–0.6 = inferred; omit signal entirely if below 0.4."
+            "Inference certainty (0.0â€“1.0). "
+            "1.0 = explicit learning request; 0.7â€“0.9 = strong implicit; "
+            "0.4â€“0.6 = inferred; omit signal entirely if below 0.4."
         ),
-    )
-
-
-class LearningSignalDetection(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    status: Literal["Interested", "Understood", "Confused", "Not Interested"]
-    target_entities: List[UserInterestEntity] = Field(default_factory=list)
-    confidence: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="LLM confidence in this signal (0.0–1.0). Omit signals below 0.4.",
     )
 
 
@@ -71,7 +59,7 @@ class OrchestratorPlan(BaseAgentInput):
     Inherits all agent-dispatch fields from BaseAgentInput
     (query, ticker, start_date, end_date, metrics, granularity, conversation_id)
     so those fields are declared exactly once and _execute_node can call
-    plan.model_copy(update={"query": agent_query}) directly — no dict-filtering
+    plan.model_copy(update={"query": agent_query}) directly â€” no dict-filtering
     hack required.
 
     Orchestrator-only fields are declared below.
@@ -85,7 +73,7 @@ class OrchestratorPlan(BaseAgentInput):
         description="The original (or lightly cleaned) user query, for downstream context.",
     )
 
-    # ── Orchestrator-only fields ──────────────────────────────────────────────
+    # â”€â”€ Orchestrator-only fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     ticker: Optional[str] = Field(
         default=None,
@@ -135,8 +123,8 @@ class OrchestratorState(BaseModel):
     """
     LangGraph state for the orchestrator pipeline.
 
-    `user_context_block` is populated once — synchronously from the
-    UserContextService in-memory cache — at the start of `run()`, before the
+    `user_context_block` is populated once â€” synchronously from the
+    UserContextService in-memory cache â€” at the start of `run()`, before the
     graph is invoked.  There is no `load_context` node: context loading is
     handled externally (on session start) and the cache read is O(1).
     """

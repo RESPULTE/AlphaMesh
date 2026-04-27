@@ -2,7 +2,7 @@
 core/agents/orchestrator_agent.py
 
 Changes from previous version
-──────────────────────────────
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 1. run() now calls graph_queue_manager.open_session() before graph.ainvoke()
    and graph_queue_manager.flush_turn() + close_session() after it returns.
    This is the single addition required for the graph queue lifecycle.
@@ -16,7 +16,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -40,6 +40,9 @@ from core.agents.utils import (
     _build_clarification_message,
     _build_combined_company_context,
     _extract_last_human_message,
+    build_agent_memory_contexts,
+    build_planner_memory_block,
+    build_turn_window_block,
 )
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
@@ -58,7 +61,6 @@ AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
 _SYNTHESIS_TURN_WINDOW: int = 8
 _PLANNER_TURN_WINDOW: int = 12
 _AGENT_MEMORY_WINDOW: int = 8
-_MAX_TURN_TEXT_CHARS: int = 360
 
 
 def _sanitize_portfolio_user_email(user_email: str) -> str:
@@ -96,17 +98,6 @@ def get_portfolio_for_user(base_path: str, user_email: Optional[str]) -> List[di
         return []
 
 
-def _trim_text(value: Any, *, max_chars: int = _MAX_TURN_TEXT_CHARS) -> str:
-    text = str(value or "").strip()
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 3].rstrip() + "..."
-
-
-def _normalise_turn_timestamp(turn: dict) -> str:
-    return str(turn.get("created_at") or turn.get("timestamp") or "").strip()
-
-
 class OrchestratorAgent:
     def __init__(self):
         self._llm = service_manager.get_agent(temperature=0)
@@ -121,74 +112,15 @@ class OrchestratorAgent:
     def name(self) -> str:
         return "Orchestrator Agent"
 
-    @staticmethod
-    def _build_turn_window_block(turns: List[dict], window: int) -> str:
-        if not turns:
-            return "(no prior turns)"
-        lines: List[str] = []
-        for idx, turn in enumerate(turns[-window:], start=1):
-            ts = _normalise_turn_timestamp(turn) or "unknown_time"
-            user_message = _trim_text(turn.get("user_message") or "")
-            synthesis = _trim_text(turn.get("assistant_synthesis") or "")
-            lines.append(
-                f"{idx}. [{ts}] User: {user_message or '(empty)'}\n"
-                f"   Assistant: {synthesis or '(empty)'}"
-            )
-        return "\n".join(lines)
-
-    @staticmethod
-    def _format_news_memory_summary(summary: dict) -> str:
-        actions = summary.get("research_actions") or summary.get("tools_used") or []
-        if not isinstance(actions, list):
-            actions = []
-        actions_block = ",".join(str(a) for a in actions[:4]) or "none"
-        source_count = int(summary.get("source_count") or 0)
-        sentiment = summary.get("sentiment") or {}
-        sentiment_label = (
-            str(sentiment.get("label") or "").strip()
-            if isinstance(sentiment, dict)
-            else ""
-        )
-        main_catalyst = _trim_text(summary.get("main_catalyst") or "", max_chars=200)
-        refs = summary.get("top_references") or []
-        top_titles: List[str] = []
-        if isinstance(refs, list):
-            for ref in refs[:2]:
-                if isinstance(ref, dict):
-                    top_titles.append(_trim_text(ref.get("title") or "", max_chars=80))
-        refs_block = "; ".join(t for t in top_titles if t) or "none"
-        return (
-            f"actions={actions_block}; sources={source_count}; "
-            f"sentiment={sentiment_label or 'N/A'}; "
-            f"catalyst={main_catalyst or 'N/A'}; refs={refs_block}"
-        )
-
-    @staticmethod
-    def _format_fundamental_memory_summary(summary: dict) -> str:
-        tools = summary.get("tools_used") or []
-        if not isinstance(tools, list):
-            tools = []
-        tools_block = ",".join(str(t) for t in tools[:5]) or "none"
-
-        key_rows = summary.get("key_rows") or summary.get("computed_rows") or []
-        if not isinstance(key_rows, list):
-            key_rows = []
-        rows_block = ",".join(str(r) for r in key_rows[:6]) or "none"
-
-        task_completed = bool(summary.get("task_completed", True))
-        conclusion = _trim_text(summary.get("main_conclusion") or "", max_chars=220)
-        return (
-            f"tools={tools_block}; rows={rows_block}; "
-            f"task_completed={task_completed}; conclusion={conclusion or 'N/A'}"
-        )
-
     @classmethod
-    def _render_agent_memory_summary(cls, agent_name: str, summary: dict) -> str:
-        if agent_name == "news_agent":
-            return cls._format_news_memory_summary(summary)
-        if agent_name == "fundamentals_agent":
-            return cls._format_fundamental_memory_summary(summary)
-        return _trim_text(json.dumps(summary, ensure_ascii=True), max_chars=350)
+    def _get_memory_summary_renderers(cls) -> Dict[str, Callable[[dict], str]]:
+        renderers: Dict[str, Callable[[dict], str]] = {}
+        for agent_cls in AVAILABLE_AGENTS:
+            agent_name = agent_cls.name()
+            renderer = getattr(agent_cls, "render_memory_summary", None)
+            if callable(renderer):
+                renderers[agent_name] = renderer
+        return renderers
 
     @classmethod
     def _build_agent_memory_contexts(
@@ -196,28 +128,11 @@ class OrchestratorAgent:
         turns: List[dict],
         window: int = _AGENT_MEMORY_WINDOW,
     ) -> Dict[str, str]:
-        by_agent: Dict[str, List[Tuple[str, dict]]] = {}
-        for turn in turns:
-            summaries = turn.get("agent_memory_summaries") or {}
-            if not isinstance(summaries, dict):
-                continue
-            ts = _normalise_turn_timestamp(turn) or "unknown_time"
-            for agent_name, payload in summaries.items():
-                if not isinstance(payload, dict):
-                    continue
-                by_agent.setdefault(str(agent_name), []).append((ts, payload))
-
-        rendered: Dict[str, str] = {}
-        for agent_name, rows in by_agent.items():
-            lines = []
-            for ts, payload in rows[-window:]:
-                lines.append(
-                    f"- [{ts}] {cls._render_agent_memory_summary(agent_name, payload)}"
-                )
-            rendered[agent_name] = "\n".join(lines)
-        return rendered
-
-    # ── Graph wiring ──────────────────────────────────────────────────────────
+        return build_agent_memory_contexts(
+            turns,
+            cls._get_memory_summary_renderers(),
+            window=window,
+        )
 
     def _router(self, state: OrchestratorState) -> str:
         if state.plan is None:
@@ -266,7 +181,71 @@ class OrchestratorAgent:
         workflow.add_edge("synthesiser", END)
         return workflow.compile()
 
-    # ── Public entry point ────────────────────────────────────────────────────
+    def _load_user_context_block(self, user_email: Optional[str]) -> str:
+        if not user_email:
+            return "USER CONTEXT: None"
+        try:
+            svc = service_manager.get_user_context_service()
+            return svc.get_formatted_context(user_email) or "USER CONTEXT: None"
+        except Exception:
+            logger.exception(
+                "run: failed to read user context from cache for %s", user_email
+            )
+            return "USER CONTEXT: None"
+
+    @staticmethod
+    def _load_portfolio_block(user_email: Optional[str]) -> str:
+        portfolio = get_portfolio_for_user(settings.PORTFOLIO_JSON_PATH, user_email)
+        return json.dumps(portfolio, indent=2) if portfolio else "[]"
+
+    @staticmethod
+    async def _open_graph_session(conversation_id: Optional[str]) -> None:
+        if not conversation_id:
+            return
+        try:
+            await service_manager.get_graph_queue_manager().open_session(
+                conversation_id
+            )
+        except Exception:
+            logger.exception(
+                "run: failed to open graph queue session for '%s'", conversation_id
+            )
+
+    @staticmethod
+    async def _flush_graph_turn(conversation_id: Optional[str], turn_id: str) -> None:
+        if not conversation_id:
+            return
+        try:
+            await service_manager.get_graph_queue_manager().flush_turn(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            )
+        except Exception:
+            logger.exception("run: failed to flush graph queue turn_id='%s'", turn_id)
+
+    def _build_initial_state(
+        self,
+        *,
+        messages: List[BaseMessage],
+        conversation_id: Optional[str],
+        user_email: Optional[str],
+        history_turns: Optional[List[dict]],
+        turn_id: str,
+    ) -> OrchestratorState:
+        normalized_history_turns = list(history_turns or [])
+        agent_memory_contexts = self._build_agent_memory_contexts(
+            normalized_history_turns
+        )
+        return OrchestratorState(
+            messages=messages,
+            conversation_id=conversation_id,
+            user_email=user_email,
+            history_turns=normalized_history_turns,
+            agent_memory_contexts=agent_memory_contexts,
+            user_context_block=self._load_user_context_block(user_email),
+            portfolio_block=self._load_portfolio_block(user_email),
+            turn_id=turn_id,
+        )
 
     async def run(
         self,
@@ -285,48 +264,16 @@ class OrchestratorAgent:
           4. close_session() is NOT called here — sessions persist across turns
              and are closed by the API layer when the user disconnects.
         """
-        user_context_block = "USER CONTEXT: None"
-        if user_email:
-            try:
-                svc = service_manager.get_user_context_service()
-                user_context_block = (
-                    svc.get_formatted_context(user_email) or "USER CONTEXT: None"
-                )
-            except Exception:
-                logger.exception(
-                    "run: failed to read user context from cache for %s", user_email
-                )
-
-        portfolio = get_portfolio_for_user(settings.PORTFOLIO_JSON_PATH, user_email)
-        portfolio_block = json.dumps(portfolio, indent=2) if portfolio else "[]"
-
         turn_id = str(uuid4())
         logger.info("run: turn_id=%s", turn_id)
 
-        # ── Step 1: open session (idempotent — no-op if already open) ─────────
-        if conversation_id:
-            try:
-                await service_manager.get_graph_queue_manager().open_session(
-                    conversation_id
-                )
-            except Exception:
-                logger.exception(
-                    "run: failed to open graph queue session for '%s'", conversation_id
-                )
+        await self._open_graph_session(conversation_id)
 
-        normalized_history_turns = list(history_turns or [])
-        agent_memory_contexts = self._build_agent_memory_contexts(
-            normalized_history_turns
-        )
-
-        initial_state = OrchestratorState(
+        initial_state = self._build_initial_state(
             messages=messages,
             conversation_id=conversation_id,
             user_email=user_email,
-            history_turns=normalized_history_turns,
-            agent_memory_contexts=agent_memory_contexts,
-            user_context_block=user_context_block,
-            portfolio_block=portfolio_block,
+            history_turns=history_turns,
             turn_id=turn_id,
         )
 
@@ -352,17 +299,7 @@ class OrchestratorAgent:
                 turn_id=turn_id,
             )
 
-        # ── Step 2: flush turn (fire-and-forget — returns immediately) ────────
-        if conversation_id:
-            try:
-                await service_manager.get_graph_queue_manager().flush_turn(
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
-                )
-            except Exception:
-                logger.exception(
-                    "run: failed to flush graph queue turn_id='%s'", turn_id
-                )
+        await self._flush_graph_turn(conversation_id, turn_id)
 
         return self._coerce_final_response(raw)
 
@@ -378,7 +315,9 @@ class OrchestratorAgent:
                 fundamental_data=raw.get("fundamental_data"),
                 fundamentals_visualization=raw.get("fundamentals_visualization"),
                 fundamentals_raw_display_data=raw.get("fundamentals_raw_display_data"),
-                fundamentals_task_completed=raw.get("fundamentals_task_completed", True),
+                fundamentals_task_completed=raw.get(
+                    "fundamentals_task_completed", True
+                ),
                 fundamentals_task_completion_reason=raw.get(
                     "fundamentals_task_completion_reason", ""
                 ),
@@ -391,9 +330,7 @@ class OrchestratorAgent:
         return FinalResponse(
             summary=getattr(raw, "summary", "") or "",
             fundamental_data=getattr(raw, "fundamental_data", None),
-            fundamentals_visualization=getattr(
-                raw, "fundamentals_visualization", None
-            ),
+            fundamentals_visualization=getattr(raw, "fundamentals_visualization", None),
             fundamentals_raw_display_data=getattr(
                 raw, "fundamentals_raw_display_data", None
             ),
@@ -409,8 +346,6 @@ class OrchestratorAgent:
             tickers=getattr(raw, "tickers", []) or [],
             turn_id=getattr(raw, "turn_id", "") or "",
         )
-
-    # ── Prompt builders ───────────────────────────────────────────────────────
 
     def _build_synthesis_system_prompt(
         self,
@@ -428,8 +363,6 @@ class OrchestratorAgent:
     def _extract_response_text(raw: str) -> str:
         return raw.strip()
 
-    # ── Nodes ─────────────────────────────────────────────────────────────────
-
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
         available_agents_desc = "\n".join(
             f"  {agent.name()}: {agent.description()}" for agent in AVAILABLE_AGENTS
@@ -444,9 +377,10 @@ class OrchestratorAgent:
             f"{state.portfolio_block}"
         )
         latest_human = _extract_last_human_message(state.messages)
-        planner_turn_block = self._build_turn_window_block(
+        planner_turn_block = build_turn_window_block(
             state.history_turns, _PLANNER_TURN_WINDOW
         )
+        planner_memory_block = build_planner_memory_block(state.agent_memory_contexts)
 
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
@@ -459,12 +393,19 @@ class OrchestratorAgent:
                         f"{planner_turn_block}"
                     )
                 ),
+                SystemMessage(
+                    content=(
+                        "Agent memory contexts from prior turns (use for continuity "
+                        "during routing and per-agent query rewrites):\n"
+                        f"{planner_memory_block}"
+                    )
+                ),
                 HumanMessage(content=latest_human),
             ]
             plan: OrchestratorPlan = await structured_llm.ainvoke(planner_messages)
             publish_progress(
                 "orchestrator",
-                f"Routing → agents={plan.target_agents or []}, needs_memory={plan.needs_memory}",
+                f"Routing â†’ agents={plan.target_agents or []}, needs_memory={plan.needs_memory}",
             )
             logger.info(
                 "_plan_node: agents=%s needs_memory=%s final_answer=%s ticker=%s",
@@ -476,7 +417,7 @@ class OrchestratorAgent:
             return {"plan": plan}
 
         except Exception:
-            logger.exception("_plan_node: LLM call failed — using safe fallback plan")
+            logger.exception("_plan_node: LLM call failed â€” using safe fallback plan")
             return {"plan": None}
 
     async def _direct_answer_node(self, state: OrchestratorState) -> Dict[str, Any]:
@@ -529,7 +470,7 @@ class OrchestratorAgent:
             t for t, info in results.items() if info.is_valid and info.is_equity
         ]
 
-        # ── Re-publish ticker_resolved with validated symbols ──────────────────
+        # â”€â”€ Re-publish ticker_resolved with validated symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Defensive: covers the case where _plan_node ran on a different async
         # context before the sink was registered, or ticker casing differed.
         if confirmed_tickers:
@@ -603,14 +544,17 @@ class OrchestratorAgent:
         for name, res in zip(names, results):
             if isinstance(res, Exception):
                 logger.error(
-                    "_execute_node: agent '%s' failed — %s", name, res, exc_info=res
+                    "_execute_node: agent '%s' failed â€” %s", name, res, exc_info=res
                 )
             else:
                 outputs[name] = res
 
         return {"agent_outputs": outputs}
 
-    async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
+    @staticmethod
+    def _collect_synthesis_inputs(
+        agent_outputs: Dict[str, BaseAgentOutput],
+    ) -> Dict[str, Any]:
         context_parts: List[str] = []
         fundamental_df = None
         fundamentals_visualization = None
@@ -619,8 +563,9 @@ class OrchestratorAgent:
         fundamentals_task_completion_reason = ""
         news_sources: List[CitedSource] = []
         agent_memory_summaries: Dict[str, Dict[str, Any]] = {}
+        per_agent_analyses: Dict[str, str] = {}
 
-        for name, output in state.agent_outputs.items():
+        for name, output in agent_outputs.items():
             try:
                 context_parts.append(output.get_llm_context_str())
             except Exception:
@@ -630,7 +575,9 @@ class OrchestratorAgent:
             if name == "fundamentals_agent":
                 fundamental_df = getattr(output, "financial_data", None)
                 fundamentals_visualization = getattr(output, "visualization_plan", None)
-                fundamentals_raw_display_data = getattr(output, "raw_display_data", None)
+                fundamentals_raw_display_data = getattr(
+                    output, "raw_display_data", None
+                )
                 fundamentals_task_completed = bool(
                     getattr(output, "task_completed", True)
                 )
@@ -642,106 +589,130 @@ class OrchestratorAgent:
             memory_summary = getattr(output, "memory_summary", {}) or {}
             if isinstance(memory_summary, dict) and memory_summary:
                 agent_memory_summaries[name] = memory_summary
-
-        portfolio_block = state.portfolio_block or "[]"
-        synthesis_turn_block = self._build_turn_window_block(
-            state.history_turns, _SYNTHESIS_TURN_WINDOW
-        )
-        latest_human = _extract_last_human_message(state.messages)
-
-        analysis_text = ""
-
-        publish_progress("orchestrator", "Synthesising final response…")
-
-        if not context_parts and not state.user_context_block and not portfolio_block:
-            analysis_text = (
-                "I wasn't able to retrieve data for your query at this time. "
-                "Please try again or rephrase your question."
-            )
-        else:
-            try:
-                system_prompt = self._build_synthesis_system_prompt(
-                    user_context=state.user_context_block,
-                    portfolio=portfolio_block,
-                    context_parts=context_parts,
-                )
-                messages: List[BaseMessage] = [
-                    SystemMessage(content=system_prompt),
-                    SystemMessage(
-                        content=(
-                            "Recent conversation turns (most recent window):\n"
-                            f"{synthesis_turn_block}"
-                        )
-                    ),
-                    HumanMessage(
-                        content=(
-                            f"Latest user question:\n{latest_human}\n\n"
-                            "Produce the final analysis response."
-                        )
-                    ),
-                ]
-                response = await self._llm.ainvoke(messages)
-                analysis_text = self._extract_response_text(
-                    response.content if response else ""
-                )
-
-                publish_success("orchestrator", "Synthesis complete.")
-            except Exception:
-                logger.exception("_synthesize_node: LLM synthesis failed")
-                analysis_text = (
-                    "I encountered an error while synthesising the analysis. "
-                    "The raw data was retrieved but could not be summarised."
-                )
-
-        # User signal write-back (investment signals only)
-        if state.user_email and state.plan and state.conversation_id:
-            investment_signals = state.plan.detected_investment_signals or []
-            if investment_signals:
-                user_message = _extract_last_human_message(state.messages)
-                payload = build_signal_payload(
-                    user_email=state.user_email,
-                    conversation_id=state.conversation_id,
-                    turn_id=state.turn_id,
-                    ticker_metadata=state.ticker_metadata,
-                    user_message=user_message,
-                    detected_investment_signals=investment_signals,
-                    detected_learning_signals=[],
-                    interest_edges=[],
-                )
-                relationships, cache_entries = await build_user_signal_relationships(
-                    payload
-                )
-                if relationships:
-                    try:
-                        task = make_graph_task(
-                            turn_id=state.turn_id,
-                            conversation_id=state.conversation_id,
-                            source_agent=self.name(),
-                            relationships=relationships,
-                        )
-                        await service_manager.get_graph_queue_manager().enqueue(task)
-                    except Exception:
-                        logger.exception(
-                            "_synthesize_node: failed to enqueue user signal relationships"
-                        )
-                if cache_entries:
-                    update_user_signal_cache(cache_entries, state.user_email)
-
-        per_agent_analyses: Dict[str, str] = {
-            name: getattr(output, "analysis", "") or ""
-            for name, output in state.agent_outputs.items()
-        }
+            per_agent_analyses[name] = getattr(output, "analysis", "") or ""
 
         return {
-            "summary": analysis_text,
-            "fundamental_data": fundamental_df,
+            "context_parts": context_parts,
+            "fundamental_df": fundamental_df,
             "fundamentals_visualization": fundamentals_visualization,
             "fundamentals_raw_display_data": fundamentals_raw_display_data,
             "fundamentals_task_completed": fundamentals_task_completed,
             "fundamentals_task_completion_reason": fundamentals_task_completion_reason,
-            "sources": news_sources,
-            "agent_analyses": per_agent_analyses,
+            "news_sources": news_sources,
             "agent_memory_summaries": agent_memory_summaries,
+            "per_agent_analyses": per_agent_analyses,
+        }
+
+    async def _build_synthesis_text(
+        self,
+        *,
+        state: OrchestratorState,
+        context_parts: List[str],
+    ) -> str:
+        portfolio_block = state.portfolio_block or "[]"
+        synthesis_turn_block = build_turn_window_block(
+            state.history_turns, _SYNTHESIS_TURN_WINDOW
+        )
+        latest_human = _extract_last_human_message(state.messages)
+
+        publish_progress("orchestrator", "Synthesising final response...")
+
+        if not context_parts and not state.user_context_block and not portfolio_block:
+            return (
+                "I wasn't able to retrieve data for your query at this time. "
+                "Please try again or rephrase your question."
+            )
+        try:
+            system_prompt = self._build_synthesis_system_prompt(
+                user_context=state.user_context_block,
+                portfolio=portfolio_block,
+                context_parts=context_parts,
+            )
+            messages: List[BaseMessage] = [
+                SystemMessage(content=system_prompt),
+                SystemMessage(
+                    content=(
+                        "Recent conversation turns (most recent window):\n"
+                        f"{synthesis_turn_block}"
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Latest user question:\n{latest_human}\n\n"
+                        "Produce the final analysis response."
+                    )
+                ),
+            ]
+            response = await self._llm.ainvoke(messages)
+            publish_success("orchestrator", "Synthesis complete.")
+            return self._extract_response_text(response.content if response else "")
+        except Exception:
+            logger.exception("_synthesize_node: LLM synthesis failed")
+            return (
+                "I encountered an error while synthesising the analysis. "
+                "The raw data was retrieved but could not be summarised."
+            )
+
+    async def _write_back_investment_signals(self, state: OrchestratorState) -> None:
+        if not (state.user_email and state.plan and state.conversation_id):
+            return
+        investment_signals = state.plan.detected_investment_signals or []
+        if not investment_signals:
+            return
+        user_message = _extract_last_human_message(state.messages)
+        payload = build_signal_payload(
+            user_email=state.user_email,
+            conversation_id=state.conversation_id,
+            turn_id=state.turn_id,
+            ticker_metadata=state.ticker_metadata,
+            user_message=user_message,
+            detected_investment_signals=investment_signals,
+            detected_learning_signals=[],
+            interest_edges=[],
+        )
+        relationships, cache_entries = await build_user_signal_relationships(payload)
+        if relationships:
+            try:
+                task = make_graph_task(
+                    turn_id=state.turn_id,
+                    conversation_id=state.conversation_id,
+                    source_agent=self.name(),
+                    relationships=relationships,
+                )
+                await service_manager.get_graph_queue_manager().enqueue(task)
+            except Exception:
+                logger.exception(
+                    "_synthesize_node: failed to enqueue user signal relationships"
+                )
+        if cache_entries:
+            update_user_signal_cache(cache_entries, state.user_email)
+
+    async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
+        synthesis_inputs = self._collect_synthesis_inputs(state.agent_outputs)
+        analysis_text = await self._build_synthesis_text(
+            state=state,
+            context_parts=synthesis_inputs["context_parts"],
+        )
+        await self._write_back_investment_signals(state)
+
+        return {
+            "summary": analysis_text,
+            "fundamental_data": synthesis_inputs["fundamental_df"],
+            "fundamentals_visualization": synthesis_inputs[
+                "fundamentals_visualization"
+            ],
+            "fundamentals_raw_display_data": synthesis_inputs[
+                "fundamentals_raw_display_data"
+            ],
+            "fundamentals_task_completed": synthesis_inputs[
+                "fundamentals_task_completed"
+            ],
+            "fundamentals_task_completion_reason": synthesis_inputs[
+                "fundamentals_task_completion_reason"
+            ],
+            "sources": synthesis_inputs["news_sources"],
+            "agent_analyses": synthesis_inputs["per_agent_analyses"],
+            "agent_memory_summaries": synthesis_inputs["agent_memory_summaries"],
             "tickers": state.plan.tickers if state.plan else [],
             "turn_id": state.turn_id,
         }
