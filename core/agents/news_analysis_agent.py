@@ -51,6 +51,9 @@ logger = get_logger(__name__)
 _ENTITY_CACHE: Dict[str, Dict[Tuple[str, str], Tuple[str, str]]] = {}
 _ENTITY_CACHE_TS: Dict[str, float] = {}
 
+# Maximum number of RetrievedChunk objects retained per conversation in working memory.
+_WORKING_MEMORY_MAX_CHUNKS: int = 100
+
 
 class NewsAnalysisStructuredOutput(BaseModel):
     analysis: str
@@ -215,7 +218,9 @@ def _build_context_prefix(
     if agent_memory_context:
         sections.append(f"Agent Memory Context:\n{agent_memory_context}")
     if cached_entities:
-        entity_lines = [f"  - {name} ({entity_type})" for name, entity_type in cached_entities]
+        entity_lines = [
+            f"  - {name} ({entity_type})" for name, entity_type in cached_entities
+        ]
         sections.append("Known entities from prior turns:\n" + "\n".join(entity_lines))
     if not sections:
         return ""
@@ -226,12 +231,16 @@ def _remap_citations_and_sources(
     analysis_text: str,
     sources: List[CitedSource],
 ) -> Tuple[str, List[CitedSource]]:
-    cited_ids = sorted(set(int(match) for match in _re.findall(r"\[(\d+)\]", analysis_text)))
+    cited_ids = sorted(
+        set(int(match) for match in _re.findall(r"\[(\d+)\]", analysis_text))
+    )
     old_to_new = {old_id: new_id for new_id, old_id in enumerate(cited_ids, start=1)}
 
     def _remap(match: _re.Match[str]) -> str:
         source_id = int(match.group(1))
-        return f"[{old_to_new[source_id]}]" if source_id in old_to_new else match.group(0)
+        return (
+            f"[{old_to_new[source_id]}]" if source_id in old_to_new else match.group(0)
+        )
 
     remapped_text = _re.sub(r"\[(\d+)\]", _remap, analysis_text)
     if not old_to_new:
@@ -272,6 +281,10 @@ class NewsAnalysisAgent(AbstractAgent):
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
         self._memory_context_by_conversation: Dict[str, str] = {}
+        # Working memory: stores the reranked RetrievedChunk objects accessed during
+        # each turn, keyed by conversation_id.  Chunks are deduplicated by chunk_id
+        # and capped at _WORKING_MEMORY_MAX_CHUNKS entries per conversation.
+        self._working_memory_by_conversation: Dict[str, List[RetrievedChunk]] = {}
 
     @staticmethod
     def name() -> str:
@@ -314,6 +327,44 @@ class NewsAnalysisAgent(AbstractAgent):
             f"catalyst={catalyst or 'N/A'}"
         )
 
+    # -- Working memory helpers ------------------------------------------------
+
+    def _get_working_memory_chunks(self, conversation_id: str) -> List[RetrievedChunk]:
+        """Return a snapshot of previously accessed chunks for this conversation."""
+        if not conversation_id:
+            return []
+        return list(self._working_memory_by_conversation.get(conversation_id, []))
+
+    def _update_working_memory_chunks(
+        self,
+        conversation_id: str,
+        new_chunks: List[RetrievedChunk],
+    ) -> None:
+        """Merge new_chunks into this conversation's working memory.
+
+        Deduplicates by chunk_id (new chunks take precedence) and caps the store
+        at _WORKING_MEMORY_MAX_CHUNKS, retaining the most-recently merged tail.
+        Chunks without a chunk_id are silently skipped.
+        """
+        if not conversation_id or not new_chunks:
+            return
+        existing = self._working_memory_by_conversation.get(conversation_id, [])
+        chunk_map: Dict[str, RetrievedChunk] = {
+            c.chunk_id: c for c in existing if c.chunk_id
+        }
+        for chunk in new_chunks:
+            if chunk.chunk_id:
+                chunk_map[chunk.chunk_id] = chunk
+        merged = list(chunk_map.values())
+        if len(merged) > _WORKING_MEMORY_MAX_CHUNKS:
+            merged = merged[-_WORKING_MEMORY_MAX_CHUNKS:]
+        self._working_memory_by_conversation[conversation_id] = merged
+        logger.debug(
+            "_update_working_memory_chunks: conversation=%s stored=%d chunks",
+            conversation_id,
+            len(merged),
+        )
+
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
         start_date, end_date = _get_default_date_range(
@@ -342,6 +393,11 @@ class NewsAnalysisAgent(AbstractAgent):
         state_payload["memory_task"] = None
         final_state = await self._graph.ainvoke(state_payload)
         output = NewsAgentOutput(**final_state)
+
+        # Persist the reranked chunks from this turn into per-conversation working memory.
+        final_chunks: List[RetrievedChunk] = final_state.get("final_chunks") or []
+        self._update_working_memory_chunks(conversation_id, final_chunks)
+
         persist_agent_memory_summary(
             conversation_id=conversation_id,
             rendered_summary=self.render_memory_summary(output.memory_summary),
@@ -477,9 +533,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         if at_limit or threshold_met:
             if at_limit:
-                reason = (
-                    f"Reached research iteration limit ({state.max_research_iterations})."
-                )
+                reason = f"Reached research iteration limit ({state.max_research_iterations})."
             else:
                 reason = (
                     "Sufficiency threshold reached "
@@ -666,8 +720,12 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         try:
-            new_chunk_ids, existing_chunk_ids, _ = (
-                await service_manager.get_ingestor().ingest_articles(state.latest_articles)
+            (
+                new_chunk_ids,
+                existing_chunk_ids,
+                _,
+            ) = await service_manager.get_ingestor().ingest_articles(
+                state.latest_articles
             )
             publish_success(
                 "news_agent",

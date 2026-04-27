@@ -16,24 +16,32 @@ export default function App() {
 
   const handleAnalyze = (query: string) => {
     setAnalysisQuery(query);
-    setOpenConversationId(null); // clear any pending deep-link
+    setOpenConversationId(null);
     setCurrentTab('History');
-    // Simulate streaming state for the chat input
     setIsStreaming(true);
-    setTimeout(() => setIsStreaming(false), 5000); // Match the mock stream duration
+    setTimeout(() => setIsStreaming(false), 5000);
   };
 
   const handleOpenConversation = (conversationId: string) => {
-    setAnalysisQuery(null);        // don't start a new analysis
+    setAnalysisQuery(null);
     setOpenConversationId(conversationId);
     setCurrentTab('History');
+  };
+
+  /**
+   * Called when the user types a new message inside the FullConversationView modal.
+   * Sets the active conversation in localStorage so the backend continues in the
+   * same thread, then kicks off a fresh analysis stream.
+   */
+  const handleContinueConversation = (_conversationId: string, query: string) => {
+    // The conversation_id is already written to localStorage by openFullView in History.tsx
+    handleAnalyze(query);
   };
 
   const handleSetTab = (tab: string) => {
     if (tab === 'History' && currentTab === 'History') {
       setAnalysisQuery(null);
     }
-    // Reset the deep-link when manually switching tabs
     if (tab !== 'History') {
       setOpenConversationId(null);
     }
@@ -43,7 +51,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-surface text-on-surface font-body selection:bg-primary-container/30 flex flex-col pb-20 md:pb-0">
       <TopNav currentTab={currentTab} setTab={handleSetTab} />
-      
+
       <div className="flex-grow flex flex-col relative">
         <AnimatePresence mode="wait">
           {currentTab === 'Chat' && (
@@ -60,8 +68,7 @@ export default function App() {
               query={analysisQuery}
               onClearQuery={() => setAnalysisQuery(null)}
               initialExpandedId={openConversationId}
-              onAnalyze={handleAnalyze}
-              isStreaming={isStreaming}
+              onContinueConversation={handleContinueConversation}
             />
           )}
         </AnimatePresence>
@@ -70,7 +77,7 @@ export default function App() {
       {currentTab === 'History' && analysisQuery && (
         <ChatInput onAnalyze={handleAnalyze} isStreaming={isStreaming} />
       )}
-      
+
       <BottomNav currentTab={currentTab} setTab={handleSetTab} />
     </div>
   );
