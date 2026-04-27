@@ -281,6 +281,7 @@ class ConversationTurn(BaseModel):
     user_message: str
     assistant_synthesis: str
     agent_analyses: Dict[str, str] = Field(default_factory=dict)
+    agent_memory_summaries: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     ticker_results: List[TickerResult] = Field(default_factory=list)
     tickers: List[str] = Field(default_factory=list)
 

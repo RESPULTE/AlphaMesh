@@ -33,6 +33,7 @@ from api.services.conversation_service import ConversationStore
 from api.services.event_broadcaster import EventBroadcaster
 from api.services.session_service import SessionService
 from api.sinks.sse_sink import SSESink
+from core.agents.orchestrator_agent import OrchestratorAgent
 from core.services import service_manager
 
 logger = logging.getLogger(__name__)
@@ -155,10 +156,12 @@ class AnalysisRunner:
         broadcaster: EventBroadcaster,
         store: ConversationStore,
         session_service: SessionService,
+        orchestrator: OrchestratorAgent,
     ) -> None:
         self._broadcaster = broadcaster
         self._store = store
         self._session_service = session_service
+        self._orchestrator = orchestrator
 
     def launch(
         self,
@@ -237,11 +240,8 @@ class AnalysisRunner:
         session_id: str,
     ) -> None:
         """Background task: runs the full agent pipeline for one user turn."""
-        # Import here to avoid circular imports at module load time
-        from core.agents.orchestrator_agent import OrchestratorAgent
         from core.event_queue import _current_response_label, get_queue
 
-        orchestrator = OrchestratorAgent()
         queue = get_queue()
         event_queue = self._broadcaster.get(request_id)
         if event_queue is None:
@@ -317,13 +317,18 @@ class AnalysisRunner:
                 conversation_id,
                 user_email=user_id,
             )
+            history_turns = await self._store.get_turns(
+                conversation_id,
+                user_email=user_id,
+            )
             messages = history + [HumanMessage(content=chat_request.message)]
 
             # -- 4. Run the orchestrator ---------------------------------------
-            final_response = await orchestrator.run(
+            final_response = await self._orchestrator.run(
                 messages=messages,
                 conversation_id=conversation_id,
                 user_email=user_id,
+                history_turns=history_turns,
             )
 
             final_ticker = (getattr(final_response, "tickers", []) or [None])[0]
@@ -369,8 +374,12 @@ class AnalysisRunner:
                 conversation_id=conversation_id,
                 user_id=user_id,
                 session_id=session_id,
+                turn_id=getattr(final_response, "turn_id", "") or f"{conversation_id}:{request_id}",
                 user_message=chat_request.message,
                 final_result=final_result,
+                agent_memory_summaries=(
+                    getattr(final_response, "agent_memory_summaries", {}) or {}
+                ),
             )
             await self._store.append_turn(
                 conversation_id=conversation_id,
@@ -490,12 +499,13 @@ def _build_turn_payload(
     conversation_id: str,
     user_id: str,
     session_id: str,
+    turn_id: str,
     user_message: str,
     final_result: FinalResult,
+    agent_memory_summaries: dict,
 ) -> dict:
     """Build one persisted rich turn record from final response payload."""
     created_at = datetime.now(timezone.utc).isoformat()
-    turn_id = f"{conversation_id}:{request_id}"
     tickers = [r.ticker for r in final_result.ticker_results if r.ticker]
 
     return {
@@ -509,6 +519,7 @@ def _build_turn_payload(
         "user_message": user_message,
         "assistant_synthesis": final_result.synthesis,
         "agent_analyses": final_result.agent_analyses,
+        "agent_memory_summaries": agent_memory_summaries,
         "ticker_results": [r.model_dump() for r in final_result.ticker_results],
         "tickers": tickers,
     }

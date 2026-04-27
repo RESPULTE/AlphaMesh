@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import pandas as pd
 from langchain_core.messages import BaseMessage
@@ -150,6 +150,8 @@ class OrchestratorState(BaseModel):
 
     conversation_id: Optional[str] = None
     user_email: Optional[str] = None
+    history_turns: List[dict] = Field(default_factory=list)
+    agent_memory_contexts: Dict[str, str] = Field(default_factory=dict)
 
     # Populated synchronously in run() from the UserContextService cache.
     user_context_block: str = ""
@@ -197,7 +199,12 @@ class FinalResponse(BaseModel):
     fundamentals_task_completion_reason: str = Field(default="")
     sources: List[CitedSource] = Field(default_factory=list)
     agent_analyses: Dict[str, str] = Field(default_factory=dict)
+    agent_memory_summaries: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     tickers: List[str] = Field(
         default_factory=list,
         description="Ticker symbols processed in this turn (populated by orchestrator).",
+    )
+    turn_id: str = Field(
+        default="",
+        description="Orchestrator-generated turn UUID used across sub-agents.",
     )

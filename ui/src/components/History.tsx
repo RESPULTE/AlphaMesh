@@ -1,11 +1,10 @@
 import { motion, AnimatePresence } from 'motion/react';
 import { ChevronDown, ChevronRight, MessageSquare } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ConversationSummary, ConversationTurn, ConversationTurnsResponse } from '../types/api';
 import AnalysisDashboard from './AnalysisDashboard';
 
 interface HistoryProps {
-  onAnalyze: (query: string) => void;
   query?: string | null;
   onClearQuery?: () => void;
 }
@@ -25,12 +24,15 @@ function truncateConversationId(conversationId: string): string {
   return `${conversationId.slice(0, 8)}...${conversationId.slice(-6)}`;
 }
 
-export default function History({ onAnalyze, query, onClearQuery }: HistoryProps) {
+export default function History({ query, onClearQuery }: HistoryProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationTurns, setConversationTurns] = useState<Record<string, ConversationTurn[]>>({});
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [loadingTurnsFor, setLoadingTurnsFor] = useState<string | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(
+    typeof window !== 'undefined' ? window.localStorage.getItem(STORAGE_CONVERSATION_ID) : null
+  );
 
   useEffect(() => {
     if (query) return;
@@ -57,10 +59,10 @@ export default function History({ onAnalyze, query, onClearQuery }: HistoryProps
     };
   }, [query]);
 
-  const activeConversation = useMemo(
-    () => (typeof window !== 'undefined' ? window.localStorage.getItem(STORAGE_CONVERSATION_ID) : null),
-    [query]
-  );
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    setActiveConversationId(window.localStorage.getItem(STORAGE_CONVERSATION_ID));
+  }, [query]);
 
   const loadTurns = async (conversationId: string) => {
     if (conversationTurns[conversationId]) return;
@@ -88,11 +90,11 @@ export default function History({ onAnalyze, query, onClearQuery }: HistoryProps
     }
   };
 
-  const continueConversation = (conversationId: string, message: string) => {
+  const continueConversation = (conversationId: string) => {
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(STORAGE_CONVERSATION_ID, conversationId);
     }
-    onAnalyze(message.trim() || 'Continue this conversation.');
+    setActiveConversationId(conversationId);
   };
 
   if (query) {
@@ -131,7 +133,7 @@ export default function History({ onAnalyze, query, onClearQuery }: HistoryProps
           const turns = conversationTurns[conversation.conversation_id] || [];
           const latestTurn = turns.length ? turns[turns.length - 1] : null;
           const isExpanded = expandedId === conversation.conversation_id;
-          const isActive = activeConversation === conversation.conversation_id;
+          const isActive = activeConversationId === conversation.conversation_id;
           return (
             <section
               key={conversation.conversation_id}
@@ -218,10 +220,7 @@ export default function History({ onAnalyze, query, onClearQuery }: HistoryProps
                                   </div>
                                   <button
                                     onClick={() =>
-                                      continueConversation(
-                                        conversation.conversation_id,
-                                        turn.user_message
-                                      )
+                                      continueConversation(conversation.conversation_id)
                                     }
                                     className="flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80 transition-colors px-3 py-1.5 rounded-lg hover:bg-primary/10"
                                   >

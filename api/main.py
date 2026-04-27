@@ -34,6 +34,7 @@ async def lifespan(app: FastAPI):
     from core.services import service_manager
 
     await service_manager.startup()
+    orchestrator = service_manager.get_orchestrator_agent()
 
     # API-layer singletons
     broadcaster = EventBroadcaster()
@@ -49,11 +50,13 @@ async def lifespan(app: FastAPI):
         broadcaster=broadcaster,
         store=store,
         session_service=session_service,
+        orchestrator=orchestrator,
     )
 
     app.state.broadcaster = broadcaster
     app.state.store = store
     app.state.runner = runner
+    app.state.orchestrator = orchestrator
     app.state.session_service = session_service
     app.state.portfolio_store = PortfolioJsonStore(
         base_path=settings.PORTFOLIO_JSON_PATH

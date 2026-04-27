@@ -16,6 +16,7 @@ import re as _re
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple, Type
+from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -240,6 +241,7 @@ class NewsAnalysisAgent(AbstractAgent):
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
         self._ingestor = service_manager.get_ingestor()
+        self._memory_context_by_conversation: Dict[str, str] = {}
 
     @staticmethod
     def name() -> str:
@@ -258,19 +260,61 @@ class NewsAnalysisAgent(AbstractAgent):
     def get_output_schema_class() -> Type[BaseModel]:
         return NewsAgentOutput
 
+    @staticmethod
+    def _first_sentence(value: str) -> str:
+        text = (value or "").strip()
+        if not text:
+            return ""
+        match = _re.search(r"(.+?[.!?])(?:\s|$)", text, _re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text[:220]
+
+    @staticmethod
+    def _render_memory_summary(memory_summary: Dict[str, Any]) -> str:
+        if not memory_summary:
+            return ""
+        actions = memory_summary.get("research_actions") or memory_summary.get("tools_used") or []
+        if not isinstance(actions, list):
+            actions = []
+        sentiment = memory_summary.get("sentiment") or {}
+        sentiment_label = ""
+        if isinstance(sentiment, dict):
+            sentiment_label = str(sentiment.get("label") or "").strip()
+        source_count = int(memory_summary.get("source_count") or 0)
+        catalyst = str(memory_summary.get("main_catalyst") or "").strip()
+        return (
+            f"actions={','.join(str(a) for a in actions[:4]) or 'none'}; "
+            f"sources={source_count}; "
+            f"sentiment={sentiment_label or 'N/A'}; "
+            f"catalyst={catalyst or 'N/A'}"
+        )
+
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
         start_date, end_date = _get_default_date_range(
             input_data.start_date, input_data.end_date
         )
         start_date, end_date = _constrain_date_range(start_date, end_date)
+        conversation_id = (input_data.conversation_id or "").strip()
+        incoming_memory_context = (input_data.agent_memory_context or "").strip()
+        cached_memory_context = (
+            self._memory_context_by_conversation.get(conversation_id, "")
+            if conversation_id
+            else ""
+        )
+        effective_memory_context = incoming_memory_context or cached_memory_context
+        if conversation_id and incoming_memory_context and incoming_memory_context != cached_memory_context:
+            self._memory_context_by_conversation[conversation_id] = incoming_memory_context
 
         initial_state = NewsAgentState(
             query=input_data.query,
             ticker=input_data.ticker or "",
             start_date=start_date,
             end_date=end_date,
-            conversation_id=input_data.conversation_id,
+            conversation_id=conversation_id or None,
+            turn_id=input_data.turn_id,
+            agent_memory_context=effective_memory_context,
             company_context=input_data.company_context,
             max_research_iterations=settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS,
         )
@@ -281,7 +325,14 @@ class NewsAnalysisAgent(AbstractAgent):
         # It starts as None; _rewrite_queries_node sets it.
         state_payload["memory_task"] = None
         final_state = await self._graph.ainvoke(state_payload)
-        return NewsAgentOutput(**final_state)
+        output = NewsAgentOutput(**final_state)
+
+        if conversation_id:
+            rendered_summary = self._render_memory_summary(output.memory_summary)
+            if rendered_summary:
+                self._memory_context_by_conversation[conversation_id] = rendered_summary
+
+        return output
 
     # -- Graph construction ----------------------------------------------------
 
@@ -450,6 +501,11 @@ class NewsAnalysisAgent(AbstractAgent):
             f"Recent research history:\n{self._history_block(state.research_logs)}\n\n"
             "Return only ResearchStepPlan."
         )
+        if state.agent_memory_context:
+            planner_prompt += (
+                "\n\nAgent Memory Context (from prior turns):\n"
+                f"{state.agent_memory_context}"
+            )
         publish_progress("news_agent", "Planning next research step...")
         try:
             structured_llm = self._llm.with_structured_output(ResearchStepPlan)
@@ -716,7 +772,7 @@ class NewsAnalysisAgent(AbstractAgent):
         ]
         pending_chunk_ids = list(dict.fromkeys(pending_chunk_ids))
         if pending_chunk_ids and state.conversation_id:
-            turn_id = getattr(state, "turn_id", None) or state.conversation_id
+            turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
             try:
                 task = make_extraction_task(
                     turn_id=turn_id,
@@ -776,7 +832,13 @@ class NewsAnalysisAgent(AbstractAgent):
             if state.company_context
             else ""
         )
-        context_prefix = f"{company_context_section}{entities_section}"
+        memory_context_section = (
+            "Agent Memory Context:\n"
+            f"{state.agent_memory_context}\n\n"
+            if state.agent_memory_context
+            else ""
+        )
+        context_prefix = f"{company_context_section}{memory_context_section}{entities_section}"
 
         messages = [
             SystemMessage(content=NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT),
@@ -835,7 +897,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         task_id = None
         if state.conversation_id and analysis_text:
-            turn_id = getattr(state, "turn_id", None) or state.conversation_id
+            turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
             try:
                 task = make_extraction_task(
                     turn_id=turn_id,
@@ -849,10 +911,39 @@ class NewsAnalysisAgent(AbstractAgent):
             except Exception:
                 logger.exception("_analyse_news_node: failed to enqueue graph task")
 
+        tools_used: List[str] = []
+        for row in state.research_logs:
+            action = str(getattr(row, "action", "") or "").strip()
+            if not action or action == "proceed":
+                continue
+            if action in tools_used:
+                continue
+            tools_used.append(action)
+
+        top_references: List[dict] = []
+        for src in sources[:3]:
+            top_references.append(
+                {
+                    "source_id": int(src.source_id),
+                    "title": src.title,
+                    "url": src.url,
+                }
+            )
+
+        memory_summary = {
+            "research_actions": tools_used,
+            "tools_used": tools_used,
+            "source_count": len(sources),
+            "top_references": top_references,
+            "sentiment": sentiment.model_dump() if sentiment is not None else {},
+            "main_catalyst": self._first_sentence(analysis_text),
+        }
+
         return {
             "analysis": analysis_text,
             "sources": sources,
             "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
             "sentiment": sentiment,
+            "memory_summary": memory_summary,
         }

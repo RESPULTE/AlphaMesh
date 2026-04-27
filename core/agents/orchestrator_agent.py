@@ -16,7 +16,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -40,7 +40,6 @@ from core.agents.utils import (
     _build_clarification_message,
     _build_combined_company_context,
     _extract_last_human_message,
-    _last_n_messages,
 )
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
@@ -56,8 +55,10 @@ from core.services import service_manager
 logger = get_logger(__name__)
 
 AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
-_SYNTHESIS_HISTORY_WINDOW: int = 6
-_PLANNER_HISTORY_WINDOW: int = 10
+_SYNTHESIS_TURN_WINDOW: int = 8
+_PLANNER_TURN_WINDOW: int = 12
+_AGENT_MEMORY_WINDOW: int = 8
+_MAX_TURN_TEXT_CHARS: int = 360
 
 
 def _sanitize_portfolio_user_email(user_email: str) -> str:
@@ -95,6 +96,17 @@ def get_portfolio_for_user(base_path: str, user_email: Optional[str]) -> List[di
         return []
 
 
+def _trim_text(value: Any, *, max_chars: int = _MAX_TURN_TEXT_CHARS) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _normalise_turn_timestamp(turn: dict) -> str:
+    return str(turn.get("created_at") or turn.get("timestamp") or "").strip()
+
+
 class OrchestratorAgent:
     def __init__(self):
         self._llm = service_manager.get_agent(temperature=0)
@@ -103,8 +115,107 @@ class OrchestratorAgent:
         }
         self._graph = self._build_graph()
 
+    _get_user_portfolio_path = staticmethod(_get_user_portfolio_path)
+    get_portfolio_for_user = staticmethod(get_portfolio_for_user)
+
     def name(self) -> str:
         return "Orchestrator Agent"
+
+    @staticmethod
+    def _build_turn_window_block(turns: List[dict], window: int) -> str:
+        if not turns:
+            return "(no prior turns)"
+        lines: List[str] = []
+        for idx, turn in enumerate(turns[-window:], start=1):
+            ts = _normalise_turn_timestamp(turn) or "unknown_time"
+            user_message = _trim_text(turn.get("user_message") or "")
+            synthesis = _trim_text(turn.get("assistant_synthesis") or "")
+            lines.append(
+                f"{idx}. [{ts}] User: {user_message or '(empty)'}\n"
+                f"   Assistant: {synthesis or '(empty)'}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_news_memory_summary(summary: dict) -> str:
+        actions = summary.get("research_actions") or summary.get("tools_used") or []
+        if not isinstance(actions, list):
+            actions = []
+        actions_block = ",".join(str(a) for a in actions[:4]) or "none"
+        source_count = int(summary.get("source_count") or 0)
+        sentiment = summary.get("sentiment") or {}
+        sentiment_label = (
+            str(sentiment.get("label") or "").strip()
+            if isinstance(sentiment, dict)
+            else ""
+        )
+        main_catalyst = _trim_text(summary.get("main_catalyst") or "", max_chars=200)
+        refs = summary.get("top_references") or []
+        top_titles: List[str] = []
+        if isinstance(refs, list):
+            for ref in refs[:2]:
+                if isinstance(ref, dict):
+                    top_titles.append(_trim_text(ref.get("title") or "", max_chars=80))
+        refs_block = "; ".join(t for t in top_titles if t) or "none"
+        return (
+            f"actions={actions_block}; sources={source_count}; "
+            f"sentiment={sentiment_label or 'N/A'}; "
+            f"catalyst={main_catalyst or 'N/A'}; refs={refs_block}"
+        )
+
+    @staticmethod
+    def _format_fundamental_memory_summary(summary: dict) -> str:
+        tools = summary.get("tools_used") or []
+        if not isinstance(tools, list):
+            tools = []
+        tools_block = ",".join(str(t) for t in tools[:5]) or "none"
+
+        key_rows = summary.get("key_rows") or summary.get("computed_rows") or []
+        if not isinstance(key_rows, list):
+            key_rows = []
+        rows_block = ",".join(str(r) for r in key_rows[:6]) or "none"
+
+        task_completed = bool(summary.get("task_completed", True))
+        conclusion = _trim_text(summary.get("main_conclusion") or "", max_chars=220)
+        return (
+            f"tools={tools_block}; rows={rows_block}; "
+            f"task_completed={task_completed}; conclusion={conclusion or 'N/A'}"
+        )
+
+    @classmethod
+    def _render_agent_memory_summary(cls, agent_name: str, summary: dict) -> str:
+        if agent_name == "news_agent":
+            return cls._format_news_memory_summary(summary)
+        if agent_name == "fundamentals_agent":
+            return cls._format_fundamental_memory_summary(summary)
+        return _trim_text(json.dumps(summary, ensure_ascii=True), max_chars=350)
+
+    @classmethod
+    def _build_agent_memory_contexts(
+        cls,
+        turns: List[dict],
+        window: int = _AGENT_MEMORY_WINDOW,
+    ) -> Dict[str, str]:
+        by_agent: Dict[str, List[Tuple[str, dict]]] = {}
+        for turn in turns:
+            summaries = turn.get("agent_memory_summaries") or {}
+            if not isinstance(summaries, dict):
+                continue
+            ts = _normalise_turn_timestamp(turn) or "unknown_time"
+            for agent_name, payload in summaries.items():
+                if not isinstance(payload, dict):
+                    continue
+                by_agent.setdefault(str(agent_name), []).append((ts, payload))
+
+        rendered: Dict[str, str] = {}
+        for agent_name, rows in by_agent.items():
+            lines = []
+            for ts, payload in rows[-window:]:
+                lines.append(
+                    f"- [{ts}] {cls._render_agent_memory_summary(agent_name, payload)}"
+                )
+            rendered[agent_name] = "\n".join(lines)
+        return rendered
 
     # ── Graph wiring ──────────────────────────────────────────────────────────
 
@@ -162,6 +273,7 @@ class OrchestratorAgent:
         messages: List[BaseMessage],
         conversation_id: Optional[str] = None,
         user_email: Optional[str] = None,
+        history_turns: Optional[List[dict]] = None,
     ) -> FinalResponse:
         """
         Entry point for one conversation turn.
@@ -202,10 +314,17 @@ class OrchestratorAgent:
                     "run: failed to open graph queue session for '%s'", conversation_id
                 )
 
+        normalized_history_turns = list(history_turns or [])
+        agent_memory_contexts = self._build_agent_memory_contexts(
+            normalized_history_turns
+        )
+
         initial_state = OrchestratorState(
             messages=messages,
             conversation_id=conversation_id,
             user_email=user_email,
+            history_turns=normalized_history_turns,
+            agent_memory_contexts=agent_memory_contexts,
             user_context_block=user_context_block,
             portfolio_block=portfolio_block,
             turn_id=turn_id,
@@ -223,12 +342,14 @@ class OrchestratorAgent:
                 conversation_id,
             )
             return FinalResponse(
-                summary="Analysis timed out. Please try a more specific query."
+                summary="Analysis timed out. Please try a more specific query.",
+                turn_id=turn_id,
             )
         except Exception:
             logger.exception("Graph invocation failed")
             return FinalResponse(
-                summary="I encountered an internal error. Please try again."
+                summary="I encountered an internal error. Please try again.",
+                turn_id=turn_id,
             )
 
         # ── Step 2: flush turn (fire-and-forget — returns immediately) ────────
@@ -263,7 +384,9 @@ class OrchestratorAgent:
                 ),
                 sources=raw.get("sources") or [],
                 agent_analyses=raw.get("agent_analyses") or {},
+                agent_memory_summaries=raw.get("agent_memory_summaries") or {},
                 tickers=raw.get("tickers") or [],
+                turn_id=raw.get("turn_id") or "",
             )
         return FinalResponse(
             summary=getattr(raw, "summary", "") or "",
@@ -282,7 +405,9 @@ class OrchestratorAgent:
             ),
             sources=getattr(raw, "sources", []) or [],
             agent_analyses=getattr(raw, "agent_analyses", {}) or {},
+            agent_memory_summaries=getattr(raw, "agent_memory_summaries", {}) or {},
             tickers=getattr(raw, "tickers", []) or [],
+            turn_id=getattr(raw, "turn_id", "") or "",
         )
 
     # ── Prompt builders ───────────────────────────────────────────────────────
@@ -319,17 +444,23 @@ class OrchestratorAgent:
             f"{state.portfolio_block}"
         )
         latest_human = _extract_last_human_message(state.messages)
-        history_window = _last_n_messages(state.messages, _PLANNER_HISTORY_WINDOW)
+        planner_turn_block = self._build_turn_window_block(
+            state.history_turns, _PLANNER_TURN_WINDOW
+        )
 
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
             planner_messages: List[BaseMessage] = [
                 SystemMessage(content=system_content),
                 SystemMessage(content=context_content),
-                *history_window,
+                SystemMessage(
+                    content=(
+                        "Recent conversation turns (most recent window):\n"
+                        f"{planner_turn_block}"
+                    )
+                ),
+                HumanMessage(content=latest_human),
             ]
-            if not history_window:
-                planner_messages.append(HumanMessage(content=latest_human))
             plan: OrchestratorPlan = await structured_llm.ainvoke(planner_messages)
             publish_progress(
                 "orchestrator",
@@ -358,6 +489,8 @@ class OrchestratorAgent:
             "fundamentals_raw_display_data": None,
             "fundamentals_task_completed": True,
             "fundamentals_task_completion_reason": "",
+            "agent_memory_summaries": {},
+            "turn_id": state.turn_id,
         }
 
     async def _validate_and_enrich_node(
@@ -447,11 +580,14 @@ class OrchestratorAgent:
         tasks = []
         for name in valid_names:
             agent_query = plan.per_agent_queries.get(name) or plan.query
+            agent_memory_context = state.agent_memory_contexts.get(name, "")
             agent_input: BaseAgentInput = plan.model_copy(
                 update={
                     "query": agent_query,
                     "ticker": primary_ticker,
                     "conversation_id": state.conversation_id,
+                    "turn_id": state.turn_id,
+                    "agent_memory_context": agent_memory_context,
                     "company_context": combined_context,
                 }
             )
@@ -482,6 +618,7 @@ class OrchestratorAgent:
         fundamentals_task_completed = True
         fundamentals_task_completion_reason = ""
         news_sources: List[CitedSource] = []
+        agent_memory_summaries: Dict[str, Dict[str, Any]] = {}
 
         for name, output in state.agent_outputs.items():
             try:
@@ -502,11 +639,15 @@ class OrchestratorAgent:
                 )
             if name == "news_agent":
                 news_sources = getattr(output, "sources", []) or []
+            memory_summary = getattr(output, "memory_summary", {}) or {}
+            if isinstance(memory_summary, dict) and memory_summary:
+                agent_memory_summaries[name] = memory_summary
 
         portfolio_block = state.portfolio_block or "[]"
-        multi_agent = len(state.agent_outputs) > 1
-
-        history_window = _last_n_messages(state.messages, _SYNTHESIS_HISTORY_WINDOW)
+        synthesis_turn_block = self._build_turn_window_block(
+            state.history_turns, _SYNTHESIS_TURN_WINDOW
+        )
+        latest_human = _extract_last_human_message(state.messages)
 
         analysis_text = ""
 
@@ -526,8 +667,18 @@ class OrchestratorAgent:
                 )
                 messages: List[BaseMessage] = [
                     SystemMessage(content=system_prompt),
-                    *history_window,
-                    HumanMessage(content="Produce the final analysis response."),
+                    SystemMessage(
+                        content=(
+                            "Recent conversation turns (most recent window):\n"
+                            f"{synthesis_turn_block}"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"Latest user question:\n{latest_human}\n\n"
+                            "Produce the final analysis response."
+                        )
+                    ),
                 ]
                 response = await self._llm.ainvoke(messages)
                 analysis_text = self._extract_response_text(
@@ -590,5 +741,7 @@ class OrchestratorAgent:
             "fundamentals_task_completion_reason": fundamentals_task_completion_reason,
             "sources": news_sources,
             "agent_analyses": per_agent_analyses,
+            "agent_memory_summaries": agent_memory_summaries,
             "tickers": state.plan.tickers if state.plan else [],
+            "turn_id": state.turn_id,
         }

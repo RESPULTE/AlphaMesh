@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+import asyncio
+
+from core.agents.models.news_agent_models import NewsAgentOutput
+from core.agents.models.orchestrator_models import OrchestratorPlan, OrchestratorState
+from core.agents.orchestrator_agent import OrchestratorAgent
+from core.services import service_manager
+
+
+def test_build_agent_memory_contexts_uses_last_window_entries() -> None:
+    turns = []
+    for i in range(10):
+        turns.append(
+            {
+                "created_at": f"2026-04-26T00:{i:02d}:00+00:00",
+                "agent_memory_summaries": {
+                    "news_agent": {
+                        "source_count": i + 1,
+                        "main_catalyst": f"catalyst-{i + 1}",
+                    }
+                },
+            }
+        )
+
+    contexts = OrchestratorAgent._build_agent_memory_contexts(turns, window=8)
+    news_context = contexts["news_agent"]
+
+    assert "sources=1;" not in news_context
+    assert "sources=2;" not in news_context
+    assert "sources=10;" in news_context
+    assert "catalyst=catalyst-10" in news_context
+
+
+def test_execute_node_propagates_turn_id_and_agent_memory_context() -> None:
+    class _CaptureAgent:
+        def __init__(self) -> None:
+            self.last_input = None
+
+        async def run(self, input_data):
+            self.last_input = input_data
+            return NewsAgentOutput(analysis="ok")
+
+    capture_agent = _CaptureAgent()
+
+    orchestrator = OrchestratorAgent.__new__(OrchestratorAgent)
+    orchestrator._agents = {"news_agent": capture_agent}
+
+    state = OrchestratorState(
+        plan=OrchestratorPlan(
+            query="original query",
+            target_agents=["news_agent"],
+            per_agent_queries={"news_agent": "rewritten for news"},
+            tickers=["AAPL"],
+        ),
+        conversation_id="conv-1",
+        turn_id="turn-123",
+        agent_memory_contexts={"news_agent": "- [t] sources=4; catalyst=guidance raise"},
+        company_context_blocks={"AAPL": "Company Context Block"},
+    )
+
+    payload = asyncio.run(orchestrator._execute_node(state))
+
+    assert "news_agent" in payload["agent_outputs"]
+    assert capture_agent.last_input is not None
+    assert capture_agent.last_input.turn_id == "turn-123"
+    assert capture_agent.last_input.agent_memory_context.startswith("- [t]")
+    assert capture_agent.last_input.query == "rewritten for news"
+    assert capture_agent.last_input.company_context == "Company Context Block"
+
+
+def test_service_manager_orchestrator_singleton(monkeypatch) -> None:
+    import core.agents.orchestrator_agent as orchestrator_module
+
+    class _FakeOrchestrator:
+        created = 0
+
+        def __init__(self) -> None:
+            _FakeOrchestrator.created += 1
+
+    service_manager._orchestrator_agent = None
+    monkeypatch.setattr(orchestrator_module, "OrchestratorAgent", _FakeOrchestrator)
+
+    first = service_manager.get_orchestrator_agent()
+    second = service_manager.get_orchestrator_agent()
+
+    assert first is second
+    assert _FakeOrchestrator.created == 1
+
+    service_manager._orchestrator_agent = None

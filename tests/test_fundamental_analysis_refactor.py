@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
+from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.fundamental_agent_models import (
     ExecutorBatchLog,
     ExecutorToolLog,
@@ -243,3 +244,64 @@ def test_completion_review_normalises_chart_types_and_modes(
     assert charts[0].data_mode == "snapshot"
     assert charts[1].chart_type == "bar"
     assert charts[1].data_mode == "snapshot"
+
+
+def test_run_reuses_cached_agent_memory_context() -> None:
+    captured_payloads: list[dict] = []
+
+    class _FakeDb:
+        async def initialize(self):
+            return None
+
+    class _FakeGraph:
+        async def ainvoke(self, payload, config=None):
+            _ = config
+            captured_payloads.append(payload)
+            return {
+                "financial_data": pd.DataFrame(),
+                "analysis": "Computed analysis",
+                "tool_results": [],
+                "entities_enriched": [],
+                "subgraph_id": None,
+                "relationships_extracted": False,
+                "memory_summary": {
+                    "tools_used": ["profitability_ratios"],
+                    "key_rows": ["Revenues"],
+                    "computed_rows": ["gross_margin"],
+                    "task_completed": True,
+                    "task_completion_reason": "",
+                    "main_conclusion": "Margins are stable.",
+                },
+                "task_completed": True,
+                "task_completion_reason": "",
+                "visualization_plan": None,
+                "raw_display_data": None,
+            }
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent.db = _FakeDb()
+    agent._graph = _FakeGraph()
+    agent._memory_context_by_conversation = {}
+
+    first = asyncio.run(
+        agent.run(
+            BaseAgentInput(
+                query="First",
+                conversation_id="conv-fund-memory",
+                agent_memory_context="- [older] tools=cagr; rows=Revenues",
+            )
+        )
+    )
+    second = asyncio.run(
+        agent.run(
+            BaseAgentInput(
+                query="Second",
+                conversation_id="conv-fund-memory",
+            )
+        )
+    )
+
+    assert first.memory_summary["tools_used"] == ["profitability_ratios"]
+    assert captured_payloads[0]["agent_memory_context"].startswith("- [older]")
+    assert captured_payloads[1]["agent_memory_context"].startswith("tools=profitability_ratios")
+    assert second.memory_summary["main_conclusion"] == "Margins are stable."

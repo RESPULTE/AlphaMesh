@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import pytest
 from langchain_core.documents import Document
 
+from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.news_agent_models import NewsAgentState
 from core.agents.news_analysis_agent import NewsAnalysisAgent, _get_cached_entities
 from core.memory.retrieval.dual_store_retriever import DualStoreRetriever
@@ -323,3 +324,50 @@ def test_comprehensive_retrieve_returns_deduped_entity_tuples() -> None:
 
     assert [chunk.chunk_id for chunk in context.chunks] == ["chunk-a"]
     assert context.entity_tuples == [("Apple", "Company")]
+
+
+def test_run_reuses_cached_agent_memory_context() -> None:
+    captured_states: list[dict] = []
+
+    class _FakeGraph:
+        async def ainvoke(self, state):
+            captured_states.append(state)
+            return {
+                "analysis": "Qualitative analysis output.",
+                "sources": [],
+                "memory_summary": {
+                    "research_actions": ["newsapi"],
+                    "tools_used": ["newsapi"],
+                    "source_count": 2,
+                    "top_references": [],
+                    "sentiment": {"label": "NEUTRAL", "score": 50},
+                    "main_catalyst": "Guidance was maintained.",
+                },
+            }
+
+    agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
+    agent._graph = _FakeGraph()
+    agent._memory_context_by_conversation = {}
+
+    first = asyncio.run(
+        agent.run(
+            BaseAgentInput(
+                query="First turn",
+                conversation_id="conv-memory",
+                agent_memory_context="- [older] sources=1; catalyst=prior update",
+            )
+        )
+    )
+    second = asyncio.run(
+        agent.run(
+            BaseAgentInput(
+                query="Second turn",
+                conversation_id="conv-memory",
+            )
+        )
+    )
+
+    assert first.memory_summary["source_count"] == 2
+    assert captured_states[0]["agent_memory_context"].startswith("- [older]")
+    assert captured_states[1]["agent_memory_context"].startswith("actions=newsapi")
+    assert second.memory_summary["main_catalyst"] == "Guidance was maintained."

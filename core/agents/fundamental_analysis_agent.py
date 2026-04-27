@@ -33,7 +33,9 @@ Everything else is unchanged.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict, List, Set, Tuple, Type
+from uuid import uuid4
 
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -129,6 +131,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         super().__init__()
         self.db = FinancialDatabase()
         self._graph = self._build_graph()
+        self._memory_context_by_conversation: Dict[str, str] = {}
 
     @staticmethod
     def name() -> str:
@@ -147,6 +150,35 @@ class FundamentalAnalysisAgent(AbstractAgent):
     def get_output_schema_class() -> Type[BaseModel]:
         return FundamentalAnalysisOutput
 
+    @staticmethod
+    def _first_sentence(value: str) -> str:
+        text = (value or "").strip()
+        if not text:
+            return ""
+        match = re.search(r"(.+?[.!?])(?:\s|$)", text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text[:220]
+
+    @staticmethod
+    def _render_memory_summary(memory_summary: Dict[str, Any]) -> str:
+        if not memory_summary:
+            return ""
+        tools = memory_summary.get("tools_used") or []
+        if not isinstance(tools, list):
+            tools = []
+        key_rows = memory_summary.get("key_rows") or []
+        if not isinstance(key_rows, list):
+            key_rows = []
+        completed = bool(memory_summary.get("task_completed", True))
+        conclusion = str(memory_summary.get("main_conclusion") or "").strip()
+        return (
+            f"tools={','.join(str(t) for t in tools[:5]) or 'none'}; "
+            f"rows={','.join(str(r) for r in key_rows[:6]) or 'none'}; "
+            f"task_completed={completed}; "
+            f"conclusion={conclusion or 'N/A'}"
+        )
+
     # ── Public entry point ────────────────────────────────────────────────────
 
     async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
@@ -156,12 +188,26 @@ class FundamentalAnalysisAgent(AbstractAgent):
         # FinancialDatabase — this is a no-op after the first call.
         await self.db.initialize()
 
+        conversation_id = (input_data.conversation_id or "").strip()
+        incoming_memory_context = (input_data.agent_memory_context or "").strip()
+        cached_memory_context = (
+            self._memory_context_by_conversation.get(conversation_id, "")
+            if conversation_id
+            else ""
+        )
+        effective_memory_context = incoming_memory_context or cached_memory_context
+        if conversation_id and incoming_memory_context and incoming_memory_context != cached_memory_context:
+            self._memory_context_by_conversation[conversation_id] = incoming_memory_context
+
+        state_payload = input_data.model_dump(exclude_none=False)
+        state_payload["agent_memory_context"] = effective_memory_context
+
         final_state: Dict = await self._graph.ainvoke(
-            input_data.model_dump(exclude_none=False),
+            state_payload,
             config={"recursion_limit": 20},
         )
 
-        return FundamentalAnalysisOutput(
+        output = FundamentalAnalysisOutput(
             financial_data=final_state.get("financial_data"),
             analysis=final_state.get("analysis", ""),
             tool_results=final_state.get("tool_results", []),
@@ -170,12 +216,20 @@ class FundamentalAnalysisAgent(AbstractAgent):
             subgraph_task=final_state.get("subgraph_task"),
             relationships_extracted=final_state.get("relationships_extracted", False),
             sentiment=final_state.get("sentiment"),
+            memory_summary=final_state.get("memory_summary") or {},
             executor_logs=final_state.get("executor_logs", []),
             task_completed=final_state.get("task_completed", True),
             task_completion_reason=final_state.get("task_completion_reason", ""),
             visualization_plan=final_state.get("visualization_plan"),
             raw_display_data=final_state.get("raw_display_data"),
         )
+
+        if conversation_id:
+            rendered_summary = self._render_memory_summary(output.memory_summary)
+            if rendered_summary:
+                self._memory_context_by_conversation[conversation_id] = rendered_summary
+
+        return output
 
     # ── Graph wiring ──────────────────────────────────────────────────────────
 
@@ -433,6 +487,13 @@ class FundamentalAnalysisAgent(AbstractAgent):
             iteration=state.iteration_count + 1,
             max_iterations=MAX_TOOL_ITERATIONS,
         )
+
+        agent_memory_context = (state.agent_memory_context or "").strip()
+        if agent_memory_context:
+            user_msg += (
+                "\n\nAgent Memory Context (from prior turns):\n"
+                f"{agent_memory_context}"
+            )
 
         structured_llm = service_manager.get_agent(
             temperature=0
@@ -946,6 +1007,14 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 "analysis": "No financial data was available for this query.",
                 "relationships_extracted": False,
                 "subgraph_id": None,
+                "memory_summary": {
+                    "tools_used": [],
+                    "key_rows": [],
+                    "computed_rows": [],
+                    "task_completed": False,
+                    "task_completion_reason": "No financial data was available.",
+                    "main_conclusion": "No financial data was available for this query.",
+                },
                 "task_completed": state.task_completed,
                 "task_completion_reason": state.task_completion_reason,
                 "visualization_plan": state.visualization_plan,
@@ -978,10 +1047,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
         company_context_section = (
             f"\n{state.company_context}\n" if state.company_context else ""
         )
+        memory_context_section = (
+            f"\nAgent Memory Context:\n{state.agent_memory_context}\n"
+            if state.agent_memory_context
+            else ""
+        )
         analysis_prompt = (
             f"Query: {state.query}\n\n"
             f"Ticker: {state.ticker}\n"
             f"{company_context_section}\n"
+            f"{memory_context_section}\n"
             f"Financial Data:\n{data_str}\n\n"
             f"Tool Results:\n{tool_summary or 'None'}"
         )
@@ -1004,7 +1079,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         task_id = None
         if state.conversation_id and analysis_text and success:
-            turn_id = getattr(state, "turn_id", None) or state.conversation_id
+            turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
             try:
                 task = make_extraction_task(
                     turn_id=turn_id,
@@ -1020,12 +1095,30 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     "_analyst_node: failed to enqueue deferred relationship extraction"
                 )
 
+        tools_used: List[str] = []
+        for result in state.tool_results or []:
+            if not result.success:
+                continue
+            if result.tool_name in tools_used:
+                continue
+            tools_used.append(result.tool_name)
+
+        memory_summary = {
+            "tools_used": tools_used,
+            "key_rows": [str(row) for row in list(filtered_df.index)[:8]],
+            "computed_rows": [str(row) for row in (state.computed_row_labels or [])[:8]],
+            "task_completed": bool(state.task_completed),
+            "task_completion_reason": state.task_completion_reason or "",
+            "main_conclusion": self._first_sentence(analysis_text),
+        }
+
         return {
             "financial_data": filtered_df,
             "analysis": analysis_text,
             "relationships_extracted": False,
             "subgraph_id": task_id,
             "sentiment": sentiment,
+            "memory_summary": memory_summary,
             "task_completed": state.task_completed,
             "task_completion_reason": state.task_completion_reason,
             "visualization_plan": state.visualization_plan,

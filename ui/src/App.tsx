@@ -38,7 +38,6 @@ export default function App() {
           {currentTab === 'History' && (
             <History 
               key="history" 
-              onAnalyze={handleAnalyze} 
               query={analysisQuery}
               onClearQuery={() => setAnalysisQuery(null)}
             />

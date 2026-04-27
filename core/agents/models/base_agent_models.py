@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import date
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -60,6 +60,17 @@ class BaseAgentInput(BaseModel):
     # NOTE: Do not exclude from serialization; LangGraph initial state is built
     # from model_dump() and downstream agents need this for graph queue writes.
     conversation_id: Optional[str] = Field(default=None)
+    turn_id: Optional[str] = Field(
+        default=None,
+        description="Orchestrator turn UUID for turn-level provenance.",
+    )
+    agent_memory_context: Optional[str] = Field(
+        default=None,
+        description=(
+            "Compact conversation memory context prepared for this specific agent "
+            "(typically from prior per-turn summaries)."
+        ),
+    )
 
     sentiment: Optional[AgentSentiment] = Field(default=None)
 
@@ -104,6 +115,12 @@ class BaseAgentOutput(BaseModel, ABC):
         ),
     )
     sentiment: Optional[AgentSentiment] = Field(default=None)
+    memory_summary: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Deterministic compact summary of this turn for agent-memory continuity."
+        ),
+    )
     subgraph_id: Optional[str] = Field(default=None, exclude=True)
     relationships_extracted: bool = Field(default=False)
 

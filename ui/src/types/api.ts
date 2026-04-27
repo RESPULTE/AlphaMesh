@@ -213,6 +213,7 @@ export interface ConversationTurn {
   user_message: string;
   assistant_synthesis: string;
   agent_analyses: Record<string, string>;
+  agent_memory_summaries?: Record<string, Record<string, unknown>>;
   ticker_results: TickerResult[];
   tickers: string[];
 }

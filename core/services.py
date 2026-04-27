@@ -35,6 +35,7 @@ class ServiceManager:
         self._subgraph_service = None
         self._ticker_validator = None
         self._market_data_service = None
+        self._orchestrator_agent = None
 
     def get_agent(self, temperature=0.0):
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
@@ -323,6 +324,17 @@ class ServiceManager:
                 print(f"Error initializing MarketDataService: {e}")
                 raise
         return self._market_data_service
+
+    def get_orchestrator_agent(self):
+        from core.agents.orchestrator_agent import OrchestratorAgent
+
+        if self._orchestrator_agent is None:
+            try:
+                self._orchestrator_agent = OrchestratorAgent()
+            except Exception as e:
+                print(f"Error initializing OrchestratorAgent: {e}")
+                raise
+        return self._orchestrator_agent
 
     async def startup(self) -> None:
         """
