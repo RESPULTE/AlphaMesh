@@ -17,8 +17,10 @@ from core.agents.base_agent import AbstractAgent
 from core.agents.models.base_agent_models import AgentSentiment, BaseAgentInput
 from core.agents.models.news_agent_models import (
     CitedSource,
+    DomainQuery,
     NewsAgentOutput,
     NewsAgentState,
+    QueryRewritePlan,
     ResearchStepLog,
     ResearchStepPlan,
 )
@@ -29,6 +31,7 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT,
     NEWS_ANALYSIS_USER_PROMPT,
     NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+    NEWS_QUERY_REWRITE_SYSTEM_PROMPT,
     NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT,
 )
 from core.agents.utils import (
@@ -409,6 +412,7 @@ class NewsAnalysisAgent(AbstractAgent):
         workflow = StateGraph(NewsAgentState, output_schema=NewsAgentOutput)
 
         workflow.add_node("planner", self._planner_node)
+        workflow.add_node("rewrite_queries", self._rewrite_queries_node)
         workflow.add_node("retrieve_memory", self._retrieve_memory_node)
         workflow.add_node("fetch_and_ingest", self._fetch_and_ingest_node)
         workflow.add_node("rendezvous", self._rendezvous_node)
@@ -418,7 +422,12 @@ class NewsAnalysisAgent(AbstractAgent):
         workflow.add_conditional_edges(
             "planner",
             self._route_after_planner,
-            ["retrieve_memory", "fetch_and_ingest", "analyse_news"],
+            ["rewrite_queries", "analyse_news"],
+        )
+        workflow.add_conditional_edges(
+            "rewrite_queries",
+            self._route_after_rewrite,
+            ["retrieve_memory", "fetch_and_ingest"],
         )
         workflow.add_edge("fetch_and_ingest", "rendezvous")
         workflow.add_edge("retrieve_memory", "rendezvous")
@@ -428,13 +437,16 @@ class NewsAnalysisAgent(AbstractAgent):
         return workflow.compile()
 
     @staticmethod
-    def _route_after_planner(state: NewsAgentState):
-        """Fan out to parallel branches or route directly to analysis."""
+    def _route_after_planner(state: NewsAgentState) -> str:
+        """Go to query rewriting when fetching, or directly to analysis."""
         plan = state.research_plan
         if plan is None or plan.action == "proceed":
             return "analyse_news"
-        # Both branches always fire when fetching — memory retrieval runs every
-        # iteration with the freshly rewritten domain queries.
+        return "rewrite_queries"
+
+    @staticmethod
+    def _route_after_rewrite(state: NewsAgentState) -> list:
+        """Fan out both parallel branches after query rewriting."""
         return [
             Send("retrieve_memory", state),
             Send("fetch_and_ingest", state),
@@ -522,7 +534,6 @@ class NewsAnalysisAgent(AbstractAgent):
                     query=state.query,
                     rationale="Fallback to NewsAPI on planner failure.",
                     max_results=settings.NEWS_FETCH_MAX_ARTICLES,
-                    company_query=state.query,
                 )
             elif settings.TAVILY_API_KEY:
                 plan = ResearchStepPlan(
@@ -530,7 +541,6 @@ class NewsAnalysisAgent(AbstractAgent):
                     query=state.query,
                     rationale="Fallback web search after planner failure.",
                     max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
-                    company_query=state.query,
                 )
             else:
                 plan = ResearchStepPlan(
@@ -545,10 +555,6 @@ class NewsAnalysisAgent(AbstractAgent):
                 query=plan.query or state.query,
                 rationale="Tavily key not configured; falling back to NewsAPI.",
                 max_results=plan.max_results,
-                company_query=plan.company_query,
-                sector_query=plan.sector_query,
-                market_query=plan.market_query,
-                knowledge_query=plan.knowledge_query,
             )
 
         if not plan.query and plan.action != "proceed":
@@ -569,33 +575,86 @@ class NewsAnalysisAgent(AbstractAgent):
             "is_information_sufficient": plan.action == "proceed",
         }
 
+    # -- Node: rewrite_queries -------------------------------------------------
+
+    async def _rewrite_queries_node(self, state: NewsAgentState) -> dict:
+        """Rewrite the planner's base query into domain-specific retrieval strings."""
+        plan = state.research_plan
+        if plan is None:
+            return {"rewrite_plan": None}
+
+        # Build the history block so the rewriter can avoid repeating prior queries.
+        prior_queries: List[str] = [
+            f"  iter={log.iteration} domain=online query='{log.query}'"
+            for log in state.research_logs
+            if log.query
+        ]
+        if state.rewrite_plan:
+            for dq in state.rewrite_plan.queries:
+                prior_queries.append(f"  iter={state.research_iteration} domain={dq.domain} query='{dq.query}'")
+
+        prior_block = "\n".join(prior_queries) if prior_queries else "  (none)"
+
+        rewrite_prompt = (
+            f"Original query: {state.query}\n"
+            f"Ticker: {state.ticker or 'N/A'}\n"
+            f"Iteration: {state.research_iteration}\n"
+            f"Planner base query: {plan.query}\n"
+            f"Planner action: {plan.action}\n"
+            f"\nPrevious retrieval queries across all iterations:\n{prior_block}\n"
+            "\nReturn only QueryRewritePlan."
+        )
+
+        publish_progress(
+            "news_agent",
+            f"Rewriting queries (iteration {state.research_iteration})…",
+        )
+        try:
+            structured_llm = self._llm.with_structured_output(QueryRewritePlan)
+            rewrite_plan: QueryRewritePlan = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=NEWS_QUERY_REWRITE_SYSTEM_PROMPT),
+                    HumanMessage(content=rewrite_prompt),
+                ]
+            )
+        except Exception:
+            logger.exception("_rewrite_queries_node: LLM call failed; using fallback")
+            rewrite_plan = QueryRewritePlan(
+                queries=[DomainQuery(domain="company", query=plan.query or state.query)],
+                rationale="Fallback: single company query due to rewriter failure.",
+            )
+
+        logger.info(
+            "_rewrite_queries_node: iter=%d produced %d domain queries: %s",
+            state.research_iteration,
+            len(rewrite_plan.queries),
+            [(dq.domain, dq.query[:60]) for dq in rewrite_plan.queries],
+        )
+        return {"rewrite_plan": rewrite_plan}
+
     # -- Node: retrieve_memory -------------------------------------------------
 
     async def _retrieve_memory_node(self, state: NewsAgentState) -> dict:
-        """Retrieve relevant chunks from semantic memory using the planner's domain queries."""
+        """Retrieve relevant chunks from semantic memory using the rewritten domain queries."""
+        rewrite = state.rewrite_plan
         plan = state.research_plan
-        if plan is None:
+        if rewrite is None or plan is None:
             return {"memory_chunks": []}
 
-        # Derive active domains from whichever query fields the planner populated.
-        domain_map = [
-            ("company", plan.company_query),
-            ("sector", plan.sector_query),
-            ("market", plan.market_query),
-            ("knowledge", plan.knowledge_query),
-        ]
-        active_domains = [d for d, q in domain_map if q]
+        # Map domain queries from rewrite plan into RewrittenQueries fields.
+        domain_queries: Dict[str, str] = {dq.domain: dq.query for dq in rewrite.queries}
+        active_domains = list(domain_queries.keys())
 
-        # Guarantee at least one domain so memory always runs this iteration.
+        # Guarantee at least one domain.
         if not active_domains:
-            plan = plan.model_copy(update={"company_query": plan.query or state.query})
+            domain_queries["company"] = plan.query or state.query
             active_domains = ["company"]
 
         rewritten = RewrittenQueries(
-            company_query=plan.company_query,
-            sector_query=plan.sector_query,
-            market_query=plan.market_query,
-            knowledge_query=plan.knowledge_query,
+            company_query=domain_queries.get("company"),
+            sector_query=domain_queries.get("sector"),
+            market_query=domain_queries.get("market"),
+            knowledge_query=domain_queries.get("knowledge"),
             active_domains=active_domains,
             original_query=state.query,
         )
@@ -620,62 +679,70 @@ class NewsAnalysisAgent(AbstractAgent):
     # -- Node: fetch_and_ingest ------------------------------------------------
 
     async def _fetch_and_ingest_node(self, state: NewsAgentState) -> dict:
-        """Fetch articles using the planner's rewritten query, then ingest and score them."""
+        """Fetch articles for all rewritten queries in parallel, then ingest and score."""
         plan = state.research_plan
-        if plan is None or plan.action == "proceed":
+        rewrite = state.rewrite_plan
+        if plan is None or plan.action == "proceed" or rewrite is None:
             return {"retrieved_chunks": state.retrieved_chunks}
 
-        query_text = (plan.query or state.query).strip()
-        logger.info(
-            "_fetch_and_ingest_node: action=%s iteration=%d query='%.120s'",
-            plan.action,
-            state.research_iteration,
-            query_text,
-        )
+        queries = rewrite.queries or [DomainQuery(domain="company", query=plan.query or state.query)]
+        action = plan.action
+        iter_label = state.research_iteration + 1
 
         publish_progress(
             "news_agent",
-            f"Research iter {state.research_iteration + 1}: "
-            f"fetching via {plan.action} — '{query_text[:80]}'…",
+            f"Research iter {iter_label}: fetching {len(queries)} query/queries via {action}…",
         )
-        try:
-            articles = await fetch_news(
-                plan.action,
-                query_text,
-                from_date=state.start_date.isoformat() if plan.action == "newsapi" else None,
-                to_date=state.end_date.isoformat() if plan.action == "newsapi" else None,
-                max_results=plan.max_results,
-                include_domains=plan.include_domains,
-                exclude_domains=plan.exclude_domains,
-            )
-        except Exception:
-            logger.exception("_fetch_and_ingest_node: fetch failed")
-            articles = []
 
-        # Deduplicate by URL against already-seen URLs.
+        async def _fetch_one(dq: DomainQuery) -> List[dict]:
+            try:
+                return await fetch_news(
+                    action,
+                    dq.query,
+                    from_date=state.start_date.isoformat() if action == "newsapi" else None,
+                    to_date=state.end_date.isoformat() if action == "newsapi" else None,
+                    max_results=plan.max_results,
+                    include_domains=plan.include_domains,
+                    exclude_domains=plan.exclude_domains,
+                )
+            except Exception:
+                logger.exception(
+                    "_fetch_and_ingest_node: fetch failed for domain=%s query='%.80s'",
+                    dq.domain,
+                    dq.query,
+                )
+                return []
+
+        results_per_query: List[List[dict]] = await asyncio.gather(
+            *(_fetch_one(dq) for dq in queries)
+        )
+        all_fetched = [a for batch in results_per_query for a in batch]
+
+        # Deduplicate by URL across all fetched articles and against prior seen URLs.
         seen_urls = set(state.seen_urls or [])
         new_articles: List[dict] = []
-        for article in articles:
+        for article in all_fetched:
             url = str(article.get("url") or "").strip()
             if url and url not in seen_urls:
                 new_articles.append(article)
                 seen_urls.add(url)
 
+        query_summary = "; ".join(f"{dq.domain}:{dq.query[:40]}" for dq in queries)
         log_row = ResearchStepLog(
-            iteration=state.research_iteration + 1,
-            action=plan.action,
-            query=query_text,
+            iteration=iter_label,
+            action=action,
+            query=query_summary,
             rationale=plan.rationale,
-            fetched_articles=len(articles),
+            fetched_articles=len(all_fetched),
             newly_added_articles=len(new_articles),
         )
         publish_success(
             "news_agent",
-            f"Research iter {state.research_iteration + 1}: "
-            f"{plan.action} fetched={len(articles)} new={len(new_articles)}",
+            f"Research iter {iter_label}: {action} "
+            f"fetched={len(all_fetched)} new={len(new_articles)} "
+            f"across {len(queries)} domain query/queries",
         )
 
-        # --- Ingest new articles and score chunks ---
         if not new_articles:
             logger.info("_fetch_and_ingest_node: no new articles this iteration")
             return {

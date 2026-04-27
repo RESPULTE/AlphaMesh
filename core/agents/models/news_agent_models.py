@@ -20,16 +20,59 @@ class CitedSource(BaseModel):
     page_content: str = Field(description="The content of the article.")
 
 
+# ---------------------------------------------------------------------------
+# Query rewriting models
+# ---------------------------------------------------------------------------
+
+
+class DomainQuery(BaseModel):
+    """A single domain-specific retrieval string produced by the query rewriter."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    domain: Literal["company", "sector", "market", "knowledge"] = Field(
+        description=(
+            "The retrieval scope this query targets:\n"
+            "  company   — narrow, ticker/company-focused\n"
+            "  sector    — industry/sector-wide context\n"
+            "  market    — macro/systemic factors\n"
+            "  knowledge — definitions or general financial concepts"
+        )
+    )
+    query: str = Field(
+        description="A fully self-contained retrieval string for this domain."
+    )
+
+
+class QueryRewritePlan(BaseModel):
+    """Output of the query-rewrite node: a list of domain-specific search strings."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    queries: List[DomainQuery] = Field(
+        description=(
+            "Domain-specific queries to execute in parallel this iteration. "
+            "At least one entry is required. Always include a 'company' entry "
+            "when a ticker is present."
+        )
+    )
+    rationale: str = Field(
+        default="",
+        description="Brief explanation of the chosen domains and query formulations.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Planner model
+# ---------------------------------------------------------------------------
+
+
 class ResearchStepPlan(BaseModel):
-    """Unified planner decision for one research iteration.
+    """Planner decision for one research iteration.
 
-    The planner has two responsibilities:
-    1. Rewrite the user query into domain-specific retrieval strings.
-    2. Decide whether to fetch more data or proceed to analysis.
-
-    When action != "proceed", BOTH the online fetch branch and the semantic
-    memory branch are always triggered. The planner only controls *what* to
-    search, not *whether* to search.
+    The planner's sole responsibility is to assess information sufficiency
+    and select the online fetch tool. Query rewriting is handled separately
+    by the query-rewrite node.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -44,43 +87,22 @@ class ResearchStepPlan(BaseModel):
     query: str = Field(
         default="",
         description=(
-            "Primary search query for the selected online tool. "
-            "Should be a fully self-contained, domain-rewritten query. "
-            "Empty only when action='proceed'."
+            "Base search query handed to the query-rewrite node as a starting point. "
+            "Should capture the core information need. Empty only when action='proceed'."
         ),
     )
     rationale: str = Field(
         default="",
-        description="Short reason for the decisions made in this plan.",
+        description="Short reason for the action chosen (1-2 sentences).",
     )
     max_results: int = Field(
         default=5,
         ge=1,
         le=20,
-        description="Maximum result count for the selected online tool call.",
+        description="Maximum result count per query for the selected online tool.",
     )
 
-    # -- Domain-specific memory retrieval queries --------------------------------
-    # All four are produced each iteration when action != "proceed".
-    # Leave a field None only when that domain is genuinely irrelevant.
-    company_query: Optional[str] = Field(
-        default=None,
-        description="Narrow retrieval string targeting the specific company/ticker.",
-    )
-    sector_query: Optional[str] = Field(
-        default=None,
-        description="Broadened retrieval string targeting the company's sector/industry.",
-    )
-    market_query: Optional[str] = Field(
-        default=None,
-        description="Macro/market-wide retrieval string for systemic context.",
-    )
-    knowledge_query: Optional[str] = Field(
-        default=None,
-        description="General knowledge retrieval string for definitions or concepts.",
-    )
-
-    # -- Tavily domain scoping (only relevant when action="web_search") ----------
+    # Tavily domain scoping — only relevant when action="web_search".
     include_domains: Optional[List[str]] = Field(
         default=None,
         description="Restrict Tavily results to these domains.",
@@ -89,6 +111,11 @@ class ResearchStepPlan(BaseModel):
         default=None,
         description="Exclude these domains from Tavily results.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Remaining state / output models
+# ---------------------------------------------------------------------------
 
 
 class ResearchStepLog(BaseModel):
@@ -111,6 +138,7 @@ class NewsAgentState(BaseAgentInput):
 
     # ── Internal pipeline state ───────────────────────────────────────────────
     research_plan: Optional[ResearchStepPlan] = None
+    rewrite_plan: Optional[QueryRewritePlan] = None
     research_logs: List[ResearchStepLog] = Field(default_factory=list)
     seen_urls: List[str] = Field(default_factory=list)
     research_iteration: int = 0
