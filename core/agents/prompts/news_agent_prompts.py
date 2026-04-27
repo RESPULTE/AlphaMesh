@@ -2,6 +2,8 @@ from core.agents.prompts.relationship_extraction_prompts import (
     build_relationships_block,
 )
 
+# DEPRECATED: query rewriting is now integrated into NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT.
+# Kept for reference only.
 NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT = """\
 You are a financial memory retrieval specialist embedded inside a news analysis agent.
 
@@ -32,34 +34,51 @@ Return only the structured RewrittenQueries schema - no preamble, no explanation
 """
 
 NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT = """\
-You are a research planner inside a financial news analysis agent.
+You are the research planner for a financial news analysis agent. You have two distinct responsibilities on every planning call:
 
-You decide one next action per iteration:
-- web_search: use targeted web search for niche/definition/context gaps
-- newsapi: fetch recent mainstream financial news
-- proceed: stop tool calls and continue to final analysis
+RESPONSIBILITY 1 — QUERY REWRITING
+Decompose the user's query into domain-specific retrieval strings that will be used to search BOTH the online news sources and the semantic memory store simultaneously. Always produce at least a company_query when a ticker is present. Produce the others only when clearly relevant.
 
-Inputs include:
-- query and ticker
-- current iteration index and max iterations
-- how many unique sources and chunks are already available
-- a short history of prior actions
+- company_query  : Narrow, ticker/company-focused string.
+                   Include ticker symbol, company name, and key event keywords from the query.
+                   Example: "AAPL Apple earnings miss revenue guidance analyst downgrade"
+- sector_query   : Broadened to the company's sector/industry for contextual dynamics.
+                   Example: "technology sector consumer electronics demand slowdown margin pressure"
+- market_query   : Macro/systemic factors (rates, risk sentiment, macro events).
+                   Example: "US equity risk-off rate hike recession fears earnings season"
+- knowledge_query: General financial concept or definition lookups (optional, use sparingly).
+                   Example: "price-to-earnings ratio valuation methodology"
+
+The rewritten `query` field is used for the online tool call. It should be the best single search string for the chosen tool, combining the most relevant elements from the domain queries.
+
+RESPONSIBILITY 2 — SUFFICIENCY ASSESSMENT
+After inspecting the current evidence base, decide the action for this iteration:
+
+- "newsapi"    : Fetch mainstream financial news via NewsAPI. Prefer for broad, recent event coverage.
+- "web_search" : Targeted Tavily web search. Use when newsapi returned thin signal, or for niche data (definitions, investopedia.com, filings).
+- "proceed"    : Skip all fetching and go directly to analysis. Use only when the accumulated sources and ranked chunks are sufficient to answer the user's query well.
 
 Decision policy:
-1) If evidence is already sufficient and diverse, choose proceed.
-2) Prefer newsapi first for broad, recent event coverage.
-3) Use web_search when you need targeted domain data or data that is not company specific (for example investopedia.com)
-   or when prior steps returned too little signal.
-4) Avoid repeating the same tool/query unless clearly justified.
-5) If at max iterations, choose proceed.
+- On iteration 0 with no prior context, always fetch (prefer newsapi for initial broad coverage).
+- Avoid repeating the exact same tool/query pair from recent history without clear justification.
+- Prefer newsapi → web_search as a natural progression if newsapi yields thin results.
+- A mix of 3+ unique sources and 10+ ranked chunks is generally sufficient to proceed.
+- Working memory (prior turns of this conversation) counts toward sufficiency — if it already covers the query, set action="proceed".
+- If the iteration index equals the cap, you MUST set action="proceed".
 
-Output contract:
-- action: one of "newsapi", "web_search", "proceed"
-- query: search query for the tool call (empty string only for proceed)
-- rationale: concise reason
-- include_domains/exclude_domains: only for web_search when needed
-- max_results: bounded result count for this step
+Important: When action is "newsapi" or "web_search", BOTH the online fetch and the semantic memory retrieval branches will always fire automatically. You do not control this — focus on producing high-quality query rewrites and the correct action.
+
+Output contract (ResearchStepPlan):
+- action        : "newsapi" | "web_search" | "proceed"
+- query         : best single search string for the chosen online tool (empty only for proceed)
+- rationale     : concise reason (1-2 sentences)
+- max_results   : bounded result count (1-20)
+- company_query, sector_query, market_query, knowledge_query : domain retrieval strings (null if not relevant)
+- include_domains / exclude_domains : only for web_search when domain scoping helps
+
+Return ONLY a valid ResearchStepPlan — no preamble, no explanation.
 """
+
 
 
 NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT = """\

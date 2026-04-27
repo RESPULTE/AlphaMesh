@@ -1,22 +1,21 @@
 """
 news_fetcher.py
 ───────────────
-Combines NewsAPI (article discovery) with Trafilatura (full-content extraction).
+Combines NewsAPI (article discovery) with Trafilatura (full-content extraction)
+and Tavily (web search).
 
-Two public entry-points:
-  • build_news_query(...)   – constructs an advanced NewsAPI `q` string
-  • fetch_articles(...)     – fetches + scrapes articles, returns enriched dicts
+Public entry-points:
+  • build_news_query(...)        – constructs an advanced NewsAPI `q` string
+  • fetch_articles(...)          – NewsAPI fetch + trafilatura scrape
+  • fetch_articles_from_tavily() – Tavily web search, normalized to article dicts
+  • fetch_news(action, query)    – unified dispatcher for the agent's fetch nodes
 
 Usage (standalone / testing):
     import asyncio
-    from news_fetcher import fetch_articles, build_news_query
+    from news_fetcher import fetch_news, build_news_query
 
-    q = build_news_query(
-        ticker="AAPL",
-        must_include=["earnings", "revenue"],
-        must_exclude=["rumour"],
-    )
-    articles = asyncio.run(fetch_articles(q, from_date="2025-01-01", to_date="2025-03-01"))
+    articles = asyncio.run(fetch_news("newsapi", "AAPL earnings", from_date="2025-01-01"))
+    articles = asyncio.run(fetch_news("web_search", "Apple AI strategy"))
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -415,3 +414,42 @@ async def fetch_articles(
         sum(1 for a in enriched if a.get("content_source") == "newsapi_snippet"),
     )
     return enriched
+
+
+# ---------------------------------------------------------------------------
+# 5. Unified dispatcher
+# ---------------------------------------------------------------------------
+
+
+async def fetch_news(
+    action: Literal["newsapi", "web_search"],
+    query: str,
+    *,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    max_results: int = 5,
+    include_domains: Optional[List[str]] = None,
+    exclude_domains: Optional[List[str]] = None,
+) -> List[dict]:
+    """
+    Unified entry-point for the agent's online-fetch branch.
+
+    Routes to NewsAPI (+ trafilatura scrape) or Tavily based on *action*.
+    Returns a normalized list of article dicts compatible with the ingestor.
+    """
+    if action == "newsapi":
+        return await fetch_articles(
+            q=query,
+            from_date=from_date,
+            to_date=to_date,
+            page_size=max_results,
+        )
+    if action == "web_search":
+        return await fetch_articles_from_tavily(
+            query=query,
+            max_results=max_results,
+            include_domains=include_domains,
+            exclude_domains=exclude_domains,
+        )
+    logger.warning("fetch_news: unknown action '%s'; returning []", action)
+    return []

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,35 +21,73 @@ class CitedSource(BaseModel):
 
 
 class ResearchStepPlan(BaseModel):
-    """Planner decision for one research iteration."""
+    """Unified planner decision for one research iteration.
+
+    The planner has two responsibilities:
+    1. Rewrite the user query into domain-specific retrieval strings.
+    2. Decide whether to fetch more data or proceed to analysis.
+
+    When action != "proceed", BOTH the online fetch branch and the semantic
+    memory branch are always triggered. The planner only controls *what* to
+    search, not *whether* to search.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     action: Literal["newsapi", "web_search", "proceed"] = Field(
         default="proceed",
-        description="Research action to take in this iteration.",
+        description=(
+            "Online fetch tool to use, or 'proceed' to skip all fetching "
+            "and go directly to analysis."
+        ),
     )
     query: str = Field(
         default="",
-        description="Tool query to execute for this iteration.",
+        description=(
+            "Primary search query for the selected online tool. "
+            "Should be a fully self-contained, domain-rewritten query. "
+            "Empty only when action='proceed'."
+        ),
     )
     rationale: str = Field(
         default="",
-        description="Short reason for the selected action.",
-    )
-    include_domains: List[str] = Field(
-        default_factory=list,
-        description="Domain allow-list for web search tools (if any).",
-    )
-    exclude_domains: List[str] = Field(
-        default_factory=list,
-        description="Domain block-list for web search tools (if any).",
+        description="Short reason for the decisions made in this plan.",
     )
     max_results: int = Field(
         default=5,
         ge=1,
         le=20,
-        description="Maximum result count for the selected tool call.",
+        description="Maximum result count for the selected online tool call.",
+    )
+
+    # -- Domain-specific memory retrieval queries --------------------------------
+    # All four are produced each iteration when action != "proceed".
+    # Leave a field None only when that domain is genuinely irrelevant.
+    company_query: Optional[str] = Field(
+        default=None,
+        description="Narrow retrieval string targeting the specific company/ticker.",
+    )
+    sector_query: Optional[str] = Field(
+        default=None,
+        description="Broadened retrieval string targeting the company's sector/industry.",
+    )
+    market_query: Optional[str] = Field(
+        default=None,
+        description="Macro/market-wide retrieval string for systemic context.",
+    )
+    knowledge_query: Optional[str] = Field(
+        default=None,
+        description="General knowledge retrieval string for definitions or concepts.",
+    )
+
+    # -- Tavily domain scoping (only relevant when action="web_search") ----------
+    include_domains: Optional[List[str]] = Field(
+        default=None,
+        description="Restrict Tavily results to these domains.",
+    )
+    exclude_domains: Optional[List[str]] = Field(
+        default=None,
+        description="Exclude these domains from Tavily results.",
     )
 
 
@@ -72,20 +110,18 @@ class NewsAgentState(BaseAgentInput):
     model_config = ConfigDict(extra="ignore")
 
     # ── Internal pipeline state ───────────────────────────────────────────────
-    # memory_task is created in _rewrite_queries_node and awaited in
-    # _rendezvous_node. Excluded from Pydantic serialisation; carried through
-    # the LangGraph state dict directly.
-    memory_task: Optional[Any] = Field(default=None, exclude=True)
     research_plan: Optional[ResearchStepPlan] = None
     research_logs: List[ResearchStepLog] = Field(default_factory=list)
-    latest_articles: List[dict] = Field(default_factory=list)
     seen_urls: List[str] = Field(default_factory=list)
     research_iteration: int = 0
     max_research_iterations: int = 3
     is_information_sufficient: bool = False
 
-    raw_articles: List[dict] = Field(default_factory=list)
+    # Chunks accumulated from the online fetch+ingest branch across all iterations.
     retrieved_chunks: List[RetrievedChunk] = Field(default_factory=list)
+    # Chunks returned by retrieve_memory for the current iteration.
+    # Reset to [] by rendezvous after merging into final_chunks.
+    memory_chunks: List[RetrievedChunk] = Field(default_factory=list)
     final_chunks: List[RetrievedChunk] = Field(default_factory=list)
 
     # ── Output fields ─────────────────────────────────────────────────────────
