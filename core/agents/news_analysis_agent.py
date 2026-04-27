@@ -1,13 +1,4 @@
-"""
-core/agents/news_analysis_agent.py
-
-News analysis agent with iterative research planning, dual-store ingestion,
-and chunk-level extraction.
-
-Graph topology:
-  rewrite_queries -> plan_research -> (fetch_news -> ingest_articles)* -> rendezvous -> analyse_news
-  with memory retrieval fired in the background from rewrite_queries.
-"""
+"""News analysis agent graph and node logic."""
 
 from __future__ import annotations
 
@@ -43,7 +34,12 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT,
     NEWS_RESEARCH_PLANNER_SYSTEM_PROMPT,
 )
-from core.agents.utils import extract_first_sentence, trim_text
+from core.agents.utils import (
+    extract_first_sentence,
+    persist_agent_memory_summary,
+    resolve_agent_memory_context,
+    trim_text,
+)
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
@@ -66,17 +62,7 @@ def _get_default_date_range(
     end_date: datetime | None,
     default_days_back: int = 30,
 ) -> Tuple[datetime, datetime]:
-    """
-    Fill in missing start/end dates with sensible defaults.
-
-    Args:
-        start_date: Requested start date (or None for default)
-        end_date: Requested end date (or None for default)
-        default_days_back: How many days back to default start_date (default: 1 month)
-
-    Returns:
-        Tuple of (start_date, end_date) with defaults applied
-    """
+    """Fill in missing start/end dates with defaults."""
     now_utc = datetime.now(timezone.utc)
 
     if end_date is None:
@@ -92,21 +78,7 @@ def _constrain_date_range(
     end_date: date,
     api_limit_days: int = 28,
 ) -> Tuple[date, date]:
-    """
-    Constrain date range to valid API query bounds.
-
-    - end_date cannot be in the future (capped at now)
-    - start_date cannot exceed the API limit window (default 28 days)
-
-    Args:
-        start_date: Requested start date
-        end_date: Requested end date
-        api_limit_days: Maximum number of days in the past for API queries
-
-    Returns:
-        Tuple of (constrained_start, constrained_end) as date objects in YYYY-MM-DD format
-    """
-    # Use consistent timezone awareness for comparison
+    """Constrain date range to NewsAPI bounds."""
     if isinstance(start_date, datetime):
         start_date = start_date.date()
     if isinstance(end_date, datetime):
@@ -190,16 +162,7 @@ def _merge_cached_entities(
 def _build_deduplicated_sources(
     chunks: List[RetrievedChunk],
 ) -> Tuple[List[CitedSource], Dict[int, int]]:
-    """
-    Deduplicate chunks by article (title + url) and return:
-      - sources: one CitedSource per unique article, numbered 1..N
-      - chunk_to_source_id: maps the original chunk index (0-based) to its
-        canonical source_id so context blocks can reference the right number.
-
-    Multiple chunks from the same article get the same source_id.
-    CitedSource.page_content accumulates all unique chunk texts for that
-    article so the tooltip remains informative.
-    """
+    """Deduplicate chunks by article and map each chunk to a source id."""
     article_map: Dict[Tuple[str, str], Tuple[int, List[str]]] = {}
     chunk_to_source_id: Dict[int, int] = {}
     next_id = 1
@@ -234,6 +197,73 @@ def _build_deduplicated_sources(
     return sources, chunk_to_source_id
 
 
+def _build_context_block(chunks: List[RetrievedChunk], mapping: Dict[int, int]) -> str:
+    return "\n\n".join(
+        f"[{mapping.get(idx, '?')}] {chunk.text}" for idx, chunk in enumerate(chunks)
+    )
+
+
+def _build_context_prefix(
+    *,
+    company_context: str | None,
+    agent_memory_context: str | None,
+    cached_entities: List[Tuple[str, str]],
+) -> str:
+    sections: List[str] = []
+    if company_context:
+        sections.append(f"Company Context:\n{company_context}")
+    if agent_memory_context:
+        sections.append(f"Agent Memory Context:\n{agent_memory_context}")
+    if cached_entities:
+        entity_lines = [f"  - {name} ({entity_type})" for name, entity_type in cached_entities]
+        sections.append("Known entities from prior turns:\n" + "\n".join(entity_lines))
+    if not sections:
+        return ""
+    return "\n\n".join(sections) + "\n\n"
+
+
+def _remap_citations_and_sources(
+    analysis_text: str,
+    sources: List[CitedSource],
+) -> Tuple[str, List[CitedSource]]:
+    cited_ids = sorted(set(int(match) for match in _re.findall(r"\[(\d+)\]", analysis_text)))
+    old_to_new = {old_id: new_id for new_id, old_id in enumerate(cited_ids, start=1)}
+
+    def _remap(match: _re.Match[str]) -> str:
+        source_id = int(match.group(1))
+        return f"[{old_to_new[source_id]}]" if source_id in old_to_new else match.group(0)
+
+    remapped_text = _re.sub(r"\[(\d+)\]", _remap, analysis_text)
+    if not old_to_new:
+        return remapped_text, []
+
+    by_old_id = {source.source_id: source for source in sources}
+    remapped_sources: List[CitedSource] = []
+    for old_id, new_id in old_to_new.items():
+        source = by_old_id.get(old_id)
+        if source is None:
+            continue
+        remapped_sources.append(
+            CitedSource(
+                source_id=new_id,
+                title=source.title,
+                url=source.url,
+                page_content=source.page_content,
+            )
+        )
+    return remapped_text, remapped_sources
+
+
+def _list_unique_actions(logs: List[ResearchStepLog]) -> List[str]:
+    actions: List[str] = []
+    for row in logs:
+        action = str(getattr(row, "action", "") or "").strip()
+        if not action or action == "proceed" or action in actions:
+            continue
+        actions.append(action)
+    return actions
+
+
 class NewsAnalysisAgent(AbstractAgent):
     """LangGraph-based news analysis agent with self-managed memory retrieval."""
 
@@ -241,7 +271,6 @@ class NewsAnalysisAgent(AbstractAgent):
         super().__init__()
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
-        self._ingestor = service_manager.get_ingestor()
         self._memory_context_by_conversation: Dict[str, str] = {}
 
     @staticmethod
@@ -291,16 +320,11 @@ class NewsAnalysisAgent(AbstractAgent):
             input_data.start_date, input_data.end_date
         )
         start_date, end_date = _constrain_date_range(start_date, end_date)
-        conversation_id = (input_data.conversation_id or "").strip()
-        incoming_memory_context = (input_data.agent_memory_context or "").strip()
-        cached_memory_context = (
-            self._memory_context_by_conversation.get(conversation_id, "")
-            if conversation_id
-            else ""
+        conversation_id, effective_memory_context = resolve_agent_memory_context(
+            conversation_id=input_data.conversation_id,
+            incoming_memory_context=input_data.agent_memory_context,
+            memory_context_cache=self._memory_context_by_conversation,
         )
-        effective_memory_context = incoming_memory_context or cached_memory_context
-        if conversation_id and incoming_memory_context and incoming_memory_context != cached_memory_context:
-            self._memory_context_by_conversation[conversation_id] = incoming_memory_context
 
         initial_state = NewsAgentState(
             query=input_data.query,
@@ -315,17 +339,14 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         state_payload = initial_state.model_dump()
-        # memory_task is excluded from model_dump() (exclude=True) but must be
-        # carried in the state dict so LangGraph can thread it between nodes.
-        # It starts as None; _rewrite_queries_node sets it.
         state_payload["memory_task"] = None
         final_state = await self._graph.ainvoke(state_payload)
         output = NewsAgentOutput(**final_state)
-
-        if conversation_id:
-            rendered_summary = self.render_memory_summary(output.memory_summary)
-            if rendered_summary:
-                self._memory_context_by_conversation[conversation_id] = rendered_summary
+        persist_agent_memory_summary(
+            conversation_id=conversation_id,
+            rendered_summary=self.render_memory_summary(output.memory_summary),
+            memory_context_cache=self._memory_context_by_conversation,
+        )
 
         return output
 
@@ -370,18 +391,7 @@ class NewsAnalysisAgent(AbstractAgent):
     # -- Node: rewrite_queries -------------------------------------------------
 
     async def _rewrite_queries_node(self, state: NewsAgentState) -> dict:
-        """
-        Expand the orchestrator's rewritten query into three domain-specific
-        memory retrieval strings (company / sector / market) and immediately
-        fire the memory retrieval as a background asyncio task.
-
-        original_query is stamped onto the RewrittenQueries object here so
-        that TwoStageReranker.rank() has the right query string available when
-        _rendezvous_node calls it on the final combined chunk pool.
-
-        Falls back gracefully: if the LLM call or task creation fails,
-        `memory_task` remains None and the rendezvous node skips memory.
-        """
+        """Rewrite memory queries and start background retrieval."""
         rewritten_queries: RewrittenQueries | None = None
         try:
             publish_progress(
@@ -394,8 +404,6 @@ class NewsAnalysisAgent(AbstractAgent):
                     HumanMessage(content=state.query),
                 ]
             )
-            # Stamp the agent-level query so the final Jina reranker call in
-            # _rendezvous_node has a focused, orchestrator-rewritten query string.
             if rewritten_queries is not None:
                 rewritten_queries.original_query = state.query
             logger.info(
@@ -422,7 +430,9 @@ class NewsAnalysisAgent(AbstractAgent):
                             "_rewrite_queries_node: memory retrieval failed: %s", exc
                         )
                         return MemoryContext(
-                            chunks=[], rewritten_queries=rewritten_queries
+                            chunks=[],
+                            rewritten_queries=rewritten_queries,
+                            entity_tuples=[],
                         )
 
                 memory_task = asyncio.create_task(_retrieve())
@@ -724,14 +734,13 @@ class NewsAnalysisAgent(AbstractAgent):
         total = len(final_chunks)
         publish_progress("news_agent", f"Reranking {total} candidate chunk(s)…")
 
-        # TwoStageReranker: composite prefilter → Jina cross-encoder.
-        # query comes from state.query (the agent-level, orchestrator-rewritten
-        # query — already focused for news analysis).
         final_ranked = await service_manager.get_reranker().rank(
             state.query, final_chunks
         )
 
         merged_entity_tuples: List[Tuple[str, str]] = []
+        if memory_context is not None:
+            merged_entity_tuples.extend(memory_context.entity_tuples or [])
         final_ranked_chunk_ids = list(
             dict.fromkeys(chunk.chunk_id for chunk in final_ranked if chunk.chunk_id)
         )
@@ -757,9 +766,6 @@ class NewsAnalysisAgent(AbstractAgent):
         if state.conversation_id and merged_entity_tuples:
             _merge_cached_entities(state.conversation_id, merged_entity_tuples)
 
-        # Extract entities only from the reranked set — chunks that actually
-        # contributed to this query. Fire-and-forget: extraction enriches the
-        # graph for future retrieval but does not affect the current analysis.
         pending_chunk_ids = [
             chunk.chunk_id
             for chunk in final_ranked
@@ -804,36 +810,15 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         sources, chunk_to_source_id = _build_deduplicated_sources(chunks)
-
-        context_lines = []
-        for idx, chunk in enumerate(chunks):
-            sid = chunk_to_source_id.get(idx, "?")
-            context_lines.append(f"[{sid}] {chunk.text}")
-        context_block = "\n\n".join(context_lines)
+        context_block = _build_context_block(chunks, chunk_to_source_id)
 
         conversation_id = state.conversation_id or ""
         cached_entities = _get_cached_entities(conversation_id)
-        entities_section = ""
-        if cached_entities:
-            entity_lines = [
-                f"  - {name} ({entity_type})" for name, entity_type in cached_entities
-            ]
-            entities_section = (
-                "Known entities from prior turns:\n" + "\n".join(entity_lines) + "\n\n"
-            )
-
-        company_context_section = (
-            f"Company Context:\n{state.company_context}\n\n"
-            if state.company_context
-            else ""
+        context_prefix = _build_context_prefix(
+            company_context=state.company_context,
+            agent_memory_context=state.agent_memory_context,
+            cached_entities=cached_entities,
         )
-        memory_context_section = (
-            "Agent Memory Context:\n"
-            f"{state.agent_memory_context}\n\n"
-            if state.agent_memory_context
-            else ""
-        )
-        context_prefix = f"{company_context_section}{memory_context_section}{entities_section}"
 
         messages = [
             SystemMessage(content=NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT),
@@ -865,30 +850,7 @@ class NewsAnalysisAgent(AbstractAgent):
             logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
 
-        # Citation filtering (unchanged)
-        cited_ids = set(int(m) for m in _re.findall(r"\[(\d+)\]", analysis_text))
-        _cited_in_order = sorted(cited_ids)
-        _old_to_new: dict = {
-            old_id: new_id for new_id, old_id in enumerate(_cited_in_order, start=1)
-        }
-
-        def _remap(m: _re.Match) -> str:
-            sid = int(m.group(1))
-            return f"[{_old_to_new[sid]}]" if sid in _old_to_new else m.group(0)
-
-        analysis_text = _re.sub(r"\[(\d+)\]", _remap, analysis_text)
-
-        _sources_by_old_id = {s.source_id: s for s in sources}
-        sources = [
-            CitedSource(
-                source_id=new_id,
-                title=_sources_by_old_id[old_id].title,
-                url=_sources_by_old_id[old_id].url,
-                page_content=_sources_by_old_id[old_id].page_content,
-            )
-            for old_id, new_id in _old_to_new.items()
-            if old_id in _sources_by_old_id
-        ]
+        analysis_text, sources = _remap_citations_and_sources(analysis_text, sources)
 
         task_id = None
         if state.conversation_id and analysis_text:
@@ -906,14 +868,7 @@ class NewsAnalysisAgent(AbstractAgent):
             except Exception:
                 logger.exception("_analyse_news_node: failed to enqueue graph task")
 
-        tools_used: List[str] = []
-        for row in state.research_logs:
-            action = str(getattr(row, "action", "") or "").strip()
-            if not action or action == "proceed":
-                continue
-            if action in tools_used:
-                continue
-            tools_used.append(action)
+        tools_used = _list_unique_actions(state.research_logs)
 
         top_references: List[dict] = []
         for src in sources[:3]:

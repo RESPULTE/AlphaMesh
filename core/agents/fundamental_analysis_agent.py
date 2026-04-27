@@ -72,7 +72,12 @@ from core.agents.prompts.fundamental_agent_prompts import (
     _TOOL_PLANNER_SYSTEM,
     _TOOL_PLANNER_USER,
 )
-from core.agents.utils import extract_first_sentence, trim_text
+from core.agents.utils import (
+    extract_first_sentence,
+    persist_agent_memory_summary,
+    resolve_agent_memory_context,
+    trim_text,
+)
 from core.config import settings
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.logger import get_logger
@@ -179,16 +184,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
         # FinancialDatabase — this is a no-op after the first call.
         await self.db.initialize()
 
-        conversation_id = (input_data.conversation_id or "").strip()
-        incoming_memory_context = (input_data.agent_memory_context or "").strip()
-        cached_memory_context = (
-            self._memory_context_by_conversation.get(conversation_id, "")
-            if conversation_id
-            else ""
+        conversation_id, effective_memory_context = resolve_agent_memory_context(
+            conversation_id=input_data.conversation_id,
+            incoming_memory_context=input_data.agent_memory_context,
+            memory_context_cache=self._memory_context_by_conversation,
         )
-        effective_memory_context = incoming_memory_context or cached_memory_context
-        if conversation_id and incoming_memory_context and incoming_memory_context != cached_memory_context:
-            self._memory_context_by_conversation[conversation_id] = incoming_memory_context
 
         state_payload = input_data.model_dump(exclude_none=False)
         state_payload["agent_memory_context"] = effective_memory_context
@@ -215,10 +215,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
             raw_display_data=final_state.get("raw_display_data"),
         )
 
-        if conversation_id:
-            rendered_summary = self.render_memory_summary(output.memory_summary)
-            if rendered_summary:
-                self._memory_context_by_conversation[conversation_id] = rendered_summary
+        persist_agent_memory_summary(
+            conversation_id=conversation_id,
+            rendered_summary=self.render_memory_summary(output.memory_summary),
+            memory_context_cache=self._memory_context_by_conversation,
+        )
 
         return output
 

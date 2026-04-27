@@ -251,7 +251,7 @@ def test_ingest_articles_node_queries_new_and_existing_chunk_ids(
 
     state = NewsAgentState(
         query="AAPL latest catalysts",
-        raw_articles=[{"url": "https://example.com/article"}],
+        latest_articles=[{"url": "https://example.com/article"}],
     )
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
     result = asyncio.run(agent._ingest_articles_node(state))

@@ -127,6 +127,43 @@ def build_planner_memory_block(agent_memory_contexts: Dict[str, str]) -> str:
     return "\n\n".join(lines) if lines else "(none)"
 
 
+def resolve_agent_memory_context(
+    *,
+    conversation_id: Optional[str],
+    incoming_memory_context: Optional[str],
+    memory_context_cache: Dict[str, str],
+) -> tuple[str, str]:
+    """
+    Resolve the effective per-agent memory context for this turn.
+
+    Rules:
+    - If an incoming context is provided, it takes precedence and refreshes cache.
+    - Otherwise, use cached context for the conversation if present.
+    """
+    conversation_key = (conversation_id or "").strip()
+    incoming = (incoming_memory_context or "").strip()
+    cached = memory_context_cache.get(conversation_key, "") if conversation_key else ""
+
+    if conversation_key and incoming and incoming != cached:
+        memory_context_cache[conversation_key] = incoming
+    return conversation_key, (incoming or cached)
+
+
+def persist_agent_memory_summary(
+    *,
+    conversation_id: str,
+    rendered_summary: str,
+    memory_context_cache: Dict[str, str],
+) -> None:
+    """Persist a rendered agent summary into the per-conversation memory cache."""
+    if not conversation_id:
+        return
+    summary = (rendered_summary or "").strip()
+    if not summary:
+        return
+    memory_context_cache[conversation_id] = summary
+
+
 def _build_combined_company_context(
     tickers: List[str],
     context_blocks: Dict[str, str],
@@ -165,9 +202,3 @@ def _build_clarification_message(needs_confirmation: Dict[str, "TickerInfo"]) ->
     return "\n".join(lines)
 
 
-def _trim_text(value: Any, *, max_chars: int = MAX_TURN_TEXT_CHARS) -> str:
-    return trim_text(value, max_chars=max_chars)
-
-
-def _normalise_turn_timestamp(turn: dict) -> str:
-    return normalise_turn_timestamp(turn)
