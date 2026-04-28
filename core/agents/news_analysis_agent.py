@@ -30,6 +30,8 @@ from core.agents.news_fetcher import search_web
 from core.agents.prompts.news_agent_prompts import (
     NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT,
     NEWS_ANALYSIS_USER_PROMPT,
+    NEWS_DEFERRED_ALLOWED_ENTITY_TYPES,
+    NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
     NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     NEWS_PLANNER_SYSTEM_PROMPT,
 )
@@ -1109,6 +1111,10 @@ class NewsAnalysisAgent(AbstractAgent):
                     source_agent=self.name(),
                     extraction_text=analysis_text,
                     system_prompt=NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                    allowed_entity_types=list(NEWS_DEFERRED_ALLOWED_ENTITY_TYPES),
+                    allowed_relationship_types=list(
+                        NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES
+                    ),
                     llm_config={"temperature": getattr(self._llm, "temperature", 0.7)},
                 )
                 task_id = await service_manager.get_graph_queue_manager().enqueue(task)

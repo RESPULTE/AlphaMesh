@@ -65,6 +65,8 @@ from core.agents.models.fundamental_agent_models import (
     _AgentState,
 )
 from core.agents.prompts.fundamental_agent_prompts import (
+    FUNDAMENTAL_DEFERRED_ALLOWED_ENTITY_TYPES,
+    FUNDAMENTAL_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
     FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     _ANALYST_SYSTEM,
     _COMPLETION_REVIEW_SYSTEM,
@@ -1079,6 +1081,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     source_agent=self.name(),
                     extraction_text=analysis_text,
                     system_prompt=FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+                    allowed_entity_types=list(FUNDAMENTAL_DEFERRED_ALLOWED_ENTITY_TYPES),
+                    allowed_relationship_types=list(
+                        FUNDAMENTAL_DEFERRED_ALLOWED_RELATIONSHIP_TYPES
+                    ),
                     llm_config={"temperature": 0.7},
                 )
                 task_id = await service_manager.get_graph_queue_manager().enqueue(task)

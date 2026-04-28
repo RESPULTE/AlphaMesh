@@ -4,18 +4,23 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
-from core.memory.graph.models import _USER_SCOPED_TYPES
+from core.memory.graph.models import (
+    _USER_SCOPED_TYPES,
+    ALLOWED_ENTITY_TYPES,
+    ALLOWED_RELATIONSHIP_TYPES,
+)
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
-from core.memory.graph.queue.task_utils import (
+from core.memory.graph.queue.types import TASK_KIND_CHUNK_ENTITIES, GraphTask
+from core.memory.graph.queue.utils import (
     has_extractable_payload,
     is_chunk_entities_task,
 )
-from core.memory.graph.queue.types import TASK_KIND_CHUNK_ENTITIES, GraphTask
 from core.memory.graph.utils import (
     entity_key,
     normalize_entity_name,
     normalize_entity_type,
+    normalize_relationship_type,
 )
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
@@ -84,6 +89,9 @@ class GraphWritePipeline:
                 relationships = await self.extract_relationships_for_task(task)
                 if relationships:
                     task.relationships = relationships
+            if relationships and task.extraction_text:
+                relationships = self._filter_relationships_for_task(task, relationships)
+                task.relationships = relationships
             if relationships:
                 allow_create = self._normalize_allow_create(
                     task.allow_create,
@@ -334,3 +342,46 @@ class GraphWritePipeline:
             )
             return False
         return bool(allow_create)
+
+    def _filter_relationships_for_task(
+        self,
+        task: GraphTask,
+        relationships: List[dict],
+    ) -> List[dict]:
+        if not relationships:
+            return []
+
+        allowed_entity_types = set(task.allowed_entity_types or ALLOWED_ENTITY_TYPES)
+        allowed_relationship_types = set(
+            task.allowed_relationship_types or ALLOWED_RELATIONSHIP_TYPES
+        )
+        scoped_relationships: List[dict] = []
+        dropped = 0
+
+        for rel in relationships:
+            from_type = normalize_entity_type(str(rel.get("from_type") or "").strip())
+            to_type = normalize_entity_type(str(rel.get("to_type") or "").strip())
+            relation_type = normalize_relationship_type(
+                str(rel.get("relation") or rel.get("relation_type") or "RELATED_TO")
+            )
+            if (
+                not from_type
+                or not to_type
+                or from_type not in allowed_entity_types
+                or to_type not in allowed_entity_types
+                or relation_type not in allowed_relationship_types
+            ):
+                dropped += 1
+                continue
+
+            scoped_rel = dict(rel)
+            scoped_rel["relation"] = relation_type
+            scoped_relationships.append(scoped_rel)
+
+        if dropped:
+            logger.info(
+                "GraphWritePipeline: dropped %d out-of-scope relationship(s) for task '%s'",
+                dropped,
+                task.task_id,
+            )
+        return scoped_relationships

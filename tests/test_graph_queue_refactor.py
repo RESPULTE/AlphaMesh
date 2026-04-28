@@ -14,7 +14,9 @@ from core.memory.graph.graph_queue import (
     GraphQueueManager,
     make_extraction_task,
     make_graph_task,
+    prompt_id_from_text,
 )
+from core.memory.graph.models import ALLOWED_ENTITY_TYPES, ALLOWED_RELATIONSHIP_TYPES
 from core.memory.graph.queue.pipeline import GraphWritePipeline
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.sql_store import GraphTaskSqlStore
@@ -391,5 +393,149 @@ def test_recover_pending_tasks_applies_allow_create_policy(
         await manager._recover_pending_tasks()
 
         assert recovered_allow_create == [True]
+
+    asyncio.run(_run())
+
+
+def test_make_extraction_task_normalizes_scope_and_rejects_unknown_values() -> None:
+    task = make_extraction_task(
+        turn_id="turn-1",
+        conversation_id="conv-1",
+        source_agent="agent-a",
+        extraction_text="analysis text",
+        system_prompt="extract relationships",
+        allowed_entity_types=["Sector", "Company", "Company"],
+        allowed_relationship_types=["BELONGS_TO", "BELONGS_TO", "RELATED_TO"],
+    )
+
+    assert task.allowed_entity_types == ["Company", "Sector"]
+    assert task.allowed_relationship_types == ["BELONGS_TO", "RELATED_TO"]
+    assert task.system_prompt is not None
+    assert "Task-scoped extraction constraints:" in task.system_prompt
+    assert task.system_prompt_id == prompt_id_from_text(task.system_prompt)
+
+    with pytest.raises(ValueError, match="Unknown entity_type\\(s\\): UnknownType"):
+        make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            system_prompt="extract relationships",
+            allowed_entity_types=["UnknownType"],
+        )
+
+    with pytest.raises(ValueError, match="Unknown relationship_type\\(s\\): UNKNOWN_EDGE"):
+        make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            system_prompt="extract relationships",
+            allowed_relationship_types=["UNKNOWN_EDGE"],
+        )
+
+
+def test_graph_task_store_roundtrip_persists_extraction_scope(tmp_path: Path) -> None:
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+
+    async def _run() -> None:
+        await store.initialize()
+        task = make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            system_prompt="extract relationships",
+            allowed_entity_types=["Company", "Sector"],
+            allowed_relationship_types=["BELONGS_TO"],
+        )
+        await store.persist_task(task.to_payload())
+
+        rows = await store.load_pending_tasks()
+        assert len(rows) == 1
+        loaded = rows[0]
+        assert loaded["allowed_entity_types"] == ["Company", "Sector"]
+        assert loaded["allowed_relationship_types"] == ["BELONGS_TO"]
+
+    asyncio.run(_run())
+
+
+def test_pipeline_drops_out_of_scope_extracted_relationships(tmp_path: Path) -> None:
+    class ScopedExtractor:
+        async def extract(
+            self,
+            *,
+            text: str,
+            llm,
+            system_prompt: str,
+        ) -> List[dict]:
+            _ = (text, llm, system_prompt)
+            return [
+                {
+                    "from_name": "Apple",
+                    "from_type": "Company",
+                    "relation": "BELONGS_TO",
+                    "to_name": "Technology",
+                    "to_type": "Sector",
+                },
+                {
+                    "from_name": "Apple",
+                    "from_type": "Company",
+                    "relation": "RELATED_TO",
+                    "to_name": "US",
+                    "to_type": "Market",
+                },
+                {
+                    "from_name": "Apple",
+                    "from_type": "Company",
+                    "relation": "BELONGS_TO",
+                    "to_name": "Earnings Beat",
+                    "to_type": "FinancialEvent",
+                },
+            ]
+
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+
+    async def _run() -> None:
+        await store.initialize()
+        prompt_registry = PromptRegistry(store)
+        pipeline = GraphWritePipeline(
+            entity_resolver=resolver,
+            graph_writer=writer,
+            relationship_extractor=ScopedExtractor(),
+            entity_extractor=fake_entity_extractor,
+            llm_provider=fake_llm_provider,
+            prompt_registry=prompt_registry,
+        )
+
+        task = make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            system_prompt="extract relationships",
+            allowed_entity_types=["Company", "Sector"],
+            allowed_relationship_types=["BELONGS_TO"],
+            allow_create=False,
+        )
+        assert task.system_prompt is not None
+        await prompt_registry.register(task.system_prompt)
+
+        results = await pipeline.process_tasks([task])
+        assert results["domain_edges"] == 0
+        assert results["user_edges"] == 0
+        assert resolver.edge_calls
+        scoped_relationships, _allow_create = resolver.edge_calls[0]
+        assert len(scoped_relationships) == 1
+        assert scoped_relationships[0]["relation"] == "BELONGS_TO"
+        assert len(writer.write_calls) == 1
+        written_relationships, _entity_cache = writer.write_calls[0]
+        assert len(written_relationships) == 1
+        assert written_relationships[0]["relation"] == "BELONGS_TO"
+        assert written_relationships[0]["from_type"] in ALLOWED_ENTITY_TYPES
+        assert written_relationships[0]["to_type"] in ALLOWED_ENTITY_TYPES
+        assert written_relationships[0]["relation"] in ALLOWED_RELATIONSHIP_TYPES
 
     asyncio.run(_run())

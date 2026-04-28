@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
 
 TASK_KIND_RELATIONSHIPS = "relationships"
 TASK_KIND_CHUNK_ENTITIES = "chunk_entities"
 SHUTDOWN_TURN_ID = "__SHUTDOWN__"
-
-
-def prompt_id_from_text(system_prompt: str) -> str:
-    return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -28,6 +22,8 @@ class GraphTask:
     extraction_text: Optional[str] = None
     system_prompt: Optional[str] = None
     system_prompt_id: Optional[str] = None
+    allowed_entity_types: Optional[List[str]] = None
+    allowed_relationship_types: Optional[List[str]] = None
     llm_config: Optional[dict] = None
     allow_create: Optional[bool] = None
     created_at: float = field(default_factory=time.time)
@@ -43,10 +39,40 @@ class GraphTask:
             "relationships": self.relationships,
             "extraction_text": self.extraction_text,
             "system_prompt_id": self.system_prompt_id,
+            "allowed_entity_types": self.allowed_entity_types,
+            "allowed_relationship_types": self.allowed_relationship_types,
             "llm_config": self.llm_config,
             "allow_create": self.allow_create,
             "created_at": self.created_at,
         }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> GraphTask:
+        allow_create = payload.get("allow_create")
+        if allow_create is not None:
+            allow_create = bool(allow_create)
+        allowed_entity_types = payload.get("allowed_entity_types")
+        if allowed_entity_types is not None:
+            allowed_entity_types = list(allowed_entity_types)
+        allowed_relationship_types = payload.get("allowed_relationship_types")
+        if allowed_relationship_types is not None:
+            allowed_relationship_types = list(allowed_relationship_types)
+        return cls(
+            task_id=str(payload["task_id"]),
+            turn_id=str(payload["turn_id"]),
+            conversation_id=str(payload["conversation_id"]),
+            source_agent=str(payload["source_agent"]),
+            task_kind=str(payload.get("task_kind") or TASK_KIND_RELATIONSHIPS),
+            chunk_ids=payload.get("chunk_ids"),
+            relationships=list(payload.get("relationships") or []),
+            extraction_text=payload.get("extraction_text"),
+            system_prompt_id=payload.get("system_prompt_id"),
+            allowed_entity_types=allowed_entity_types,
+            allowed_relationship_types=allowed_relationship_types,
+            llm_config=payload.get("llm_config"),
+            allow_create=allow_create,
+            created_at=float(payload.get("created_at", time.time())),
+        )
 
 
 @dataclass
@@ -56,72 +82,3 @@ class SentinelTask:
 
 
 QueueItem = GraphTask | SentinelTask
-
-
-def graph_task_from_payload(payload: Dict[str, Any]) -> GraphTask:
-    allow_create = payload.get("allow_create")
-    if allow_create is not None:
-        allow_create = bool(allow_create)
-    return GraphTask(
-        task_id=str(payload["task_id"]),
-        turn_id=str(payload["turn_id"]),
-        conversation_id=str(payload["conversation_id"]),
-        source_agent=str(payload["source_agent"]),
-        task_kind=str(payload.get("task_kind") or TASK_KIND_RELATIONSHIPS),
-        chunk_ids=payload.get("chunk_ids"),
-        relationships=list(payload.get("relationships") or []),
-        extraction_text=payload.get("extraction_text"),
-        system_prompt_id=payload.get("system_prompt_id"),
-        llm_config=payload.get("llm_config"),
-        allow_create=allow_create,
-        created_at=float(payload.get("created_at", time.time())),
-    )
-
-
-def make_graph_task(
-    turn_id: str,
-    conversation_id: str,
-    source_agent: str,
-    relationships: List[dict],
-    immediate: bool = False,
-    allow_create: Optional[bool] = None,
-) -> GraphTask:
-    return GraphTask(
-        task_id=str(uuid4()),
-        turn_id=turn_id,
-        conversation_id=conversation_id,
-        source_agent=source_agent,
-        immediate=immediate,
-        relationships=relationships,
-        allow_create=allow_create,
-    )
-
-
-def make_extraction_task(
-    turn_id: str,
-    conversation_id: str,
-    source_agent: str,
-    extraction_text: Optional[str] = None,
-    system_prompt: Optional[str] = None,
-    llm_config: Optional[dict] = None,
-    immediate: bool = False,
-    task_kind: str = TASK_KIND_RELATIONSHIPS,
-    chunk_ids: Optional[List[str]] = None,
-    allow_create: Optional[bool] = None,
-) -> GraphTask:
-    prompt_id = prompt_id_from_text(system_prompt) if system_prompt else None
-    return GraphTask(
-        task_id=str(uuid4()),
-        turn_id=turn_id,
-        conversation_id=conversation_id,
-        source_agent=source_agent,
-        immediate=immediate,
-        task_kind=task_kind,
-        chunk_ids=chunk_ids,
-        relationships=[],
-        extraction_text=extraction_text,
-        system_prompt=system_prompt,
-        system_prompt_id=prompt_id,
-        llm_config=llm_config,
-        allow_create=allow_create,
-    )

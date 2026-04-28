@@ -15,14 +15,21 @@ from core.memory.graph.queue.policies import (
 )
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
-from core.memory.graph.queue.task_utils import (
+from core.memory.graph.queue.types import (
+    TASK_KIND_RELATIONSHIPS,
+    GraphTask,
+    default_allowed_entity_types,
+    default_allowed_relationship_types,
+    normalize_allowed_entity_types,
+    normalize_allowed_relationship_types,
+)
+from core.memory.graph.queue.utils import (
     has_chunk_ids,
     has_extractable_payload,
     has_extraction_text,
     has_inline_relationships,
     is_chunk_entities_task,
 )
-from core.memory.graph.queue.types import GraphTask, graph_task_from_payload
 from core.memory.graph.queue.worker import ConversationQueueWorker
 from core.memory.graph.sql_store import GraphTaskSqlStore
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
@@ -190,7 +197,7 @@ class GraphQueueManager:
 
         logger.info("GraphQueueManager: recovering %d pending task(s)", len(rows))
 
-        tasks: List[GraphTask] = [graph_task_from_payload(row) for row in rows]
+        tasks: List[GraphTask] = [GraphTask.from_payload(row) for row in rows]
         for task in tasks:
             self._apply_allow_create_policy(task)
 
@@ -239,6 +246,12 @@ class GraphQueueManager:
     async def _prepare_task(self, task: GraphTask) -> bool:
         is_chunk_entities = is_chunk_entities_task(task)
 
+        if task.task_kind == TASK_KIND_RELATIONSHIPS:
+            task.allowed_entity_types = self._resolve_task_entity_scope(task)
+            task.allowed_relationship_types = self._resolve_task_relationship_scope(
+                task
+            )
+
         if task.system_prompt is not None and not is_chunk_entities:
             task.system_prompt_id = await self._prompt_registry.register(
                 task.system_prompt
@@ -286,3 +299,23 @@ class GraphQueueManager:
                 task.system_prompt_id,
             )
         return True
+
+    @staticmethod
+    def _resolve_task_entity_scope(task: GraphTask) -> List[str]:
+        if task.allowed_entity_types is None:
+            return default_allowed_entity_types()
+        normalized = normalize_allowed_entity_types(task.allowed_entity_types)
+        if not normalized:
+            return default_allowed_entity_types()
+        return normalized
+
+    @staticmethod
+    def _resolve_task_relationship_scope(task: GraphTask) -> List[str]:
+        if task.allowed_relationship_types is None:
+            return default_allowed_relationship_types()
+        normalized = normalize_allowed_relationship_types(
+            task.allowed_relationship_types
+        )
+        if not normalized:
+            return default_allowed_relationship_types()
+        return normalized

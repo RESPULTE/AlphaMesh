@@ -131,6 +131,29 @@ Structured-output rule:
 - Return `sentiment` only when rating is needed; otherwise return `sentiment=null`.\
 """.strip()
 
+NEWS_DEFERRED_ALLOWED_ENTITY_TYPES = (
+    "Company",
+    "FinancialEvent",
+    "FinancialConcept",
+    "Sector",
+    "Industry",
+    "Market",
+)
+
+NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES = (
+    "AFFECTS",
+    "CAUSED_BY",
+    "INCREASES",
+    "DECREASES",
+    "CORRELATED_WITH",
+    "EXPOSES_TO",
+    "MITIGATES",
+    "COMPETES_WITH",
+    "ACQUIRED_BY",
+    "RELATED_TO",
+    "BELONGS_TO",
+)
+
 
 NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = f"""\
 You are a graph relationship extractor for financial NEWS analysis outputs.

@@ -211,6 +211,23 @@ Financial Data Preview:
 {data_preview}
 """
 
+FUNDAMENTAL_DEFERRED_ALLOWED_ENTITY_TYPES = (
+    "Company",
+    "FinancialConcept",
+    "FinancialEvent",
+)
+
+FUNDAMENTAL_DEFERRED_ALLOWED_RELATIONSHIP_TYPES = (
+    "AFFECTS",
+    "CAUSED_BY",
+    "INCREASES",
+    "DECREASES",
+    "CORRELATED_WITH",
+    "EXPOSES_TO",
+    "MITIGATES",
+    "RELATED_TO",
+)
+
 
 FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = f"""\
 You are a graph relationship extractor for FUNDAMENTAL equity analysis outputs.

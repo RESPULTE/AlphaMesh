@@ -29,6 +29,8 @@ class GraphTaskSqlStore(SQLiteAdapter):
                 relationships   TEXT NOT NULL,
                 extraction_text TEXT,
                 system_prompt_id TEXT,
+                allowed_entity_types TEXT,
+                allowed_relationship_types TEXT,
                 llm_config      TEXT,
                 task_kind       TEXT,
                 chunk_ids       TEXT,
@@ -60,6 +62,8 @@ class GraphTaskSqlStore(SQLiteAdapter):
         for col, col_type in [
             ("extraction_text", "TEXT"),
             ("system_prompt_id", "TEXT"),
+            ("allowed_entity_types", "TEXT"),
+            ("allowed_relationship_types", "TEXT"),
             ("llm_config", "TEXT"),
             ("task_kind", "TEXT"),
             ("chunk_ids", "TEXT"),
@@ -72,8 +76,8 @@ class GraphTaskSqlStore(SQLiteAdapter):
     async def persist_task(self, task_payload: Dict[str, Any]) -> None:
         await self.execute(
             """INSERT OR IGNORE INTO graph_tasks
-               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, task_kind, chunk_ids, allow_create, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
+               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, allow_create, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
             (
                 task_payload["task_id"],
                 task_payload["turn_id"],
@@ -82,6 +86,16 @@ class GraphTaskSqlStore(SQLiteAdapter):
                 json.dumps(task_payload.get("relationships") or []),
                 task_payload.get("extraction_text"),
                 task_payload.get("system_prompt_id"),
+                (
+                    json.dumps(task_payload["allowed_entity_types"])
+                    if task_payload.get("allowed_entity_types") is not None
+                    else None
+                ),
+                (
+                    json.dumps(task_payload["allowed_relationship_types"])
+                    if task_payload.get("allowed_relationship_types") is not None
+                    else None
+                ),
                 (
                     json.dumps(task_payload["llm_config"])
                     if task_payload.get("llm_config") is not None
@@ -113,7 +127,7 @@ class GraphTaskSqlStore(SQLiteAdapter):
 
     async def load_pending_tasks(self) -> List[Dict[str, Any]]:
         rows = await self.fetchall(
-            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, llm_config, task_kind, chunk_ids, allow_create, created_at "
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, allow_create, created_at "
             "FROM graph_tasks WHERE status='PENDING' ORDER BY created_at ASC"
         )
         tasks: List[Dict[str, Any]] = []
@@ -130,6 +144,16 @@ class GraphTaskSqlStore(SQLiteAdapter):
                     "relationships": json.loads(row["relationships"] or "[]"),
                     "extraction_text": row["extraction_text"],
                     "system_prompt_id": row["system_prompt_id"],
+                    "allowed_entity_types": (
+                        json.loads(row["allowed_entity_types"])
+                        if row["allowed_entity_types"]
+                        else None
+                    ),
+                    "allowed_relationship_types": (
+                        json.loads(row["allowed_relationship_types"])
+                        if row["allowed_relationship_types"]
+                        else None
+                    ),
                     "llm_config": (
                         json.loads(row["llm_config"]) if row["llm_config"] else None
                     ),
