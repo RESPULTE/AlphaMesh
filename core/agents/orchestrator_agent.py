@@ -130,10 +130,17 @@ class OrchestratorAgent:
         contexts: Dict[str, str] = {}
         for agent_name, agent in self._agents.items():
             builder = getattr(agent, "build_memory_context_from_history", None)
-            if not callable(builder):
-                continue
             try:
-                context = builder(turns, window=window)
+                if callable(builder):
+                    context = builder(turns, window=window)
+                else:
+                    working_memory = getattr(agent, "_working_memory", None)
+                    fallback_builder = getattr(
+                        working_memory, "build_context_from_history_summaries", None
+                    )
+                    if not callable(fallback_builder):
+                        continue
+                    context = fallback_builder(turns, window=window)
             except Exception:
                 logger.exception(
                     "_build_runtime_agent_memory_contexts: context build failed for '%s'",

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import re as _re
 import time
-from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Type
 from uuid import uuid4
 
@@ -33,7 +31,16 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     NEWS_PLANNER_SYSTEM_PROMPT,
 )
-from core.agents.utils import extract_first_sentence
+from core.agents.utils import (
+    build_analysis_context_prefix,
+    build_planner_relevance_context_block,
+    coerce_entity_tuple,
+    constrain_date_range,
+    extract_first_sentence,
+    get_default_date_range,
+    normalize_entity_tuple,
+    remap_numeric_citations,
+)
 from core.agents.working_memory.news_working_memory import NewsWorkingMemoryManager
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
@@ -54,65 +61,6 @@ class NewsAnalysisStructuredOutput(BaseModel):
     sentiment: Optional[AgentSentiment] = None
 
 
-def _get_default_date_range(
-    start_date: datetime | None,
-    end_date: datetime | None,
-    default_days_back: int = 30,
-) -> Tuple[datetime, datetime]:
-    """Fill in missing start/end dates with defaults."""
-    now_utc = datetime.now(timezone.utc)
-    if end_date is None:
-        end_date = now_utc
-    if start_date is None:
-        start_date = now_utc - timedelta(days=default_days_back)
-    return start_date, end_date
-
-
-def _constrain_date_range(
-    start_date: date,
-    end_date: date,
-    api_limit_days: int = 28,
-) -> Tuple[date, date]:
-    """Constrain date range to NewsAPI bounds."""
-    if isinstance(start_date, datetime):
-        start_date = start_date.date()
-    if isinstance(end_date, datetime):
-        end_date = end_date.date()
-
-    now = datetime.now().date()
-    api_limit_date = now - timedelta(days=api_limit_days)
-    start_date_only = start_date
-    end_date_only = end_date
-
-    if end_date_only > now:
-        end_date_only = now
-    if start_date_only < api_limit_date:
-        start_date_only = api_limit_date
-    return start_date_only, end_date_only
-
-
-def _normalize_entity_tuple(name: Any, entity_type: Any) -> Tuple[str, str] | None:
-    normalized_name = str(name or "").strip()
-    normalized_type = str(entity_type or "").strip()
-    if not normalized_name or not normalized_type:
-        return None
-    return normalized_name, normalized_type
-
-
-def _coerce_entity_tuple(entity: Any) -> Tuple[str, str] | None:
-    if isinstance(entity, dict):
-        return _normalize_entity_tuple(
-            entity.get("name") or entity.get("entity_name"),
-            entity.get("entity_type"),
-        )
-    if isinstance(entity, (tuple, list)) and len(entity) >= 2:
-        return _normalize_entity_tuple(entity[0], entity[1])
-    return _normalize_entity_tuple(
-        getattr(entity, "name", None),
-        getattr(entity, "entity_type", None),
-    )
-
-
 def _get_cached_entities(conversation_id: str) -> List[Tuple[str, str]]:
     if not conversation_id:
         return []
@@ -125,7 +73,7 @@ def _get_cached_entities(conversation_id: str) -> List[Tuple[str, str]]:
     cache = _ENTITY_CACHE.setdefault(conversation_id, {})
     normalized_cache: Dict[Tuple[str, str], Tuple[str, str]] = {}
     for raw in list(cache.values()):
-        normalized = _coerce_entity_tuple(raw)
+        normalized = coerce_entity_tuple(raw)
         if normalized is None:
             continue
         normalized_cache[normalized] = normalized
@@ -138,86 +86,11 @@ def _merge_cached_entities(conversation_id: str, entities: List[Any]) -> None:
         return
     cache = _ENTITY_CACHE.setdefault(conversation_id, {})
     for entity in entities:
-        normalized = _coerce_entity_tuple(entity)
+        normalized = coerce_entity_tuple(entity)
         if normalized is None:
             continue
         cache[normalized] = normalized
     _ENTITY_CACHE_TS[conversation_id] = time.time()
-
-
-def _build_context_block(
-    chunks: List[RetrievedChunk],
-    mapping: Dict[int, int],
-    rationale_by_chunk_id: Dict[str, str] | None = None,
-) -> str:
-    rationale_by_chunk_id = rationale_by_chunk_id or {}
-    lines: List[str] = []
-    for idx, chunk in enumerate(chunks):
-        source_id = mapping.get(idx, "?")
-        rationale = rationale_by_chunk_id.get(chunk.chunk_id, "").strip()
-        if not rationale:
-            rationale = "Selected by planner as relevant to the query."
-        lines.append(
-            f"[{source_id}] Planner relevance rationale: {rationale}\n{chunk.text}"
-        )
-    return "\n\n".join(lines)
-
-
-def _build_context_prefix(
-    *,
-    company_context: str | None,
-    agent_memory_context: str | None,
-    cached_entities: List[Tuple[str, str]],
-) -> str:
-    sections: List[str] = []
-    if company_context:
-        sections.append(f"Company Context:\n{company_context}")
-    if agent_memory_context:
-        sections.append(f"Agent Memory Context:\n{agent_memory_context}")
-    if cached_entities:
-        entity_lines = [
-            f"  - {name} ({entity_type})" for name, entity_type in cached_entities
-        ]
-        sections.append("Known entities from prior turns:\n" + "\n".join(entity_lines))
-    if not sections:
-        return ""
-    return "\n\n".join(sections) + "\n\n"
-
-
-def _remap_citations_and_sources(
-    analysis_text: str,
-    sources: List[CitedSource],
-) -> Tuple[str, List[CitedSource]]:
-    cited_ids = sorted(
-        set(int(match) for match in _re.findall(r"\[(\d+)\]", analysis_text))
-    )
-    old_to_new = {old_id: new_id for new_id, old_id in enumerate(cited_ids, start=1)}
-
-    def _remap(match: _re.Match[str]) -> str:
-        source_id = int(match.group(1))
-        return (
-            f"[{old_to_new[source_id]}]" if source_id in old_to_new else match.group(0)
-        )
-
-    remapped_text = _re.sub(r"\[(\d+)\]", _remap, analysis_text)
-    if not old_to_new:
-        return remapped_text, []
-
-    by_old_id = {source.source_id: source for source in sources}
-    remapped_sources: List[CitedSource] = []
-    for old_id, new_id in old_to_new.items():
-        source = by_old_id.get(old_id)
-        if source is None:
-            continue
-        remapped_sources.append(
-            CitedSource(
-                source_id=new_id,
-                title=source.title,
-                url=source.url,
-                page_content=source.page_content,
-            )
-        )
-    return remapped_text, remapped_sources
 
 
 class NewsAnalysisAgent(AbstractAgent):
@@ -246,69 +119,15 @@ class NewsAnalysisAgent(AbstractAgent):
     def get_output_schema_class() -> Type[BaseModel]:
         return NewsAgentOutput
 
-    @staticmethod
-    def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
-        return NewsWorkingMemoryManager.render_memory_summary(memory_summary)
-
-    @classmethod
-    def build_memory_context_from_history(
-        cls,
-        history_turns: List[dict],
-        window: int = 8,
-    ) -> str:
-        return NewsWorkingMemoryManager.build_context_from_history_summaries(
-            history_turns, window=window
-        )
-
-    def _resolve_agent_memory_context(
-        self,
-        *,
-        conversation_id: str,
-        incoming_memory_context: str | None,
-    ) -> str:
-        return self._working_memory.resolve_agent_memory_context(
-            conversation_id=conversation_id,
-            incoming_memory_context=incoming_memory_context,
-        )
-
-    def _persist_agent_memory_summary(
-        self, conversation_id: str, rendered_summary: str
-    ) -> None:
-        self._working_memory.persist_agent_memory_summary(
-            conversation_id=conversation_id,
-            rendered_summary=rendered_summary,
-        )
-
-    def _get_working_memory_chunks(self, conversation_id: str) -> List[RetrievedChunk]:
-        return self._working_memory.get_working_memory_chunks(conversation_id)
-
-    def _persist_finalized_working_memory(
-        self,
-        *,
-        conversation_id: str,
-        turn_id: str,
-        query: str,
-        chunks: List[RetrievedChunk],
-        score_unavailable: bool,
-    ) -> None:
-        self._working_memory.persist_finalized_turn(
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-            query=query,
-            chunks=chunks,
-            score_unavailable=score_unavailable,
-            source_key_fn=RetrievedChunk._source_key,
-        )
-
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
-        start_date, end_date = _get_default_date_range(
+        start_date, end_date = get_default_date_range(
             input_data.start_date, input_data.end_date
         )
-        start_date, end_date = _constrain_date_range(start_date, end_date)
+        start_date, end_date = constrain_date_range(start_date, end_date)
 
         conversation_id = (input_data.conversation_id or "").strip()
-        effective_memory_context = self._resolve_agent_memory_context(
+        effective_memory_context = self._working_memory.resolve_agent_memory_context(
             conversation_id=conversation_id,
             incoming_memory_context=input_data.agent_memory_context,
         )
@@ -330,7 +149,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         final_chunks: List[RetrievedChunk] = final_state.get("final_chunks") or []
         turn_id = (input_data.turn_id or "").strip() or str(uuid4())
-        self._persist_finalized_working_memory(
+        self._working_memory.persist_finalized_turn(
             conversation_id=conversation_id,
             turn_id=turn_id,
             query=input_data.goal,
@@ -338,10 +157,13 @@ class NewsAnalysisAgent(AbstractAgent):
             score_unavailable=bool(
                 final_state.get("rendezvous_score_unavailable", False)
             ),
+            source_key_fn=RetrievedChunk._source_key,
         )
-        self._persist_agent_memory_summary(
+        self._working_memory.persist_agent_memory_summary(
             conversation_id=conversation_id,
-            rendered_summary=self.render_memory_summary(output.memory_summary),
+            rendered_summary=NewsWorkingMemoryManager.render_memory_summary(
+                output.memory_summary
+            ),
         )
         return output
 
@@ -674,7 +496,7 @@ class NewsAnalysisAgent(AbstractAgent):
         all_candidates = (
             list(state.retrieved_chunks)
             + list(state.memory_chunks)
-            + self._get_working_memory_chunks(conversation_id)
+            + self._working_memory.get_working_memory_chunks(conversation_id)
         )
         publish_progress(
             "news_agent", f"Reranking {len(all_candidates)} candidate chunk(s)..."
@@ -723,7 +545,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     )
                 )
                 for row in rows:
-                    parsed = _normalize_entity_tuple(
+                    parsed = normalize_entity_tuple(
                         row.get("entity_name"), row.get("entity_type")
                     )
                     if parsed is not None:
@@ -831,7 +653,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 if not chunk_id:
                     continue
                 planner_reasons[chunk_id] = (selected.reason or "").strip()
-        context_block = _build_context_block(
+        context_block = build_planner_relevance_context_block(
             chunks,
             chunk_to_source_id,
             planner_reasons,
@@ -839,7 +661,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         conversation_id = state.conversation_id or ""
         cached_entities = _get_cached_entities(conversation_id)
-        context_prefix = _build_context_prefix(
+        context_prefix = build_analysis_context_prefix(
             company_context=state.company_context,
             agent_memory_context=state.agent_memory_context,
             cached_entities=cached_entities,
@@ -875,7 +697,7 @@ class NewsAnalysisAgent(AbstractAgent):
             logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
 
-        analysis_text, sources = _remap_citations_and_sources(analysis_text, sources)
+        analysis_text, sources = remap_numeric_citations(analysis_text, sources)
 
         task_id = None
         if state.conversation_id and analysis_text:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from asyncio.log import logger
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.messages import BaseMessage, HumanMessage
@@ -125,6 +126,141 @@ def build_planner_memory_block(agent_memory_contexts: Dict[str, str]) -> str:
             continue
         lines.append(f"[{agent_name}]\n{block}")
     return "\n\n".join(lines) if lines else "(none)"
+
+
+def get_default_date_range(
+    start_date: datetime | None,
+    end_date: datetime | None,
+    *,
+    default_days_back: int = 30,
+) -> tuple[datetime, datetime]:
+    """Fill in missing start/end dates with defaults."""
+    now_utc = datetime.now(timezone.utc)
+    if end_date is None:
+        end_date = now_utc
+    if start_date is None:
+        start_date = now_utc - timedelta(days=default_days_back)
+    return start_date, end_date
+
+
+def constrain_date_range(
+    start_date: date,
+    end_date: date,
+    *,
+    api_limit_days: int = 28,
+) -> tuple[date, date]:
+    """Constrain date range to bounded API window."""
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+
+    now = datetime.now().date()
+    api_limit_date = now - timedelta(days=api_limit_days)
+    start_date_only = start_date
+    end_date_only = end_date
+
+    if end_date_only > now:
+        end_date_only = now
+    if start_date_only < api_limit_date:
+        start_date_only = api_limit_date
+    return start_date_only, end_date_only
+
+
+def normalize_entity_tuple(name: Any, entity_type: Any) -> tuple[str, str] | None:
+    normalized_name = str(name or "").strip()
+    normalized_type = str(entity_type or "").strip()
+    if not normalized_name or not normalized_type:
+        return None
+    return normalized_name, normalized_type
+
+
+def coerce_entity_tuple(entity: Any) -> tuple[str, str] | None:
+    if isinstance(entity, dict):
+        return normalize_entity_tuple(
+            entity.get("name") or entity.get("entity_name"),
+            entity.get("entity_type"),
+        )
+    if isinstance(entity, (tuple, list)) and len(entity) >= 2:
+        return normalize_entity_tuple(entity[0], entity[1])
+    return normalize_entity_tuple(
+        getattr(entity, "name", None),
+        getattr(entity, "entity_type", None),
+    )
+
+
+def build_planner_relevance_context_block(
+    chunks: List[Any],
+    mapping: Dict[int, int],
+    rationale_by_chunk_id: Dict[str, str] | None = None,
+) -> str:
+    rationale_by_chunk_id = rationale_by_chunk_id or {}
+    lines: List[str] = []
+    for idx, chunk in enumerate(chunks):
+        source_id = mapping.get(idx, "?")
+        chunk_id = str(getattr(chunk, "chunk_id", "") or "")
+        rationale = rationale_by_chunk_id.get(chunk_id, "").strip()
+        if not rationale:
+            rationale = "Selected by planner as relevant to the query."
+        chunk_text = str(getattr(chunk, "text", "") or "")
+        lines.append(
+            f"[{source_id}] Planner relevance rationale: {rationale}\n{chunk_text}"
+        )
+    return "\n\n".join(lines)
+
+
+def build_analysis_context_prefix(
+    *,
+    company_context: str | None,
+    agent_memory_context: str | None,
+    cached_entities: List[tuple[str, str]],
+) -> str:
+    sections: List[str] = []
+    if company_context:
+        sections.append(f"Company Context:\n{company_context}")
+    if agent_memory_context:
+        sections.append(f"Agent Memory Context:\n{agent_memory_context}")
+    if cached_entities:
+        entity_lines = [
+            f"  - {name} ({entity_type})" for name, entity_type in cached_entities
+        ]
+        sections.append("Known entities from prior turns:\n" + "\n".join(entity_lines))
+    if not sections:
+        return ""
+    return "\n\n".join(sections) + "\n\n"
+
+
+def remap_numeric_citations(
+    analysis_text: str,
+    sources: List[Any],
+) -> tuple[str, List[Any]]:
+    cited_ids = sorted(set(int(match) for match in re.findall(r"\[(\d+)\]", analysis_text)))
+    old_to_new = {old_id: new_id for new_id, old_id in enumerate(cited_ids, start=1)}
+
+    def _remap(match: re.Match[str]) -> str:
+        source_id = int(match.group(1))
+        return f"[{old_to_new[source_id]}]" if source_id in old_to_new else match.group(0)
+
+    remapped_text = re.sub(r"\[(\d+)\]", _remap, analysis_text)
+    if not old_to_new:
+        return remapped_text, []
+
+    by_old_id: Dict[int, Any] = {}
+    for source in sources:
+        source_id = getattr(source, "source_id", None)
+        if isinstance(source_id, int):
+            by_old_id[source_id] = source
+
+    remapped_sources: List[Any] = []
+    for old_id, new_id in old_to_new.items():
+        source = by_old_id.get(old_id)
+        if source is None:
+            continue
+        if hasattr(source, "model_copy"):
+            remapped_sources.append(source.model_copy(update={"source_id": new_id}))
+            continue
+        remapped_sources.append(source)
+    return remapped_text, remapped_sources
 
 
 def resolve_agent_memory_context(
