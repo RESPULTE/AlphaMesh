@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
 from langchain_core.documents import Document
 from pydantic import BaseModel, ConfigDict, Field
 
+from core.agents.models.news_agent_models import CitedSource
+from core.agents.utils import trim_text
+
 
 class NodeSelectionOutput(BaseModel):
     """Structured output for selecting nodes to expand."""
@@ -154,9 +157,72 @@ class RetrievedChunk(BaseModel):
             composite_score=chunk.composite_score,
         )
 
-    # Keep the old name as a deprecated alias so any external callers that
-    # haven't been updated yet continue to work without modification.
-    from_raw_chunk = normalize_for_reranking
+    def _source_key(self) -> str:
+        metadata = self.metadata or {}
+        return str(metadata.get("source_url") or self.source_url or "").strip()
+
+    @staticmethod
+    def _chunks_block(chunks: List[RetrievedChunk], *, limit: int = 12) -> str:
+        if not chunks:
+            return "(none)"
+        lines: List[str] = []
+        for chunk in chunks[:limit]:
+            title = (
+                chunk.article_title
+                or (chunk.metadata or {}).get("article_title")
+                or "Unknown"
+            )
+            url = chunk._source_key() or "no-url"
+            relevance = chunk.reranker_relevance_score
+            relevance_text = "N/A" if relevance is None else f"{relevance:.4f}"
+            preview = (chunk.text or "").replace("\n", " ")
+            preview = trim_text(preview, max_chars=160)
+            lines.append(
+                f"- chunk_id={chunk.chunk_id} | title={title} | source={url} | "
+                f"relevance_score={relevance_text}\n  text={preview}"
+            )
+        if len(chunks) > limit:
+            lines.append(f"... and {len(chunks) - limit} more chunk(s)")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_deduplicated_sources(
+        chunks: List[RetrievedChunk],
+    ) -> Tuple[List[CitedSource], Dict[int, int]]:
+        """Deduplicate chunks by article and map each chunk to a source id."""
+        article_map: Dict[Tuple[str, str], Tuple[int, List[str]]] = {}
+        chunk_to_source_id: Dict[int, int] = {}
+        next_id = 1
+
+        for chunk_idx, chunk in enumerate(chunks):
+            metadata = chunk.metadata or {}
+            title = (
+                metadata.get("article_title") or chunk.article_title or "Unknown Title"
+            )
+            url = metadata.get("source_url") or chunk.source_url or ""
+            key = (title, url)
+
+            if key not in article_map:
+                article_map[key] = (next_id, [chunk.text])
+                next_id += 1
+            else:
+                sid, texts = article_map[key]
+                if chunk.text not in texts:
+                    texts.append(chunk.text)
+
+            chunk_to_source_id[chunk_idx] = article_map[key][0]
+
+        sources: List[CitedSource] = []
+        for (title, url), (source_id, texts) in article_map.items():
+            sources.append(
+                CitedSource(
+                    source_id=source_id,
+                    title=title,
+                    url=url,
+                    page_content="\n\n".join(texts),
+                )
+            )
+        return sources, chunk_to_source_id
 
 
 class MemoryContext(BaseModel):

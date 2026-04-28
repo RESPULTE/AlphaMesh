@@ -190,6 +190,7 @@ def test_analyse_news_node_includes_planner_chunk_rationales_in_prompt(
 
     assert llm.last_messages is not None
     human_prompt = llm.last_messages[1].content
+    assert "Goal:" in human_prompt
     assert "Planner relevance rationale: Directly answers catalyst timing." in human_prompt
     assert "Planner relevance rationale: Provides counter-signal risk detail." in human_prompt
     assert "Chunk A text" in human_prompt

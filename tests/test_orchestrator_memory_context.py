@@ -81,7 +81,7 @@ def test_execute_node_propagates_turn_id_and_agent_memory_context() -> None:
         plan=OrchestratorPlan(
             query="original query",
             target_agents=["news_agent"],
-            per_agent_queries={"news_agent": "rewritten for news"},
+            per_agent_goals={"news_agent": "Assess AAPL near-term catalyst strength and risks."},
             tickers=["AAPL"],
         ),
         conversation_id="conv-1",
@@ -106,7 +106,8 @@ def test_execute_node_propagates_turn_id_and_agent_memory_context() -> None:
     assert capture_agent.last_input is not None
     assert capture_agent.last_input.turn_id == "turn-123"
     assert capture_agent.last_input.agent_memory_context.startswith("- [2026-04-26T01:00:00+00:00]")
-    assert capture_agent.last_input.query == "rewritten for news"
+    assert capture_agent.last_input.query == ""
+    assert capture_agent.last_input.goal == "Assess AAPL near-term catalyst strength and risks."
     assert capture_agent.last_input.company_context == "Company Context Block"
 
 

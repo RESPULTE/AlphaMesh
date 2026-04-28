@@ -70,7 +70,14 @@ class OrchestratorPlan(BaseAgentInput):
     # be empty.  Override with a default here.
     query: str = Field(
         default="",
-        description="The original (or lightly cleaned) user query, for downstream context.",
+        description="The original (or lightly cleaned) user query, for orchestrator continuity.",
+    )
+    goal: str = Field(
+        default="",
+        description=(
+            "Reserved orchestrator-level goal field. Per-agent goals should be set via "
+            "`per_agent_goals`."
+        ),
     )
 
     # â”€â”€ Orchestrator-only fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -100,14 +107,21 @@ class OrchestratorPlan(BaseAgentInput):
     target_agents: List[str] = Field(default_factory=list)
     target_entities: List[str] = Field(default_factory=list)
 
+    per_agent_goals: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "A plain-text execution goal tailored to each target agent's job. "
+            "Keys are agent names (e.g. 'news_agent', 'fundamentals_agent'); "
+            "values are goal strings. Every agent listed in "
+            "`target_agents` should have an entry here.  Falls back to `query` "
+            "for any agent without an explicit entry."
+        ),
+    )
     per_agent_queries: Dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "A rewritten query tailored to each target agent's job and retrieval strategy. "
-            "Keys are agent names (e.g. 'news_agent', 'fundamentals_agent'); "
-            "values are the rewritten query string.  Every agent listed in "
-            "`target_agents` should have an entry here.  Falls back to `query` "
-            "for any agent without an explicit entry."
+            "Deprecated legacy field. Kept for backward compatibility only; "
+            "sub-agent dispatch should use `per_agent_goals`."
         ),
     )
 

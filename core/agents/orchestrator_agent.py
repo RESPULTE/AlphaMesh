@@ -408,7 +408,7 @@ class OrchestratorAgent:
                 SystemMessage(
                     content=(
                         "Agent-provided memory contexts from prior turn summaries "
-                        "(use for continuity during routing and per-agent query rewrites):\n"
+                        "(use for continuity during routing and per-agent goal generation):\n"
                         f"{planner_memory_block}"
                     )
                 ),
@@ -535,11 +535,16 @@ class OrchestratorAgent:
             state.history_turns
         )
         for name in valid_names:
-            agent_query = plan.per_agent_queries.get(name) or plan.query
+            agent_goal = (
+                (plan.per_agent_goals or {}).get(name)
+                or (plan.per_agent_queries or {}).get(name)
+                or plan.query
+            )
             agent_memory_context = agent_memory_contexts.get(name, "")
             agent_input: BaseAgentInput = plan.model_copy(
                 update={
-                    "query": agent_query,
+                    "query": "",
+                    "goal": agent_goal,
                     "ticker": primary_ticker,
                     "conversation_id": state.conversation_id,
                     "turn_id": state.turn_id,

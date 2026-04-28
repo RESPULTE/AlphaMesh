@@ -140,6 +140,7 @@ class Settings(BaseSettings):
     ORCHESTRATOR_TIMEOUT_SECONDS: float = 120.0
 
     # ── Fundamental visualisation planning ───────────────────────────────────
+    FUNDAMENTAL_AGENT_TASKLIST_MAX_ITEMS: int = 6
     FUNDAMENTAL_VIZ_MAX_ROWS_PER_CHART: int = 6
     FUNDAMENTAL_RAW_DISPLAY_MAX_ROWS: int = 12
 

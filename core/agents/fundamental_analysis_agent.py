@@ -57,6 +57,7 @@ from core.agents.models.fundamental_agent_models import (
     CompletionReviewDecision,
     ExecutorBatchLog,
     ExecutorToolLog,
+    FundamentalTaskSummary,
     FundamentalAnalysisOutput,
     IterativeToolPlan,
     ToolCallBatch,
@@ -172,6 +173,13 @@ class FundamentalAnalysisAgent(AbstractAgent):
             history_turns, window=window
         )
 
+    @staticmethod
+    def _effective_goal(state: _AgentState) -> str:
+        text = (state.goal or state.query or "").strip()
+        if text:
+            return text
+        return "Perform fundamental analysis for the provided ticker."
+
     # ── Public entry point ────────────────────────────────────────────────────
 
     async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
@@ -206,6 +214,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             sentiment=final_state.get("sentiment"),
             memory_summary=final_state.get("memory_summary") or {},
             executor_logs=final_state.get("executor_logs", []),
+            task_summaries=final_state.get("task_summaries", []),
             task_completed=final_state.get("task_completed", True),
             task_completion_reason=final_state.get("task_completion_reason", ""),
             visualization_plan=final_state.get("visualization_plan"),
@@ -220,7 +229,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         self._working_memory.persist_finalized_turn(
             conversation_id=conversation_id,
             turn_id=turn_id,
-            query=input_data.query,
+            query=(input_data.goal or input_data.query),
             task_completed=bool(output.task_completed),
             task_completion_reason=output.task_completion_reason or "",
             computed_row_labels=list(final_state.get("computed_row_labels") or []),
@@ -237,16 +246,20 @@ class FundamentalAnalysisAgent(AbstractAgent):
         workflow.add_node("data_prep", self._data_prep_node)
         workflow.add_node("tool_planner", self._tool_planner_node)
         workflow.add_node("tool_executor", self._tool_executor_node)
+        workflow.add_node("task_check", self._task_check_node)
+        workflow.add_node("task_summary", self._task_summary_node)
         workflow.add_node("completion_review", self._completion_review_node)
         workflow.add_node("analyst", self._analyst_node)
 
         workflow.add_edge(START, "data_prep")
         workflow.add_edge("data_prep", "tool_planner")
         workflow.add_edge("tool_planner", "tool_executor")
+        workflow.add_edge("tool_executor", "task_check")
+        workflow.add_edge("task_check", "task_summary")
 
         # ── Routing: advance batch, re-plan on failure, or proceed to analyst ─
         workflow.add_conditional_edges(
-            "tool_executor",
+            "task_summary",
             self._should_continue,
             {
                 "next_batch": "tool_executor",  # advance to next batch, no LLM
@@ -307,7 +320,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
             batch = plan.get_batch(state.current_batch_index - 1)
             n_calls = len(batch.calls)
             current_results = (state.tool_results or [])[-n_calls:]
-            if any(not r.success for r in current_results):
+            if (not state.active_task_completed) or any(
+                not r.success for r in current_results
+            ):
                 logger.info(
                     "[Router] Failure in batch %d — re-planning. Iteration %d/%d",
                     state.current_batch_index - 1,
@@ -412,7 +427,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         """
         logger.info(
             "[Node] tool_planner — %s%s",
-            state.query,
+            self._effective_goal(state),
             (
                 " [RE-PLANNING]"
                 if (state.last_batch_failed or state.completion_replan_guidance)
@@ -476,8 +491,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 f"Guidance: {state.completion_replan_guidance}"
             )
 
+        tasklist_cap = max(1, int(settings.FUNDAMENTAL_AGENT_TASKLIST_MAX_ITEMS))
         user_msg = _TOOL_PLANNER_USER.format(
-            query=state.query,
+            goal=self._effective_goal(state),
             ticker=state.ticker or "N/A",
             start_date=(
                 state.start_date.strftime("%Y-%m-%d") if state.start_date else "N/A"
@@ -491,6 +507,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             tool_descriptions=get_tool_descriptions(),
             iteration=state.iteration_count + 1,
             max_iterations=MAX_TOOL_ITERATIONS,
+            tasklist_cap=tasklist_cap,
         )
 
         agent_memory_context = (state.agent_memory_context or "").strip()
@@ -530,6 +547,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
             tool_plan.batch_count(),
             tool_plan.data_summary,
         )
+        if tool_plan.batch_count() > tasklist_cap:
+            tool_plan = tool_plan.model_copy(update={"batches": tool_plan.batches[:tasklist_cap]})
+            logger.info("[tool_planner] Truncated plan to tasklist cap=%d batch(es).", tasklist_cap)
         for i, batch in enumerate(tool_plan.batches):
             logger.info(
                 "  Batch %d (%d call(s)): %s",
@@ -571,6 +591,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return {
                 "iteration_count": state.iteration_count + 1,
                 "current_batch_index": batch_index + 1,
+                "active_task_id": "",
+                "active_task_completed": True,
                 "last_batch_failed": False,
             }
 
@@ -583,6 +605,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             return {
                 "iteration_count": state.iteration_count + 1,
                 "current_batch_index": batch_index + 1,
+                "active_task_id": "",
+                "active_task_completed": True,
                 "last_batch_failed": False,
             }
 
@@ -683,10 +707,50 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "tool_results": list(state.tool_results) + batch_results,
             "iteration_count": state.iteration_count + 1,
             "current_batch_index": batch_index + 1,
+            "active_task_id": f"fund-task-{batch_index + 1}",
+            "active_task_completed": not batch_failed,
             "available_concepts": updated_concepts,
             "computed_row_labels": updated_computed,
             "executor_logs": list(state.executor_logs) + [batch_log],
             "last_batch_failed": batch_failed,
+        }
+
+    async def _task_check_node(self, state: _AgentState) -> Dict:
+        """Validate completion state for the currently executed task item."""
+        if not state.active_task_id:
+            return {"active_task_completed": True}
+        if not state.executor_logs:
+            return {"active_task_completed": False}
+        latest_batch = state.executor_logs[-1]
+        success = all(call.success for call in latest_batch.calls)
+        return {"active_task_completed": success}
+
+    async def _task_summary_node(self, state: _AgentState) -> Dict:
+        """Summarize one completed fundamentals task item (batch)."""
+        if not state.active_task_id:
+            return {}
+        latest_batch = state.executor_logs[-1] if state.executor_logs else None
+        if latest_batch is None:
+            return {"active_task_id": ""}
+        row_labels: List[str] = []
+        for call in latest_batch.calls:
+            for row in call.output_row_labels:
+                if row not in row_labels:
+                    row_labels.append(row)
+        outcome_summary = (
+            latest_batch.batch_reasoning
+            or f"Executed batch {latest_batch.batch_index}."
+        )
+        summary = FundamentalTaskSummary(
+            task_id=state.active_task_id,
+            batch_index=latest_batch.batch_index,
+            outcome_summary=outcome_summary,
+            success=bool(state.active_task_completed),
+            output_row_labels=row_labels,
+        )
+        return {
+            "task_summaries": list(state.task_summaries) + [summary],
+            "active_task_id": "",
         }
 
     async def _persist_computed_rows(
@@ -753,10 +817,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         data_preview = df.to_string(max_rows=max(20, max_raw_rows), float_format="%.4g")
         user_msg = _COMPLETION_REVIEW_USER.format(
-            query=state.query,
+            goal=self._effective_goal(state),
             ticker=state.ticker or "N/A",
             iteration_count=state.iteration_count,
             max_iterations=MAX_TOOL_ITERATIONS,
+            tasklist_cap=max(1, int(settings.FUNDAMENTAL_AGENT_TASKLIST_MAX_ITEMS)),
             completion_replan_used=state.completion_review_replan_used,
             max_rows_per_chart=max_rows_per_chart,
             max_raw_rows=max_raw_rows,
@@ -1012,7 +1077,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             logger.warning("[analyst] No financial data — returning empty analysis.")
             return {
                 "financial_data": pd.DataFrame(),
-                "analysis": "No financial data was available for this query.",
+                "analysis": "No financial data was available for this goal.",
                 "relationships_extracted": False,
                 "subgraph_id": None,
                 "memory_summary": {
@@ -1021,8 +1086,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     "computed_rows": [],
                     "task_completed": False,
                     "task_completion_reason": "No financial data was available.",
-                    "main_conclusion": "No financial data was available for this query.",
+                    "main_conclusion": "No financial data was available for this goal.",
                 },
+                "task_summaries": list(state.task_summaries),
                 "task_completed": state.task_completed,
                 "task_completion_reason": state.task_completion_reason,
                 "visualization_plan": state.visualization_plan,
@@ -1061,7 +1127,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             else ""
         )
         analysis_prompt = (
-            f"Query: {state.query}\n\n"
+            f"Goal: {self._effective_goal(state)}\n\n"
             f"Ticker: {state.ticker}\n"
             f"{company_context_section}\n"
             f"{memory_context_section}\n"
@@ -1131,6 +1197,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "subgraph_id": task_id,
             "sentiment": sentiment,
             "memory_summary": memory_summary,
+            "task_summaries": list(state.task_summaries),
             "task_completed": state.task_completed,
             "task_completion_reason": state.task_completion_reason,
             "visualization_plan": state.visualization_plan,

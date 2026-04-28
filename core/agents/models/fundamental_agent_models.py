@@ -145,6 +145,16 @@ class ExecutorBatchLog(BaseModel):
     calls: List[ExecutorToolLog] = Field(default_factory=list)
 
 
+class FundamentalTaskSummary(BaseModel):
+    """Summary of one completed fundamentals task item (batch)."""
+
+    task_id: str = Field(default="")
+    batch_index: int = 0
+    outcome_summary: str = ""
+    success: bool = True
+    output_row_labels: List[str] = Field(default_factory=list)
+
+
 class ChartSpec(BaseModel):
     """Chart instruction payload produced by the completion-review node."""
 
@@ -212,6 +222,7 @@ class FundamentalAnalysisOutput(BaseAgentOutput):
     subgraph_id: Optional[str] = Field(default=None)
     relationships_extracted: bool = Field(default=False)
     executor_logs: List[ExecutorBatchLog] = Field(default_factory=list)
+    task_summaries: List[FundamentalTaskSummary] = Field(default_factory=list)
     task_completed: bool = Field(default=True)
     task_completion_reason: str = Field(default="")
     visualization_plan: Optional[VisualizationPlan] = Field(default=None)
@@ -266,6 +277,8 @@ class _AgentState(BaseAgentInput):
     # Index into tool_plan.batches — incremented by tool_executor each pass.
     # When current_batch_index == len(tool_plan.batches), execution is done.
     current_batch_index: int = Field(default=0)
+    active_task_id: str = Field(default="")
+    active_task_completed: bool = Field(default=False)
 
     # Incremented by tool_executor after each batch (used for MAX guard only)
     iteration_count: int = Field(default=0)
@@ -281,6 +294,7 @@ class _AgentState(BaseAgentInput):
 
     # Batch-level executor audit logs used by completion review.
     executor_logs: List[ExecutorBatchLog] = Field(default_factory=list)
+    task_summaries: List[FundamentalTaskSummary] = Field(default_factory=list)
 
     # Set True when a failure triggers re-planning so the planner prompt
     # can acknowledge the context

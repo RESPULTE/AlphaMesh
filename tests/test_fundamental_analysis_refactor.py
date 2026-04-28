@@ -10,6 +10,7 @@ from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.fundamental_agent_models import (
     ExecutorBatchLog,
     ExecutorToolLog,
+    FundamentalTaskSummary,
     IterativeToolPlan,
     ToolCallBatch,
     ToolCallSpec,
@@ -404,8 +405,87 @@ def test_tool_planner_includes_prior_working_memory_block_in_prompt(
     assert llm.schema is IterativeToolPlan
     assert llm.last_messages is not None
     planner_user_prompt = llm.last_messages[1].content
+    assert "Goal:" in planner_user_prompt
+    assert "Tasklist Cap:" in planner_user_prompt
     assert "Prior fundamentals working memory" in planner_user_prompt
     assert "call=profitability_ratios" in planner_user_prompt
+
+
+def test_tool_planner_truncates_batches_to_tasklist_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    monkeypatch.setattr(module.settings, "FUNDAMENTAL_AGENT_TASKLIST_MAX_ITEMS", 1)
+
+    llm = _FakeLLM(
+        payload={
+            "batches": [
+                {
+                    "batch_reasoning": "First",
+                    "calls": [
+                        {
+                            "tool_name": "cagr",
+                            "parameters": {"metric": "Revenues"},
+                            "reasoning": "Growth",
+                        }
+                    ],
+                },
+                {
+                    "batch_reasoning": "Second",
+                    "calls": [
+                        {
+                            "tool_name": "cagr",
+                            "parameters": {"metric": "NetIncomeLoss"},
+                            "reasoning": "Income growth",
+                        }
+                    ],
+                },
+            ],
+            "data_summary": "Two-step plan.",
+            "selected_row_labels": [],
+        }
+    )
+    monkeypatch.setattr(module.service_manager, "get_agent", lambda temperature=0: llm)
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
+    state = _AgentState(
+        goal="Assess profitability and growth.",
+        ticker="AAPL",
+        available_concepts=["Revenues", "NetIncomeLoss"],
+        iteration_count=0,
+    )
+    result = asyncio.run(agent._tool_planner_node(state))
+    assert result["tool_plan"].batch_count() == 1
+
+
+def test_task_summary_node_records_batch_summary() -> None:
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    state = _AgentState(
+        active_task_id="fund-task-1",
+        active_task_completed=True,
+        executor_logs=[
+            ExecutorBatchLog(
+                batch_index=0,
+                batch_reasoning="Compute trend metrics.",
+                calls=[
+                    ExecutorToolLog(
+                        tool_name="cagr",
+                        parameters={"metric": "Revenues"},
+                        success=True,
+                        output_row_labels=["Revenues CAGR"],
+                    )
+                ],
+            )
+        ],
+        task_summaries=[],
+    )
+    result = asyncio.run(agent._task_summary_node(state))
+    assert len(result["task_summaries"]) == 1
+    summary: FundamentalTaskSummary = result["task_summaries"][0]
+    assert summary.task_id == "fund-task-1"
+    assert summary.output_row_labels == ["Revenues CAGR"]
 
 
 def test_render_memory_summary_delegates_to_manager() -> None:

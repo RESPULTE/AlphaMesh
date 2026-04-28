@@ -78,6 +78,40 @@ class ResearchStepLog(BaseModel):
     score_unavailable: bool = False
     no_relevant_note: str = ""
 
+    @staticmethod
+    def _history_block(logs: List[ResearchStepLog], limit: int = 6) -> str:
+        if not logs:
+            return "(none)"
+        lines: List[str] = []
+        for row in logs[-limit:]:
+            query_lines = (
+                ", ".join(f"{q.domain}:{q.query}" for q in row.queries)
+                or row.query
+                or "(none)"
+            )
+            lines.append(
+                f"Iteration {row.iteration}\n"
+                f"  action: {row.action}\n"
+                f"  queries: {query_lines}\n"
+                f"  Total fetched articles: {row.total_fetched_articles}\n"
+                f"  newly fetched articles: {row.newly_fetched_articles}\n"
+                f"  relevant chunks: {row.relevant_chunk_count}\n"
+                f"  relevant sources: {row.relevant_source_count}\n"
+                f"  score unavailable: {row.score_unavailable}\n"
+                f"  note: {row.no_relevant_note or '(none)'}"
+            )
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _list_unique_actions(logs: List[ResearchStepLog]) -> List[str]:
+        actions: List[str] = []
+        for row in logs:
+            action = str(getattr(row, "action", "") or "").strip()
+            if not action or action in {"proceed", "none"} or action in actions:
+                continue
+            actions.append(action)
+        return actions
+
 
 class NewsAgentState(BaseAgentInput):
     """State container for the news analysis agent."""

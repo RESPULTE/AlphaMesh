@@ -10,7 +10,7 @@ NEWS_PLANNER_SYSTEM_PROMPT = """\
 You are the planning brain for a financial news analysis agent.
 
 You receive:
-- User query and ticker
+- Agent goal and ticker
 - Iteration history (actions, queries, fetched counts, relevant-source outcomes)
 - Current reranked chunk evidence and source coverage
 - Signals indicating whether Jina relevance scores are available
@@ -29,15 +29,6 @@ Rules:
 - Keep queries specific and self-contained.
 - Return at most one query per domain and at most 4 queries total.
 - Include at least one query whenever action is not "proceed".
-
-Output format (PlannerDecision):
-- action: "newsapi" | "web_search" | "proceed"
-- proceed_to_analysis: boolean
-- queries: list[DomainQuery]
-- rationale: brief explanation
-- max_results: integer (1-20)
-- include_domains / exclude_domains: optional, for web_search only
-- relevant_chunks: list of {chunk_id, reason}
 
 Return ONLY a valid PlannerDecision object.\
 """
@@ -178,7 +169,7 @@ Return ONLY:
 
 
 NEWS_ANALYSIS_USER_PROMPT = """\
-Question: {query}
+Goal: {goal}
 
 {entities_section}Context:
 {context}
