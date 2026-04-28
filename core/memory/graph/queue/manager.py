@@ -15,20 +15,17 @@ from core.memory.graph.queue.policies import (
 )
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
-from core.memory.graph.queue.types import (
-    TASK_KIND_RELATIONSHIPS,
-    GraphTask,
+from core.memory.graph.queue.types import TASK_KIND_RELATIONSHIPS, GraphTask
+from core.memory.graph.queue.utils import (
     default_allowed_entity_types,
     default_allowed_relationship_types,
-    normalize_allowed_entity_types,
-    normalize_allowed_relationship_types,
-)
-from core.memory.graph.queue.utils import (
     has_chunk_ids,
     has_extractable_payload,
     has_extraction_text,
     has_inline_relationships,
     is_chunk_entities_task,
+    normalize_allowed_entity_types,
+    normalize_allowed_relationship_types,
 )
 from core.memory.graph.queue.worker import ConversationQueueWorker
 from core.memory.graph.sql_store import GraphTaskSqlStore

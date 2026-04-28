@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
@@ -192,6 +192,53 @@ class ConversationStore:
             if conversation_id not in self._turn_cache:
                 await self._load_from_adapter(conversation_id, user_email=user_email)
         return list(self._turn_cache.get(conversation_id, []))
+
+    async def get_turns_paginated(
+        self,
+        conversation_id: str,
+        user_email: Optional[str] = None,
+        *,
+        limit: Optional[int] = None,
+        before_turn_id: Optional[str] = None,
+    ) -> Tuple[List[dict], bool, Optional[str]]:
+        """
+        Return paginated structured turn history in chronological order.
+
+        Pagination semantics:
+        - `limit=None`: return the full conversation history.
+        - First page (`before_turn_id=None`): return the newest `limit` turns.
+        - Older pages (`before_turn_id=<id>`): return turns strictly older than <id>.
+        """
+        turns = await self.get_turns(conversation_id, user_email=user_email)
+        if limit is None:
+            return turns, False, None
+
+        if not turns or limit <= 0:
+            return [], False, None
+
+        if before_turn_id:
+            slice_end = next(
+                (
+                    idx
+                    for idx, turn in enumerate(turns)
+                    if str(turn.get("turn_id") or "") == before_turn_id
+                ),
+                None,
+            )
+            if slice_end is None or slice_end <= 0:
+                return [], False, None
+        else:
+            slice_end = len(turns)
+
+        start = max(0, slice_end - limit)
+        page = turns[start:slice_end]
+        has_more = start > 0
+        next_before_turn_id = (
+            str(page[0].get("turn_id") or "")
+            if has_more and page and page[0].get("turn_id")
+            else None
+        )
+        return list(page), has_more, next_before_turn_id
 
     async def list_conversations(
         self,

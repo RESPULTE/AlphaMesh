@@ -221,6 +221,8 @@ export interface ConversationTurn {
 export interface ConversationTurnsResponse {
   conversation_id: string;
   turns: ConversationTurn[];
+  has_more: boolean;
+  next_before_turn_id: string | null;
 }
 
 export type StreamEvent =

@@ -6,9 +6,6 @@ from core.memory.graph.queue.types import (
     TASK_KIND_CHUNK_ENTITIES,
     TASK_KIND_RELATIONSHIPS,
     GraphTask,
-    make_extraction_task,
-    make_graph_task,
-    prompt_id_from_text,
 )
 
 from .utils import (

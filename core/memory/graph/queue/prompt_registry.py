@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 from core.logger import get_logger
-from core.memory.graph.queue.types import prompt_id_from_text
+from core.memory.graph.queue.utils import prompt_id_from_text
 from core.memory.graph.sql_store import GraphTaskSqlStore
 
 logger = get_logger(__name__)

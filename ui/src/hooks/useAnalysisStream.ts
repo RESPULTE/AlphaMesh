@@ -300,6 +300,12 @@ function mergeFinalWithLive(next: AnalysisResponse, prev?: AnalysisResponse | nu
 export function useAnalysisStream(query: string | null) {
   const [data, setData] = useState<PartialAnalysis>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [conversationId, setConversationId] = useState<string | null>(
+    typeof window !== 'undefined'
+      ? window.localStorage.getItem(STORAGE_CONVERSATION_ID)
+      : null
+  );
+  const [requestId, setRequestId] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const conversationIdRef = useRef<string | null>(
     typeof window !== 'undefined'
@@ -323,6 +329,7 @@ export function useAnalysisStream(query: string | null) {
 
     let isMounted = true;
     setIsStreaming(true);
+    setRequestId(null);
     setData(baseResponse());
     resolvedTickerRef.current = '';
     pendingQuoteRef.current = null;
@@ -348,6 +355,7 @@ export function useAnalysisStream(query: string | null) {
               const latestConversationId = rows?.[0]?.conversation_id;
               if (latestConversationId) {
                 conversationIdRef.current = latestConversationId;
+                setConversationId(latestConversationId);
                 if (typeof window !== 'undefined') {
                   window.localStorage.setItem(STORAGE_CONVERSATION_ID, latestConversationId);
                 }
@@ -375,8 +383,12 @@ export function useAnalysisStream(query: string | null) {
 
         const ack = await res.json();
         if (!isMounted) return;
+        if (ack.request_id) {
+          setRequestId(ack.request_id);
+        }
         if (ack.conversation_id) {
           conversationIdRef.current = ack.conversation_id;
+          setConversationId(ack.conversation_id);
           if (typeof window !== 'undefined') {
             window.localStorage.setItem(STORAGE_CONVERSATION_ID, ack.conversation_id);
           }
@@ -577,5 +589,5 @@ export function useAnalysisStream(query: string | null) {
     };
   }, [query, stableEmail]);
 
-  return { data, isStreaming };
+  return { data, isStreaming, conversationId, requestId };
 }

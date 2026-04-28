@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import re as _re
 import time
-from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Type
 from uuid import uuid4
@@ -39,6 +38,7 @@ from core.agents.utils import extract_first_sentence, trim_text
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
+from core.agents.working_memory.news_working_memory import NewsWorkingMemoryManager
 from core.memory.graph.graph_queue import make_extraction_task
 from core.memory.retrieval.models import RetrievedChunk, RewrittenQueries
 from core.services import service_manager
@@ -47,32 +47,12 @@ logger = get_logger(__name__)
 _ENTITY_CACHE: Dict[str, Dict[Tuple[str, str], Tuple[str, str]]] = {}
 _ENTITY_CACHE_TS: Dict[str, float] = {}
 
-# Maximum number of RetrievedChunk objects retained per conversation in working memory.
-_WORKING_MEMORY_MAX_CHUNKS: int = 100
-_WORKING_MEMORY_MAX_TURNS: int = 20
 _MIN_RELEVANT_DISTINCT_SOURCES: int = 2
 
 
 class NewsAnalysisStructuredOutput(BaseModel):
     analysis: str
     sentiment: Optional[AgentSentiment] = None
-
-
-@dataclass
-class TurnRelevantMemory:
-    turn_id: str
-    query: str
-    chunk_ids: List[str] = field(default_factory=list)
-    source_urls: List[str] = field(default_factory=list)
-    score_unavailable: bool = False
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-@dataclass
-class ConversationWorkingMemory:
-    agent_memory_context: str = ""
-    working_chunks: List[RetrievedChunk] = field(default_factory=list)
-    turn_records: List[TurnRelevantMemory] = field(default_factory=list)
 
 
 def _get_default_date_range(
@@ -300,7 +280,7 @@ class NewsAnalysisAgent(AbstractAgent):
         super().__init__()
         self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
-        self._conversation_memory: Dict[str, ConversationWorkingMemory] = {}
+        self._working_memory = NewsWorkingMemoryManager()
 
     @staticmethod
     def name() -> str:
@@ -342,41 +322,27 @@ class NewsAnalysisAgent(AbstractAgent):
             f"catalyst={catalyst or 'N/A'}"
         )
 
-    def _get_conversation_memory(
-        self, conversation_id: str
-    ) -> ConversationWorkingMemory:
-        return self._conversation_memory.setdefault(
-            conversation_id, ConversationWorkingMemory()
-        )
-
     def _resolve_agent_memory_context(
         self,
         *,
         conversation_id: str,
         incoming_memory_context: str | None,
     ) -> str:
-        memory = self._get_conversation_memory(conversation_id)
-        incoming = (incoming_memory_context or "").strip()
-        if incoming and incoming != memory.agent_memory_context:
-            memory.agent_memory_context = incoming
-        return incoming or memory.agent_memory_context
+        return self._working_memory.resolve_agent_memory_context(
+            conversation_id=conversation_id,
+            incoming_memory_context=incoming_memory_context,
+        )
 
     def _persist_agent_memory_summary(
         self, conversation_id: str, rendered_summary: str
     ) -> None:
-        if not conversation_id:
-            return
-        summary = (rendered_summary or "").strip()
-        if not summary:
-            return
-        memory = self._get_conversation_memory(conversation_id)
-        memory.agent_memory_context = summary
+        self._working_memory.persist_agent_memory_summary(
+            conversation_id=conversation_id,
+            rendered_summary=rendered_summary,
+        )
 
     def _get_working_memory_chunks(self, conversation_id: str) -> List[RetrievedChunk]:
-        if not conversation_id:
-            return []
-        memory = self._get_conversation_memory(conversation_id)
-        return list(memory.working_chunks)
+        return self._working_memory.get_working_memory_chunks(conversation_id)
 
     def _persist_finalized_working_memory(
         self,
@@ -387,34 +353,14 @@ class NewsAnalysisAgent(AbstractAgent):
         chunks: List[RetrievedChunk],
         score_unavailable: bool,
     ) -> None:
-        if not conversation_id:
-            return
-        memory = self._get_conversation_memory(conversation_id)
-        existing = memory.working_chunks
-        chunk_map: Dict[str, RetrievedChunk] = {
-            c.chunk_id: c for c in existing if c.chunk_id
-        }
-        for chunk in chunks:
-            if chunk.chunk_id:
-                chunk_map[chunk.chunk_id] = chunk
-        merged = list(chunk_map.values())
-        if len(merged) > _WORKING_MEMORY_MAX_CHUNKS:
-            merged = merged[-_WORKING_MEMORY_MAX_CHUNKS:]
-        memory.working_chunks = merged
-
-        source_urls = list(
-            dict.fromkeys(_source_key(chunk) for chunk in chunks if _source_key(chunk))
-        )
-        record = TurnRelevantMemory(
+        self._working_memory.persist_finalized_turn(
+            conversation_id=conversation_id,
             turn_id=turn_id,
             query=query,
-            chunk_ids=[chunk.chunk_id for chunk in chunks if chunk.chunk_id],
-            source_urls=source_urls,
+            chunks=chunks,
             score_unavailable=score_unavailable,
+            source_key_fn=_source_key,
         )
-        memory.turn_records.append(record)
-        if len(memory.turn_records) > _WORKING_MEMORY_MAX_TURNS:
-            memory.turn_records = memory.turn_records[-_WORKING_MEMORY_MAX_TURNS:]
 
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
@@ -547,22 +493,9 @@ class NewsAnalysisAgent(AbstractAgent):
     def _working_memory_block(
         self, conversation_id: str, *, turn_limit: int = 4
     ) -> str:
-        if not conversation_id:
-            return "(none)"
-        memory = self._conversation_memory.get(conversation_id)
-        if memory is None or not memory.turn_records:
-            return "(none)"
-        lines: List[str] = []
-        for row in memory.turn_records[-turn_limit:]:
-            ts = row.created_at.isoformat()
-            lines.append(
-                f"- turn={row.turn_id} at={ts}\n"
-                f"  query={row.query}\n"
-                f"  relevant_chunks={len(row.chunk_ids)}\n"
-                f"  relevant_sources={len(row.source_urls)}\n"
-                f"  score_unavailable={row.score_unavailable}"
-            )
-        return "\n".join(lines)
+        return self._working_memory.render_working_memory_block(
+            conversation_id, turn_limit=turn_limit
+        )
 
     @staticmethod
     def _apply_relevant_chunk_selection(

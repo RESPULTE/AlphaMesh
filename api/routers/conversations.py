@@ -115,6 +115,8 @@ async def get_turns(
     conversation_id: str,
     user_id_from_token: str | None = Depends(get_current_user_optional),
     user_email: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    before_turn_id: str | None = Query(default=None),
     session_svc: SessionService = Depends(get_session_service),
     store: ConversationStore = Depends(get_store),
 ) -> ConversationTurnsResponse:
@@ -125,7 +127,12 @@ async def get_turns(
     )
     if not allowed:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    turns = await store.get_turns(conversation_id, user_email=resolved_user_email)
+    turns, has_more, next_before_turn_id = await store.get_turns_paginated(
+        conversation_id,
+        user_email=resolved_user_email,
+        limit=limit,
+        before_turn_id=before_turn_id,
+    )
     parsed_turns: list[ConversationTurn] = []
     for turn in turns:
         try:
@@ -135,4 +142,6 @@ async def get_turns(
     return ConversationTurnsResponse(
         conversation_id=conversation_id,
         turns=parsed_turns,
+        has_more=has_more,
+        next_before_turn_id=next_before_turn_id,
     )

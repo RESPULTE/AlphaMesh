@@ -103,6 +103,7 @@ def test_analyse_news_node_uses_structured_output_and_defers_extraction(
     )
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
     agent._llm = llm
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
 
     state = NewsAgentState(
         query="AAPL near-term setup",
@@ -157,6 +158,7 @@ def test_analyse_news_node_includes_planner_chunk_rationales_in_prompt(
     )
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
     agent._llm = llm
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
 
     state = NewsAgentState(
         query="AAPL setup",
@@ -245,7 +247,7 @@ def test_rendezvous_node_applies_threshold_and_sets_gate(
     monkeypatch.setattr(news_module.settings, "NEWS_AGENT_MIN_RELEVANCE_SCORE", 0.60)
 
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
-    agent._conversation_memory = {}
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
 
     state = NewsAgentState(
         query="AAPL context",
@@ -301,7 +303,7 @@ def test_rendezvous_node_returns_all_when_score_unavailable(
     )
 
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
-    agent._conversation_memory = {}
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
 
     state = NewsAgentState(
         query="AAPL context",
@@ -343,7 +345,9 @@ def test_planner_node_filters_selected_chunks(
 
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
     agent._llm = _FakeLLM(planner_payload)
-    agent._conversation_memory = {}
+    from core.agents import news_analysis_agent as news_module
+
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
 
     state = NewsAgentState(
         query="AAPL catalysts",
@@ -362,6 +366,8 @@ def test_planner_node_filters_selected_chunks(
 
 
 def test_run_reuses_cached_agent_memory_context() -> None:
+    from core.agents import news_analysis_agent as news_module
+
     captured_states: list[dict] = []
 
     class _FakeGraph:
@@ -391,7 +397,7 @@ def test_run_reuses_cached_agent_memory_context() -> None:
 
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
     agent._graph = _FakeGraph()
-    agent._conversation_memory = {}
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
 
     first = asyncio.run(
         agent.run(

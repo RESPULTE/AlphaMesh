@@ -289,6 +289,8 @@ class ConversationTurn(BaseModel):
 class ConversationTurnsResponse(BaseModel):
     conversation_id: str
     turns: List[ConversationTurn] = Field(default_factory=list)
+    has_more: bool = False
+    next_before_turn_id: Optional[str] = None
 
 
 
