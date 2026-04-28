@@ -228,6 +228,25 @@ class AnalysisRunner:
                 }
             )
 
+    async def _refresh_conversation_memory_index(
+        self,
+        *,
+        conversation_id: str,
+        user_email: str,
+        turns: list[dict],
+    ) -> None:
+        try:
+            await service_manager.get_conversation_memory_service().ensure_index(
+                conversation_id=conversation_id,
+                user_email=user_email,
+                turns=turns,
+            )
+        except Exception:
+            logger.exception(
+                "_refresh_conversation_memory_index: background index refresh failed for '%s'",
+                conversation_id,
+            )
+
     # -- Private --------------------------------------------------------------
 
     async def _run(
@@ -322,6 +341,26 @@ class AnalysisRunner:
                 user_email=user_id,
             )
             messages = history + [HumanMessage(content=chat_request.message)]
+            conversation_memory_block = "(none)"
+            conversation_memory_hits: list[dict] = []
+
+            try:
+                (
+                    conversation_memory_block,
+                    conversation_memory_hits,
+                ) = await service_manager.get_conversation_memory_service().ensure_index_and_retrieve(
+                    conversation_id=conversation_id,
+                    user_email=user_id,
+                    turns=history_turns,
+                    query=chat_request.message,
+                )
+            except Exception:
+                logger.exception(
+                    "_run: failed to prepare private conversation memory for '%s'",
+                    conversation_id,
+                )
+                conversation_memory_block = "(none)"
+                conversation_memory_hits = []
 
             # -- 4. Run the orchestrator ---------------------------------------
             final_response = await self._orchestrator.run(
@@ -329,6 +368,8 @@ class AnalysisRunner:
                 conversation_id=conversation_id,
                 user_email=user_id,
                 history_turns=history_turns,
+                conversation_memory_block=conversation_memory_block,
+                conversation_memory_hits=conversation_memory_hits,
             )
 
             final_ticker = (getattr(final_response, "tickers", []) or [None])[0]
@@ -385,6 +426,14 @@ class AnalysisRunner:
                 conversation_id=conversation_id,
                 user_email=user_id,
                 turn=turn_payload,
+            )
+            asyncio.create_task(
+                self._refresh_conversation_memory_index(
+                    conversation_id=conversation_id,
+                    user_email=user_id,
+                    turns=[*history_turns, turn_payload],
+                ),
+                name=f"convmem_index_{conversation_id[:8]}",
             )
 
             # -- 8. Deliver completion event -----------------------------------

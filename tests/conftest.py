@@ -113,7 +113,8 @@ def chroma_adapter_stub(
     )
     vectorstore = DummyVectorStore()
 
-    async def fake_get_vectorstore() -> DummyVectorStore:
+    async def fake_get_vectorstore(*, collection_name=None) -> DummyVectorStore:
+        _ = collection_name
         return vectorstore
 
     monkeypatch.setattr(adapter, "_get_vectorstore", fake_get_vectorstore)

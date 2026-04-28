@@ -276,6 +276,8 @@ class OrchestratorAgent:
         conversation_id: Optional[str],
         user_email: Optional[str],
         history_turns: Optional[List[dict]],
+        conversation_memory_block: str,
+        conversation_memory_hits: Optional[List[dict]],
         turn_id: str,
     ) -> OrchestratorState:
         normalized_history_turns = list(history_turns or [])
@@ -287,6 +289,8 @@ class OrchestratorAgent:
             agent_memory_summaries=self._collect_latest_agent_memory_summaries(
                 normalized_history_turns
             ),
+            conversation_memory_block=(conversation_memory_block or "(none)"),
+            conversation_memory_hits=list(conversation_memory_hits or []),
             user_context_block=self._load_user_context_block(user_email),
             portfolio_block=self._load_portfolio_block(user_email),
             turn_id=turn_id,
@@ -298,6 +302,8 @@ class OrchestratorAgent:
         conversation_id: Optional[str] = None,
         user_email: Optional[str] = None,
         history_turns: Optional[List[dict]] = None,
+        conversation_memory_block: str = "(none)",
+        conversation_memory_hits: Optional[List[dict]] = None,
     ) -> FinalResponse:
         """
         Entry point for one conversation turn.
@@ -319,6 +325,8 @@ class OrchestratorAgent:
             conversation_id=conversation_id,
             user_email=user_email,
             history_turns=history_turns,
+            conversation_memory_block=conversation_memory_block,
+            conversation_memory_hits=conversation_memory_hits,
             turn_id=turn_id,
         )
 
@@ -428,6 +436,7 @@ class OrchestratorAgent:
         planner_memory_block = build_planner_memory_block(
             self._build_runtime_agent_memory_contexts(state.history_turns)
         )
+        planner_conversation_memory_block = state.conversation_memory_block or "(none)"
 
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
@@ -445,6 +454,13 @@ class OrchestratorAgent:
                         "Agent-provided memory contexts from prior turn summaries "
                         "(use for continuity during routing and per-agent goal generation):\n"
                         f"{planner_memory_block}"
+                    )
+                ),
+                SystemMessage(
+                    content=(
+                        "Retrieved private conversation memory chunks "
+                        "(use when relevant for continuity; do not treat as external facts):\n"
+                        f"{planner_conversation_memory_block}"
                     )
                 ),
                 HumanMessage(content=latest_human),
@@ -689,6 +705,13 @@ class OrchestratorAgent:
                     content=(
                         "Recent conversation turns (most recent window):\n"
                         f"{synthesis_turn_block}"
+                    )
+                ),
+                SystemMessage(
+                    content=(
+                        "Retrieved private conversation memory chunks "
+                        "(use when relevant for continuity; do not treat as external facts):\n"
+                        f"{state.conversation_memory_block or '(none)'}"
                     )
                 ),
                 HumanMessage(

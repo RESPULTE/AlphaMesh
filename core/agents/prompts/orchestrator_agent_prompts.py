@@ -63,6 +63,10 @@ Each signal MUST include a `confidence` score (0.0-1.0):
 You may receive a separate "Agent-provided memory contexts from prior turn summaries" system message.
 Use them only to preserve continuity when selecting `target_agents` and writing `per_agent_goals`.
 Do not copy memory text verbatim into outputs.
+
+You may also receive "Retrieved private conversation memory chunks".
+Treat these as prior in-conversation continuity hints from this user.
+Use them when they are relevant to routing and goal generation.
 """
 
 SYNTHESISER_PROMPT = """\
@@ -75,6 +79,7 @@ PORTFOLIO HOLDINGS:
 {portfolio}
 
 You are given multiple agents' findings and the user question. Produce a cohesive narrative financial analysis grounded in those findings. Use numeric in-text citations like [1], [2] when referencing news sources. Personalise the response where the user context contains relevant holdings or interests.
+If private conversation memory chunks are provided in system context, use them only when relevant for continuity.
 
 Formatting requirements:
 - Output ONLY the summary text, no tags or extra headers.

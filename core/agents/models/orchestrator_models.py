@@ -154,6 +154,8 @@ class OrchestratorState(BaseModel):
     user_email: Optional[str] = None
     history_turns: List[dict] = Field(default_factory=list)
     agent_memory_summaries: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    conversation_memory_block: str = "(none)"
+    conversation_memory_hits: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Populated synchronously in run() from the UserContextService cache.
     user_context_block: str = ""

@@ -28,21 +28,27 @@ class ChromaDBAdapter:
         self._persist_directory = persist_directory
         self._collection_name = collection_name
         self._embedding_function = embedding_function
-        self._vectorstore: Optional[Chroma] = None
+        self._vectorstores: Dict[str, Chroma] = {}
         self._logger = get_logger(__name__)
 
-    async def _get_vectorstore(self) -> Chroma:
+    def _resolve_collection_name(self, collection_name: Optional[str] = None) -> str:
+        return (collection_name or self._collection_name).strip()
+
+    async def _get_vectorstore(self, collection_name: Optional[str] = None) -> Chroma:
         """Lazily initialize and return the underlying Chroma vector store."""
-        if self._vectorstore is not None:
-            return self._vectorstore
+        resolved_collection_name = self._resolve_collection_name(collection_name)
+        existing = self._vectorstores.get(resolved_collection_name)
+        if existing is not None:
+            return existing
 
         try:
-            self._vectorstore = Chroma(
-                collection_name=self._collection_name,
+            vectorstore = Chroma(
+                collection_name=resolved_collection_name,
                 embedding_function=self._embedding_function,
                 persist_directory=self._persist_directory,
             )
-            return self._vectorstore
+            self._vectorstores[resolved_collection_name] = vectorstore
+            return vectorstore
         except Exception:
             self._logger.exception("Failed to initialize local Chroma vector store.")
             raise
@@ -85,15 +91,20 @@ class ChromaDBAdapter:
 
     async def get_or_create_collection(self, collection_name: str) -> Chroma:
         """Return a Chroma vector store, creating it if needed."""
-        _ = collection_name
-        return await self._get_vectorstore()
+        return await self._get_vectorstore(collection_name=collection_name)
 
-    async def add_documents(self, documents: List[Document], ids: List[str]) -> None:
+    async def add_documents(
+        self,
+        documents: List[Document],
+        ids: List[str],
+        *,
+        collection_name: Optional[str] = None,
+    ) -> None:
         """Add documents to Chroma using the vector store API."""
         if not documents:
             return
         try:
-            vectorstore = await self._get_vectorstore()
+            vectorstore = await self._get_vectorstore(collection_name=collection_name)
             await asyncio.to_thread(
                 vectorstore.add_documents, documents=documents, ids=ids
             )
@@ -106,6 +117,8 @@ class ChromaDBAdapter:
         chunk_ids: List[str],
         texts: List[str],
         metadatas: List[dict],
+        *,
+        collection_name: Optional[str] = None,
     ) -> None:
         """Batch upsert chunk vectors with metadata."""
         if not self._embedding_function:
@@ -117,7 +130,11 @@ class ChromaDBAdapter:
                 )
                 for id_, text, meta in zip(chunk_ids, texts, metadatas, strict=False)
             ]
-            await self.add_documents(documents, chunk_ids)
+            await self.add_documents(
+                documents,
+                chunk_ids,
+                collection_name=collection_name,
+            )
         except Exception:
             self._logger.exception("Failed to upsert chunks to ChromaDB.")
             raise
@@ -229,12 +246,13 @@ class ChromaDBAdapter:
         lambda_mult: float = 0.5,
         where: Optional[dict] = None,
         where_document: Optional[dict] = None,
+        collection_name: Optional[str] = None,
     ) -> List[Tuple[Document, float]]:
         """Query ChromaDB for nearest neighbors with scores."""
         if query_text is None and query_embedding is None:
             return []
 
-        vectorstore = await self._get_vectorstore()
+        vectorstore = await self._get_vectorstore(collection_name=collection_name)
 
         try:
             if query_embedding is None and query_text is not None:
@@ -349,10 +367,15 @@ class ChromaDBAdapter:
                 await asyncio.sleep(delay + jitter)
         return None
 
-    async def get_by_ids(self, ids: List[str]) -> dict:
+    async def get_by_ids(
+        self,
+        ids: List[str],
+        *,
+        collection_name: Optional[str] = None,
+    ) -> dict:
         """Fetch documents by their IDs."""
         try:
-            vectorstore = await self._get_vectorstore()
+            vectorstore = await self._get_vectorstore(collection_name=collection_name)
             result = await asyncio.to_thread(
                 vectorstore.get, ids=ids, include=["documents", "metadatas"]
             )
@@ -363,29 +386,48 @@ class ChromaDBAdapter:
             self._logger.exception("Failed to fetch documents from ChromaDB.")
             raise
 
-    async def get_documents_by_ids(self, ids: List[str]) -> List[Document]:
+    async def get_documents_by_ids(
+        self,
+        ids: List[str],
+        *,
+        collection_name: Optional[str] = None,
+    ) -> List[Document]:
         """Fetch LangChain Documents by their IDs."""
         try:
-            vectorstore = await self._get_vectorstore()
+            vectorstore = await self._get_vectorstore(collection_name=collection_name)
             docs = await asyncio.to_thread(vectorstore.get_by_ids, ids)
             return [self._with_deserialized_metadata(doc) for doc in docs]
         except Exception:
             self._logger.exception("Failed to fetch documents from ChromaDB.")
             raise
 
-    async def delete_by_ids(self, ids: List[str]) -> None:
+    async def delete_by_ids(
+        self,
+        ids: List[str],
+        *,
+        collection_name: Optional[str] = None,
+    ) -> None:
         """Delete documents by their IDs."""
         try:
-            vectorstore = await self._get_vectorstore()
+            vectorstore = await self._get_vectorstore(collection_name=collection_name)
             await asyncio.to_thread(vectorstore.delete, ids=ids)
         except Exception:
             self._logger.error("Failed to delete documents from ChromaDB.")
 
-    async def update_metadata(self, ids: List[str], metadatas: List[dict]) -> None:
+    async def update_metadata(
+        self,
+        ids: List[str],
+        metadatas: List[dict],
+        *,
+        collection_name: Optional[str] = None,
+    ) -> None:
         """Update metadata for existing documents."""
         try:
-            vectorstore = await self._get_vectorstore()
-            existing = await self.get_documents_by_ids(ids)
+            vectorstore = await self._get_vectorstore(collection_name=collection_name)
+            existing = await self.get_documents_by_ids(
+                ids,
+                collection_name=collection_name,
+            )
             metadata_map = {
                 id_: meta for id_, meta in zip(ids, metadatas, strict=False)
             }
@@ -413,12 +455,17 @@ class ChromaDBAdapter:
             self._logger.exception("Failed to update ChromaDB metadata.")
             raise
 
-    async def get_chunks_with_source_url(self, source_url: str) -> List[Document]:
+    async def get_chunks_with_source_url(
+        self,
+        source_url: str,
+        *,
+        collection_name: Optional[str] = None,
+    ) -> List[Document]:
         """Check whether any chunks exist with the given source URL."""
         if not source_url:
             return []
         try:
-            vectorstore = await self._get_vectorstore()
+            vectorstore = await self._get_vectorstore(collection_name=collection_name)
             result = await asyncio.to_thread(
                 vectorstore.get,
                 where={"source_url": source_url},

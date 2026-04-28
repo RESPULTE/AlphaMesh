@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     # ── Memory retrieval ──────────────────────────────────────────────────────
     MEMORY_VECTOR_TOP_K: int = 10
     MEMORY_SIMILARITY_THRESHOLD: float = 0.72
+    CONVERSATION_MEMORY_TOKEN_LIMIT: int = 5000
 
     # ── Re-ranking ────────────────────────────────────────────────────────────
     RERANK_ALPHA: float = 0.8

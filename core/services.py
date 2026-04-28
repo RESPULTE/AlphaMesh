@@ -36,6 +36,7 @@ class ServiceManager:
         self._ticker_validator = None
         self._market_data_service = None
         self._orchestrator_agent = None
+        self._conversation_memory_service = None
 
     def get_agent(self, temperature=0.0):
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
@@ -335,6 +336,20 @@ class ServiceManager:
                 print(f"Error initializing OrchestratorAgent: {e}")
                 raise
         return self._orchestrator_agent
+
+    def get_conversation_memory_service(self):
+        from core.memory.conversation import ConversationVectorMemoryService
+
+        if self._conversation_memory_service is None:
+            try:
+                self._conversation_memory_service = ConversationVectorMemoryService(
+                    chroma_adapter=self.get_chroma_adapter(),
+                    llm=self.get_agent(temperature=0),
+                )
+            except Exception as e:
+                print(f"Error initializing ConversationVectorMemoryService: {e}")
+                raise
+        return self._conversation_memory_service
 
     async def startup(self) -> None:
         """

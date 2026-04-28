@@ -129,6 +129,7 @@ def test_plan_node_receives_portfolio_context_message() -> None:
         messages=[HumanMessage(content="Should I add more AAPL?")],
         user_context_block="USER CONTEXT: interested in large-cap tech",
         portfolio_block='[{"ticker":"AAPL","shares":25}]',
+        conversation_memory_block="1. [2026-04-26T00:00:00+00:00] turn=t-1 score=0.91\n   User asked about AAPL weighting.",
         history_turns=[
             {
                 "created_at": "2026-04-26T00:01:00+00:00",
@@ -158,6 +159,12 @@ def test_plan_node_receives_portfolio_context_message() -> None:
         and "news_agent" in str(message.content)
         for message in captured["messages"]
     )
+    assert any(
+        isinstance(message, SystemMessage)
+        and "Retrieved private conversation memory chunks" in str(message.content)
+        and "AAPL weighting" in str(message.content)
+        for message in captured["messages"]
+    )
 
 
 def test_synthesize_node_uses_state_portfolio_block() -> None:
@@ -175,6 +182,7 @@ def test_synthesize_node_uses_state_portfolio_block() -> None:
         messages=[HumanMessage(content="Summarise this for me.")],
         user_context_block="USER CONTEXT: None",
         portfolio_block='[{"ticker":"TSLA","shares":10}]',
+        conversation_memory_block="1. [2026-04-26T00:00:00+00:00] turn=t-1 score=0.87\n   User prefers concise summaries.",
     )
 
     payload = asyncio.run(agent._synthesize_node(state))
@@ -184,3 +192,8 @@ def test_synthesize_node_uses_state_portfolio_block() -> None:
         m for m in captured["messages"] if isinstance(m, SystemMessage)
     ]
     assert any("TSLA" in str(m.content) for m in system_messages)
+    assert any(
+        "Retrieved private conversation memory chunks" in str(m.content)
+        and "prefers concise summaries" in str(m.content)
+        for m in system_messages
+    )
