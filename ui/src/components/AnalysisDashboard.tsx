@@ -7,15 +7,23 @@ import DashboardTurnPanel from './DashboardTurnPanel';
 import { mapTurnToAnalysisResponse } from './dashboardTurnMapper';
 
 interface AnalysisDashboardProps {
-  query: string;
+  query?: string | null;
+  conversationIdOverride?: string | null;
   onBack?: () => void;
 }
 
 const DEV_USER_EMAIL = 'demo@alphamesh.local';
 const HISTORY_PAGE_SIZE = 8;
 
-export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardProps) {
-  const { data, isStreaming, conversationId, requestId } = useAnalysisStream(query);
+export default function AnalysisDashboard({
+  query,
+  conversationIdOverride,
+  onBack,
+}: AnalysisDashboardProps) {
+  const { data, isStreaming, conversationId: streamedConversationId, requestId } = useAnalysisStream(
+    query ?? null
+  );
+  const conversationId = conversationIdOverride ?? streamedConversationId;
   const [historicalTurns, setHistoricalTurns] = useState<ConversationTurn[]>([]);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [nextBeforeTurnId, setNextBeforeTurnId] = useState<string | null>(null);
@@ -112,6 +120,7 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
   }, [historicalTurns, requestId]);
 
   const hasLiveData = Boolean(data);
+  const hasActiveStreamQuery = Boolean(query);
 
   useEffect(() => {
     if (!conversationId || historyLoadedForConversation !== conversationId) return;
@@ -132,7 +141,7 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
     filteredHistoricalTurns.length,
   ]);
 
-  if (!hasLiveData) {
+  if (hasActiveStreamQuery && !hasLiveData) {
     return (
       <div className="pt-32 pb-24 px-6 md:px-12 flex flex-col items-center justify-center min-h-screen w-full max-w-[1600px] mx-auto">
         <motion.div
@@ -185,10 +194,10 @@ export default function AnalysisDashboard({ query, onBack }: AnalysisDashboardPr
           />
         ))}
 
-        {!liveTurnAlreadyPersisted && (
+        {hasLiveData && hasActiveStreamQuery && !liveTurnAlreadyPersisted && (
           <DashboardTurnPanel
             key={`live-${requestId ?? query}`}
-            query={query}
+            query={query ?? ''}
             data={data as AnalysisResponse}
             isStreaming={isStreaming}
           />

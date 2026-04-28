@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   X,
@@ -11,7 +11,6 @@ import {
   ExternalLink,
   FileText,
   BarChart2,
-  Plus,
   ArrowUp,
 } from 'lucide-react';
 import Markdown from 'react-markdown';
@@ -34,7 +33,6 @@ import type {
   DataFramePayload,
   FundamentalsVisualizationPayload,
   SourceItem,
-  TickerResult,
 } from '../types/api';
 import {
   normaliseChartSpec,
@@ -46,11 +44,14 @@ interface FullConversationViewProps {
   turns: ConversationTurn[];
   conversationId: string;
   onClose: () => void;
-  /** Called when user submits a new message to continue the conversation */
-  onContinue: (query: string) => void;
+  /** Called when user wants to continue in main dashboard view */
+  onContinue: () => void;
   isStreaming?: boolean;
   /** Show a loading spinner in the thread area while turns are being fetched */
   isLoading?: boolean;
+  hasMore?: boolean;
+  isLoadingMore?: boolean;
+  onLoadMore?: () => void;
 }
 
 const CHART_COLORS = ['#007a01', '#2b9f30', '#6ecf72', '#87d98a', '#b6e8b9', '#d1f2d3'];
@@ -394,44 +395,80 @@ export default function FullConversationView({
   onContinue,
   isStreaming = false,
   isLoading = false,
+  hasMore = false,
+  isLoadingMore = false,
+  onLoadMore,
 }: FullConversationViewProps) {
-  const [inputValue, setInputValue] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
+  const threadRef = useRef<HTMLDivElement>(null);
+  const hasInitialBottomScrollRef = useRef(false);
+  const pendingPrependOffsetRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
+  const requestedMoreRef = useRef(false);
 
-  // Scroll to bottom on open
+  // Reset per-conversation transient state.
   useEffect(() => {
-    setTimeout(() => {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, 150);
-  }, []);
+    hasInitialBottomScrollRef.current = false;
+    pendingPrependOffsetRef.current = null;
+    requestedMoreRef.current = false;
+  }, [conversationId]);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (inputValue.trim() && !isStreaming) {
-      onContinue(inputValue.trim());
-      setInputValue('');
-      onClose(); // close the modal so the streaming view can show
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit(e as unknown as React.FormEvent);
-    }
-  };
-
-  // Prevent body scroll while modal is open
+  // Prevent body scroll while modal is open.
   useEffect(() => {
     document.body.style.overflow = 'hidden';
-    return () => { document.body.style.overflow = ''; };
+    return () => {
+      document.body.style.overflow = '';
+    };
   }, []);
 
-  const shortId = `${conversationId.slice(0, 8)}…${conversationId.slice(-6)}`;
+  // Keep "latest first" robust: once initial turns load, jump to bottom exactly once.
+  useEffect(() => {
+    if (isLoading || turns.length === 0 || hasInitialBottomScrollRef.current) return;
+    requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ behavior: 'auto' });
+      hasInitialBottomScrollRef.current = true;
+    });
+  }, [isLoading, turns.length]);
+
+  // Preserve viewport position when older turns are prepended.
+  useEffect(() => {
+    if (!pendingPrependOffsetRef.current) return;
+    if (isLoadingMore) return;
+    const thread = threadRef.current;
+    if (!thread) return;
+    const { scrollTop, scrollHeight } = pendingPrependOffsetRef.current;
+    const delta = thread.scrollHeight - scrollHeight;
+    thread.scrollTop = Math.max(0, scrollTop + delta);
+    pendingPrependOffsetRef.current = null;
+  }, [isLoadingMore, turns.length]);
+
+  useEffect(() => {
+    if (!isLoadingMore) {
+      requestedMoreRef.current = false;
+    }
+  }, [isLoadingMore]);
+
+  const handleThreadScroll = useCallback(() => {
+    const thread = threadRef.current;
+    if (!thread) return;
+    if (!onLoadMore || !hasMore || isLoading || isLoadingMore || requestedMoreRef.current) return;
+
+    const scrollableDelta = thread.scrollHeight - thread.clientHeight;
+    // Only fetch older turns when the list is genuinely scrollable and user reaches near-top.
+    if (scrollableDelta <= 24) return;
+    if (thread.scrollTop > 72) return;
+
+    requestedMoreRef.current = true;
+    pendingPrependOffsetRef.current = {
+      scrollTop: thread.scrollTop,
+      scrollHeight: thread.scrollHeight,
+    };
+    onLoadMore();
+  }, [hasMore, isLoading, isLoadingMore, onLoadMore]);
+
+  const shortId = `${conversationId.slice(0, 8)}...${conversationId.slice(-6)}`;
 
   return (
     <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      {/* Backdrop */}
       <motion.div
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
@@ -440,7 +477,6 @@ export default function FullConversationView({
         onClick={onClose}
       />
 
-      {/* Modal panel */}
       <motion.div
         initial={{ opacity: 0, y: 40, scale: 0.97 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -449,7 +485,6 @@ export default function FullConversationView({
         className="relative flex flex-col w-full h-[100dvh] md:h-[88vh] md:max-w-3xl md:rounded-3xl overflow-hidden bg-surface shadow-2xl border border-outline-variant/15 z-10"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* ── Header ───────────────────────────────────────────────── */}
         <div className="shrink-0 flex items-center justify-between px-5 py-4 border-b border-outline-variant/10 bg-surface-container-lowest">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-full bg-primary/10 border border-primary/15 flex items-center justify-center">
@@ -475,8 +510,21 @@ export default function FullConversationView({
           </div>
         </div>
 
-        {/* ── Scrollable thread ─────────────────────────────────────── */}
-        <div className="flex-1 overflow-y-auto custom-scrollbar p-4 md:p-6 space-y-8 bg-surface-container-lowest/30">
+        <div
+          ref={threadRef}
+          onScroll={handleThreadScroll}
+          className="flex-1 overflow-y-auto custom-scrollbar p-4 md:p-6 pb-32 space-y-8 bg-surface-container-lowest/30"
+        >
+          {isLoadingMore && (
+            <div className="flex items-center justify-center py-3">
+              <motion.div
+                animate={{ rotate: 360 }}
+                transition={{ repeat: Infinity, duration: 1.2, ease: 'linear' }}
+                className="w-5 h-5 border-2 border-primary/20 border-t-primary rounded-full"
+              />
+            </div>
+          )}
+
           {isLoading ? (
             <div className="flex flex-col items-center justify-center gap-4 py-24">
               <motion.div
@@ -484,59 +532,45 @@ export default function FullConversationView({
                 transition={{ repeat: Infinity, duration: 1.2, ease: 'linear' }}
                 className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full"
               />
-              <p className="text-sm text-on-surface-variant/60 font-medium">Loading conversation…</p>
+              <p className="text-sm text-on-surface-variant/60 font-medium">Loading conversation...</p>
             </div>
           ) : turns.length === 0 ? (
             <div className="flex items-center justify-center py-24 text-sm text-on-surface-variant/50">
               No messages in this conversation yet.
             </div>
           ) : (
-            turns.map((turn, i) => (
-              <RichTurn key={turn.turn_id} turn={turn} index={i} />
-            ))
+            turns.map((turn, i) => <RichTurn key={turn.turn_id} turn={turn} index={i} />)
           )}
           <div ref={bottomRef} className="h-2" />
         </div>
 
-        {/* ── Chat input ────────────────────────────────────────────── */}
-        <div className="shrink-0 border-t border-outline-variant/10 p-4 bg-surface-container-lowest">
-          <form onSubmit={handleSubmit} className="flex items-end gap-3">
+        <div className="absolute bottom-0 left-0 right-0 border-t border-outline-variant/10 px-4 py-5 bg-transparent relative overflow-hidden">
+          {/* Soft tint so content remains visible behind the action strip */}
+          <div className="absolute inset-0 bg-surface-container-lowest/18 pointer-events-none" />
+          {/* Gradient depth: lighter at top, denser at bottom */}
+          <div className="absolute inset-0 bg-gradient-to-t from-surface-container-lowest/72 via-surface-container-lowest/36 to-transparent pointer-events-none" />
+          {/* Backdrop blur gradient layers */}
+          <div className="absolute inset-x-0 top-0 h-10 backdrop-blur-[1px] pointer-events-none" />
+          <div className="absolute inset-x-0 top-8 h-14 backdrop-blur-[3px] pointer-events-none" />
+          <div className="absolute inset-x-0 bottom-0 h-24 backdrop-blur-xl pointer-events-none" />
+          <div className="relative flex items-center justify-center">
             <button
               type="button"
-              className="p-2.5 rounded-xl hover:bg-surface-container-low text-on-surface-variant/60 transition-colors shrink-0"
-            >
-              <Plus className="w-5 h-5" />
-            </button>
-            <textarea
-              value={inputValue}
-              onChange={(e) => {
-                setInputValue(e.target.value);
-                // Auto-resize
-                e.target.style.height = 'auto';
-                e.target.style.height = `${Math.min(e.target.scrollHeight, 120)}px`;
-              }}
-              onKeyDown={handleKeyDown}
+              onClick={onContinue}
               disabled={isStreaming}
-              placeholder="Continue the conversation…"
-              rows={1}
-              className="flex-1 bg-surface-container border border-outline-variant/20 rounded-2xl px-4 py-3 text-sm font-medium text-on-surface placeholder:text-on-surface-variant/40 outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 resize-none transition-all"
-              style={{ minHeight: '44px' }}
-            />
-            <button
-              type="submit"
-              disabled={!inputValue.trim() || isStreaming}
-              className="w-11 h-11 rounded-[1.25rem] bg-primary flex items-center justify-center hover:shadow-[0_0_24px_rgba(0,200,5,0.35)] hover:scale-[1.04] active:scale-95 transition-all shrink-0 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:shadow-none"
+              aria-label="Continue conversation in dashboard"
+              className="group relative w-14 h-14 md:w-16 md:h-16 rotate-45 bg-primary/20 border border-primary/40 backdrop-blur-xl rounded-2xl flex items-center justify-center hover:bg-primary/30 hover:shadow-[0_0_24px_rgba(0,200,5,0.35)] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <ArrowUp className="w-5 h-5 text-on-primary" />
+              <div className="-rotate-45">
+                <ArrowUp className="w-5 h-5 md:w-6 md:h-6 text-primary group-hover:-translate-y-0.5 transition-transform" />
+              </div>
             </button>
-          </form>
+          </div>
           <p className="text-[9px] text-center text-on-surface-variant/40 mt-3 font-black uppercase tracking-[0.25em]">
-            AlphaMesh Intelligence Unit · Press Enter to send
+            Continue in dashboard
           </p>
         </div>
       </motion.div>
     </div>
   );
 }
-
-

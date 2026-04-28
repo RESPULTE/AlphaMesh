@@ -8,14 +8,15 @@ import FullConversationView from './FullConversationView';
 interface HistoryProps {
   query?: string | null;
   onClearQuery?: () => void;
-  /** When set, auto-open this conversation on mount */
+  dashboardConversationId?: string | null;
+  onClearDashboardConversation?: () => void;
   initialExpandedId?: string | null;
-  /** Called when user submits a new message inside the full-view modal */
-  onContinueConversation?: (conversationId: string, query: string) => void;
+  onContinueConversation?: (conversationId: string) => void;
 }
 
 const DEV_USER_EMAIL = 'demo@alphamesh.local';
 const STORAGE_CONVERSATION_ID = 'alphamesh.active_conversation_id';
+const TURN_PAGE_SIZE = 8;
 
 function formatTimestamp(value: string): string {
   if (!value) return 'Unknown time';
@@ -25,31 +26,33 @@ function formatTimestamp(value: string): string {
 }
 
 function truncateLabel(text: string, max = 72): string {
-  return text.length > max ? `${text.slice(0, max)}…` : text;
+  return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
 export default function History({
   query,
   onClearQuery,
+  dashboardConversationId,
+  onClearDashboardConversation,
   initialExpandedId,
   onContinueConversation,
 }: HistoryProps) {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
-  const [conversationTurns, setConversationTurns] = useState<Record<string, ConversationTurn[]>>({});
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [loadingTurnsFor, setLoadingTurnsFor] = useState<string | null>(null);
+  const [isLoadingMoreTurns, setIsLoadingMoreTurns] = useState(false);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(
     typeof window !== 'undefined' ? window.localStorage.getItem(STORAGE_CONVERSATION_ID) : null
   );
-  /** Which conversation is open in the full-screen modal */
   const [fullViewId, setFullViewId] = useState<string | null>(null);
+  const [fullViewTurns, setFullViewTurns] = useState<ConversationTurn[]>([]);
+  const [fullViewHasMore, setFullViewHasMore] = useState(false);
+  const [fullViewNextBefore, setFullViewNextBefore] = useState<string | null>(null);
 
-  // Track whether initialExpandedId has already triggered an open
   const initialOpenDone = useRef(false);
 
-  // ── Load conversation list ───────────────────────────────────────────────
   useEffect(() => {
-    if (query) return;
+    if (query || dashboardConversationId) return;
     let cancelled = false;
 
     const load = async () => {
@@ -66,72 +69,109 @@ export default function History({
       }
     };
 
-    load();
-    return () => { cancelled = true; };
-  }, [query]);
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [query, dashboardConversationId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
     setActiveConversationId(window.localStorage.getItem(STORAGE_CONVERSATION_ID));
-  }, [query]);
+  }, [query, dashboardConversationId]);
 
-  // ── Auto-open a specific conversation (e.g. from Chat tab deep-link) ────
   useEffect(() => {
     if (initialExpandedId && !initialOpenDone.current) {
       initialOpenDone.current = true;
-      openFullView(initialExpandedId);
+      void openFullView(initialExpandedId);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialExpandedId, conversations]);
 
-  // ── Lazily load turns for a conversation ────────────────────────────────
-  const loadTurns = async (conversationId: string) => {
-    if (conversationTurns[conversationId]) return;
-    setLoadingTurnsFor(conversationId);
+  const loadTurnsPage = async (
+    conversationId: string,
+    opts?: { reset?: boolean; beforeTurnId?: string | null }
+  ) => {
+    const reset = opts?.reset ?? false;
+    if (reset) {
+      setLoadingTurnsFor(conversationId);
+    } else {
+      setIsLoadingMoreTurns(true);
+    }
     try {
+      const params = new URLSearchParams({
+        user_email: DEV_USER_EMAIL,
+        limit: String(TURN_PAGE_SIZE),
+      });
+      if (!reset && opts?.beforeTurnId) {
+        params.set('before_turn_id', opts.beforeTurnId);
+      }
       const res = await fetch(
-        `/api/v1/conversations/${encodeURIComponent(conversationId)}/turns?user_email=${encodeURIComponent(DEV_USER_EMAIL)}`
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/turns?${params.toString()}`
       );
       if (!res.ok) return;
       const payload = (await res.json()) as ConversationTurnsResponse;
-      setConversationTurns((prev) => ({
-        ...prev,
-        [conversationId]: payload.turns || [],
-      }));
+      const incoming = payload.turns || [];
+      setFullViewTurns((prev) => {
+        if (reset) return incoming;
+        const seen = new Set(prev.map((turn) => turn.turn_id));
+        const prepended = incoming.filter((turn) => !seen.has(turn.turn_id));
+        return [...prepended, ...prev];
+      });
+      setFullViewHasMore(Boolean(payload.has_more));
+      setFullViewNextBefore(payload.next_before_turn_id ?? null);
     } finally {
       setLoadingTurnsFor(null);
+      setIsLoadingMoreTurns(false);
     }
   };
 
-  // ── Open the full-screen modal ───────────────────────────────────────────
   const openFullView = async (conversationId: string) => {
-    await loadTurns(conversationId);
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(STORAGE_CONVERSATION_ID, conversationId);
     }
     setActiveConversationId(conversationId);
     setFullViewId(conversationId);
+    setFullViewTurns([]);
+    setFullViewHasMore(false);
+    setFullViewNextBefore(null);
+    await loadTurnsPage(conversationId, { reset: true });
   };
 
-  const closeFullView = () => setFullViewId(null);
+  const closeFullView = () => {
+    setFullViewId(null);
+    setFullViewTurns([]);
+    setFullViewHasMore(false);
+    setFullViewNextBefore(null);
+  };
 
-  const handleContinue = (newQuery: string) => {
+  const handleContinue = () => {
     if (fullViewId && onContinueConversation) {
-      onContinueConversation(fullViewId, newQuery);
+      onContinueConversation(fullViewId);
     }
     closeFullView();
   };
 
-  // ── If a live analysis query is active, show the dashboard ──────────────
-  if (query) {
-    return <AnalysisDashboard query={query} onBack={onClearQuery} />;
-  }
+  const handleLoadMoreTurns = async () => {
+    if (!fullViewId || !fullViewHasMore || !fullViewNextBefore || isLoadingMoreTurns) return;
+    await loadTurnsPage(fullViewId, { reset: false, beforeTurnId: fullViewNextBefore });
+  };
 
-  const fullViewTurns = fullViewId ? (conversationTurns[fullViewId] ?? []) : [];
+  if (query || dashboardConversationId) {
+    return (
+      <AnalysisDashboard
+        query={query}
+        conversationIdOverride={dashboardConversationId}
+        onBack={() => {
+          onClearQuery?.();
+          onClearDashboardConversation?.();
+        }}
+      />
+    );
+  }
 
   return (
     <>
-      {/* ── Full-screen conversation modal ──────────────────────────── */}
       <AnimatePresence>
         {fullViewId && (
           <FullConversationView
@@ -140,11 +180,13 @@ export default function History({
             onClose={closeFullView}
             onContinue={handleContinue}
             isLoading={loadingTurnsFor === fullViewId}
+            hasMore={fullViewHasMore}
+            isLoadingMore={isLoadingMoreTurns}
+            onLoadMore={handleLoadMoreTurns}
           />
         )}
       </AnimatePresence>
 
-      {/* ── Page ────────────────────────────────────────────────────── */}
       <motion.main
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -168,7 +210,7 @@ export default function History({
               transition={{ repeat: Infinity, duration: 1.2, ease: 'linear' }}
               className="w-4 h-4 border-2 border-primary/20 border-t-primary rounded-full"
             />
-            Loading conversation history…
+            Loading conversation history...
           </div>
         )}
 
@@ -178,15 +220,10 @@ export default function History({
           </div>
         )}
 
-        {/* ── Conversation card list (static, click-to-open) ────────── */}
         <div className="space-y-3 md:space-y-4">
           {conversations.map((conv, i) => {
             const isActive = activeConversationId === conv.conversation_id;
-            // Use the cached first-turn user message as label if available
-            const cachedTurns = conversationTurns[conv.conversation_id];
-            const label = cachedTurns?.[0]?.user_message
-              ? truncateLabel(cachedTurns[0].user_message)
-              : truncateLabel(conv.conversation_id);
+            const label = truncateLabel(conv.conversation_id);
 
             return (
               <motion.div
@@ -194,15 +231,13 @@ export default function History({
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.3, delay: i * 0.04 }}
-                onClick={() => openFullView(conv.conversation_id)}
+                onClick={() => void openFullView(conv.conversation_id)}
                 className="group flex items-center gap-4 md:gap-6 p-5 md:p-8 bg-surface-container-lowest rounded-xl cursor-pointer hover:bg-surface-container-low transition-colors border border-transparent hover:border-outline-variant/10 shadow-[0_4px_20px_rgba(0,0,0,0.05)]"
               >
-                {/* Icon */}
                 <div className="w-12 h-12 md:w-14 md:h-14 bg-surface-container rounded-full flex items-center justify-center shrink-0 group-hover:bg-primary/10 transition-colors">
                   <MessageSquare className="w-5 h-5 md:w-6 md:h-6 text-primary" />
                 </div>
 
-                {/* Text */}
                 <div className="flex-1 min-w-0">
                   <h2 className="font-headline text-base md:text-lg font-bold tracking-tight text-on-surface truncate group-hover:text-primary transition-colors">
                     {label}
@@ -210,9 +245,7 @@ export default function History({
                   <p className="text-outline text-xs md:text-sm mt-0.5">
                     {conv.message_count} messages · Last active {formatTimestamp(conv.last_message_at)}
                   </p>
-                  {isActive && (
-                    <p className="text-primary text-xs font-semibold mt-1">Active conversation</p>
-                  )}
+                  {isActive && <p className="text-primary text-xs font-semibold mt-1">Active conversation</p>}
                 </div>
               </motion.div>
             );
