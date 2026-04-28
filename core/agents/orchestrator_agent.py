@@ -14,7 +14,7 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -38,7 +38,6 @@ from core.agents.utils import (
     _build_clarification_message,
     _build_combined_company_context,
     _extract_last_human_message,
-    build_agent_memory_contexts,
     build_planner_memory_block,
     build_turn_window_block,
 )
@@ -110,27 +109,41 @@ class OrchestratorAgent:
     def name(self) -> str:
         return "Orchestrator Agent"
 
-    @classmethod
-    def _get_memory_summary_renderers(cls) -> Dict[str, Callable[[dict], str]]:
-        renderers: Dict[str, Callable[[dict], str]] = {}
-        for agent_cls in AVAILABLE_AGENTS:
-            agent_name = agent_cls.name()
-            renderer = getattr(agent_cls, "render_memory_summary", None)
-            if callable(renderer):
-                renderers[agent_name] = renderer
-        return renderers
+    @staticmethod
+    def _collect_latest_agent_memory_summaries(turns: List[dict]) -> Dict[str, Dict[str, Any]]:
+        latest: Dict[str, Dict[str, Any]] = {}
+        for turn in turns:
+            summaries = turn.get("agent_memory_summaries") or {}
+            if not isinstance(summaries, dict):
+                continue
+            for agent_name, payload in summaries.items():
+                if isinstance(payload, dict):
+                    latest[str(agent_name)] = payload
+        return latest
 
-    @classmethod
-    def _build_agent_memory_contexts(
-        cls,
+    def _build_runtime_agent_memory_contexts(
+        self,
         turns: List[dict],
+        *,
         window: int = _AGENT_MEMORY_WINDOW,
     ) -> Dict[str, str]:
-        return build_agent_memory_contexts(
-            turns,
-            cls._get_memory_summary_renderers(),
-            window=window,
-        )
+        contexts: Dict[str, str] = {}
+        for agent_name, agent in self._agents.items():
+            builder = getattr(agent, "build_memory_context_from_history", None)
+            if not callable(builder):
+                continue
+            try:
+                context = builder(turns, window=window)
+            except Exception:
+                logger.exception(
+                    "_build_runtime_agent_memory_contexts: context build failed for '%s'",
+                    agent_name,
+                )
+                continue
+            text = str(context or "").strip()
+            if text:
+                contexts[agent_name] = text
+        return contexts
 
     def _router(self, state: OrchestratorState) -> str:
         if state.plan is None:
@@ -231,15 +244,14 @@ class OrchestratorAgent:
         turn_id: str,
     ) -> OrchestratorState:
         normalized_history_turns = list(history_turns or [])
-        agent_memory_contexts = self._build_agent_memory_contexts(
-            normalized_history_turns
-        )
         return OrchestratorState(
             messages=messages,
             conversation_id=conversation_id,
             user_email=user_email,
             history_turns=normalized_history_turns,
-            agent_memory_contexts=agent_memory_contexts,
+            agent_memory_summaries=self._collect_latest_agent_memory_summaries(
+                normalized_history_turns
+            ),
             user_context_block=self._load_user_context_block(user_email),
             portfolio_block=self._load_portfolio_block(user_email),
             turn_id=turn_id,
@@ -378,7 +390,9 @@ class OrchestratorAgent:
         planner_turn_block = build_turn_window_block(
             state.history_turns, _PLANNER_TURN_WINDOW
         )
-        planner_memory_block = build_planner_memory_block(state.agent_memory_contexts)
+        planner_memory_block = build_planner_memory_block(
+            self._build_runtime_agent_memory_contexts(state.history_turns)
+        )
 
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
@@ -393,8 +407,8 @@ class OrchestratorAgent:
                 ),
                 SystemMessage(
                     content=(
-                        "Agent memory contexts from prior turns (use for continuity "
-                        "during routing and per-agent query rewrites):\n"
+                        "Agent-provided memory contexts from prior turn summaries "
+                        "(use for continuity during routing and per-agent query rewrites):\n"
                         f"{planner_memory_block}"
                     )
                 ),
@@ -517,9 +531,12 @@ class OrchestratorAgent:
         )
 
         tasks = []
+        agent_memory_contexts = self._build_runtime_agent_memory_contexts(
+            state.history_turns
+        )
         for name in valid_names:
             agent_query = plan.per_agent_queries.get(name) or plan.query
-            agent_memory_context = state.agent_memory_contexts.get(name, "")
+            agent_memory_context = agent_memory_contexts.get(name, "")
             agent_input: BaseAgentInput = plan.model_copy(
                 update={
                     "query": agent_query,

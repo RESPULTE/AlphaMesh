@@ -8,6 +8,7 @@ from core.agents.working_memory.base import (
     ConversationWorkingMemoryManagerBase,
     TurnRelevantMemoryBase,
 )
+from core.agents.utils import trim_text
 from core.agents.models.fundamental_agent_models import ExecutorBatchLog
 
 
@@ -55,6 +56,8 @@ class FundamentalWorkingMemoryManager(
         FundamentalTurnRelevantMemory, FundamentalConversationWorkingMemory
     ]
 ):
+    AGENT_NAME = "fundamentals_agent"
+
     def __init__(self, *, max_turns: int = 20) -> None:
         super().__init__(
             max_chunks=1,
@@ -167,4 +170,47 @@ class FundamentalWorkingMemoryManager(
                     rendered_calls += 1
             if row.tool_call_count > rendered_calls:
                 lines.append(f"  ... and {row.tool_call_count - rendered_calls} more call(s)")
+        return "\n".join(lines)
+
+    @staticmethod
+    def render_memory_summary(memory_summary: dict) -> str:
+        if not memory_summary:
+            return ""
+        tools = memory_summary.get("tools_used") or []
+        if not isinstance(tools, list):
+            tools = []
+        key_rows = (
+            memory_summary.get("key_rows")
+            or memory_summary.get("computed_rows")
+            or []
+        )
+        if not isinstance(key_rows, list):
+            key_rows = []
+        completed = bool(memory_summary.get("task_completed", True))
+        conclusion = trim_text(memory_summary.get("main_conclusion") or "", max_chars=220)
+        return (
+            f"tools={','.join(str(t) for t in tools[:5]) or 'none'}; "
+            f"rows={','.join(str(r) for r in key_rows[:6]) or 'none'}; "
+            f"task_completed={completed}; "
+            f"conclusion={conclusion or 'N/A'}"
+        )
+
+    @classmethod
+    def build_context_from_history_summaries(
+        cls,
+        turns: List[dict],
+        window: int = 8,
+    ) -> str:
+        rows = cls.collect_agent_summaries_from_turns(
+            turns=turns,
+            agent_name=cls.AGENT_NAME,
+        )
+        if not rows:
+            return ""
+        lines: List[str] = []
+        for ts, payload in rows[-window:]:
+            rendered = cls.render_memory_summary(payload)
+            if not rendered:
+                rendered = cls.render_memory_summary_fallback(payload)
+            lines.append(f"- [{ts}] {rendered}")
         return "\n".join(lines)

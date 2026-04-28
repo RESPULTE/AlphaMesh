@@ -8,6 +8,7 @@ from core.agents.working_memory.base import (
     ConversationWorkingMemoryManagerBase,
     TurnRelevantMemoryBase,
 )
+from core.agents.utils import trim_text
 from core.memory.retrieval.models import RetrievedChunk
 
 
@@ -30,6 +31,8 @@ class NewsWorkingMemoryManager(
         NewsTurnRelevantMemory, NewsConversationWorkingMemory
     ]
 ):
+    AGENT_NAME = "news_agent"
+
     def __init__(self, *, max_chunks: int = 100, max_turns: int = 20) -> None:
         super().__init__(
             max_chunks=max_chunks,
@@ -84,4 +87,47 @@ class NewsWorkingMemoryManager(
                 f"  relevant_sources={len(row.source_urls)}\n"
                 f"  score_unavailable={row.score_unavailable}"
             )
+        return "\n".join(lines)
+
+    @staticmethod
+    def render_memory_summary(memory_summary: dict) -> str:
+        if not memory_summary:
+            return ""
+        actions = (
+            memory_summary.get("research_actions")
+            or memory_summary.get("tools_used")
+            or []
+        )
+        if not isinstance(actions, list):
+            actions = []
+        sentiment = memory_summary.get("sentiment") or {}
+        sentiment_label = ""
+        if isinstance(sentiment, dict):
+            sentiment_label = str(sentiment.get("label") or "").strip()
+        source_count = int(memory_summary.get("source_count") or 0)
+        catalyst = trim_text(memory_summary.get("main_catalyst") or "", max_chars=200)
+        return (
+            f"actions={','.join(str(a) for a in actions[:4]) or 'none'}; "
+            f"sources={source_count}; sentiment={sentiment_label or 'N/A'}; "
+            f"catalyst={catalyst or 'N/A'}"
+        )
+
+    @classmethod
+    def build_context_from_history_summaries(
+        cls,
+        turns: List[dict],
+        window: int = 8,
+    ) -> str:
+        rows = cls.collect_agent_summaries_from_turns(
+            turns=turns,
+            agent_name=cls.AGENT_NAME,
+        )
+        if not rows:
+            return ""
+        lines: List[str] = []
+        for ts, payload in rows[-window:]:
+            rendered = cls.render_memory_summary(payload)
+            if not rendered:
+                rendered = cls.render_memory_summary_fallback(payload)
+            lines.append(f"- [{ts}] {rendered}")
         return "\n".join(lines)

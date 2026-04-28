@@ -406,3 +406,15 @@ def test_tool_planner_includes_prior_working_memory_block_in_prompt(
     planner_user_prompt = llm.last_messages[1].content
     assert "Prior fundamentals working memory" in planner_user_prompt
     assert "call=profitability_ratios" in planner_user_prompt
+
+
+def test_render_memory_summary_delegates_to_manager() -> None:
+    summary = {
+        "tools_used": ["cagr"],
+        "key_rows": ["Revenues"],
+        "task_completed": True,
+        "main_conclusion": "Revenue trend is stable.",
+    }
+    rendered = FundamentalAnalysisAgent.render_memory_summary(summary)
+    assert rendered.startswith("tools=cagr")
+    assert "rows=Revenues" in rendered

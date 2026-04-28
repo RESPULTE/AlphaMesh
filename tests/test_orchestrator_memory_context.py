@@ -8,7 +8,22 @@ from core.agents.orchestrator_agent import OrchestratorAgent
 from core.services import service_manager
 
 
-def test_build_agent_memory_contexts_uses_last_window_entries() -> None:
+def test_runtime_agent_memory_context_uses_agent_adapter_window() -> None:
+    class _HistoryAdapterAgent:
+        @staticmethod
+        def build_memory_context_from_history(turns, window=8):
+            rows = []
+            for turn in turns:
+                payload = (turn.get("agent_memory_summaries") or {}).get("news_agent")
+                if not isinstance(payload, dict):
+                    continue
+                ts = turn.get("created_at") or "unknown_time"
+                rows.append(
+                    f"- [{ts}] sources={payload.get('source_count')}; "
+                    f"catalyst={payload.get('main_catalyst')}"
+                )
+            return "\n".join(rows[-window:])
+
     turns = []
     for i in range(10):
         turns.append(
@@ -23,7 +38,9 @@ def test_build_agent_memory_contexts_uses_last_window_entries() -> None:
             }
         )
 
-    contexts = OrchestratorAgent._build_agent_memory_contexts(turns, window=8)
+    orchestrator = OrchestratorAgent.__new__(OrchestratorAgent)
+    orchestrator._agents = {"news_agent": _HistoryAdapterAgent()}
+    contexts = orchestrator._build_runtime_agent_memory_contexts(turns, window=8)
     news_context = contexts["news_agent"]
 
     assert "sources=1;" not in news_context
@@ -36,6 +53,20 @@ def test_execute_node_propagates_turn_id_and_agent_memory_context() -> None:
     class _CaptureAgent:
         def __init__(self) -> None:
             self.last_input = None
+
+        @staticmethod
+        def build_memory_context_from_history(turns, window=8):
+            rows = []
+            for turn in turns:
+                payload = (turn.get("agent_memory_summaries") or {}).get("news_agent")
+                if not isinstance(payload, dict):
+                    continue
+                ts = turn.get("created_at") or "unknown_time"
+                rows.append(
+                    f"- [{ts}] sources={payload.get('source_count')}; "
+                    f"catalyst={payload.get('main_catalyst')}"
+                )
+            return "\n".join(rows[-window:])
 
         async def run(self, input_data):
             self.last_input = input_data
@@ -55,7 +86,17 @@ def test_execute_node_propagates_turn_id_and_agent_memory_context() -> None:
         ),
         conversation_id="conv-1",
         turn_id="turn-123",
-        agent_memory_contexts={"news_agent": "- [t] sources=4; catalyst=guidance raise"},
+        history_turns=[
+            {
+                "created_at": "2026-04-26T01:00:00+00:00",
+                "agent_memory_summaries": {
+                    "news_agent": {
+                        "source_count": 4,
+                        "main_catalyst": "guidance raise",
+                    }
+                },
+            }
+        ],
         company_context_blocks={"AAPL": "Company Context Block"},
     )
 
@@ -64,7 +105,7 @@ def test_execute_node_propagates_turn_id_and_agent_memory_context() -> None:
     assert "news_agent" in payload["agent_outputs"]
     assert capture_agent.last_input is not None
     assert capture_agent.last_input.turn_id == "turn-123"
-    assert capture_agent.last_input.agent_memory_context.startswith("- [t]")
+    assert capture_agent.last_input.agent_memory_context.startswith("- [2026-04-26T01:00:00+00:00]")
     assert capture_agent.last_input.query == "rewritten for news"
     assert capture_agent.last_input.company_context == "Company Context Block"
 

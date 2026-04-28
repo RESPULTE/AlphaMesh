@@ -421,3 +421,14 @@ def test_run_reuses_cached_agent_memory_context() -> None:
     assert captured_states[0]["agent_memory_context"].startswith("- [older]")
     assert captured_states[1]["agent_memory_context"].startswith("actions=newsapi")
     assert second.memory_summary["main_catalyst"] == "Guidance was maintained."
+
+
+def test_render_memory_summary_delegates_to_manager() -> None:
+    summary = {
+        "tools_used": ["newsapi"],
+        "source_count": 3,
+        "main_catalyst": "Catalyst",
+    }
+    rendered = NewsAnalysisAgent.render_memory_summary(summary)
+    assert rendered.startswith("actions=newsapi")
+    assert "sources=3" in rendered

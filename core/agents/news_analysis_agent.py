@@ -301,25 +301,16 @@ class NewsAnalysisAgent(AbstractAgent):
 
     @staticmethod
     def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
-        if not memory_summary:
-            return ""
-        actions = (
-            memory_summary.get("research_actions")
-            or memory_summary.get("tools_used")
-            or []
-        )
-        if not isinstance(actions, list):
-            actions = []
-        sentiment = memory_summary.get("sentiment") or {}
-        sentiment_label = ""
-        if isinstance(sentiment, dict):
-            sentiment_label = str(sentiment.get("label") or "").strip()
-        source_count = int(memory_summary.get("source_count") or 0)
-        catalyst = trim_text(memory_summary.get("main_catalyst") or "", max_chars=200)
-        return (
-            f"actions={','.join(str(a) for a in actions[:4]) or 'none'}; "
-            f"sources={source_count}; sentiment={sentiment_label or 'N/A'}; "
-            f"catalyst={catalyst or 'N/A'}"
+        return NewsWorkingMemoryManager.render_memory_summary(memory_summary)
+
+    @classmethod
+    def build_memory_context_from_history(
+        cls,
+        history_turns: List[dict],
+        window: int = 8,
+    ) -> str:
+        return NewsWorkingMemoryManager.build_context_from_history_summaries(
+            history_turns, window=window
         )
 
     def _resolve_agent_memory_context(

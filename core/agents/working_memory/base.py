@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, Generic, List, TypeVar
+from typing import Callable, Dict, Generic, List, Tuple, TypeVar
 
 from core.memory.retrieval.models import RetrievedChunk
 
@@ -102,3 +103,35 @@ class ConversationWorkingMemoryManagerBase(Generic[TurnMemoryT, ConversationMemo
         memory.turn_records.append(record)
         if len(memory.turn_records) > self._max_turns:
             memory.turn_records = memory.turn_records[-self._max_turns :]
+
+    @staticmethod
+    def normalize_turn_timestamp(turn: dict) -> str:
+        return str(turn.get("created_at") or turn.get("timestamp") or "").strip()
+
+    @classmethod
+    def collect_agent_summaries_from_turns(
+        cls,
+        *,
+        turns: List[dict],
+        agent_name: str,
+    ) -> List[Tuple[str, dict]]:
+        rows: List[Tuple[str, dict]] = []
+        for turn in turns:
+            summaries = turn.get("agent_memory_summaries") or {}
+            if not isinstance(summaries, dict):
+                continue
+            payload = summaries.get(agent_name)
+            if not isinstance(payload, dict):
+                continue
+            ts = cls.normalize_turn_timestamp(turn) or "unknown_time"
+            rows.append((ts, payload))
+        return rows
+
+    @staticmethod
+    def render_memory_summary_fallback(
+        memory_summary: dict, *, max_chars: int = 350
+    ) -> str:
+        text = json.dumps(memory_summary or {}, ensure_ascii=True)
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."

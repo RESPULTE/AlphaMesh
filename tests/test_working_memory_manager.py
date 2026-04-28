@@ -169,6 +169,41 @@ def test_news_manager_render_working_memory_block_is_stable() -> None:
     assert "score_unavailable=False" in block
 
 
+def test_news_manager_build_context_from_history_summaries_is_stable() -> None:
+    turns = [
+        {
+            "created_at": "2026-04-26T00:00:00+00:00",
+            "agent_memory_summaries": {
+                "news_agent": {
+                    "research_actions": ["newsapi"],
+                    "source_count": 2,
+                    "sentiment": {"label": "BUY"},
+                    "main_catalyst": "Raised guidance.",
+                }
+            },
+        },
+        {
+            "created_at": "2026-04-26T00:01:00+00:00",
+            "agent_memory_summaries": {
+                "news_agent": {
+                    "research_actions": ["web_search"],
+                    "source_count": 1,
+                    "sentiment": {"label": "NEUTRAL"},
+                    "main_catalyst": "Mixed follow-through.",
+                }
+            },
+        },
+    ]
+
+    block = NewsWorkingMemoryManager.build_context_from_history_summaries(
+        turns, window=2
+    )
+    assert "[2026-04-26T00:00:00+00:00]" in block
+    assert "actions=newsapi" in block
+    assert "actions=web_search" in block
+    assert "catalyst=Mixed follow-through." in block
+
+
 def test_fundamental_manager_persists_counts_and_batch_records() -> None:
     manager = FundamentalWorkingMemoryManager(max_turns=10)
     manager.persist_finalized_turn(
@@ -249,3 +284,38 @@ def test_fundamental_manager_truncates_turns_and_renders_stably() -> None:
     assert "turn=turn-3" in block
     assert "turn=turn-1" not in block
     assert "call=cagr" in block
+
+
+def test_fundamental_manager_build_context_from_history_summaries_is_stable() -> None:
+    turns = [
+        {
+            "created_at": "2026-04-26T01:00:00+00:00",
+            "agent_memory_summaries": {
+                "fundamentals_agent": {
+                    "tools_used": ["profitability_ratios"],
+                    "key_rows": ["Revenues"],
+                    "task_completed": False,
+                    "main_conclusion": "Need one more ratio.",
+                }
+            },
+        },
+        {
+            "created_at": "2026-04-26T01:01:00+00:00",
+            "agent_memory_summaries": {
+                "fundamentals_agent": {
+                    "tools_used": ["cagr"],
+                    "key_rows": ["NetIncomeLoss"],
+                    "task_completed": True,
+                    "main_conclusion": "Trend is positive.",
+                }
+            },
+        },
+    ]
+
+    block = FundamentalWorkingMemoryManager.build_context_from_history_summaries(
+        turns, window=2
+    )
+    assert "[2026-04-26T01:00:00+00:00]" in block
+    assert "tools=profitability_ratios" in block
+    assert "tools=cagr" in block
+    assert "conclusion=Trend is positive." in block

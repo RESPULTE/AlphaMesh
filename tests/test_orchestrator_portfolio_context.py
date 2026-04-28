@@ -117,14 +117,30 @@ def test_plan_node_receives_portfolio_context_message() -> None:
 
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
     agent._llm = FakeLLM()
+    agent._agents = {
+        "news_agent": SimpleNamespace(
+            build_memory_context_from_history=lambda turns, window=8: (
+                "- [2026-04-26T00:01:00+00:00] actions=newsapi; sources=3"
+            )
+        )
+    }
 
     state = OrchestratorState(
         messages=[HumanMessage(content="Should I add more AAPL?")],
         user_context_block="USER CONTEXT: interested in large-cap tech",
         portfolio_block='[{"ticker":"AAPL","shares":25}]',
-        agent_memory_contexts={
-            "news_agent": "- [2026-04-26T00:01:00+00:00] actions=newsapi; sources=3"
-        },
+        history_turns=[
+            {
+                "created_at": "2026-04-26T00:01:00+00:00",
+                "agent_memory_summaries": {
+                    "news_agent": {
+                        "research_actions": ["newsapi"],
+                        "source_count": 3,
+                        "main_catalyst": "Guidance",
+                    }
+                },
+            }
+        ],
     )
 
     payload = asyncio.run(agent._plan_node(state))
@@ -138,7 +154,7 @@ def test_plan_node_receives_portfolio_context_message() -> None:
     )
     assert any(
         isinstance(message, SystemMessage)
-        and "Agent memory contexts from prior turns" in str(message.content)
+        and "Agent-provided memory contexts from prior turn summaries" in str(message.content)
         and "news_agent" in str(message.content)
         for message in captured["messages"]
     )

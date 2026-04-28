@@ -76,7 +76,6 @@ from core.agents.prompts.fundamental_agent_prompts import (
 )
 from core.agents.utils import (
     extract_first_sentence,
-    trim_text,
 )
 from core.agents.working_memory.fundamental_working_memory import (
     FundamentalWorkingMemoryManager,
@@ -161,21 +160,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
     @staticmethod
     def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
-        if not memory_summary:
-            return ""
-        tools = memory_summary.get("tools_used") or []
-        if not isinstance(tools, list):
-            tools = []
-        key_rows = memory_summary.get("key_rows") or memory_summary.get("computed_rows") or []
-        if not isinstance(key_rows, list):
-            key_rows = []
-        completed = bool(memory_summary.get("task_completed", True))
-        conclusion = trim_text(memory_summary.get("main_conclusion") or "", max_chars=220)
-        return (
-            f"tools={','.join(str(t) for t in tools[:5]) or 'none'}; "
-            f"rows={','.join(str(r) for r in key_rows[:6]) or 'none'}; "
-            f"task_completed={completed}; "
-            f"conclusion={conclusion or 'N/A'}"
+        return FundamentalWorkingMemoryManager.render_memory_summary(memory_summary)
+
+    @classmethod
+    def build_memory_context_from_history(
+        cls,
+        history_turns: List[dict],
+        window: int = 8,
+    ) -> str:
+        return FundamentalWorkingMemoryManager.build_context_from_history_summaries(
+            history_turns, window=window
         )
 
     # ── Public entry point ────────────────────────────────────────────────────
