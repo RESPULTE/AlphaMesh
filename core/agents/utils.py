@@ -7,8 +7,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
-from core.agents.ticker_validation import TickerInfo
-
 
 MAX_TURN_TEXT_CHARS = 360
 
@@ -234,12 +232,16 @@ def remap_numeric_citations(
     analysis_text: str,
     sources: List[Any],
 ) -> tuple[str, List[Any]]:
-    cited_ids = sorted(set(int(match) for match in re.findall(r"\[(\d+)\]", analysis_text)))
+    cited_ids = sorted(
+        set(int(match) for match in re.findall(r"\[(\d+)\]", analysis_text))
+    )
     old_to_new = {old_id: new_id for new_id, old_id in enumerate(cited_ids, start=1)}
 
     def _remap(match: re.Match[str]) -> str:
         source_id = int(match.group(1))
-        return f"[{old_to_new[source_id]}]" if source_id in old_to_new else match.group(0)
+        return (
+            f"[{old_to_new[source_id]}]" if source_id in old_to_new else match.group(0)
+        )
 
     remapped_text = re.sub(r"\[(\d+)\]", _remap, analysis_text)
     if not old_to_new:
@@ -310,31 +312,3 @@ def _build_combined_company_context(
     """
     blocks = [context_blocks[t] for t in tickers if t in context_blocks]
     return "\n\n---\n\n".join(blocks) if blocks else None
-
-
-def _build_clarification_message(needs_confirmation: Dict[str, "TickerInfo"]) -> str:
-    """Format a user-facing message asking for ticker confirmation."""
-    lines = ["Before proceeding, I want to confirm the securities you're asking about:"]
-    for ticker, info in needs_confirmation.items():
-        if not info.is_valid and info.suggestions:
-            suggestions_str = ", ".join(f"**{s}**" for s in info.suggestions[:3])
-            lines.append(
-                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
-                f"Did you mean one of: {suggestions_str}?"
-            )
-        elif not info.is_valid:
-            lines.append(
-                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
-                f"Please double-check the symbol and try again."
-            )
-        else:
-            # Valid but non-equity (ETF, MUTUALFUND, etc.)
-            qt = info.quote_type or "unknown type"
-            lines.append(
-                f"• **{ticker}** appears to be a `{qt}` rather than a common equity. "
-                f"Is this correct, or did you mean a different symbol?"
-            )
-    lines.append("\nPlease reply with the correct ticker symbol(s) and I'll proceed.")
-    return "\n".join(lines)
-
-

@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
 from core.agents.models.fundamental_agent_models import VisualizationPlan
-from core.agents.models.news_agent_models import CitedSource
+from core.memory.retrieval.models import CitedSource
 
 
 class UserInterestEntity(BaseModel):

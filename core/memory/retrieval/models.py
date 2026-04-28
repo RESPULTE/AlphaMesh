@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
 from langchain_core.documents import Document
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.agents.models.news_agent_models import CitedSource
 from core.agents.utils import trim_text
 
 
@@ -53,6 +52,17 @@ class RewrittenQueries(BaseModel):
     # Carries the agent-level query (already orchestrator-rewritten) for use
     # as the Jina reranker's query string in _rendezvous_node.
     original_query: Optional[str] = None
+
+
+class CitedSource(BaseModel):
+    """Citable source metadata for news analysis output."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    source_id: int = Field(description="The numeric ID used in the text, e.g., 1.")
+    title: str = Field(description="The title of the article.")
+    url: str = Field(description="The URL of the article.")
+    page_content: str = Field(description="The content of the article.")
 
 
 class RetrievedChunk(BaseModel):

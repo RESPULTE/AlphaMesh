@@ -23,7 +23,6 @@ from langgraph.graph import END, START, StateGraph
 from core.agents.base_agent import AbstractAgent
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
-from core.agents.models.news_agent_models import CitedSource
 from core.agents.models.orchestrator_models import (
     FinalResponse,
     OrchestratorPlan,
@@ -34,8 +33,8 @@ from core.agents.prompts.orchestrator_agent_prompts import (
     ORCHESTRATOR_PLANNER_SYSTEM_PROMPT,
     SYNTHESISER_PROMPT,
 )
+from core.agents.ticker_validation import TickerInfo
 from core.agents.utils import (
-    _build_clarification_message,
     _build_combined_company_context,
     _extract_last_human_message,
     build_planner_memory_block,
@@ -45,6 +44,7 @@ from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
 from core.memory.graph.graph_queue import make_graph_task
+from core.memory.retrieval.models import CitedSource
 from core.memory.user_signal_writeback import (
     build_signal_payload,
     build_user_signal_relationships,
@@ -58,6 +58,32 @@ AVAILABLE_AGENTS: List[type] = [NewsAnalysisAgent, FundamentalAnalysisAgent]
 _SYNTHESIS_TURN_WINDOW: int = 8
 _PLANNER_TURN_WINDOW: int = 12
 _AGENT_MEMORY_WINDOW: int = 8
+
+
+def _build_clarification_message(needs_confirmation: Dict[str, "TickerInfo"]) -> str:
+    """Format a user-facing message asking for ticker confirmation."""
+    lines = ["Before proceeding, I want to confirm the securities you're asking about:"]
+    for ticker, info in needs_confirmation.items():
+        if not info.is_valid and info.suggestions:
+            suggestions_str = ", ".join(f"**{s}**" for s in info.suggestions[:3])
+            lines.append(
+                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
+                f"Did you mean one of: {suggestions_str}?"
+            )
+        elif not info.is_valid:
+            lines.append(
+                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
+                f"Please double-check the symbol and try again."
+            )
+        else:
+            # Valid but non-equity (ETF, MUTUALFUND, etc.)
+            qt = info.quote_type or "unknown type"
+            lines.append(
+                f"• **{ticker}** appears to be a `{qt}` rather than a common equity. "
+                f"Is this correct, or did you mean a different symbol?"
+            )
+    lines.append("\nPlease reply with the correct ticker symbol(s) and I'll proceed.")
+    return "\n".join(lines)
 
 
 def _sanitize_portfolio_user_email(user_email: str) -> str:
@@ -110,7 +136,9 @@ class OrchestratorAgent:
         return "Orchestrator Agent"
 
     @staticmethod
-    def _collect_latest_agent_memory_summaries(turns: List[dict]) -> Dict[str, Dict[str, Any]]:
+    def _collect_latest_agent_memory_summaries(
+        turns: List[dict],
+    ) -> Dict[str, Dict[str, Any]]:
         latest: Dict[str, Dict[str, Any]] = {}
         for turn in turns:
             summaries = turn.get("agent_memory_summaries") or {}

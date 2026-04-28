@@ -6,18 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
 from core.memory.graph.models import EntityNode
-from core.memory.retrieval.models import RetrievedChunk
-
-
-class CitedSource(BaseModel):
-    """Citable source metadata for news analysis output."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    source_id: int = Field(description="The numeric ID used in the text, e.g., 1.")
-    title: str = Field(description="The title of the article.")
-    url: str = Field(description="The URL of the article.")
-    page_content: str = Field(description="The content of the article.")
+from core.memory.retrieval.models import CitedSource, RetrievedChunk
 
 
 class DomainQuery(BaseModel):

@@ -15,7 +15,6 @@ from pydantic import BaseModel
 from core.agents.base_agent import AbstractAgent
 from core.agents.models.base_agent_models import AgentSentiment, BaseAgentInput
 from core.agents.models.news_agent_models import (
-    CitedSource,
     DomainQuery,
     NewsAgentOutput,
     NewsAgentState,
