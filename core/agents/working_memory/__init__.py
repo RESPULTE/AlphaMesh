@@ -8,6 +8,13 @@ from core.agents.working_memory.news_working_memory import (
     NewsTurnRelevantMemory,
     NewsWorkingMemoryManager,
 )
+from core.agents.working_memory.fundamental_working_memory import (
+    FundamentalConversationWorkingMemory,
+    FundamentalTurnBatchRecord,
+    FundamentalTurnCallRecord,
+    FundamentalTurnRelevantMemory,
+    FundamentalWorkingMemoryManager,
+)
 
 __all__ = [
     "TurnRelevantMemoryBase",
@@ -16,4 +23,9 @@ __all__ = [
     "NewsTurnRelevantMemory",
     "NewsConversationWorkingMemory",
     "NewsWorkingMemoryManager",
+    "FundamentalTurnCallRecord",
+    "FundamentalTurnBatchRecord",
+    "FundamentalTurnRelevantMemory",
+    "FundamentalConversationWorkingMemory",
+    "FundamentalWorkingMemoryManager",
 ]

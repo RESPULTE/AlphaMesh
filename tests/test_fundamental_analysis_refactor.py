@@ -11,15 +11,20 @@ from core.agents.models.fundamental_agent_models import (
     ExecutorBatchLog,
     ExecutorToolLog,
     IterativeToolPlan,
+    ToolCallBatch,
+    ToolCallSpec,
     _AgentState,
 )
 
 
 class _FakeStructuredLLM:
-    def __init__(self, response) -> None:
+    def __init__(self, response, owner=None) -> None:
         self._response = response
+        self._owner = owner
 
-    async def ainvoke(self, _messages):
+    async def ainvoke(self, messages):
+        if self._owner is not None:
+            self._owner.last_messages = messages
         return self._response
 
 
@@ -28,11 +33,14 @@ class _FakeLLM:
         self._payload = payload
         self.schema = None
         self.structured_calls = 0
+        self.last_messages = None
 
     def with_structured_output(self, schema):
         self.schema = schema
         self.structured_calls += 1
-        return _FakeStructuredLLM(schema.model_validate(self._payload))
+        return _FakeStructuredLLM(
+            schema.model_validate(self._payload), owner=self
+        )
 
 
 def _sample_df() -> pd.DataFrame:
@@ -247,6 +255,8 @@ def test_completion_review_normalises_chart_types_and_modes(
 
 
 def test_run_reuses_cached_agent_memory_context() -> None:
+    from core.agents import fundamental_analysis_agent as module
+
     captured_payloads: list[dict] = []
 
     class _FakeDb:
@@ -281,7 +291,7 @@ def test_run_reuses_cached_agent_memory_context() -> None:
     agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
     agent.db = _FakeDb()
     agent._graph = _FakeGraph()
-    agent._memory_context_by_conversation = {}
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
 
     first = asyncio.run(
         agent.run(
@@ -305,3 +315,94 @@ def test_run_reuses_cached_agent_memory_context() -> None:
     assert captured_payloads[0]["agent_memory_context"].startswith("- [older]")
     assert captured_payloads[1]["agent_memory_context"].startswith("tools=profitability_ratios")
     assert second.memory_summary["main_conclusion"] == "Margins are stable."
+
+
+def test_tool_executor_populates_structured_result_detail_fields() -> None:
+    state = _AgentState(
+        query="Compute margin trend",
+        ticker="AAPL",
+        financial_data=_sample_df(),
+        tool_plan=IterativeToolPlan(
+            batches=[
+                ToolCallBatch(
+                    calls=[
+                        ToolCallSpec(
+                            tool_name="cagr",
+                            parameters={"metric": "Revenues"},
+                            reasoning="Measure long-term growth.",
+                        )
+                    ],
+                    batch_reasoning="Run CAGR on revenue baseline.",
+                )
+            ],
+            data_summary="Compute one growth metric.",
+        ),
+        current_batch_index=0,
+    )
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    result = asyncio.run(agent._tool_executor_node(state))
+
+    logs = result["executor_logs"]
+    assert logs
+    call_log = logs[0].calls[0]
+    assert call_log.added_row_count >= 0
+    assert isinstance(call_log.series_values, dict)
+    assert hasattr(call_log, "scalar_value")
+
+
+def test_tool_planner_includes_prior_working_memory_block_in_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    planner_payload = {
+        "batches": [],
+        "data_summary": "No tools needed.",
+        "selected_row_labels": ["Revenues"],
+    }
+    llm = _FakeLLM(payload=planner_payload)
+    monkeypatch.setattr(module.service_manager, "get_agent", lambda temperature=0: llm)
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
+    agent._working_memory.persist_finalized_turn(
+        conversation_id="conv-fund-plan",
+        turn_id="turn-1",
+        query="Prior turn",
+        task_completed=True,
+        task_completion_reason="",
+        computed_row_labels=["gross_margin"],
+        executor_logs=[
+            ExecutorBatchLog(
+                batch_index=0,
+                batch_reasoning="Prior batch",
+                calls=[
+                    ExecutorToolLog(
+                        tool_name="profitability_ratios",
+                        parameters={},
+                        success=True,
+                        summary="Computed gross_margin",
+                        output_row_labels=["gross_margin"],
+                        added_row_count=1,
+                    )
+                ],
+            )
+        ],
+    )
+
+    state = _AgentState(
+        query="Current turn",
+        ticker="AAPL",
+        conversation_id="conv-fund-plan",
+        available_concepts=["Revenues", "NetIncomeLoss"],
+        tool_results=[],
+        computed_row_labels=[],
+        iteration_count=0,
+    )
+    _ = asyncio.run(agent._tool_planner_node(state))
+
+    assert llm.schema is IterativeToolPlan
+    assert llm.last_messages is not None
+    planner_user_prompt = llm.last_messages[1].content
+    assert "Prior fundamentals working memory" in planner_user_prompt
+    assert "call=profitability_ratios" in planner_user_prompt

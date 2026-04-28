@@ -105,6 +105,9 @@ derived metrics from previous iterations):
 Previous iteration tool results:
 {prior_summary}
 
+Prior fundamentals working memory (recent turns):
+{working_memory_block}
+
 Available Tools:
 {tool_descriptions}
 

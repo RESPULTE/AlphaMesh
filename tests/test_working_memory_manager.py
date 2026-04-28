@@ -8,6 +8,13 @@ from core.agents.working_memory.base import (
     TurnRelevantMemoryBase,
 )
 from core.agents.working_memory.news_working_memory import NewsWorkingMemoryManager
+from core.agents.working_memory.fundamental_working_memory import (
+    FundamentalWorkingMemoryManager,
+)
+from core.agents.models.fundamental_agent_models import (
+    ExecutorBatchLog,
+    ExecutorToolLog,
+)
 from core.memory.retrieval.models import RetrievedChunk
 
 
@@ -160,3 +167,85 @@ def test_news_manager_render_working_memory_block_is_stable() -> None:
     assert "relevant_chunks=1" in block
     assert "relevant_sources=1" in block
     assert "score_unavailable=False" in block
+
+
+def test_fundamental_manager_persists_counts_and_batch_records() -> None:
+    manager = FundamentalWorkingMemoryManager(max_turns=10)
+    manager.persist_finalized_turn(
+        conversation_id="conv-fund",
+        turn_id="turn-1",
+        query="Assess margins",
+        task_completed=False,
+        task_completion_reason="Need one more ratio.",
+        computed_row_labels=["gross_margin", "operating_margin"],
+        executor_logs=[
+            ExecutorBatchLog(
+                batch_index=0,
+                batch_reasoning="First pass",
+                calls=[
+                    ExecutorToolLog(
+                        tool_name="profitability_ratios",
+                        parameters={"revenue_metric": "Revenues"},
+                        success=True,
+                        summary="Computed margin rows.",
+                        output_row_labels=["gross_margin"],
+                        added_row_count=1,
+                    ),
+                    ExecutorToolLog(
+                        tool_name="dcf_intrinsic_value",
+                        parameters={"fcf_metric": "FreeCashFlow"},
+                        success=False,
+                        error="Missing FreeCashFlow",
+                        summary="Failed",
+                        added_row_count=0,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    row = manager.get_conversation_memory("conv-fund").turn_records[0]
+    assert row.tool_call_count == 2
+    assert row.successful_tool_call_count == 1
+    assert row.failed_tool_call_count == 1
+    assert row.computed_row_labels == ["gross_margin", "operating_margin"]
+    assert row.batch_records[0].calls[0].tool_name == "profitability_ratios"
+
+
+def test_fundamental_manager_truncates_turns_and_renders_stably() -> None:
+    manager = FundamentalWorkingMemoryManager(max_turns=2)
+    for idx in range(1, 4):
+        manager.persist_finalized_turn(
+            conversation_id="conv-trunc",
+            turn_id=f"turn-{idx}",
+            query=f"query-{idx}",
+            task_completed=True,
+            task_completion_reason="",
+            computed_row_labels=[f"row-{idx}"],
+            executor_logs=[
+                ExecutorBatchLog(
+                    batch_index=idx,
+                    batch_reasoning=f"batch-{idx}",
+                    calls=[
+                        ExecutorToolLog(
+                            tool_name="cagr",
+                            parameters={"metric": "Revenues"},
+                            success=True,
+                            summary=f"summary-{idx}",
+                            added_row_count=1,
+                        )
+                    ],
+                )
+            ],
+        )
+
+    memory = manager.get_conversation_memory("conv-trunc")
+    assert [row.turn_id for row in memory.turn_records] == ["turn-2", "turn-3"]
+
+    block = manager.render_planner_working_memory_block(
+        "conv-trunc", turn_limit=4, max_calls_per_turn=12
+    )
+    assert "turn=turn-2" in block
+    assert "turn=turn-3" in block
+    assert "turn=turn-1" not in block
+    assert "call=cagr" in block

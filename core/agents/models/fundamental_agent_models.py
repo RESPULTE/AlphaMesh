@@ -132,6 +132,9 @@ class ExecutorToolLog(BaseModel):
     summary: str = ""
     reasoning: Optional[str] = None
     output_row_labels: List[str] = Field(default_factory=list)
+    scalar_value: Optional[float] = None
+    series_values: Dict[str, float] = Field(default_factory=dict)
+    added_row_count: int = 0
 
 
 class ExecutorBatchLog(BaseModel):

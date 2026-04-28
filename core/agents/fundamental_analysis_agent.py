@@ -76,9 +76,10 @@ from core.agents.prompts.fundamental_agent_prompts import (
 )
 from core.agents.utils import (
     extract_first_sentence,
-    persist_agent_memory_summary,
-    resolve_agent_memory_context,
     trim_text,
+)
+from core.agents.working_memory.fundamental_working_memory import (
+    FundamentalWorkingMemoryManager,
 )
 from core.config import settings
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
@@ -139,7 +140,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         super().__init__()
         self.db = FinancialDatabase()
         self._graph = self._build_graph()
-        self._memory_context_by_conversation: Dict[str, str] = {}
+        self._working_memory = FundamentalWorkingMemoryManager()
 
     @staticmethod
     def name() -> str:
@@ -186,10 +187,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
         # FinancialDatabase — this is a no-op after the first call.
         await self.db.initialize()
 
-        conversation_id, effective_memory_context = resolve_agent_memory_context(
-            conversation_id=input_data.conversation_id,
+        conversation_id = (input_data.conversation_id or "").strip()
+        effective_memory_context = self._working_memory.resolve_agent_memory_context(
+            conversation_id=conversation_id,
             incoming_memory_context=input_data.agent_memory_context,
-            memory_context_cache=self._memory_context_by_conversation,
         )
 
         state_payload = input_data.model_dump(exclude_none=False)
@@ -217,10 +218,19 @@ class FundamentalAnalysisAgent(AbstractAgent):
             raw_display_data=final_state.get("raw_display_data"),
         )
 
-        persist_agent_memory_summary(
+        self._working_memory.persist_agent_memory_summary(
             conversation_id=conversation_id,
             rendered_summary=self.render_memory_summary(output.memory_summary),
-            memory_context_cache=self._memory_context_by_conversation,
+        )
+        turn_id = (input_data.turn_id or "").strip() or str(uuid4())
+        self._working_memory.persist_finalized_turn(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            query=input_data.query,
+            task_completed=bool(output.task_completed),
+            task_completion_reason=output.task_completion_reason or "",
+            computed_row_labels=list(final_state.get("computed_row_labels") or []),
+            executor_logs=output.executor_logs,
         )
 
         return output
@@ -449,6 +459,12 @@ class FundamentalAnalysisAgent(AbstractAgent):
         else:
             prior_results_block = "  (none)"
 
+        working_memory_block = self._working_memory.render_planner_working_memory_block(
+            state.conversation_id or "",
+            turn_limit=4,
+            max_calls_per_turn=12,
+        )
+
         # ── Replanning note for failure context ───────────────────────────────
         replanning_note = ""
         if state.last_batch_failed:
@@ -477,6 +493,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             n_concepts=len(state.available_concepts),
             concepts_block=concepts_block,
             prior_summary=prior_results_block,
+            working_memory_block=working_memory_block,
             tool_descriptions=get_tool_descriptions(),
             iteration=state.iteration_count + 1,
             max_iterations=MAX_TOOL_ITERATIONS,
@@ -655,6 +672,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 output_row_labels=(
                     list(result.added_rows.keys()) if result.added_rows else []
                 ),
+                scalar_value=result.scalar_value,
+                series_values=dict(result.series_values or {}),
+                added_row_count=len(result.added_rows or {}),
             )
             for spec, result in zip(batch.calls, batch_results)
         ]
