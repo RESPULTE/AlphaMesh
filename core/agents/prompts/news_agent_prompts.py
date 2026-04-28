@@ -91,11 +91,13 @@ Write a structured report with the following sections:
 - Use citations [N] where applicable.
 - If signals are mixed, explain which side appears more decisive and why.
 
-5. Conclusion and Rating
-- Assign:
-  - score: integer from 0 to 100
-  - label: one of "STRONG BUY", "BUY", "NEUTRAL", "SELL", "STRONG SELL"
-- Then provide a concise rationale explaining why the evidence supports that score.
+5. Conclusion and Rating (Conditional)
+- Only include a directional sentiment/rating section when the user is explicitly or implicitly asking for sentiment, bullish/bearish stance, recommendation, attractiveness, or directional view.
+- If sentiment is needed:
+  - Assign score (0-100) and label ("STRONG BUY", "BUY", "NEUTRAL", "SELL", "STRONG SELL")
+  - Provide a concise rationale for the score.
+- If sentiment is not needed:
+  - Omit directional scoring/rating language and keep the output focused on evidence-based qualitative analysis.
 
 6. Point-Form Summary
 - End with a short bullet-point summary of the full analysis.
@@ -123,6 +125,10 @@ Style rules:
 - If evidence is incomplete, explicitly say so.
 - Prefer nuanced judgment over exaggerated certainty.
 - Keep the report readable, logically structured, and investment-useful.\
+
+Structured-output rule:
+- Always return `analysis`.
+- Return `sentiment` only when rating is needed; otherwise return `sentiment=null`.\
 """.strip()
 
 

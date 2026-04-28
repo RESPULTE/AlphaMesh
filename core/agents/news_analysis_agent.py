@@ -7,13 +7,13 @@ import re as _re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.models.base_agent_models import AgentSentiment, BaseAgentInput
@@ -53,7 +53,7 @@ _MIN_RELEVANT_DISTINCT_SOURCES: int = 2
 
 class NewsAnalysisStructuredOutput(BaseModel):
     analysis: str
-    sentiment: AgentSentiment = Field(default_factory=AgentSentiment)
+    sentiment: Optional[AgentSentiment] = None
 
 
 @dataclass
@@ -1128,7 +1128,7 @@ class NewsAnalysisAgent(AbstractAgent):
             "sentiment": sentiment.model_dump() if sentiment is not None else {},
             "main_catalyst": extract_first_sentence(analysis_text),
         }
-        return {
+        result = {
             "analysis": analysis_text,
             "sources": sources,
             "subgraph_id": task_id,
@@ -1136,3 +1136,7 @@ class NewsAnalysisAgent(AbstractAgent):
             "sentiment": sentiment,
             "memory_summary": memory_summary,
         }
+
+        if sentiment is not None:
+            result["sentiment"] = sentiment
+        return result
