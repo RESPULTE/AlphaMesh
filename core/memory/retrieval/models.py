@@ -60,6 +60,7 @@ class RetrievedChunk(BaseModel):
     chunk_id: str
     text: str
     score: Optional[float] = None
+    reranker_relevance_score: Optional[float] = None
     source: Literal["vector", "graph"]
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -94,6 +95,7 @@ class RetrievedChunk(BaseModel):
             chunk_id=chunk_id,
             text=document.page_content,
             score=score,
+            reranker_relevance_score=None,
             source=source,
             metadata=metadata,
             domain=domain,
@@ -136,6 +138,7 @@ class RetrievedChunk(BaseModel):
             chunk_id=chunk.chunk_id,
             text=chunk.text,
             score=chunk.score,
+            reranker_relevance_score=chunk.reranker_relevance_score,
             source=chunk.source,
             metadata=chunk.metadata or {},
             domain=domain,

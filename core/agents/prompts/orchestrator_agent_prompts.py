@@ -12,10 +12,8 @@ Changes
   the planner because that responsibility has moved into the news agent
   (see NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT).
 
-- NEWS_MEMORY_QUERY_REWRITE_SYSTEM_PROMPT: new constant consumed by
-  NewsAnalysisAgent._rewrite_queries_node to expand the orchestrator's
-  already-tailored query into three domain-specific retrieval strings
-  (company / sector / market) for its internal memory lookup.
+- News-agent query expansion now happens inside NewsAnalysisAgent._planner_node,
+  which produces domain-specific retrieval strings per research iteration.
 """
 
 from __future__ import annotations

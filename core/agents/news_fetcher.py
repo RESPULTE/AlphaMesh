@@ -47,84 +47,84 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def build_news_query(
-    ticker: str,
-    *,
-    company_name: Optional[str] = None,
-    must_include: Optional[List[str]] = None,
-    must_exclude: Optional[List[str]] = None,
-    any_of: Optional[List[str]] = None,
-    exact_phrase: Optional[str] = None,
-) -> str:
-    """
-    Build an advanced NewsAPI `q` string using boolean operators.
+# def build_news_query(
+#     ticker: str,
+#     *,
+#     company_name: Optional[str] = None,
+#     must_include: Optional[List[str]] = None,
+#     must_exclude: Optional[List[str]] = None,
+#     any_of: Optional[List[str]] = None,
+#     exact_phrase: Optional[str] = None,
+# ) -> str:
+#     """
+#     Build an advanced NewsAPI `q` string using boolean operators.
 
-    NewsAPI supports:
-      • "phrase"      → exact match
-      • +word         → must appear
-      • -word         → must NOT appear
-      • AND / OR / NOT and parentheses for grouping
+#     NewsAPI supports:
+#       • "phrase"      → exact match
+#       • +word         → must appear
+#       • -word         → must NOT appear
+#       • AND / OR / NOT and parentheses for grouping
 
-    Examples
-    --------
-    >>> build_news_query("AAPL", must_include=["earnings"], must_exclude=["rumour"])
-    '(AAPL OR Apple) +earnings -rumour'
+#     Examples
+#     --------
+#     >>> build_news_query("AAPL", must_include=["earnings"], must_exclude=["rumour"])
+#     '(AAPL OR Apple) +earnings -rumour'
 
-    >>> build_news_query(
-    ...     "MSFT",
-    ...     company_name="Microsoft",
-    ...     any_of=["Azure", "cloud", "AI"],
-    ...     must_exclude=["lawsuit"],
-    ...     exact_phrase="quarterly results",
-    ... )
-    '(MSFT OR Microsoft) AND (Azure OR cloud OR AI) +"quarterly results" -lawsuit'
+#     >>> build_news_query(
+#     ...     "MSFT",
+#     ...     company_name="Microsoft",
+#     ...     any_of=["Azure", "cloud", "AI"],
+#     ...     must_exclude=["lawsuit"],
+#     ...     exact_phrase="quarterly results",
+#     ... )
+#     '(MSFT OR Microsoft) AND (Azure OR cloud OR AI) +"quarterly results" -lawsuit'
 
-    Parameters
-    ----------
-    ticker:         Stock ticker (always included).
-    company_name:   Human-readable company name (ORed with ticker).
-    must_include:   Words/phrases that MUST appear (+prefix).
-    must_exclude:   Words/phrases that must NOT appear (-prefix).
-    any_of:         Words that should match at least one (OR group).
-    exact_phrase:   An exact phrase wrapped in quotes.
+#     Parameters
+#     ----------
+#     ticker:         Stock ticker (always included).
+#     company_name:   Human-readable company name (ORed with ticker).
+#     must_include:   Words/phrases that MUST appear (+prefix).
+#     must_exclude:   Words/phrases that must NOT appear (-prefix).
+#     any_of:         Words that should match at least one (OR group).
+#     exact_phrase:   An exact phrase wrapped in quotes.
 
-    Returns
-    -------
-    A URL-safe query string (NewsAPI handles URL encoding internally).
-    Max 500 chars — truncated with a warning if exceeded.
-    """
-    parts: List[str] = []
+#     Returns
+#     -------
+#     A URL-safe query string (NewsAPI handles URL encoding internally).
+#     Max 500 chars — truncated with a warning if exceeded.
+#     """
+#     parts: List[str] = []
 
-    # Core subject: ticker OR company name
-    if company_name:
-        parts.append(f"({ticker} OR {company_name})")
-    else:
-        parts.append(ticker)
+#     # Core subject: ticker OR company name
+#     if company_name:
+#         parts.append(f"({ticker} OR {company_name})")
+#     else:
+#         parts.append(ticker)
 
-    # Optional OR group
-    if any_of:
-        group = " OR ".join(any_of)
-        parts.append(f"AND ({group})")
+#     # Optional OR group
+#     if any_of:
+#         group = " OR ".join(any_of)
+#         parts.append(f"AND ({group})")
 
-    # Exact phrase
-    if exact_phrase:
-        parts.append(f'+"{exact_phrase}"')
+#     # Exact phrase
+#     if exact_phrase:
+#         parts.append(f'+"{exact_phrase}"')
 
-    # Must-include terms (+prefix)
-    for word in must_include or []:
-        parts.append(f"+{word}")
+#     # Must-include terms (+prefix)
+#     for word in must_include or []:
+#         parts.append(f"+{word}")
 
-    # Must-exclude terms (-prefix)
-    for word in must_exclude or []:
-        parts.append(f"-{word}")
+#     # Must-exclude terms (-prefix)
+#     for word in must_exclude or []:
+#         parts.append(f"-{word}")
 
-    q = " ".join(parts)
+#     q = " ".join(parts)
 
-    if len(q) > 500:
-        logger.warning("NewsAPI query exceeds 500 chars (%d). Truncating.", len(q))
-        q = q[:500]
+#     if len(q) > 500:
+#         logger.warning("NewsAPI query exceeds 500 chars (%d). Truncating.", len(q))
+#         q = q[:500]
 
-    return q
+#     return q
 
 
 # ---------------------------------------------------------------------------
@@ -238,12 +238,7 @@ def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
 async def fetch_articles_from_tavily(
     query: str,
     *,
-    max_results: int = settings.TAVILY_SEARCH_MAX_RESULTS,
-    include_domains: Optional[List[str]] = None,
-    exclude_domains: Optional[List[str]] = None,
     topic: str = settings.TAVILY_TOPIC,
-    search_depth: str = settings.TAVILY_SEARCH_DEPTH,
-    include_raw_content: bool = True,
 ) -> List[dict]:
     """
     Search the web using Tavily and normalize results to NewsAPI-like articles.
@@ -255,20 +250,15 @@ async def fetch_articles_from_tavily(
         logger.warning("TAVILY_API_KEY not configured. Skipping Tavily web search.")
         return []
 
-    max_results = max(1, min(int(max_results or 1), 20))
     payload: Dict[str, Any] = {
         "api_key": settings.TAVILY_API_KEY,
         "query": query,
         "topic": topic,
-        "search_depth": search_depth,
-        "max_results": max_results,
-        "include_raw_content": include_raw_content,
+        "search_depth": settings.TAVILY_SEARCH_DEPTH,
+        "max_results": settings.TAVILY_SEARCH_MAX_RESULTS,
+        "include_raw_content": True,
+        "include_domains": settings.INCLUDE_DOMAINS,
     }
-    if include_domains:
-        payload["include_domains"] = include_domains
-    if exclude_domains:
-        payload["exclude_domains"] = exclude_domains
-
     try:
         response: Dict[str, Any] = await asyncio.to_thread(
             _call_tavily_search,
@@ -301,12 +291,11 @@ async def fetch_articles_from_tavily(
 # ---------------------------------------------------------------------------
 
 
-async def fetch_articles(
+async def fetch_articles_from_newsapi(
     q: str,
     *,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-    page_size: int = settings.NEWS_FETCH_MAX_ARTICLES,
     page: int = 1,
     language: str = "en",
     sort_by: str = "relevancy",
@@ -356,7 +345,7 @@ async def fetch_articles(
                 sort_by=sort_by,
                 page=page,
                 page_size=page_size,
-                domains=settings.FINANCIAL_DOMAINS,
+                domains=settings.INCLUDE_DOMAINS,
             ),
         )
     except Exception as exc:
@@ -421,15 +410,12 @@ async def fetch_articles(
 # ---------------------------------------------------------------------------
 
 
-async def fetch_news(
+async def search_web(
     action: Literal["newsapi", "web_search"],
     query: str,
     *,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-    max_results: int = 5,
-    include_domains: Optional[List[str]] = None,
-    exclude_domains: Optional[List[str]] = None,
 ) -> List[dict]:
     """
     Unified entry-point for the agent's online-fetch branch.
@@ -438,18 +424,14 @@ async def fetch_news(
     Returns a normalized list of article dicts compatible with the ingestor.
     """
     if action == "newsapi":
-        return await fetch_articles(
+        return await fetch_articles_from_newsapi(
             q=query,
             from_date=from_date,
             to_date=to_date,
-            page_size=max_results,
         )
     if action == "web_search":
         return await fetch_articles_from_tavily(
             query=query,
-            max_results=max_results,
-            include_domains=include_domains,
-            exclude_domains=exclude_domains,
         )
     logger.warning("fetch_news: unknown action '%s'; returning []", action)
     return []

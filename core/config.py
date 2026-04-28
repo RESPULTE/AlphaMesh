@@ -99,29 +99,28 @@ class Settings(BaseSettings):
     NEWS_AGENT_MAX_RESEARCH_ITERATIONS: int = 3
     NEWS_AGENT_MIN_SOURCES_FOR_SUFFICIENCY: int = 4
     NEWS_AGENT_MIN_CHUNKS_FOR_SUFFICIENCY: int = 8
+    NEWS_AGENT_MIN_RELEVANCE_SCORE: float = 0.40
 
-    FINANCIAL_DOMAINS: str = ",".join(
-        [
-            "reuters.com",
-            "bbc.co.uk",
-            "bbc.com",
-            "theguardian.com",
-            "ft.com",
-            "bloomberg.com",
-            "wsj.com",
-            "cnbc.com",
-            "marketwatch.com",
-            "forbes.com",
-            "businessinsider.com",
-            "economist.com",
-            "apnews.com",
-            "finance.yahoo.com",
-            "seekingalpha.com",
-            "investing.com",
-            "morningstar.com",
-            "barrons.com",
-        ]
-    )
+    INCLUDE_DOMAINS: List[str] = [
+        "reuters.com",
+        "bbc.co.uk",
+        "bbc.com",
+        "theguardian.com",
+        "ft.com",
+        "bloomberg.com",
+        "wsj.com",
+        "cnbc.com",
+        "marketwatch.com",
+        "forbes.com",
+        "businessinsider.com",
+        "economist.com",
+        "apnews.com",
+        "finance.yahoo.com",
+        "seekingalpha.com",
+        "investing.com",
+        "morningstar.com",
+        "barrons.com",
+    ]
 
     # ── Scraping ──────────────────────────────────────────────────────────────
     _SCRAPE_CONCURRENCY: int = 8

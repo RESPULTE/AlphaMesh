@@ -214,7 +214,15 @@ class TwoStageReranker:
         for item in results:
             idx = item.get("index")
             if idx is not None and 0 <= idx < len(chunks):
-                reranked.append(chunks[idx])
+                raw_score = item.get("relevance_score")
+                relevance_score = None
+                if isinstance(raw_score, (int, float)):
+                    relevance_score = float(raw_score)
+                reranked.append(
+                    chunks[idx].model_copy(
+                        update={"reranker_relevance_score": relevance_score}
+                    )
+                )
 
         if not reranked:
             logger.warning(
