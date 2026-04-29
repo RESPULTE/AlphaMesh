@@ -134,6 +134,10 @@ class TickerResult(BaseModel):
 
     ticker: str
     analysis_text: str = Field(description="Per-agent or combined narrative analysis.")
+    market_quote: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Latest market quote payload used by the UI header.",
+    )
     market_chart: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="Intraday market chart points as sent to the frontend.",

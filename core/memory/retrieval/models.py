@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
 
 from langchain_core.documents import Document
@@ -19,13 +19,7 @@ class NodeSelectionOutput(BaseModel):
 
 
 class RetrieverState(TypedDict):
-    """LangGraph state for the dual-store retriever.
-
-    candidate_neighbors was intentionally removed: it was written by
-    select_neighbor_frontier but never read by any downstream node.
-    Keeping unread fields in LangGraph state causes unnecessary serialisation
-    overhead and misleads readers about what data is actually consumed.
-    """
+    """LangGraph state for the dual-store retriever."""
 
     query: str
     accumulated_chunks: List["RetrievedChunk"]
@@ -40,7 +34,6 @@ class RetrieverState(TypedDict):
 
 
 class RewrittenQueries(BaseModel):
-    # Domain-specific retrieval strings produced by the query-rewrite LLM call.
     company_query: Optional[str] = None
     sector_query: Optional[str] = None
     market_query: Optional[str] = None
@@ -48,9 +41,6 @@ class RewrittenQueries(BaseModel):
     active_domains: List[Literal["company", "sector", "market", "knowledge"]] = Field(
         default_factory=list
     )
-    # Set programmatically after the LLM call — not produced by the LLM.
-    # Carries the agent-level query (already orchestrator-rewritten) for use
-    # as the Jina reranker's query string in _rendezvous_node.
     original_query: Optional[str] = None
 
 
@@ -65,29 +55,90 @@ class CitedSource(BaseModel):
     page_content: str = Field(description="The content of the article.")
 
 
-class RetrievedChunk(BaseModel):
-    """Represents a retrieved chunk from either vector or graph store."""
+def _parse_published_at(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    elif hasattr(value, "to_native"):
+        try:
+            dt = value.to_native()
+        except Exception:
+            return None
+    elif hasattr(value, "to_datetime"):
+        try:
+            dt = value.to_datetime()
+        except Exception:
+            return None
+    else:
+        return None
 
-    model_config = ConfigDict(extra="ignore")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_date_tag(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return ""
+    return dt.strftime("%d-%m-%Y")
+
+
+@dataclass
+class RetrievedChunk:
+    """Canonical retrieved chunk shared by ingestion, retrieval, and agent nodes."""
 
     chunk_id: str
     text: str
-    score: Optional[float] = None
-    reranker_relevance_score: Optional[float] = None
     source: Literal["vector", "graph"]
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Unified relevance surface used by the agent.
+    relevance_score: Optional[float] = None
+    relevance_source: Optional[Literal["jina", "tavily", "vector", "composite"]] = None
 
     document_id: Optional[str] = None
     chunk_index: Optional[int] = None
     article_title: Optional[str] = None
     source_url: Optional[str] = None
     published_at: Optional[datetime] = None
-    nodeset_ids: List[str] = Field(default_factory=list)
+    date_tag: str = ""
+
+    nodeset_ids: List[str] = field(default_factory=list)
     extraction_status: Literal["PENDING", "EXTRACTED"] = "PENDING"
     domain: Optional[str] = None
+
+    # Composite prefilter internals.
     embedding_score: float = 0.0
     graph_depth: int = 0
     composite_score: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.published_at = _parse_published_at(self.published_at)
+        if not self.date_tag:
+            self.date_tag = _format_date_tag(self.published_at)
+        if isinstance(self.nodeset_ids, str):
+            self.nodeset_ids = [self.nodeset_ids]
+        if self.relevance_score is not None:
+            self.relevance_score = float(self.relevance_score)
+
+    def model_dump(self) -> Dict[str, Any]:
+        """Compatibility helper for call sites previously using pydantic models."""
+        return asdict(self)
+
+    def model_copy(self, update: Optional[Dict[str, Any]] = None) -> "RetrievedChunk":
+        """Compatibility helper for call sites previously using pydantic models."""
+        if not update:
+            return replace(self)
+        return replace(self, **update)
 
     @classmethod
     def from_document(
@@ -97,26 +148,34 @@ class RetrievedChunk(BaseModel):
         score: Optional[float] = None,
         source: Literal["vector", "graph"] = "vector",
         domain: Optional[str] = None,
+        relevance_source: Optional[Literal["jina", "tavily", "vector", "composite"]] = None,
     ) -> "RetrievedChunk":
-        """Build a RetrievedChunk from a LangChain Document."""
         metadata = document.metadata or {}
         chunk_id = document.id or metadata.get("chunk_id") or ""
         nodeset_ids = metadata.get("nodeset_ids") or []
         if isinstance(nodeset_ids, str):
             nodeset_ids = [nodeset_ids]
+        published_at = metadata.get("published_at")
+        parsed_published_at = _parse_published_at(published_at)
+
+        chosen_relevance_source = relevance_source
+        if chosen_relevance_source is None and score is not None:
+            chosen_relevance_source = "vector"
+
         return cls(
             chunk_id=chunk_id,
             text=document.page_content,
-            score=score,
-            reranker_relevance_score=None,
             source=source,
             metadata=metadata,
+            relevance_score=score,
+            relevance_source=chosen_relevance_source,
             domain=domain,
             document_id=metadata.get("document_id"),
             chunk_index=metadata.get("chunk_index"),
             article_title=metadata.get("article_title"),
             source_url=metadata.get("source_url"),
-            published_at=metadata.get("published_at"),
+            published_at=parsed_published_at,
+            date_tag=_format_date_tag(parsed_published_at),
             nodeset_ids=nodeset_ids,
             extraction_status=metadata.get("extraction_status", "PENDING"),
         )
@@ -127,52 +186,32 @@ class RetrievedChunk(BaseModel):
         chunk: "RetrievedChunk",
         domain: str,
     ) -> "RetrievedChunk":
-        """
-        Return a copy of *chunk* with reranking fields properly populated.
-
-        For vector chunks: embedding_score is taken from chunk.score.
-        For graph chunks:  embedding_score is 0.0 (no similarity score available);
-                           graph_depth is preserved from the chunk if already set by
-                           the traversal (hop-aware), otherwise defaults to 1.
-
-        Previously named from_raw_chunk.  Renamed because the input is always
-        a fully-typed RetrievedChunk, not a raw/untyped source.
-        """
         if chunk.source == "graph":
             embedding_score = 0.0
-            # Preserve the hop depth set by _fetch_frontier_chunks_node so the
-            # reranker's depth_bonus reflects actual traversal distance.
             graph_depth = chunk.graph_depth if chunk.graph_depth > 0 else 1
         else:
-            embedding_score = float(chunk.score) if chunk.score is not None else 0.0
+            embedding_score = (
+                float(chunk.relevance_score) if chunk.relevance_score is not None else 0.0
+            )
             graph_depth = 0
 
-        return cls(
-            chunk_id=chunk.chunk_id,
-            text=chunk.text,
-            score=chunk.score,
-            reranker_relevance_score=chunk.reranker_relevance_score,
-            source=chunk.source,
-            metadata=chunk.metadata or {},
-            domain=domain,
-            document_id=chunk.document_id,
-            chunk_index=chunk.chunk_index,
-            article_title=chunk.article_title,
-            source_url=chunk.source_url,
-            published_at=chunk.published_at,
-            nodeset_ids=chunk.nodeset_ids,
-            extraction_status=chunk.extraction_status,
-            embedding_score=embedding_score,
-            graph_depth=graph_depth,
-            composite_score=chunk.composite_score,
+        normalized = chunk.model_copy(
+            update={
+                "domain": domain,
+                "embedding_score": embedding_score,
+                "graph_depth": graph_depth,
+            }
         )
+        if normalized.relevance_source is None and normalized.relevance_score is not None:
+            normalized.relevance_source = "vector"
+        return normalized
 
     def _source_key(self) -> str:
         metadata = self.metadata or {}
         return str(metadata.get("source_url") or self.source_url or "").strip()
 
     @staticmethod
-    def _chunks_block(chunks: List[RetrievedChunk], *, limit: int = 12) -> str:
+    def _chunks_block(chunks: List["RetrievedChunk"], *, limit: int = 12) -> str:
         if not chunks:
             return "(none)"
         lines: List[str] = []
@@ -183,12 +222,12 @@ class RetrievedChunk(BaseModel):
                 or "Unknown"
             )
             url = chunk._source_key() or "no-url"
-            relevance = chunk.reranker_relevance_score
+            relevance = chunk.relevance_score
             relevance_text = "N/A" if relevance is None else f"{relevance:.4f}"
             preview = (chunk.text or "").replace("\n", " ")
             preview = trim_text(preview, max_chars=160)
             lines.append(
-                f"- chunk_id={chunk.chunk_id} | title={title} | source={url} | "
+                f"- chunk_id={chunk.chunk_id} | title={title} | date={chunk.date_tag or 'N/A'} | source={url} | "
                 f"relevance_score={relevance_text}\n  text={preview}"
             )
         if len(chunks) > limit:
@@ -197,9 +236,8 @@ class RetrievedChunk(BaseModel):
 
     @staticmethod
     def _build_deduplicated_sources(
-        chunks: List[RetrievedChunk],
+        chunks: List["RetrievedChunk"],
     ) -> Tuple[List[CitedSource], Dict[int, int]]:
-        """Deduplicate chunks by article and map each chunk to a source id."""
         article_map: Dict[Tuple[str, str], Tuple[int, List[str]]] = {}
         chunk_to_source_id: Dict[int, int] = {}
         next_id = 1
@@ -236,7 +274,7 @@ class RetrievedChunk(BaseModel):
 
     @staticmethod
     def _build_chunk_alias_maps(
-        chunks: List[RetrievedChunk],
+        chunks: List["RetrievedChunk"],
     ) -> tuple[Dict[str, str], Dict[str, str]]:
         chunk_id_to_alias: Dict[str, str] = {}
         alias_to_chunk_id: Dict[str, str] = {}
@@ -253,7 +291,7 @@ class RetrievedChunk(BaseModel):
 
     @staticmethod
     def _render_candidate_chunks(
-        chunks: List[RetrievedChunk],
+        chunks: List["RetrievedChunk"],
         chunk_id_to_alias: Dict[str, str],
     ) -> str:
         if not chunks:
@@ -262,11 +300,11 @@ class RetrievedChunk(BaseModel):
         for chunk in chunks:
             chunk_id = (chunk.chunk_id or "").strip()
             normalized_chunk_id = chunk_id_to_alias.get(chunk_id, "?")
-            relevance = chunk.reranker_relevance_score
+            relevance = chunk.relevance_score
             relevance_text = "N/A" if relevance is None else f"{relevance:.4f}"
             chunk_text = str(chunk.text or "").strip() or "(empty)"
             lines.append(
-                f"- chunk_id={normalized_chunk_id} | relevance_score={relevance_text}\n"
+                f"- chunk_id={normalized_chunk_id} | date={chunk.date_tag or 'N/A'} | relevance_score={relevance_text}\n"
                 f"  text={chunk_text}"
             )
         return "\n".join(lines)
@@ -275,17 +313,11 @@ class RetrievedChunk(BaseModel):
 class MemoryContext(BaseModel):
     chunks: List[RetrievedChunk]
     rewritten_queries: RewrittenQueries
-    entity_tuples: List[Tuple[str, str]] = Field(default_factory=list)
 
 
 @dataclass
 class NeighborCandidate:
-    """
-    Typed representation of one row returned by Neo4jAdapter.get_entity_neighbors().
-
-    Confines string-key access to _parse_neighbor() so node logic works with
-    typed attributes instead of raw dict lookups.
-    """
+    """Typed representation of one row returned by Neo4jAdapter.get_entity_neighbors()."""
 
     source_entity_id: str
     neighbor_entity_id: str
@@ -296,12 +328,7 @@ class NeighborCandidate:
 
 @dataclass
 class GraphChunkRow:
-    """
-    Typed representation of one row returned by Neo4jAdapter.get_chunks_for_entities().
-
-    extraction_status is included so PENDING vs EXTRACTED state flows correctly
-    into RetrievedChunk objects and avoids spurious re-extraction queuing.
-    """
+    """Typed representation of one row returned by Neo4jAdapter.get_chunks_for_entities()."""
 
     chunk_id: str
     chunk_text: str

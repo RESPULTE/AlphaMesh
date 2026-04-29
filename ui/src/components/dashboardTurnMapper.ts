@@ -59,7 +59,8 @@ function buildMetrics(payload?: DataFramePayload | null): AgentAnalysis['metrics
 
 export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisResponse {
   const primary = turn.ticker_results?.[0];
-  const ticker = turn.tickers?.[0] || primary?.ticker || '';
+  const marketQuote = primary?.market_quote;
+  const ticker = turn.tickers?.[0] || primary?.ticker || marketQuote?.ticker || '';
   const financialData =
     primary?.financial_data ?? primary?.fundamentals_visualization?.raw_data ?? null;
   const fundamentalsVisualization = primary?.fundamentals_visualization ?? null;
@@ -108,11 +109,11 @@ export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisRespo
 
   return {
     ticker,
-    companyName: ticker || '',
-    currentPrice: null,
-    priceChange: null,
-    priceChangePercent: null,
-    marketStatus: 'MARKET DATA UNAVAILABLE',
+    companyName: marketQuote?.companyName || ticker || '',
+    currentPrice: marketQuote?.currentPrice ?? null,
+    priceChange: marketQuote?.priceChange ?? null,
+    priceChangePercent: marketQuote?.priceChangePercent ?? null,
+    marketStatus: marketQuote?.marketStatus || 'MARKET DATA UNAVAILABLE',
     chartData: primary?.market_chart ?? [],
     fundamentalData: financialData,
     fundamentalsVisualization,

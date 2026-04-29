@@ -194,7 +194,7 @@ class AnalysisRunner:
         event_queue: asyncio.Queue,
         request_id: str,
         ticker: str,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         market_svc = service_manager.get_market_data_service()
         try:
             quote, chart = await asyncio.wait_for(
@@ -211,26 +211,29 @@ class AnalysisRunner:
             await event_queue.put(
                 {"event_type": "chart", "request_id": request_id, "chart": chart_payload}
             )
-            return chart_payload
+            quote_payload = quote if isinstance(quote, dict) else {"ticker": ticker, "companyName": ticker}
+            return quote_payload, chart_payload
         except asyncio.TimeoutError:
+            fallback_quote = {"ticker": ticker, "companyName": ticker}
             await event_queue.put(
                 {
                     "event_type": "init",
                     "request_id": request_id,
-                    "quote": {"ticker": ticker, "companyName": ticker},
+                    "quote": fallback_quote,
                 }
             )
-            return []
+            return fallback_quote, []
         except Exception as exc:
             logger.warning("Market data fetch failed: %s", exc)
+            fallback_quote = {"ticker": ticker, "companyName": ticker}
             await event_queue.put(
                 {
                     "event_type": "init",
                     "request_id": request_id,
-                    "quote": {"ticker": ticker, "companyName": ticker},
+                    "quote": fallback_quote,
                 }
             )
-            return []
+            return fallback_quote, []
 
     async def _refresh_conversation_memory_index(
         self,
@@ -277,6 +280,7 @@ class AnalysisRunner:
         t_start = time.monotonic()
         market_data_emitted = False
         market_data_task: Optional[asyncio.Task[None]] = None
+        market_quote: Optional[dict[str, Any]] = None
         market_chart: list[dict[str, Any]] = []
 
         # -- 1. Register response group + SSE sink -----------------------------
@@ -297,8 +301,11 @@ class AnalysisRunner:
 
         # -- 2a. Market data fetch is driven by validated ticker events ---------
         async def _emit_and_capture_market_data(ticker: str) -> None:
-            nonlocal market_chart
-            chart_payload = await self._emit_market_data(event_queue, request_id, ticker)
+            nonlocal market_quote, market_chart
+            quote_payload, chart_payload = await self._emit_market_data(
+                event_queue, request_id, ticker
+            )
+            market_quote = quote_payload
             if chart_payload:
                 market_chart = chart_payload
 
@@ -422,6 +429,7 @@ class AnalysisRunner:
                 final_response=final_response,
                 duration_ms=duration_ms,
                 fundamentals_visualization_payload=visualization_payload,
+                market_quote=market_quote,
                 market_chart=market_chart,
             )
 
@@ -498,6 +506,7 @@ def _build_final_result(
     final_response,  # core.agents.models.orchestrator_models.FinalResponse
     duration_ms: float,
     fundamentals_visualization_payload: Optional[FundamentalsVisualizationPayload] = None,
+    market_quote: Optional[dict[str, Any]] = None,
     market_chart: Optional[list[dict[str, Any]]] = None,
 ) -> FinalResult:
     """
@@ -540,6 +549,7 @@ def _build_final_result(
     ticker_result = TickerResult(
         ticker=tickers[0] if tickers else "",
         analysis_text=primary_analysis,
+        market_quote=market_quote,
         market_chart=market_chart or [],
         financial_data=financial_payload,
         fundamentals_visualization=(

@@ -98,18 +98,28 @@ def test_final_result_embeds_fundamentals_visualization_payload() -> None:
         conversation_id="conv-1",
         final_response=response,
         duration_ms=45.6,
+        market_quote={
+            "ticker": "AAPL",
+            "companyName": "Apple Inc.",
+            "currentPrice": 123.45,
+            "priceChange": 1.23,
+            "priceChangePercent": 1.01,
+            "marketStatus": "REGULAR",
+        },
         market_chart=[{"time": "09:30", "price": 123.45}],
     )
 
     assert result.ticker_results
     assert result.ticker_results[0].fundamentals_visualization is not None
     assert result.ticker_results[0].fundamentals_visualization.charts[0].chart_type == "line"
+    assert result.ticker_results[0].market_quote is not None
     assert result.ticker_results[0].market_chart == [{"time": "09:30", "price": 123.45}]
 
 
 def test_stream_event_and_ticker_result_are_backward_compatible() -> None:
     ticker_result = TickerResult(ticker="AAPL", analysis_text="ok", sources=[])
     assert ticker_result.fundamentals_visualization is None
+    assert ticker_result.market_quote is None
     assert ticker_result.market_chart == []
 
     viz_payload = FundamentalsVisualizationPayload(charts=[], raw_row_labels=[])
@@ -152,4 +162,5 @@ def test_turn_payload_includes_agent_memory_summaries_and_turn_id() -> None:
 
     assert payload["turn_id"] == "turn-abc"
     assert payload["agent_memory_summaries"]["news_agent"]["source_count"] == 3
+    assert payload["ticker_results"][0]["market_quote"] is None
     assert payload["ticker_results"][0]["market_chart"] == []

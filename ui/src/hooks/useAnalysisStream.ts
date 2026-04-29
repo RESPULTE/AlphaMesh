@@ -196,7 +196,13 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
   const tickerResult = result.ticker_results[0];
   if (tickerResult) {
     response.ticker = tickerResult.ticker || '';
-    response.companyName = tickerResult.ticker || '';
+    response.companyName =
+      tickerResult.market_quote?.companyName || tickerResult.ticker || '';
+    response.currentPrice = tickerResult.market_quote?.currentPrice ?? null;
+    response.priceChange = tickerResult.market_quote?.priceChange ?? null;
+    response.priceChangePercent = tickerResult.market_quote?.priceChangePercent ?? null;
+    response.marketStatus =
+      tickerResult.market_quote?.marketStatus || response.marketStatus;
     response.chartData = tickerResult.market_chart ?? [];
     response.fundamentalData = tickerResult.financial_data ?? null;
     response.fundamentalsVisualization = tickerResult.fundamentals_visualization ?? null;

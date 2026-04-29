@@ -164,6 +164,7 @@ export interface SourceItem {
 export interface TickerResult {
   ticker: string;
   analysis_text: string;
+  market_quote?: MarketQuote | null;
   market_chart?: ChartDataPoint[];
   financial_data?: DataFramePayload | null;
   fundamentals_visualization?: FundamentalsVisualizationPayload | null;
