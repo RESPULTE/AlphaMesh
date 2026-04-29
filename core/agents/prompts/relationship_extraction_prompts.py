@@ -45,5 +45,3 @@ def build_relationships_block(*, include_context_only_rule: bool = False) -> str
     </relationships>
 """.strip()
 
-
-print(_build_relationship_schema_for_prompt())

@@ -433,10 +433,12 @@ class Neo4jAdapter:
             "WHERE e.id IN $entity_ids "
             "AND ($exclude_ids IS NULL OR NOT neighbor.id IN $exclude_ids) "
             "RETURN e.id AS source_entity_id, "
+            "e.name AS source_entity_name, "
             "neighbor.id AS neighbor_entity_id, "
             "neighbor.name AS neighbor_name, "
             "neighbor.entity_type AS neighbor_type, "
-            "r.relationship_type AS relationship_type"
+            "r.relationship_type AS relationship_type, "
+            "r.reason AS reason"
         )
         records = await self._execute_read(
             cypher, {"entity_ids": entity_ids, "exclude_ids": exclude_ids}

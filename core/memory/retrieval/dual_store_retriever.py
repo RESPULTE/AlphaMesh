@@ -28,10 +28,14 @@ from core.memory.retrieval.tracing import (
     NullRetrievalTraceSink,
     PrefilterTraceContext,
     RetrievalTraceEvent,
+    RetrievalTraceSink,
 )
 from core.memory.retrieval.traversal_policy import TraversalPolicy
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
+
+RELATIONSHIP_DETAIL_KEY = "reason"
+SELECTED_NEIGHBOR_RELATIONSHIPS_KEY = "selected_neighbor_relationships"
 
 
 def _parse_neighbor(row: dict) -> Optional[NeighborCandidate]:
@@ -42,10 +46,14 @@ def _parse_neighbor(row: dict) -> Optional[NeighborCandidate]:
         return None
     return NeighborCandidate(
         source_entity_id=sid,
+        source_entity_name=(row.get("source_entity_name") or "").strip(),
         neighbor_entity_id=nid,
         neighbor_name=(row.get("neighbor_name") or "").strip(),
         neighbor_type=(row.get("neighbor_type") or "FinancialConcept").strip(),
         relationship_type=(row.get("relationship_type") or "RELATED_TO").strip(),
+        relationship_reason=(
+            str(row.get(RELATIONSHIP_DETAIL_KEY) or "").strip() or None
+        ),
     )
 
 
@@ -112,12 +120,15 @@ class DualStoreRetriever:
         chroma_adapter: ChromaDBAdapter,
         prefilter: CompositePrefilter,
         reranker: TwoStageReranker,
+        trace_sink: RetrievalTraceSink | None = None,
     ) -> None:
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
         self._prefilter = prefilter
         self._reranker = reranker
-        if settings.RETRIEVAL_TRACE_ENABLED:
+        if trace_sink is not None:
+            self._trace_sink = trace_sink
+        elif settings.RETRIEVAL_TRACE_ENABLED:
             self._trace_sink = NetworkXRetrievalTraceSink(
                 max_runs=settings.RETRIEVAL_TRACE_MAX_RUNS
             )
@@ -195,6 +206,113 @@ class DualStoreRetriever:
             )
         except Exception:
             self._logger.warning("Trace sink emission failed", exc_info=True)
+
+    @staticmethod
+    def _normalize_relationship_detail(value: Any) -> Optional[str]:
+        detail = str(value or "").strip()
+        return detail or None
+
+    @classmethod
+    def _dedupe_relationship_records(
+        cls, records: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        deduped: List[Dict[str, Any]] = []
+        seen: Set[tuple[str, str, str, str]] = set()
+        for record in records:
+            frontier_name = str(record.get("frontier_name") or "").strip()
+            neighbor_name = str(record.get("selected_neighbor_name") or "").strip()
+            relationship_type = str(record.get("relationship_type") or "").strip()
+            detail = cls._normalize_relationship_detail(
+                record.get(RELATIONSHIP_DETAIL_KEY)
+            )
+            key = (frontier_name, neighbor_name, relationship_type, detail or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(
+                {
+                    "frontier_name": frontier_name,
+                    "selected_neighbor_name": neighbor_name,
+                    "relationship_type": relationship_type,
+                    RELATIONSHIP_DETAIL_KEY: detail,
+                }
+            )
+        return deduped
+
+    @classmethod
+    def _build_selected_relationship_map(
+        cls,
+        candidates: Sequence[NeighborCandidate],
+        selected_ids: Set[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        relationship_map: Dict[str, List[Dict[str, Any]]] = {}
+        for candidate in candidates:
+            selected_id = (candidate.neighbor_entity_id or "").strip()
+            if not selected_id or selected_id not in selected_ids:
+                continue
+            relationship_map.setdefault(selected_id, []).append(
+                {
+                    "frontier_name": (candidate.source_entity_name or "").strip()
+                    or candidate.source_entity_id,
+                    "selected_neighbor_name": (candidate.neighbor_name or "").strip()
+                    or selected_id,
+                    "relationship_type": (candidate.relationship_type or "").strip()
+                    or "RELATED_TO",
+                    RELATIONSHIP_DETAIL_KEY: cls._normalize_relationship_detail(
+                        candidate.relationship_reason
+                    ),
+                }
+            )
+        return {
+            neighbor_id: cls._dedupe_relationship_records(records)
+            for neighbor_id, records in relationship_map.items()
+        }
+
+    @staticmethod
+    def _upsert_best_chunk(
+        chunk_map: Dict[str, RetrievedChunk], incoming: RetrievedChunk
+    ) -> None:
+        existing = chunk_map.get(incoming.chunk_id)
+        if (
+            existing is None
+            or (
+                incoming.relevance_score is not None
+                and (
+                    existing.relevance_score is None
+                    or incoming.relevance_score > existing.relevance_score
+                )
+            )
+        ):
+            chunk_map[incoming.chunk_id] = incoming
+
+    @staticmethod
+    def _normalize_domain_chunks(
+        domain: str, chunks: List[RetrievedChunk]
+    ) -> List[RetrievedChunk]:
+        return [
+            RetrievedChunk.normalize_for_reranking(chunk, domain)
+            for chunk in chunks
+            if isinstance(chunk, RetrievedChunk)
+        ]
+
+    async def _rerank_domain_chunks(
+        self,
+        domain: str,
+        query: str,
+        chunks: List[RetrievedChunk],
+    ) -> tuple[str, List[RetrievedChunk]]:
+        if not chunks:
+            return domain, []
+        try:
+            ranked = await self._reranker.rank(query, chunks)
+        except Exception as exc:
+            self._logger.error(
+                "Jina rerank failed for domain '%s': %s; fallback to prefilter only.",
+                domain,
+                exc,
+            )
+            ranked = self._prefilter.score(chunks)
+        return domain, ranked
 
     # -- Graph wiring --------------------------------------------------------
 
@@ -339,7 +457,11 @@ class DualStoreRetriever:
     async def _select_neighbor_frontier_node(self, state: RetrieverState) -> dict:
         frontier = state["current_frontier"]
         if not frontier:
-            return {"current_frontier": [], "should_continue": False}
+            return {
+                "current_frontier": [],
+                "selected_neighbor_relationships": {},
+                "should_continue": False,
+            }
 
         hop_depth = state["iteration"] + 1
         try:
@@ -353,7 +475,11 @@ class DualStoreRetriever:
                 len(frontier),
                 exc,
             )
-            return {"current_frontier": [], "should_continue": False}
+            return {
+                "current_frontier": [],
+                "selected_neighbor_relationships": {},
+                "should_continue": False,
+            }
 
         candidates: List[NeighborCandidate] = [
             parsed for row in raw_rows if (parsed := _parse_neighbor(row)) is not None
@@ -363,26 +489,41 @@ class DualStoreRetriever:
             self._logger.info(
                 "Hop %d: no valid neighbor candidates - stopping.", hop_depth
             )
-            return {"current_frontier": [], "should_continue": False}
+            return {
+                "current_frontier": [],
+                "selected_neighbor_relationships": {},
+                "should_continue": False,
+            }
 
         selected = self._policy.select_frontier(capped, state["query"], hop_depth)
         if not selected:
             self._logger.info(
                 "Hop %d: frontier selection returned empty - stopping.", hop_depth
             )
-            return {"current_frontier": [], "should_continue": False}
+            return {
+                "current_frontier": [],
+                "selected_neighbor_relationships": {},
+                "should_continue": False,
+            }
 
         selected_set = set(selected)
+        selected_relationship_map = self._build_selected_relationship_map(
+            capped, selected_set
+        )
         scored_candidates = []
         for candidate in capped:
             score = self._policy.score_neighbor(candidate, state["query"], hop_depth)
             scored_candidates.append(
                 {
                     "source_entity_id": candidate.source_entity_id,
+                    "source_entity_name": candidate.source_entity_name,
                     "neighbor_entity_id": candidate.neighbor_entity_id,
                     "neighbor_name": candidate.neighbor_name,
                     "neighbor_type": candidate.neighbor_type,
                     "relationship_type": candidate.relationship_type,
+                    RELATIONSHIP_DETAIL_KEY: self._normalize_relationship_detail(
+                        candidate.relationship_reason
+                    ),
                     "score": score,
                     "selected": candidate.neighbor_entity_id in selected_set,
                 }
@@ -409,6 +550,7 @@ class DualStoreRetriever:
         )
         return {
             "current_frontier": selected,
+            "selected_neighbor_relationships": selected_relationship_map,
             "visited_entity_ids": updated_visited,
             "should_continue": True,
         }
@@ -418,6 +560,7 @@ class DualStoreRetriever:
         if not frontier:
             return {}
 
+        selected_relationships_map = state.get("selected_neighbor_relationships") or {}
         hop_depth = state["iteration"] + 1
         try:
             rows = await self._neo4j_adapter.get_chunks_for_entities(
@@ -467,6 +610,7 @@ class DualStoreRetriever:
                         "source_url": parsed.source_url,
                         "published_at": parsed.published_at,
                         "supporting_entity_ids": [],
+                        SELECTED_NEIGHBOR_RELATIONSHIPS_KEY: [],
                     },
                 )
                 new_chunks_by_id[parsed.chunk_id] = chunk
@@ -476,6 +620,16 @@ class DualStoreRetriever:
                 support_ids = chunk.metadata.setdefault("supporting_entity_ids", [])
                 if support_id not in support_ids:
                     support_ids.append(support_id)
+
+                support_relationships = selected_relationships_map.get(support_id) or []
+                existing_relationships = chunk.metadata.setdefault(
+                    SELECTED_NEIGHBOR_RELATIONSHIPS_KEY, []
+                )
+                chunk.metadata[SELECTED_NEIGHBOR_RELATIONSHIPS_KEY] = (
+                    self._dedupe_relationship_records(
+                        [*existing_relationships, *support_relationships]
+                    )
+                )
                 trace_links.add((support_id, parsed.chunk_id))
 
         new_chunks = list(new_chunks_by_id.values())
@@ -548,6 +702,7 @@ class DualStoreRetriever:
             "current_frontier": [],
             "iteration": 0,
             "should_continue": False,
+            "selected_neighbor_relationships": {},
             "run_id": retrieval_run_id,
             "parent_run_id": parent_run_id,
             "domain": domain,
@@ -602,7 +757,7 @@ class DualStoreRetriever:
             *(task for _, task in task_items), return_exceptions=True
         )
 
-        chunk_map: Dict[str, RetrievedChunk] = {}
+        domain_inputs: List[tuple[str, str, List[RetrievedChunk]]] = []
         for (domain, _task), result in zip(task_items, results):
             if isinstance(result, Exception):
                 self._logger.error(
@@ -611,40 +766,29 @@ class DualStoreRetriever:
                 continue
             if not isinstance(result, list):
                 continue
-            domain_query = active_queries.get(domain, "")
-            normalized_domain_chunks: List[RetrievedChunk] = [
-                RetrievedChunk.normalize_for_reranking(chunk, domain)
-                for chunk in result
-                if isinstance(chunk, RetrievedChunk)
-            ]
+            normalized_domain_chunks = self._normalize_domain_chunks(domain, result)
             if not normalized_domain_chunks:
                 continue
-            try:
-                reranked_domain_chunks = await self._reranker.rank(
-                    domain_query,
-                    normalized_domain_chunks,
-                )
-            except Exception as exc:
-                self._logger.error(
-                    "Jina rerank failed for domain '%s': %s; fallback to prefilter only.",
-                    domain,
-                    exc,
-                )
-                reranked_domain_chunks = self._prefilter.score(normalized_domain_chunks)
+            domain_inputs.append(
+                (domain, active_queries.get(domain, ""), normalized_domain_chunks)
+            )
 
+        rerank_tasks = [
+            asyncio.create_task(self._rerank_domain_chunks(domain, query, chunks))
+            for domain, query, chunks in domain_inputs
+        ]
+        rerank_results = await asyncio.gather(*rerank_tasks, return_exceptions=True)
+
+        chunk_map: Dict[str, RetrievedChunk] = {}
+        for rerank_result in rerank_results:
+            if isinstance(rerank_result, Exception):
+                self._logger.error(
+                    "Domain rerank task failed unexpectedly: %s", rerank_result
+                )
+                continue
+            _domain, reranked_domain_chunks = rerank_result
             for reranked in reranked_domain_chunks:
-                existing = chunk_map.get(reranked.chunk_id)
-                if (
-                    existing is None
-                    or (
-                        reranked.relevance_score is not None
-                        and (
-                            existing.relevance_score is None
-                            or reranked.relevance_score > existing.relevance_score
-                        )
-                    )
-                ):
-                    chunk_map[reranked.chunk_id] = reranked
+                self._upsert_best_chunk(chunk_map, reranked)
 
         merged_count = len(chunk_map)
         merged = self._prefilter.score(

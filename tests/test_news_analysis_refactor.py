@@ -472,7 +472,7 @@ def test_parallel_fanin_updates_are_merged_for_chunk_fields() -> None:
 
     def _branch_a(_state: NewsAgentState):
         return {
-            "seen_urls": ["https://example.com/a"],
+            "seen_url_keys": ["https://example.com/a"],
             "research_logs": [
                 ResearchStepLog(iteration=1, action="web_search", query="a")
             ],
@@ -493,7 +493,7 @@ def test_parallel_fanin_updates_are_merged_for_chunk_fields() -> None:
 
     def _branch_b(_state: NewsAgentState):
         return {
-            "seen_urls": ["https://example.com/b"],
+            "seen_url_keys": ["https://example.com/b"],
             "research_logs": [
                 ResearchStepLog(iteration=1, action="newsapi", query="b")
             ],
@@ -524,7 +524,7 @@ def test_parallel_fanin_updates_are_merged_for_chunk_fields() -> None:
 
     state = NewsAgentState(goal="fanin-test")
     final_state = graph.invoke(state.model_dump())
-    assert sorted(final_state["seen_urls"]) == [
+    assert sorted(final_state["seen_url_keys"]) == [
         "https://example.com/a",
         "https://example.com/b",
     ]

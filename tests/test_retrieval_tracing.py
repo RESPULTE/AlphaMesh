@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -93,30 +95,47 @@ class FakeNeo4jAdapter:
                 rows.append(
                     {
                         "source_entity_id": "e-comp-1",
+                        "source_entity_name": "Apple",
                         "neighbor_entity_id": "e-common-1",
                         "neighbor_name": "Supply Chain",
                         "neighbor_type": "FinancialConcept",
                         "relationship_type": "RELATED_TO",
+                        "reason": "Apple depends on supply chain continuity.",
                     }
                 )
             elif entity_id == "e-comp-2":
                 rows.append(
                     {
                         "source_entity_id": "e-comp-2",
+                        "source_entity_name": "iPhone",
                         "neighbor_entity_id": "e-common-2",
                         "neighbor_name": "Consumer Demand",
                         "neighbor_type": "FinancialConcept",
                         "relationship_type": "RELATED_TO",
+                        "reason": "iPhone demand drives revenue outlook.",
+                    }
+                )
+                rows.append(
+                    {
+                        "source_entity_id": "e-comp-2",
+                        "source_entity_name": "iPhone",
+                        "neighbor_entity_id": "e-common-1",
+                        "neighbor_name": "Supply Chain",
+                        "neighbor_type": "FinancialConcept",
+                        "relationship_type": "RELATED_TO",
+                        "reason": "Device availability is tied to components supply.",
                     }
                 )
             elif entity_id == "e-mkt-1":
                 rows.append(
                     {
                         "source_entity_id": "e-mkt-1",
+                        "source_entity_name": "NASDAQ",
                         "neighbor_entity_id": "e-common-1",
                         "neighbor_name": "Supply Chain",
                         "neighbor_type": "FinancialConcept",
                         "relationship_type": "RELATED_TO",
+                        "reason": "Broad supply chain risk impacts index constituents.",
                     }
                 )
         return rows
@@ -174,13 +193,50 @@ class FakeNeo4jAdapter:
         return [row for row in rows if row["chunk_id"] not in excluded]
 
 
+class FakeReranker:
+    def __init__(
+        self,
+        *,
+        delay_seconds: float = 0.0,
+        failing_domains: set[str] | None = None,
+    ) -> None:
+        self._delay_seconds = delay_seconds
+        self._failing_domains = failing_domains or set()
+
+    async def rank(self, query: str, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        _ = query
+        if self._delay_seconds > 0:
+            await asyncio.sleep(self._delay_seconds)
+
+        domain = (chunks[0].domain or "").strip() if chunks else ""
+        if domain in self._failing_domains:
+            raise RuntimeError(f"simulated reranker failure for domain={domain}")
+
+        ranked: List[RetrievedChunk] = []
+        for idx, chunk in enumerate(chunks):
+            base_score = chunk.relevance_score if chunk.relevance_score is not None else 0.0
+            ranked.append(
+                chunk.model_copy(
+                    update={
+                        "relevance_score": float(base_score + (len(chunks) - idx)),
+                        "relevance_source": "jina",
+                    }
+                )
+            )
+        return ranked
+
+
 def _build_retriever(
     trace_sink: NetworkXRetrievalTraceSink | None = None,
+    *,
+    reranker: FakeReranker | None = None,
 ) -> DualStoreRetriever:
+    prefilter = CompositePrefilter(alpha=0.8, beta=0.2, prefilter_k=10)
     return DualStoreRetriever(
         neo4j_adapter=FakeNeo4jAdapter(),
         chroma_adapter=FakeChromaAdapter(),
-        prefilter=CompositePrefilter(alpha=0.8, beta=0.2, prefilter_k=10),
+        prefilter=prefilter,
+        reranker=reranker or FakeReranker(),
         trace_sink=trace_sink,
     )
 
@@ -204,6 +260,21 @@ async def test_retrieve_output_unchanged_when_tracing_disabled() -> None:
         "e-common-1",
         "e-common-2",
     ]
+
+    relationships = shared_chunk.metadata.get("selected_neighbor_relationships", [])
+    assert relationships
+    assert {
+        "frontier_name": "Apple",
+        "selected_neighbor_name": "Supply Chain",
+        "relationship_type": "RELATED_TO",
+        "reason": "Apple depends on supply chain continuity.",
+    } in relationships
+    assert {
+        "frontier_name": "iPhone",
+        "selected_neighbor_name": "Supply Chain",
+        "relationship_type": "RELATED_TO",
+        "reason": "Device availability is tied to components supply.",
+    } in relationships
 
 
 @pytest.mark.asyncio
@@ -288,6 +359,35 @@ async def test_comprehensive_retrieve_creates_parent_and_child_runs() -> None:
         attrs.get("prefilter_rank") is not None
         for _, attrs in parent_graph.nodes(data=True)
     )
+
+
+@pytest.mark.asyncio
+async def test_comprehensive_retrieve_parallel_rerank_and_fallback() -> None:
+    retriever = _build_retriever(
+        reranker=FakeReranker(delay_seconds=0.3, failing_domains={"market"})
+    )
+    rewritten = RewrittenQueries(
+        company_query="company query",
+        market_query="market query",
+        active_domains=["company", "market"],
+    )
+
+    started = time.monotonic()
+    context = await retriever.comprehensive_retrieve(rewritten)
+    elapsed = time.monotonic() - started
+
+    assert context.chunks
+    # Two domain rerank calls are each delayed by 0.3s. Serial execution would
+    # exceed ~0.6s in this fixture, so this bound validates parallel reranking.
+    assert elapsed < 0.55
+
+    company_chunks = [chunk for chunk in context.chunks if chunk.domain == "company"]
+    market_chunks = [chunk for chunk in context.chunks if chunk.domain == "market"]
+    assert company_chunks
+    assert market_chunks
+    assert all(chunk.relevance_source == "jina" for chunk in company_chunks)
+    # Market rerank is forced to fail, so fallback should avoid Jina source labels.
+    assert any(chunk.relevance_source != "jina" for chunk in market_chunks)
 
 
 def test_trace_sink_lru_eviction() -> None:

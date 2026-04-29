@@ -60,14 +60,14 @@ class NewsAgentState(BaseAgentInput):
     research_logs: Annotated[List[ResearchStepLog], operator.add] = Field(
         default_factory=list
     )
-    seen_urls: Annotated[List[str], operator.add] = Field(default_factory=list)
+    seen_url_keys: Annotated[List[str], operator.add] = Field(default_factory=list)
+    seen_chunk_ids: Annotated[List[str], operator.add] = Field(default_factory=list)
     research_iteration: int = 0
 
     is_context_sufficient: bool = False
     missing_information_goal: Optional[str] = None
     persist_chunk_ids: List[str] = Field(default_factory=list)
-    grouped_query_context_block: str = ""
-    working_memory_context_block: str = ""
+    article_context_block: str = ""
 
     retrieved_chunks: Annotated[List[RetrievedChunk], operator.add] = Field(
         default_factory=list

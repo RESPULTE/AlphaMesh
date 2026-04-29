@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import List, Tuple
 from uuid import uuid4
 
@@ -25,6 +27,29 @@ class ArticleChunker:
         )
         self._logger = get_logger(__name__)
 
+    @staticmethod
+    def _parse_published_at(value: object) -> datetime:
+        """Parse publishedAt into a timezone-aware UTC datetime."""
+        now_utc = datetime.now(timezone.utc)
+        if not isinstance(value, str):
+            return now_utc
+
+        raw = value.strip()
+        if not raw:
+            return now_utc
+
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(raw)
+            except (TypeError, ValueError):
+                return now_utc
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     def chunk_article(
         self, article: dict
     ) -> Tuple[DocumentMetadata, List[RetrievedChunk]]:
@@ -33,7 +58,7 @@ class ArticleChunker:
         description = (article.get("description") or "").strip()
         content = (article.get("content") or "").strip()
         source_url = (article.get("url") or "").strip()
-        published_at = article.get("publishedAt")
+        published_at = self._parse_published_at(article.get("publishedAt"))
 
         document_id = str(uuid4())
         full_text = "\n\n".join(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Type
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -26,8 +26,8 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_ANALYSIS_USER_PROMPT,
     NEWS_DEFERRED_ALLOWED_ENTITY_TYPES,
     NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
-    NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     NEWS_PLANNER_SYSTEM_PROMPT,
+    build_news_deferred_relationship_system_prompt,
 )
 from core.agents.utils import (
     build_analysis_context_prefix,
@@ -45,7 +45,6 @@ from core.services import service_manager
 logger = get_logger(__name__)
 
 _TARGET_MIN_CHUNKS_PER_SOURCE = 3
-_PLANNER_DOMAIN_ORDER = ("company", "sector", "market", "knowledge")
 
 
 def _history_block(logs: List[ResearchStepLog], limit: int = 6) -> str:
@@ -115,34 +114,6 @@ class NewsAnalysisAgent(AbstractAgent):
     def render_memory_summary(memory_summary: Dict[str, object]) -> str:
         return NewsWorkingMemoryManager.render_memory_summary(memory_summary)
 
-    @classmethod
-    def build_memory_context_from_history(
-        cls,
-        history_turns: List[dict],
-        window: int = 8,
-    ) -> str:
-        return NewsWorkingMemoryManager.build_context_from_history_summaries(
-            history_turns, window=window
-        )
-
-    @classmethod
-    def _build_missing_goal_output(cls) -> NewsAgentOutput:
-        reason = (
-            "news_agent requires a non-empty goal. "
-            "Goal is now mandatory and query-only execution is deprecated."
-        )
-        return NewsAgentOutput(
-            analysis="News analysis skipped: missing execution goal.",
-            sources=[],
-            entities_enriched=[],
-            memory_summary={
-                "bypassed": True,
-                "reason": reason,
-                "research_actions": [],
-                "tools_used": [],
-            },
-        )
-
     @staticmethod
     def _resolve_selected_chunks(
         chunks: List[RetrievedChunk],
@@ -156,50 +127,57 @@ class NewsAnalysisAgent(AbstractAgent):
         filtered = [chunk for chunk in chunks if chunk.chunk_id in selected_ids]
         return filtered or chunks
 
-    @staticmethod
-    def _dedupe_chunks(chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
-        by_id: Dict[str, RetrievedChunk] = {}
-        fallback_chunks: List[RetrievedChunk] = []
-        for chunk in chunks:
-            chunk_id = (chunk.chunk_id or "").strip()
-            if not chunk_id:
-                fallback_chunks.append(chunk)
-                continue
-            existing = by_id.get(chunk_id)
-            if existing is None:
-                by_id[chunk_id] = chunk
-                continue
-            incoming_score = chunk.relevance_score
-            existing_score = existing.relevance_score
-            if incoming_score is not None and (
-                existing_score is None or incoming_score > existing_score
-            ):
-                by_id[chunk_id] = chunk
-        return list(by_id.values()) + fallback_chunks
 
-    @staticmethod
-    def _is_tavily_chunk(chunk: RetrievedChunk) -> bool:
-        return str(chunk.relevance_source or "").strip() == "tavily"
 
     @classmethod
-    def _merge_and_rank_chunks(
-        cls, chunks: List[RetrievedChunk]
-    ) -> List[RetrievedChunk]:
-        deduped = cls._dedupe_chunks(chunks)
-        tavily_chunks = [chunk for chunk in deduped if cls._is_tavily_chunk(chunk)]
-        threshold = settings.NEWS_AGENT_MIN_RELEVANCE_SCORE
+    def _rank_chunks(cls, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        def _is_tavily_chunk(chunk: RetrievedChunk) -> bool:
+            return str(chunk.relevance_source or "").strip() == "tavily"
+        
+        deduped_chunks = RetrievedChunk._dedupe_chunks(chunks)
+        tavily_chunks = [
+            chunk for chunk in deduped_chunks if _is_tavily_chunk(chunk)
+        ]
         non_tavily_chunks = [
             chunk
-            for chunk in deduped
-            if not cls._is_tavily_chunk(chunk)
-            if chunk.relevance_score is not None and chunk.relevance_score >= threshold
+            for chunk in deduped_chunks
+            if not _is_tavily_chunk(chunk)
+            if chunk.relevance_score is not None and chunk.relevance_score >= settings.NEWS_AGENT_MIN_RELEVANCE_SCORE
         ]
         ranked_non_tavily = sorted(
             non_tavily_chunks,
             key=lambda chunk: chunk.relevance_score or 0.0,
             reverse=True,
         )
-        return cls._dedupe_chunks(tavily_chunks + ranked_non_tavily)
+        return RetrievedChunk._dedupe_chunks(tavily_chunks + ranked_non_tavily)
+
+    @staticmethod
+    def _source_url_key(chunk: RetrievedChunk) -> str:
+        source_url = str(
+            chunk.source_url or (chunk.metadata or {}).get("source_url") or ""
+        ).strip()
+        return NewsWorkingMemoryManager.canonicalize_url_key(source_url)
+
+    @classmethod
+    def _with_chunk_metadata(
+        cls,
+        chunk: RetrievedChunk,
+        *,
+        relevance_score: float | None,
+        relevance_source: str,
+        planner_domains: List[str],
+    ) -> RetrievedChunk:
+        update_payload = {
+            "domain": "new",
+            "relevance_source": relevance_source,
+            "metadata": {
+                **(chunk.metadata or {}),
+                "planner_domains": planner_domains,
+            },
+        }
+        if relevance_score is not None:
+            update_payload["relevance_score"] = relevance_score
+        return chunk.model_copy(update=update_payload)
 
     @staticmethod
     def _build_instructional_missing_goal(
@@ -216,54 +194,41 @@ class NewsAnalysisAgent(AbstractAgent):
             "- Prefer high-signal, evidence-bearing terms (entities, events, metrics, timeframe).\n"
         )
 
-    @staticmethod
-    def _ordered_planner_domains(queries: List[DomainQuery]) -> List[str]:
-        domains = [q.domain for q in queries if q.domain in _PLANNER_DOMAIN_ORDER]
-        if not domains:
-            return list(_PLANNER_DOMAIN_ORDER)
-        return list(dict.fromkeys(domains))
-
-    @staticmethod
-    def _build_grouped_query_context_block(
+    @classmethod
+    def _build_article_context_block(
+        cls,
         *,
-        planner_domains: List[str],
         final_chunks: List[RetrievedChunk],
-        fetched_chunk_ids: List[str],
-        memory_chunk_ids: List[str],
-    ) -> Tuple[str, Dict[str, str]]:
+    ) -> tuple[str, Dict[str, str]]:
         chunk_id_to_alias, _ = RetrievedChunk._build_chunk_alias_maps(final_chunks)
-        fetched_ids = {chunk_id for chunk_id in fetched_chunk_ids if chunk_id}
-        memory_ids = {chunk_id for chunk_id in memory_chunk_ids if chunk_id}
-        grouped: Dict[str, List[RetrievedChunk]] = {
-            domain: [] for domain in planner_domains
-        }
+        grouped: Dict[str, List[RetrievedChunk]] = {}
+        group_labels: Dict[str, str] = {}
+        group_order: List[str] = []
 
         for chunk in final_chunks:
             chunk_id = (chunk.chunk_id or "").strip()
             if not chunk_id:
                 continue
-
-            if chunk_id in fetched_ids:
-                metadata = chunk.metadata or {}
-                raw_domains = metadata.get("planner_domains") or []
-                if isinstance(raw_domains, str):
-                    raw_domains = [raw_domains]
-                for domain in raw_domains:
-                    if domain in grouped:
-                        grouped[domain].append(chunk)
-
-            if chunk_id in memory_ids:
-                domain = (chunk.domain or "").strip()
-                if domain in grouped:
-                    grouped[domain].append(chunk)
+            metadata = chunk.metadata or {}
+            article_title = (
+                str(metadata.get("article_title") or chunk.article_title or "").strip()
+                or "Unknown Title"
+            )
+            source_url_key = cls._source_url_key(chunk)
+            group_key = source_url_key or f"title:{article_title.lower()}"
+            if group_key not in grouped:
+                grouped[group_key] = []
+                group_labels[group_key] = article_title
+                group_order.append(group_key)
+            grouped[group_key].append(chunk)
 
         lines: List[str] = []
-        for domain in planner_domains:
-            chunks = grouped.get(domain, [])
+        for group_key in group_order:
+            chunks = grouped.get(group_key, [])
             if not chunks:
                 continue
-            deduped = NewsAnalysisAgent._dedupe_chunks(chunks)
-            lines.append(f"[{domain}]")
+            deduped = RetrievedChunk._dedupe_chunks(chunks)
+            lines.append(f"[{group_labels.get(group_key, 'Unknown Title')}]")
             for chunk in deduped:
                 chunk_alias = chunk_id_to_alias.get((chunk.chunk_id or "").strip(), "")
                 if not chunk_alias:
@@ -283,10 +248,6 @@ class NewsAnalysisAgent(AbstractAgent):
 
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
-        if not input_data.goal:
-            logger.warning("run: missing goal; skipping news execution.")
-            return self._build_missing_goal_output()
-
         start_date, end_date = get_default_date_range(
             input_data.start_date, input_data.end_date
         )
@@ -300,6 +261,8 @@ class NewsAnalysisAgent(AbstractAgent):
         working_memory_chunks = self._working_memory.get_working_memory_chunks(
             conversation_id
         )
+        seen_url_keys = self._working_memory.get_seen_url_keys(conversation_id)
+        seen_chunk_ids = self._working_memory.get_seen_chunk_ids(conversation_id)
 
         initial_state = NewsAgentState(
             query="",
@@ -312,6 +275,8 @@ class NewsAnalysisAgent(AbstractAgent):
             agent_memory_context=effective_memory_context,
             company_context=input_data.company_context,
             final_chunks=working_memory_chunks,
+            seen_url_keys=seen_url_keys,
+            seen_chunk_ids=seen_chunk_ids,
         )
 
         final_state = await self._graph.ainvoke(initial_state.model_dump())
@@ -319,6 +284,16 @@ class NewsAnalysisAgent(AbstractAgent):
         self._working_memory.persist_agent_memory_summary(
             conversation_id=conversation_id,
             rendered_summary=self.render_memory_summary(output.memory_summary),
+        )
+        self._working_memory.merge_seen_history(
+            conversation_id=conversation_id,
+            url_keys=[
+                str(key).strip() for key in (final_state.get("seen_url_keys") or [])
+            ],
+            chunk_ids=[
+                str(chunk_id).strip()
+                for chunk_id in (final_state.get("seen_chunk_ids") or [])
+            ],
         )
 
         final_chunks: List[RetrievedChunk] = final_state.get("final_chunks") or []
@@ -333,6 +308,8 @@ class NewsAnalysisAgent(AbstractAgent):
             turn_index=turn_index,
             chunks=final_chunks,
             source_key_fn=RetrievedChunk._source_key,
+            seen_url_keys=self._working_memory.get_seen_url_keys(conversation_id),
+            seen_chunk_ids=self._working_memory.get_seen_chunk_ids(conversation_id),
         )
         return output
 
@@ -499,37 +476,32 @@ class NewsAnalysisAgent(AbstractAgent):
             *(_fetch_one(q) for q in queries)
         )
 
-        url_to_domains: Dict[str, List[str]] = {}
+        url_key_to_domains: Dict[str, List[str]] = {}
         for domain_query, batch in zip(queries, results_per_query, strict=False):
             for article in batch:
                 url = str(article.get("url") or "").strip()
-                if not url:
+                url_key = NewsWorkingMemoryManager.canonicalize_url_key(url)
+                if not url_key:
                     continue
-                domains = url_to_domains.setdefault(url, [])
+                domains = url_key_to_domains.setdefault(url_key, [])
                 if domain_query.domain not in domains:
                     domains.append(domain_query.domain)
 
         all_fetched: List[dict] = []
-        per_query_target = max(
-            _TARGET_MIN_CHUNKS_PER_SOURCE,
-            (
-                settings.NEWS_FETCH_MAX_ARTICLES
-                if action == "newsapi"
-                else settings.TAVILY_SEARCH_MAX_RESULTS
-            ),
-        )
         for batch in results_per_query:
-            all_fetched.extend(batch[:per_query_target])
+            all_fetched.extend(batch)
 
-        seen_urls = set(state.seen_urls or [])
-        newly_seen_urls: List[str] = []
+        seen_url_keys = set(state.seen_url_keys or [])
+        newly_seen_url_keys: List[str] = []
         new_articles: List[dict] = []
         for article in all_fetched:
             url = str(article.get("url") or "").strip()
-            if url and url not in seen_urls:
-                new_articles.append(article)
-                seen_urls.add(url)
-                newly_seen_urls.append(url)
+            url_key = NewsWorkingMemoryManager.canonicalize_url_key(url)
+            if not url_key or url_key in seen_url_keys:
+                continue
+            new_articles.append(article)
+            seen_url_keys.add(url_key)
+            newly_seen_url_keys.append(url_key)
 
         log_row = ResearchStepLog(
             iteration=iter_label,
@@ -546,7 +518,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
         if not new_articles:
             return {
-                "seen_urls": newly_seen_urls,
+                "seen_url_keys": newly_seen_url_keys,
                 "research_logs": [log_row],
                 "retrieved_chunks": [],
             }
@@ -565,7 +537,7 @@ class NewsAnalysisAgent(AbstractAgent):
         except Exception:
             logger.exception("_fetch_and_ingest_node: ingestion failed")
             return {
-                "seen_urls": newly_seen_urls,
+                "seen_url_keys": newly_seen_url_keys,
                 "research_logs": [log_row],
                 "retrieved_chunks": [],
             }
@@ -603,122 +575,85 @@ class NewsAnalysisAgent(AbstractAgent):
                     domain="new",
                     relevance_source="vector",
                 )
-                source_url = str(
-                    chunk.source_url or (chunk.metadata or {}).get("source_url") or ""
-                ).strip()
-                planner_domains = url_to_domains.get(source_url, [])
-                if planner_domains:
-                    scored_raw_chunks.append(
-                        chunk.model_copy(
-                            update={
-                                "metadata": {
-                                    **(chunk.metadata or {}),
-                                    "planner_domains": planner_domains,
-                                }
-                            }
-                        )
+                planner_domains = url_key_to_domains.get(
+                    self._source_url_key(chunk), []
+                )
+                scored_raw_chunks.append(
+                    self._with_chunk_metadata(
+                        chunk,
+                        relevance_score=chunk.relevance_score,
+                        relevance_source="vector",
+                        planner_domains=planner_domains,
                     )
-                else:
-                    scored_raw_chunks.append(chunk)
+                )
             if not scored_raw_chunks:
                 scored_raw_chunks = [
-                    chunk.model_copy(
-                        update={
-                            "domain": "new",
-                            "relevance_source": "vector",
-                        }
+                    self._with_chunk_metadata(
+                        chunk,
+                        relevance_score=chunk.relevance_score,
+                        relevance_source="vector",
+                        planner_domains=url_key_to_domains.get(
+                            self._source_url_key(chunk), []
+                        ),
                     )
                     for chunk in ordered_chunks
                 ]
         else:
-            tavily_score_by_url: Dict[str, float] = {}
+            tavily_score_by_url_key: Dict[str, float] = {}
             for article in new_articles:
                 raw_score = article.get("tavily_relevance_score")
                 url = str(article.get("url") or "").strip()
-                if url and isinstance(raw_score, (int, float)):
-                    tavily_score_by_url[url] = float(raw_score)
+                url_key = NewsWorkingMemoryManager.canonicalize_url_key(url)
+                if url_key and isinstance(raw_score, (int, float)):
+                    tavily_score_by_url_key[url_key] = float(raw_score)
             for chunk in ordered_chunks:
-                source_url = str(
-                    chunk.source_url or (chunk.metadata or {}).get("source_url") or ""
-                ).strip()
-                planner_domains = url_to_domains.get(source_url, [])
+                source_url_key = self._source_url_key(chunk)
+                planner_domains = url_key_to_domains.get(source_url_key, [])
                 scored_raw_chunks.append(
-                    chunk.model_copy(
-                        update={
-                            "relevance_score": float(
-                                tavily_score_by_url.get(source_url, 1.0)
-                            ),
-                            "relevance_source": "tavily",
-                            "domain": "new",
-                            "metadata": {
-                                **(chunk.metadata or {}),
-                                "planner_domains": planner_domains,
-                            },
-                        }
+                    self._with_chunk_metadata(
+                        chunk,
+                        relevance_score=float(
+                            tavily_score_by_url_key.get(source_url_key, 1.0)
+                        ),
+                        relevance_source="tavily",
+                        planner_domains=planner_domains,
                     )
                 )
 
-        existing_ids = {c.chunk_id for c in state.retrieved_chunks if c.chunk_id}
+        seen_chunk_ids = {
+            chunk_id
+            for chunk_id in (
+                list(state.seen_chunk_ids)
+                + [chunk.chunk_id for chunk in state.final_chunks if chunk.chunk_id]
+            )
+            if chunk_id
+        }
         newly_scored_chunks: List[RetrievedChunk] = []
+        newly_seen_chunk_ids: List[str] = []
         for chunk in scored_raw_chunks:
-            if chunk.chunk_id and chunk.chunk_id not in existing_ids:
-                existing_ids.add(chunk.chunk_id)
-                newly_scored_chunks.append(chunk)
+            chunk_id = str(chunk.chunk_id or "").strip()
+            if not chunk_id or chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(chunk_id)
+            newly_seen_chunk_ids.append(chunk_id)
+            newly_scored_chunks.append(chunk)
 
         return {
-            "seen_urls": newly_seen_urls,
+            "seen_url_keys": newly_seen_url_keys,
+            "seen_chunk_ids": newly_seen_chunk_ids,
             "research_logs": [log_row],
             "retrieved_chunks": newly_scored_chunks,
         }
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge tool results, memory retrieval, and working memory chunks."""
-        planner_domains = self._ordered_planner_domains(
-            state.planner_decision.queries if state.planner_decision else []
-        )
-        working_memory_chunk_ids = [
-            (chunk.chunk_id or "").strip()
-            for chunk in state.final_chunks
-            if chunk.chunk_id
-        ]
-        fetched_chunk_ids = [
-            (chunk.chunk_id or "").strip()
-            for chunk in state.retrieved_chunks
-            if chunk.chunk_id
-        ]
-        memory_chunk_ids = [
-            (chunk.chunk_id or "").strip()
-            for chunk in state.memory_chunks
-            if chunk.chunk_id
-        ]
-
-        merged = self._dedupe_chunks(
+        ranked = self._rank_chunks(
             list(state.final_chunks)
             + list(state.retrieved_chunks)
             + list(state.memory_chunks)
         )
-        ranked = self._merge_and_rank_chunks(merged)
-        grouped_query_context_block, chunk_id_to_alias = (
-            self._build_grouped_query_context_block(
-                planner_domains=planner_domains,
-                final_chunks=ranked,
-                fetched_chunk_ids=fetched_chunk_ids,
-                memory_chunk_ids=memory_chunk_ids,
-            )
-        )
-        working_memory_id_set = set(working_memory_chunk_ids)
-        ranked_working_memory_chunks = [
-            chunk
-            for chunk in ranked
-            if (chunk.chunk_id or "").strip() in working_memory_id_set
-        ]
-        working_memory_context_block = (
-            RetrievedChunk._render_candidate_chunks(
-                ranked_working_memory_chunks,
-                chunk_id_to_alias,
-            )
-            if ranked_working_memory_chunks
-            else "(none)"
+        article_context_block, _ = self._build_article_context_block(
+            final_chunks=ranked,
         )
 
         if state.conversation_id:
@@ -740,13 +675,12 @@ class NewsAnalysisAgent(AbstractAgent):
             "retrieved_chunks": Overwrite(value=[]),
             "research_logs": Overwrite(value=updated_logs),
             "research_iteration": state.research_iteration + 1,
-            "grouped_query_context_block": grouped_query_context_block,
-            "working_memory_context_block": working_memory_context_block,
+            "article_context_block": article_context_block,
         }
 
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
         """Check context sufficiency and generate grounded analysis when possible."""
-        chunks = self._dedupe_chunks(state.final_chunks)
+        chunks = self._rank_chunks(state.final_chunks)
         forced_final_pass = (
             state.research_iteration >= settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS
         )
@@ -784,11 +718,8 @@ class NewsAnalysisAgent(AbstractAgent):
         chunk_id_to_alias, alias_to_chunk_id = RetrievedChunk._build_chunk_alias_maps(
             chunks
         )
-        grouped_context_block = (
-            state.grouped_query_context_block or ""
-        ).strip() or "(none)"
-        working_memory_context_block = (
-            state.working_memory_context_block or ""
+        article_context_block = (
+            state.article_context_block or ""
         ).strip() or RetrievedChunk._render_candidate_chunks(chunks, chunk_id_to_alias)
 
         context_prefix = build_analysis_context_prefix(
@@ -806,8 +737,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     max_iterations=settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS,
                     forced_final_pass=str(forced_final_pass).lower(),
                     entities_section=context_prefix,
-                    grouped_context=grouped_context_block,
-                    working_memory_context=working_memory_context_block,
+                    article_context=article_context_block,
                 )
             ),
         ]
@@ -874,17 +804,21 @@ class NewsAnalysisAgent(AbstractAgent):
         task_id = None
         if state.conversation_id and analysis_text:
             turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
+            allowed_entity_types = list(NEWS_DEFERRED_ALLOWED_ENTITY_TYPES)
+            allowed_relationship_types = list(NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES)
+            relationship_system_prompt = build_news_deferred_relationship_system_prompt(
+                allowed_entity_types=allowed_entity_types,
+                allowed_relationship_types=allowed_relationship_types,
+            )
             try:
                 task = make_extraction_task(
                     turn_id=turn_id,
                     conversation_id=state.conversation_id,
                     source_agent=self.name(),
                     extraction_text=analysis_text,
-                    system_prompt=NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-                    allowed_entity_types=list(NEWS_DEFERRED_ALLOWED_ENTITY_TYPES),
-                    allowed_relationship_types=list(
-                        NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES
-                    ),
+                    system_prompt=relationship_system_prompt,
+                    allowed_entity_types=allowed_entity_types,
+                    allowed_relationship_types=allowed_relationship_types,
                     llm_config={"temperature": getattr(self._llm, "temperature", 0.7)},
                 )
                 task_id = await service_manager.get_graph_queue_manager().enqueue(task)

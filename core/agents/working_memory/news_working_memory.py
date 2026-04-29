@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable, List
+from urllib.parse import urlsplit, urlunsplit
 
 from core.agents.working_memory.base import (
     ConversationWorkingMemoryBase,
@@ -9,6 +10,7 @@ from core.agents.working_memory.base import (
     TurnRelevantMemoryBase,
 )
 from core.agents.utils import trim_text
+from core.config import settings
 from core.memory.retrieval.models import RetrievedChunk
 
 
@@ -17,6 +19,8 @@ class NewsTurnRelevantMemory(TurnRelevantMemoryBase):
     turn_index: int = 0
     chunk_ids: List[str] = field(default_factory=list)
     source_urls: List[str] = field(default_factory=list)
+    seen_url_keys: List[str] = field(default_factory=list)
+    seen_chunk_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -24,6 +28,8 @@ class NewsConversationWorkingMemory(
     ConversationWorkingMemoryBase[NewsTurnRelevantMemory]
 ):
     turn_records: List[NewsTurnRelevantMemory] = field(default_factory=list)
+    seen_url_keys: List[str] = field(default_factory=list)
+    seen_chunk_ids: List[str] = field(default_factory=list)
 
 
 class NewsWorkingMemoryManager(
@@ -33,12 +39,80 @@ class NewsWorkingMemoryManager(
 ):
     AGENT_NAME = "news_agent"
 
-    def __init__(self, *, max_chunks: int = 100, max_turns: int = 20) -> None:
+    def __init__(
+        self,
+        *,
+        max_chunks: int = settings.NEWS_WORKING_MEMORY_MAX_CHUNKS,
+        max_turns: int = 20,
+        seen_url_cap: int = settings.NEWS_WORKING_MEMORY_SEEN_URL_CAP,
+        seen_chunk_cap: int = settings.NEWS_WORKING_MEMORY_SEEN_CHUNK_CAP,
+    ) -> None:
         super().__init__(
             max_chunks=max_chunks,
             max_turns=max_turns,
             conversation_factory=NewsConversationWorkingMemory,
         )
+        self._seen_url_cap = max(1, int(seen_url_cap))
+        self._seen_chunk_cap = max(1, int(seen_chunk_cap))
+
+    @staticmethod
+    def canonicalize_url_key(url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        parsed = urlsplit(raw)
+        if not parsed.scheme and not parsed.netloc:
+            return raw.split("?", 1)[0].split("#", 1)[0].strip()
+        return urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                parsed.path or "",
+                "",
+                "",
+            )
+        ).strip()
+
+    def get_seen_url_keys(self, conversation_id: str) -> List[str]:
+        if not conversation_id:
+            return []
+        memory = self.get_existing_conversation_memory(conversation_id)
+        if memory is None:
+            return []
+        return list(memory.seen_url_keys)
+
+    def get_seen_chunk_ids(self, conversation_id: str) -> List[str]:
+        if not conversation_id:
+            return []
+        memory = self.get_existing_conversation_memory(conversation_id)
+        if memory is None:
+            return []
+        return list(memory.seen_chunk_ids)
+
+    def merge_seen_history(
+        self,
+        *,
+        conversation_id: str,
+        url_keys: List[str],
+        chunk_ids: List[str],
+    ) -> None:
+        if not conversation_id:
+            return
+        memory = self.get_conversation_memory(conversation_id)
+        merged_url_keys = list(
+            dict.fromkeys(
+                list(memory.seen_url_keys)
+                + [key for key in url_keys if str(key or "").strip()]
+            )
+        )
+        merged_chunk_ids = list(
+            dict.fromkeys(
+                list(memory.seen_chunk_ids)
+                + [chunk_id for chunk_id in chunk_ids if str(chunk_id or "").strip()]
+            )
+        )
+        memory.seen_url_keys = merged_url_keys[-self._seen_url_cap :]
+        memory.seen_chunk_ids = merged_chunk_ids[-self._seen_chunk_cap :]
 
     def persist_finalized_turn(
         self,
@@ -47,14 +121,43 @@ class NewsWorkingMemoryManager(
         turn_index: int,
         chunks: List[RetrievedChunk],
         source_key_fn: Callable[[RetrievedChunk], str],
+        seen_url_keys: List[str] | None = None,
+        seen_chunk_ids: List[str] | None = None,
     ) -> None:
         if not conversation_id:
             return
         self.merge_working_chunks(conversation_id=conversation_id, chunks=chunks)
-        source_urls = list(
+        source_urls = []
+        for chunk in chunks:
+            raw_source_url = source_key_fn(chunk)
+            if not raw_source_url:
+                continue
+            source_urls.append(raw_source_url)
+        source_urls = list(dict.fromkeys(source_urls))
+        scoped_seen_url_keys = list(
             dict.fromkeys(
-                source_key_fn(chunk) for chunk in chunks if source_key_fn(chunk)
+                key
+                for key in (
+                    seen_url_keys
+                    or [self.canonicalize_url_key(url) for url in source_urls]
+                )
+                if str(key or "").strip()
             )
+        )
+        scoped_seen_chunk_ids = list(
+            dict.fromkeys(
+                chunk_id
+                for chunk_id in (
+                    seen_chunk_ids
+                    or [chunk.chunk_id for chunk in chunks if chunk.chunk_id]
+                )
+                if str(chunk_id or "").strip()
+            )
+        )
+        self.merge_seen_history(
+            conversation_id=conversation_id,
+            url_keys=scoped_seen_url_keys,
+            chunk_ids=scoped_seen_chunk_ids,
         )
         self.append_turn_record(
             conversation_id=conversation_id,
@@ -64,6 +167,8 @@ class NewsWorkingMemoryManager(
                 turn_index=turn_index,
                 chunk_ids=[chunk.chunk_id for chunk in chunks if chunk.chunk_id],
                 source_urls=source_urls,
+                seen_url_keys=scoped_seen_url_keys[-self._seen_url_cap :],
+                seen_chunk_ids=scoped_seen_chunk_ids[-self._seen_chunk_cap :],
             ),
         )
 

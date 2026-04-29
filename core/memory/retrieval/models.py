@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
 from langchain_core.documents import Document
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.agents.utils import trim_text
-
 
 class NodeSelectionOutput(BaseModel):
     """Structured output for selecting nodes to expand."""
@@ -28,6 +26,7 @@ class RetrieverState(TypedDict):
     current_frontier: List[str]
     iteration: int
     should_continue: bool
+    selected_neighbor_relationships: Dict[str, List[Dict[str, Any]]]
     run_id: str
     parent_run_id: Optional[str]
     domain: str
@@ -148,7 +147,9 @@ class RetrievedChunk:
         score: Optional[float] = None,
         source: Literal["vector", "graph"] = "vector",
         domain: Optional[str] = None,
-        relevance_source: Optional[Literal["jina", "tavily", "vector", "composite"]] = None,
+        relevance_source: Optional[
+            Literal["jina", "tavily", "vector", "composite"]
+        ] = None,
     ) -> "RetrievedChunk":
         metadata = document.metadata or {}
         chunk_id = document.id or metadata.get("chunk_id") or ""
@@ -191,7 +192,9 @@ class RetrievedChunk:
             graph_depth = chunk.graph_depth if chunk.graph_depth > 0 else 1
         else:
             embedding_score = (
-                float(chunk.relevance_score) if chunk.relevance_score is not None else 0.0
+                float(chunk.relevance_score)
+                if chunk.relevance_score is not None
+                else 0.0
             )
             graph_depth = 0
 
@@ -202,37 +205,16 @@ class RetrievedChunk:
                 "graph_depth": graph_depth,
             }
         )
-        if normalized.relevance_source is None and normalized.relevance_score is not None:
+        if (
+            normalized.relevance_source is None
+            and normalized.relevance_score is not None
+        ):
             normalized.relevance_source = "vector"
         return normalized
 
     def _source_key(self) -> str:
         metadata = self.metadata or {}
         return str(metadata.get("source_url") or self.source_url or "").strip()
-
-    @staticmethod
-    def _chunks_block(chunks: List["RetrievedChunk"], *, limit: int = 12) -> str:
-        if not chunks:
-            return "(none)"
-        lines: List[str] = []
-        for chunk in chunks[:limit]:
-            title = (
-                chunk.article_title
-                or (chunk.metadata or {}).get("article_title")
-                or "Unknown"
-            )
-            url = chunk._source_key() or "no-url"
-            relevance = chunk.relevance_score
-            relevance_text = "N/A" if relevance is None else f"{relevance:.4f}"
-            preview = (chunk.text or "").replace("\n", " ")
-            preview = trim_text(preview, max_chars=160)
-            lines.append(
-                f"- chunk_id={chunk.chunk_id} | title={title} | date={chunk.date_tag or 'N/A'} | source={url} | "
-                f"relevance_score={relevance_text}\n  text={preview}"
-            )
-        if len(chunks) > limit:
-            lines.append(f"... and {len(chunks) - limit} more chunk(s)")
-        return "\n".join(lines)
 
     @staticmethod
     def _build_deduplicated_sources(
@@ -271,6 +253,27 @@ class RetrievedChunk:
                 )
             )
         return sources, chunk_to_source_id
+
+    @staticmethod
+    def _dedupe_chunks(chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        by_id: Dict[str, RetrievedChunk] = {}
+        fallback_chunks: List[RetrievedChunk] = []
+        for chunk in chunks:
+            chunk_id = (chunk.chunk_id or "").strip()
+            if not chunk_id:
+                fallback_chunks.append(chunk)
+                continue
+            existing = by_id.get(chunk_id)
+            if existing is None:
+                by_id[chunk_id] = chunk
+                continue
+            incoming_score = chunk.relevance_score
+            existing_score = existing.relevance_score
+            if incoming_score is not None and (
+                existing_score is None or incoming_score > existing_score
+            ):
+                by_id[chunk_id] = chunk
+        return list(by_id.values()) + fallback_chunks
 
     @staticmethod
     def _build_chunk_alias_maps(
@@ -320,10 +323,12 @@ class NeighborCandidate:
     """Typed representation of one row returned by Neo4jAdapter.get_entity_neighbors()."""
 
     source_entity_id: str
+    source_entity_name: str
     neighbor_entity_id: str
     neighbor_name: str
     neighbor_type: str
     relationship_type: str
+    relationship_reason: Optional[str] = None
 
 
 @dataclass

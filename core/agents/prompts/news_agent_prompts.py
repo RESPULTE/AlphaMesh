@@ -1,6 +1,7 @@
-from core.agents.prompts.relationship_extraction_prompts import (
-    build_relationships_block,
-)
+from __future__ import annotations
+
+import json
+from typing import Sequence
 
 NEWS_PLANNER_SYSTEM_PROMPT = """\
 You are a retrieval planner for a financial news analysis agent.
@@ -27,10 +28,9 @@ You are a rigorous qualitative financial-investing analysis agent and context su
 
 Input includes:
 1. Current analysis goal
-2. Domain-grouped evidence context for the current iteration
-3. Separate ungrouped working-memory evidence
-4. Optional company/agent memory context
-5. Iteration metadata (current iteration and max iterations)
+2. Article-grouped evidence context for the current iteration
+3. Optional company/agent memory context
+4. Iteration metadata (current iteration and max iterations)
 
 You must return structured output with:
 - is_context_sufficient: boolean
@@ -100,7 +100,93 @@ NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES = (
 )
 
 
-NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = f"""\
+def _build_relationship_schema_for_news_prompt(
+    *,
+    allowed_entity_types: Sequence[str],
+    allowed_relationship_types: Sequence[str],
+) -> str:
+    entity_types = [str(item).strip() for item in allowed_entity_types if str(item).strip()]
+    relationship_types = [
+        str(item).strip() for item in allowed_relationship_types if str(item).strip()
+    ]
+    schema: dict = {
+        "type": "object",
+        "title": "Relationship",
+        "description": "Schema for one relationship item expected inside <relationships>.",
+        "properties": {
+            "from_name": {"title": "From Name", "type": "string"},
+            "from_type": {
+                "title": "From Type",
+                "type": "string",
+                "enum": entity_types,
+            },
+            "relationship_type": {
+                "title": "Relationship Type",
+                "type": "string",
+                "enum": relationship_types,
+            },
+            "to_name": {"title": "To Name", "type": "string"},
+            "to_type": {
+                "title": "To Type",
+                "type": "string",
+                "enum": entity_types,
+            },
+            "confidence": {
+                "title": "Confidence",
+                "type": "string",
+                "enum": ["high", "low"],
+                "description": '"high" for explicit evidence, "low" for inferred.',
+            },
+            "reason": {
+                "title": "Reason",
+                "type": "string",
+                "description": "1-2 short sentences explaining the relationship.",
+            },
+        },
+        "required": [
+            "from_name",
+            "from_type",
+            "relationship_type",
+            "to_name",
+            "to_type",
+            "confidence",
+            "reason",
+        ],
+        "additionalProperties": False,
+    }
+    rendered = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
+    return rendered.replace("{", "{{").replace("}", "}}")
+
+
+def _build_news_relationships_block(
+    *,
+    include_context_only_rule: bool,
+    allowed_entity_types: Sequence[str],
+    allowed_relationship_types: Sequence[str],
+) -> str:
+    context_only_rule = (
+        "\nOnly reference entity names that appear in the context. Do NOT create new entities."
+        if include_context_only_rule
+        else ""
+    )
+    return f"""\
+    <relationships>
+        [JSON array of relationships between entities already mentioned in the analysis.{context_only_rule}
+        Output MUST match this JSON Schema:
+        {_build_relationship_schema_for_news_prompt(
+            allowed_entity_types=allowed_entity_types,
+            allowed_relationship_types=allowed_relationship_types,
+        )}]
+    </relationships>
+""".strip()
+
+
+def build_news_deferred_relationship_system_prompt(
+    *,
+    allowed_entity_types: Sequence[str],
+    allowed_relationship_types: Sequence[str],
+) -> str:
+    return f"""\
 You are a graph relationship extractor for financial NEWS analysis outputs.
 
 Input will be a completed news-analysis narrative. Extract only relationships
@@ -118,7 +204,11 @@ Rules:
 - If no clear relationship exists, return an empty array in <relationships>.
 
 Return ONLY:
-{build_relationships_block(include_context_only_rule=True)}
+{_build_news_relationships_block(
+    include_context_only_rule=True,
+    allowed_entity_types=allowed_entity_types,
+    allowed_relationship_types=allowed_relationship_types,
+)}
 """.strip()
 
 
@@ -128,11 +218,8 @@ Goal: {goal}
 Iteration: {iteration}/{max_iterations}
 Forced final pass: {forced_final_pass}
 
-{entities_section}Domain-grouped evidence (current iteration; fetched + memory retrieval):
-{grouped_context}
-
-Working-memory evidence (ungrouped):
-{working_memory_context}
+{entities_section}Article-grouped evidence (deduplicated across working memory + current retrieval):
+{article_context}
 
 Return structured output only.
 """.strip()

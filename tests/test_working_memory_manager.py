@@ -131,42 +131,38 @@ def test_news_manager_persists_turn_with_deduped_sources_and_score_flag() -> Non
 
     manager.persist_finalized_turn(
         conversation_id="conv-news",
-        turn_id="turn-1",
-        query="AAPL catalysts",
+        turn_index=1,
         chunks=[
             _make_chunk("chunk-1", "https://news/1"),
             _make_chunk("chunk-2", "https://news/1"),
             _make_chunk("chunk-3", "https://news/2"),
         ],
-        score_unavailable=True,
         source_key_fn=lambda chunk: str(chunk.source_url or "").strip(),
     )
 
     memory = manager.get_conversation_memory("conv-news")
     assert len(memory.turn_records) == 1
     row = memory.turn_records[0]
+    assert row.turn_id == "1"
     assert row.chunk_ids == ["chunk-1", "chunk-2", "chunk-3"]
     assert row.source_urls == ["https://news/1", "https://news/2"]
-    assert row.score_unavailable is True
+    assert memory.seen_url_keys == ["https://news/1", "https://news/2"]
+    assert memory.seen_chunk_ids == ["chunk-1", "chunk-2", "chunk-3"]
 
 
 def test_news_manager_render_working_memory_block_is_stable() -> None:
     manager = NewsWorkingMemoryManager(max_chunks=10, max_turns=10)
     manager.persist_finalized_turn(
         conversation_id="conv-render",
-        turn_id="turn-1",
-        query="MSFT guidance",
+        turn_index=1,
         chunks=[_make_chunk("chunk-1", "https://news/msft")],
-        score_unavailable=False,
         source_key_fn=lambda chunk: str(chunk.source_url or "").strip(),
     )
 
     block = manager.render_working_memory_block("conv-render", turn_limit=4)
-    assert "turn=turn-1" in block
-    assert "query=MSFT guidance" in block
+    assert "turn_index=1" in block
     assert "relevant_chunks=1" in block
     assert "relevant_sources=1" in block
-    assert "score_unavailable=False" in block
 
 
 def test_news_manager_build_context_from_history_summaries_is_stable() -> None:
@@ -201,7 +197,47 @@ def test_news_manager_build_context_from_history_summaries_is_stable() -> None:
     assert "[2026-04-26T00:00:00+00:00]" in block
     assert "actions=newsapi" in block
     assert "actions=web_search" in block
-    assert "catalyst=Mixed follow-through." in block
+    assert "sentiment=NEUTRAL" in block
+
+
+def test_news_manager_seen_history_canonicalizes_urls_and_enforces_caps() -> None:
+    manager = NewsWorkingMemoryManager(
+        max_chunks=10,
+        max_turns=10,
+        seen_url_cap=2,
+        seen_chunk_cap=3,
+    )
+    manager.merge_seen_history(
+        conversation_id="conv-cap",
+        url_keys=[
+            manager.canonicalize_url_key("https://EXAMPLE.com/a?utm_source=x#fragment"),
+            manager.canonicalize_url_key("https://example.com/b?x=1"),
+        ],
+        chunk_ids=["c1", "c2"],
+    )
+    manager.merge_seen_history(
+        conversation_id="conv-cap",
+        url_keys=[
+            manager.canonicalize_url_key("https://example.com/a?again=1"),
+            manager.canonicalize_url_key("https://example.com/c"),
+        ],
+        chunk_ids=["c2", "c3", "c4"],
+    )
+
+    assert manager.get_seen_url_keys("conv-cap") == [
+        "https://example.com/b",
+        "https://example.com/c",
+    ]
+    assert manager.get_seen_chunk_ids("conv-cap") == ["c2", "c3", "c4"]
+
+
+def test_news_manager_default_working_chunk_cap_is_config_driven() -> None:
+    manager = NewsWorkingMemoryManager()
+    chunks = [_make_chunk(f"chunk-{idx}", f"https://news/{idx}") for idx in range(40)]
+    manager.merge_working_chunks(conversation_id="conv-limit", chunks=chunks)
+    stored = manager.get_working_memory_chunks("conv-limit")
+    assert len(stored) == 30
+    assert stored[0].chunk_id == "chunk-10"
 
 
 def test_fundamental_manager_persists_counts_and_batch_records() -> None:
