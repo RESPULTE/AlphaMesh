@@ -178,7 +178,6 @@ def test_analyse_news_node_includes_planner_chunk_rationales_in_prompt(
         ],
         planner_decision=PlannerDecision(
             action="proceed",
-            proceed_to_analysis=True,
             relevant_chunks=[
                 {"chunk_id": "chunk-a", "reason": "Directly answers catalyst timing."},
                 {"chunk_id": "chunk-b", "reason": "Provides counter-signal risk detail."},
@@ -336,7 +335,6 @@ def test_planner_node_filters_selected_chunks(
 ) -> None:
     planner_payload = {
         "action": "proceed",
-        "proceed_to_analysis": True,
         "queries": [],
         "rationale": "Current context is enough.",
         "relevant_chunks": [
