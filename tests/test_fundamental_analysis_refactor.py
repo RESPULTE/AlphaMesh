@@ -5,6 +5,7 @@ import asyncio
 import pandas as pd
 import pytest
 
+from core.agents.financial_tools import ToolResult
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.fundamental_agent_models import (
@@ -486,6 +487,143 @@ def test_task_summary_node_records_batch_summary() -> None:
     summary: FundamentalTaskSummary = result["task_summaries"][0]
     assert summary.task_id == "fund-task-1"
     assert summary.output_row_labels == ["Revenues CAGR"]
+
+
+def test_task_summary_node_marks_failure_from_executor_logs() -> None:
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    state = _AgentState(
+        active_task_id="fund-task-2",
+        active_task_completed=True,  # should be ignored by summary logic now
+        last_batch_failed=True,
+        executor_logs=[
+            ExecutorBatchLog(
+                batch_index=1,
+                batch_reasoning="Compute derived metric.",
+                calls=[
+                    ExecutorToolLog(
+                        tool_name="custom_formula",
+                        parameters={"formula": "A-B"},
+                        success=False,
+                        error="Missing row B",
+                        output_row_labels=[],
+                    )
+                ],
+            )
+        ],
+        task_summaries=[],
+    )
+    result = asyncio.run(agent._task_summary_node(state))
+    summary: FundamentalTaskSummary = result["task_summaries"][0]
+    assert summary.task_id == "fund-task-2"
+    assert summary.success is False
+
+
+def test_task_summary_node_no_active_task_is_noop() -> None:
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    state = _AgentState(
+        active_task_id="",
+        executor_logs=[
+            ExecutorBatchLog(batch_index=0, batch_reasoning="", calls=[])
+        ],
+        task_summaries=[],
+    )
+    result = asyncio.run(agent._task_summary_node(state))
+    assert result == {}
+
+
+def test_should_continue_router_parity() -> None:
+    plan = IterativeToolPlan(
+        batches=[
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="cagr",
+                        parameters={"metric": "Revenues"},
+                        reasoning="Batch 0",
+                    )
+                ],
+                batch_reasoning="Batch 0",
+            ),
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="cagr",
+                        parameters={"metric": "NetIncomeLoss"},
+                        reasoning="Batch 1",
+                    )
+                ],
+                batch_reasoning="Batch 1",
+            ),
+        ],
+        data_summary="Two-step plan",
+    )
+
+    fail_state = _AgentState(
+        tool_plan=plan,
+        current_batch_index=1,
+        iteration_count=1,
+        last_batch_failed=True,
+        tool_results=[ToolResult(tool_name="cagr", success=False, error="boom")],
+    )
+    assert FundamentalAnalysisAgent._should_continue(fail_state) == "replan"
+
+    next_state = _AgentState(
+        tool_plan=plan,
+        current_batch_index=1,
+        iteration_count=1,
+        last_batch_failed=False,
+        tool_results=[ToolResult(tool_name="cagr", success=True, summary="ok")],
+    )
+    assert FundamentalAnalysisAgent._should_continue(next_state) == "next_batch"
+
+    done_state = _AgentState(
+        tool_plan=IterativeToolPlan(
+            batches=[plan.batches[0]],
+            data_summary="Single batch",
+        ),
+        current_batch_index=1,
+        iteration_count=1,
+        last_batch_failed=False,
+        tool_results=[ToolResult(tool_name="cagr", success=True, summary="ok")],
+    )
+    assert FundamentalAnalysisAgent._should_continue(done_state) == "done"
+
+
+def test_build_graph_routes_executor_directly_to_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    class _FakeStateGraph:
+        last_instance = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.nodes = []
+            self.edges = []
+            self.conditional = []
+            _FakeStateGraph.last_instance = self
+
+        def add_node(self, name, fn):
+            self.nodes.append((name, fn))
+
+        def add_edge(self, src, dst):
+            self.edges.append((src, dst))
+
+        def add_conditional_edges(self, src, router, mapping):
+            self.conditional.append((src, router, mapping))
+
+        def compile(self):
+            return self
+
+    monkeypatch.setattr(module, "StateGraph", _FakeStateGraph)
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    _ = agent._build_graph()
+    fake_graph = _FakeStateGraph.last_instance
+    node_names = [name for name, _fn in fake_graph.nodes]
+
+    assert "task_check" not in node_names
+    assert ("tool_executor", "task_summary") in fake_graph.edges
+    assert ("tool_executor", "task_check") not in fake_graph.edges
 
 
 def test_render_memory_summary_delegates_to_manager() -> None:

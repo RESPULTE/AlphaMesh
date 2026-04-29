@@ -588,6 +588,44 @@ class FinancialDatabase:
             await db.commit()
         logger.info("[DB] Save complete.")
 
+    async def persist_computed_rows(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        row_labels: List[str],
+        form_type: str,
+    ) -> int:
+        """
+        Persist newly computed time-series rows under statement_type='computed'.
+
+        Returns the number of records inserted.
+        """
+        records = []
+        for label in row_labels:
+            if label not in df.index:
+                continue
+            row = df.loc[label].dropna()
+            # Skip scalar/single-period rows to keep DB focused on time series.
+            if len(row) < 2:
+                continue
+            for date_col, value in row.items():
+                records.append(
+                    {
+                        "company": ticker.upper(),
+                        "period_date": str(date_col),
+                        "form_type": form_type,
+                        "statement_type": "computed",
+                        "label": label,
+                        "value": float(value),
+                    }
+                )
+
+        if not records:
+            return 0
+
+        await self._bulk_insert(pd.DataFrame(records))
+        return len(records)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers

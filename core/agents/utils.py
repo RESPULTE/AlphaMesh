@@ -3,10 +3,18 @@ import json
 import re
 from asyncio.log import logger
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import pandas as pd
 from langchain_core.messages import BaseMessage, HumanMessage
 
+from core.agents.financial_tools import ToolResult
+from core.agents.models.fundamental_agent_models import (
+    ChartSpec,
+    CompletionReviewDecision,
+    ExecutorBatchLog,
+    VisualizationPlan,
+)
 
 MAX_TURN_TEXT_CHARS = 360
 
@@ -312,3 +320,236 @@ def _build_combined_company_context(
     """
     blocks = [context_blocks[t] for t in tickers if t in context_blocks]
     return "\n\n---\n\n".join(blocks) if blocks else None
+
+
+def effective_goal(state: Any) -> str:
+    text = (getattr(state, "goal", None) or getattr(state, "query", "") or "").strip()
+    if text:
+        return text
+    return "Perform fundamental analysis for the provided ticker."
+
+
+def executor_logs_to_text(logs: List[ExecutorBatchLog]) -> str:
+    if not logs:
+        return "(none)"
+    lines: List[str] = []
+    for batch in logs[-20:]:
+        lines.append(
+            f"Batch {batch.batch_index} | reasoning: {batch.batch_reasoning or '(none)'}"
+        )
+        for call in batch.calls:
+            status = "SUCCESS" if call.success else f"FAILURE ({call.error or ''})"
+            lines.append(
+                f"  - {call.tool_name} | {status} | params={call.parameters} | "
+                f"rows={call.output_row_labels} | summary={call.summary}"
+            )
+    return "\n".join(lines)
+
+
+def tool_results_to_text(results: List[ToolResult]) -> str:
+    if not results:
+        return "(none)"
+    return "\n".join(
+        f"[{r.tool_name}] {'SUCCESS' if r.success else 'FAILURE'} | "
+        f"summary={r.summary or ''} | error={r.error or ''}"
+        for r in results[-100:]
+    )
+
+
+def dedupe_preserve_order(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def normalise_data_mode(data_mode: str) -> str:
+    normalised = (data_mode or "").strip().lower()
+    if normalised in {"timeseries", "snapshot"}:
+        return normalised
+    return "timeseries"
+
+
+def normalise_snapshot_period(snapshot_period: str) -> str:
+    value = (snapshot_period or "").strip()
+    return value or "latest"
+
+
+def normalise_chart_spec(
+    chart: ChartSpec,
+    *,
+    supported_chart_types: Set[str],
+    snapshot_unsupported_types: Set[str],
+) -> Tuple[str, str, str]:
+    data_mode = normalise_data_mode(chart.data_mode)
+    requested_type = (chart.chart_type or "").strip().lower()
+
+    if requested_type not in supported_chart_types:
+        requested_type = "bar" if data_mode == "snapshot" else "line"
+
+    chart_type = requested_type
+    if chart_type == "pie":
+        data_mode = "snapshot"
+    if data_mode == "snapshot" and chart_type in snapshot_unsupported_types:
+        chart_type = "bar"
+
+    snapshot_period = normalise_snapshot_period(chart.snapshot_period)
+    return chart_type, data_mode, snapshot_period
+
+
+def extract_relevant_rows(
+    state: Any,
+    financial_data: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Deterministically select DataFrame rows relevant to fundamentals analysis.
+
+    Sources:
+    1. selected_row_labels from no-tools plans.
+    2. Tool call parameter values matching existing row labels.
+    3. added_rows keys from successful tool outputs.
+    """
+    labels: set[str] = set()
+    available_index: list[str] = list(financial_data.index)
+    available_set: set[str] = set(available_index)
+
+    plan = getattr(state, "tool_plan", None)
+    if plan is not None:
+        for label in getattr(plan, "selected_row_labels", []) or []:
+            if label in available_set:
+                labels.add(label)
+
+        for batch in getattr(plan, "batches", []) or []:
+            for spec in getattr(batch, "calls", []) or []:
+                parameters = getattr(spec, "parameters", {}) or {}
+                for value in parameters.values():
+                    if isinstance(value, str) and value in available_set:
+                        labels.add(value)
+                    elif isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, str) and item in available_set:
+                                labels.add(item)
+
+    for result in getattr(state, "tool_results", []) or []:
+        if getattr(result, "success", False) and getattr(result, "added_rows", None):
+            for row_label in result.added_rows:
+                if row_label in available_set:
+                    labels.add(row_label)
+
+    if not labels:
+        return financial_data
+
+    ordered = [lbl for lbl in available_index if lbl in labels]
+    return financial_data.loc[ordered]
+
+
+def sanitize_visualization_plan(
+    *,
+    state: Any,
+    financial_data: pd.DataFrame,
+    decision: CompletionReviewDecision,
+    max_rows_per_chart: int,
+    max_raw_rows: int,
+    supported_chart_types: Set[str],
+    snapshot_unsupported_types: Set[str],
+) -> Tuple[VisualizationPlan, pd.DataFrame]:
+    available_index: List[str] = list(financial_data.index)
+    available_set: Set[str] = set(available_index)
+    used_chart_rows: Set[str] = set()
+    sanitized_charts: List[ChartSpec] = []
+
+    for chart in decision.charts:
+        chart_type, data_mode, snapshot_period = normalise_chart_spec(
+            chart,
+            supported_chart_types=supported_chart_types,
+            snapshot_unsupported_types=snapshot_unsupported_types,
+        )
+        candidate_rows = dedupe_preserve_order(
+            [
+                row
+                for row in (chart.row_labels or [])
+                if isinstance(row, str)
+                and row in available_set
+                and row not in used_chart_rows
+            ]
+        )
+        if not candidate_rows:
+            continue
+        candidate_rows = candidate_rows[:max_rows_per_chart]
+
+        if chart.group_rows:
+            sanitized_charts.append(
+                ChartSpec(
+                    chart_type=chart_type,
+                    data_mode=data_mode,
+                    snapshot_period=snapshot_period,
+                    title=(chart.title or "Financial Trend").strip(),
+                    row_labels=candidate_rows,
+                    group_rows=True,
+                    rationale=chart.rationale,
+                )
+            )
+            used_chart_rows.update(candidate_rows)
+            continue
+
+        for row_label in candidate_rows:
+            sanitized_charts.append(
+                ChartSpec(
+                    chart_type=chart_type,
+                    data_mode=data_mode,
+                    snapshot_period=snapshot_period,
+                    title=(chart.title or row_label).strip(),
+                    row_labels=[row_label],
+                    group_rows=False,
+                    rationale=chart.rationale,
+                )
+            )
+            used_chart_rows.add(row_label)
+
+    if not sanitized_charts:
+        fallback_df = extract_relevant_rows(state, financial_data)
+        fallback_rows = [row for row in fallback_df.index if row in available_set]
+        fallback_rows = fallback_rows[:max_rows_per_chart]
+        if not fallback_rows and available_index:
+            fallback_rows = available_index[:max_rows_per_chart]
+        if fallback_rows:
+            sanitized_charts = [
+                ChartSpec(
+                    chart_type="line",
+                    data_mode="timeseries",
+                    snapshot_period="latest",
+                    title="Key Financial Trends",
+                    row_labels=fallback_rows,
+                    group_rows=True,
+                    rationale="Fallback visualisation because no valid chart rows were selected.",
+                )
+            ]
+
+    raw_row_labels = dedupe_preserve_order(
+        [
+            row
+            for row in (decision.raw_row_labels or [])
+            if isinstance(row, str) and row in available_set
+        ]
+    )
+    if not raw_row_labels:
+        fallback_raw_df = extract_relevant_rows(state, financial_data)
+        raw_row_labels = [row for row in fallback_raw_df.index if row in available_set]
+    raw_row_labels = raw_row_labels[:max_raw_rows]
+
+    raw_display_df = (
+        financial_data.loc[raw_row_labels]
+        if raw_row_labels
+        else pd.DataFrame(columns=financial_data.columns)
+    )
+
+    visualization_plan = VisualizationPlan(
+        charts=sanitized_charts,
+        raw_row_labels=raw_row_labels,
+        reviewer_notes=decision.reviewer_notes,
+    )
+    return visualization_plan, raw_display_df

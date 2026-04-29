@@ -33,8 +33,7 @@ Everything else is unchanged.
 from __future__ import annotations
 
 import asyncio
-import re
-from typing import Any, Dict, List, Set, Tuple, Type
+from typing import Any, Dict, List, Set, Type
 from uuid import uuid4
 
 import pandas as pd
@@ -76,7 +75,12 @@ from core.agents.prompts.fundamental_agent_prompts import (
     _TOOL_PLANNER_USER,
 )
 from core.agents.utils import (
+    effective_goal,
+    executor_logs_to_text,
+    extract_relevant_rows,
     extract_first_sentence,
+    sanitize_visualization_plan,
+    tool_results_to_text,
 )
 from core.agents.working_memory.fundamental_working_memory import (
     FundamentalWorkingMemoryManager,
@@ -173,13 +177,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
             history_turns, window=window
         )
 
-    @staticmethod
-    def _effective_goal(state: _AgentState) -> str:
-        text = (state.goal or state.query or "").strip()
-        if text:
-            return text
-        return "Perform fundamental analysis for the provided ticker."
-
     # ── Public entry point ────────────────────────────────────────────────────
 
     async def run(self, input_data: BaseAgentInput) -> FundamentalAnalysisOutput:
@@ -246,7 +243,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
         workflow.add_node("data_prep", self._data_prep_node)
         workflow.add_node("tool_planner", self._tool_planner_node)
         workflow.add_node("tool_executor", self._tool_executor_node)
-        workflow.add_node("task_check", self._task_check_node)
         workflow.add_node("task_summary", self._task_summary_node)
         workflow.add_node("completion_review", self._completion_review_node)
         workflow.add_node("analyst", self._analyst_node)
@@ -254,8 +250,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         workflow.add_edge(START, "data_prep")
         workflow.add_edge("data_prep", "tool_planner")
         workflow.add_edge("tool_planner", "tool_executor")
-        workflow.add_edge("tool_executor", "task_check")
-        workflow.add_edge("task_check", "task_summary")
+        workflow.add_edge("tool_executor", "task_summary")
 
         # ── Routing: advance batch, re-plan on failure, or proceed to analyst ─
         workflow.add_conditional_edges(
@@ -320,9 +315,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
             batch = plan.get_batch(state.current_batch_index - 1)
             n_calls = len(batch.calls)
             current_results = (state.tool_results or [])[-n_calls:]
-            if (not state.active_task_completed) or any(
+            batch_failed = state.last_batch_failed or any(
                 not r.success for r in current_results
-            ):
+            )
+            if batch_failed:
                 logger.info(
                     "[Router] Failure in batch %d — re-planning. Iteration %d/%d",
                     state.current_batch_index - 1,
@@ -427,7 +423,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         """
         logger.info(
             "[Node] tool_planner — %s%s",
-            self._effective_goal(state),
+            effective_goal(state),
             (
                 " [RE-PLANNING]"
                 if (state.last_batch_failed or state.completion_replan_guidance)
@@ -493,7 +489,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         tasklist_cap = max(1, int(settings.FUNDAMENTAL_AGENT_TASKLIST_MAX_ITEMS))
         user_msg = _TOOL_PLANNER_USER.format(
-            goal=self._effective_goal(state),
+            goal=effective_goal(state),
             ticker=state.ticker or "N/A",
             start_date=(
                 state.start_date.strftime("%Y-%m-%d") if state.start_date else "N/A"
@@ -664,16 +660,24 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         # ── Persist new time-series rows to SQLite ────────────────────────────
         if newly_added_labels and not df.empty:
-            await self._persist_computed_rows(
-                ticker=state.ticker,
-                df=df,
-                row_labels=newly_added_labels,
-                form_type=(
-                    "10-K"
-                    if getattr(state, "granularity", "yearly") == "yearly"
-                    else "10-Q"
-                ),
-            )
+            db = getattr(self, "db", None)
+            if db is not None:
+                persisted_count = await db.persist_computed_rows(
+                    ticker=state.ticker,
+                    df=df,
+                    row_labels=newly_added_labels,
+                    form_type=(
+                        "10-K"
+                        if getattr(state, "granularity", "yearly") == "yearly"
+                        else "10-Q"
+                    ),
+                )
+                if persisted_count:
+                    logger.info(
+                        "[persist] Saved %d computed rows for %s.",
+                        persisted_count,
+                        state.ticker,
+                    )
 
         updated_concepts = list(df.index) if not df.empty else state.available_concepts
         updated_computed = list(
@@ -715,16 +719,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "last_batch_failed": batch_failed,
         }
 
-    async def _task_check_node(self, state: _AgentState) -> Dict:
-        """Validate completion state for the currently executed task item."""
-        if not state.active_task_id:
-            return {"active_task_completed": True}
-        if not state.executor_logs:
-            return {"active_task_completed": False}
-        latest_batch = state.executor_logs[-1]
-        success = all(call.success for call in latest_batch.calls)
-        return {"active_task_completed": success}
-
     async def _task_summary_node(self, state: _AgentState) -> Dict:
         """Summarize one completed fundamentals task item (batch)."""
         if not state.active_task_id:
@@ -745,46 +739,16 @@ class FundamentalAnalysisAgent(AbstractAgent):
             task_id=state.active_task_id,
             batch_index=latest_batch.batch_index,
             outcome_summary=outcome_summary,
-            success=bool(state.active_task_completed),
+            success=(
+                (not state.last_batch_failed)
+                and all(call.success for call in latest_batch.calls)
+            ),
             output_row_labels=row_labels,
         )
         return {
             "task_summaries": list(state.task_summaries) + [summary],
             "active_task_id": "",
         }
-
-    async def _persist_computed_rows(
-        self,
-        ticker: str,
-        df: pd.DataFrame,
-        row_labels: List[str],
-        form_type: str,
-    ) -> None:
-        """Saves newly computed time-series rows to SQLite under statement_type='computed'."""
-        records = []
-        for label in row_labels:
-            if label not in df.index:
-                continue
-            row = df.loc[label].dropna()
-            if len(row) < 2:
-                logger.debug("[persist] Skipping scalar/single-period row '%s'.", label)
-                continue
-            for date_col, value in row.items():
-                records.append(
-                    {
-                        "company": ticker.upper(),
-                        "period_date": str(date_col),
-                        "form_type": form_type,
-                        "statement_type": "computed",
-                        "label": label,
-                        "value": float(value),
-                    }
-                )
-        if records:
-            await self.db._bulk_insert(pd.DataFrame(records))
-            logger.info(
-                "[persist] Saved %d computed rows for %s.", len(records), ticker
-            )
 
     async def _completion_review_node(self, state: _AgentState) -> Dict:
         """
@@ -817,7 +781,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         data_preview = df.to_string(max_rows=max(20, max_raw_rows), float_format="%.4g")
         user_msg = _COMPLETION_REVIEW_USER.format(
-            goal=self._effective_goal(state),
+            goal=effective_goal(state),
             ticker=state.ticker or "N/A",
             iteration_count=state.iteration_count,
             max_iterations=MAX_TOOL_ITERATIONS,
@@ -825,8 +789,8 @@ class FundamentalAnalysisAgent(AbstractAgent):
             completion_replan_used=state.completion_review_replan_used,
             max_rows_per_chart=max_rows_per_chart,
             max_raw_rows=max_raw_rows,
-            executor_logs=self._executor_logs_to_text(state.executor_logs),
-            tool_results=self._tool_results_to_text(state.tool_results),
+            executor_logs=executor_logs_to_text(state.executor_logs),
+            tool_results=tool_results_to_text(state.tool_results),
             n_rows=len(available_rows),
             available_rows=available_rows_block or "  (none)",
             data_preview=data_preview,
@@ -854,12 +818,14 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 reviewer_notes="Completion review fallback path used.",
             )
 
-        visualization_plan, raw_display_df = self._sanitize_visualization_plan(
+        visualization_plan, raw_display_df = sanitize_visualization_plan(
             state=state,
             financial_data=df,
             decision=decision,
             max_rows_per_chart=max_rows_per_chart,
             max_raw_rows=max_raw_rows,
+            supported_chart_types=_SUPPORTED_CHART_TYPES,
+            snapshot_unsupported_types=_SNAPSHOT_UNSUPPORTED_TYPES,
         )
 
         should_replan = (
@@ -886,178 +852,6 @@ class FundamentalAnalysisAgent(AbstractAgent):
             ),
             "last_batch_failed": False,
         }
-
-    @staticmethod
-    def _executor_logs_to_text(logs: List[ExecutorBatchLog]) -> str:
-        if not logs:
-            return "(none)"
-        lines: List[str] = []
-        for batch in logs[-20:]:
-            lines.append(
-                f"Batch {batch.batch_index} | reasoning: {batch.batch_reasoning or '(none)'}"
-            )
-            for call in batch.calls:
-                status = "SUCCESS" if call.success else f"FAILURE ({call.error or ''})"
-                lines.append(
-                    f"  - {call.tool_name} | {status} | params={call.parameters} | "
-                    f"rows={call.output_row_labels} | summary={call.summary}"
-                )
-        return "\n".join(lines)
-
-    @staticmethod
-    def _tool_results_to_text(results: List[ToolResult]) -> str:
-        if not results:
-            return "(none)"
-        return "\n".join(
-            f"[{r.tool_name}] {'SUCCESS' if r.success else 'FAILURE'} | "
-            f"summary={r.summary or ''} | error={r.error or ''}"
-            for r in results[-100:]
-        )
-
-    @staticmethod
-    def _normalise_data_mode(data_mode: str) -> str:
-        normalised = (data_mode or "").strip().lower()
-        if normalised in {"timeseries", "snapshot"}:
-            return normalised
-        return "timeseries"
-
-    @staticmethod
-    def _normalise_snapshot_period(snapshot_period: str) -> str:
-        value = (snapshot_period or "").strip()
-        return value or "latest"
-
-    @classmethod
-    def _normalise_chart_spec(cls, chart: ChartSpec) -> Tuple[str, str, str]:
-        data_mode = cls._normalise_data_mode(chart.data_mode)
-        requested_type = (chart.chart_type or "").strip().lower()
-
-        # Contract fallback for unsupported chart_type.
-        if requested_type not in _SUPPORTED_CHART_TYPES:
-            requested_type = "bar" if data_mode == "snapshot" else "line"
-
-        chart_type = requested_type
-
-        # Contract: pie is snapshot-only.
-        if chart_type == "pie":
-            data_mode = "snapshot"
-
-        # Snapshot mode should default to bar-family renderers.
-        if data_mode == "snapshot" and chart_type in _SNAPSHOT_UNSUPPORTED_TYPES:
-            chart_type = "bar"
-
-        snapshot_period = cls._normalise_snapshot_period(chart.snapshot_period)
-        return chart_type, data_mode, snapshot_period
-
-    @staticmethod
-    def _dedupe_preserve_order(values: List[str]) -> List[str]:
-        out: List[str] = []
-        seen: Set[str] = set()
-        for value in values:
-            if value in seen:
-                continue
-            seen.add(value)
-            out.append(value)
-        return out
-
-    def _sanitize_visualization_plan(
-        self,
-        state: _AgentState,
-        financial_data: pd.DataFrame,
-        decision: CompletionReviewDecision,
-        max_rows_per_chart: int,
-        max_raw_rows: int,
-    ) -> Tuple[VisualizationPlan, pd.DataFrame]:
-        available_index: List[str] = list(financial_data.index)
-        available_set: Set[str] = set(available_index)
-        used_chart_rows: Set[str] = set()
-        sanitized_charts: List[ChartSpec] = []
-
-        for chart in decision.charts:
-            chart_type, data_mode, snapshot_period = self._normalise_chart_spec(chart)
-            candidate_rows = self._dedupe_preserve_order(
-                [
-                    r
-                    for r in (chart.row_labels or [])
-                    if isinstance(r, str) and r in available_set and r not in used_chart_rows
-                ]
-            )
-            if not candidate_rows:
-                continue
-            candidate_rows = candidate_rows[:max_rows_per_chart]
-
-            if chart.group_rows:
-                sanitized_charts.append(
-                    ChartSpec(
-                        chart_type=chart_type,
-                        data_mode=data_mode,
-                        snapshot_period=snapshot_period,
-                        title=(chart.title or "Financial Trend").strip(),
-                        row_labels=candidate_rows,
-                        group_rows=True,
-                        rationale=chart.rationale,
-                    )
-                )
-                used_chart_rows.update(candidate_rows)
-                continue
-
-            for row_label in candidate_rows:
-                sanitized_charts.append(
-                    ChartSpec(
-                        chart_type=chart_type,
-                        data_mode=data_mode,
-                        snapshot_period=snapshot_period,
-                        title=(chart.title or row_label).strip(),
-                        row_labels=[row_label],
-                        group_rows=False,
-                        rationale=chart.rationale,
-                    )
-                )
-                used_chart_rows.add(row_label)
-
-        if not sanitized_charts:
-            fallback_df = self._extract_relevant_rows(state, financial_data)
-            fallback_rows = [row for row in fallback_df.index if row in available_set]
-            fallback_rows = fallback_rows[:max_rows_per_chart]
-            if not fallback_rows and available_index:
-                fallback_rows = available_index[:max_rows_per_chart]
-            if fallback_rows:
-                sanitized_charts = [
-                    ChartSpec(
-                        chart_type="line",
-                        data_mode="timeseries",
-                        snapshot_period="latest",
-                        title="Key Financial Trends",
-                        row_labels=fallback_rows,
-                        group_rows=True,
-                        rationale="Fallback visualisation because no valid chart rows were selected.",
-                    )
-                ]
-                used_chart_rows.update(fallback_rows)
-
-        raw_row_labels = self._dedupe_preserve_order(
-            [
-                r
-                for r in (decision.raw_row_labels or [])
-                if isinstance(r, str) and r in available_set
-            ]
-        )
-        if not raw_row_labels:
-            fallback_raw_df = self._extract_relevant_rows(state, financial_data)
-            raw_row_labels = [row for row in fallback_raw_df.index if row in available_set]
-        raw_row_labels = raw_row_labels[:max_raw_rows]
-
-        raw_display_df = (
-            financial_data.loc[raw_row_labels]
-            if raw_row_labels
-            else pd.DataFrame(columns=financial_data.columns)
-        )
-
-        visualization_plan = VisualizationPlan(
-            charts=sanitized_charts,
-            raw_row_labels=raw_row_labels,
-            reviewer_notes=decision.reviewer_notes,
-        )
-        return visualization_plan, raw_display_df
 
     # ── Node: analyst ─────────────────────────────────────────────────────────
 
@@ -1109,7 +903,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             tool_summary = "\n".join(lines + reasoning_lines)
 
         # ── Deterministic row selection (no LLM) ─────────────────────────────
-        filtered_df = self._extract_relevant_rows(state, state.financial_data)
+        filtered_df = extract_relevant_rows(state, state.financial_data)
         logger.info(
             "[analyst] Selected %d/%d rows deterministically for query.",
             len(filtered_df),
@@ -1127,7 +921,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             else ""
         )
         analysis_prompt = (
-            f"Goal: {self._effective_goal(state)}\n\n"
+            f"Goal: {effective_goal(state)}\n\n"
             f"Ticker: {state.ticker}\n"
             f"{company_context_section}\n"
             f"{memory_context_section}\n"
@@ -1204,58 +998,3 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "raw_display_data": state.raw_display_data,
         }
 
-    def _extract_relevant_rows(
-        self,
-        state: _AgentState,
-        financial_data: pd.DataFrame,
-    ) -> pd.DataFrame:
-        """
-        Deterministically select the DataFrame rows relevant to this analysis.
-
-        Sources (in priority order):
-        1. No-tools path  — selected_row_labels from IterativeToolPlan.
-        2. Input rows     — every string / list-of-strings value inside each
-                            ToolCallSpec.parameters that matches an index label.
-        3. Output rows    — added_rows keys from every successful ToolResult.
-
-        Preserves the original DataFrame row ordering.
-        """
-        labels: set[str] = set()
-        available_index: list[str] = list(financial_data.index)
-        available_set: set[str] = set(available_index)
-
-        plan = state.tool_plan
-        if plan is not None:
-            # No-tools path: planner explicitly nominated the rows to analyse.
-            for label in plan.selected_row_labels or []:
-                if label in available_set:
-                    labels.add(label)
-
-            # Input rows: scan all parameter values in every ToolCallSpec.
-            for batch in plan.batches:
-                for spec in batch.calls:
-                    for v in spec.parameters.values():
-                        if isinstance(v, str) and v in available_set:
-                            labels.add(v)
-                        elif isinstance(v, list):
-                            for item in v:
-                                if isinstance(item, str) and item in available_set:
-                                    labels.add(item)
-
-        # Output rows: every row that a tool wrote back into the DataFrame.
-        for result in state.tool_results or []:
-            if result.success and result.added_rows:
-                for row_label in result.added_rows:
-                    if row_label in available_set:
-                        labels.add(row_label)
-
-        if not labels:
-            logger.warning(
-                "[analyst] _extract_relevant_rows: no labels resolved — "
-                "falling back to full DataFrame."
-            )
-            return financial_data
-
-        # Preserve original index ordering.
-        ordered = [lbl for lbl in available_index if lbl in labels]
-        return financial_data.loc[ordered]
