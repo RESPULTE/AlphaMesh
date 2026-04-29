@@ -42,8 +42,9 @@ class PlannerDecision(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    action: Literal["newsapi", "web_search", "proceed"] = Field(default="proceed")
-    proceed_to_analysis: bool = Field(default=False)
+    action: Literal["newsapi", "web_search", "proceed", "bypass"] = Field(
+        default="proceed"
+    )
     queries: List[DomainQuery] = Field(default_factory=list)
     rationale: str = Field(default="")
     max_results: int = Field(default=5, ge=1, le=20)

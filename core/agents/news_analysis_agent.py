@@ -180,7 +180,7 @@ class NewsAnalysisAgent(AbstractAgent):
         workflow.add_conditional_edges(
             "planner",
             self._route_after_planner,
-            ["analyse_news", "retrieve_memory", "fetch_and_ingest"],
+            ["analyse_news", "retrieve_memory", "fetch_and_ingest", END],
         )
         workflow.add_edge("fetch_and_ingest", "rendezvous")
         workflow.add_edge("retrieve_memory", "rendezvous")
@@ -191,11 +191,9 @@ class NewsAnalysisAgent(AbstractAgent):
     @staticmethod
     def _route_after_planner(state: NewsAgentState):
         decision = state.planner_decision
-        if (
-            decision is None
-            or decision.proceed_to_analysis
-            or decision.action == "proceed"
-        ):
+        if decision is not None and decision.action == "bypass":
+            return END
+        if decision is None or decision.action == "proceed":
             return "analyse_news"
         return [
             Send("retrieve_memory", state),
@@ -210,9 +208,7 @@ class NewsAnalysisAgent(AbstractAgent):
         goal = state.goal
         if at_limit:
             reason = f"Reached research iteration limit ({settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS})."
-            decision = PlannerDecision(
-                action="proceed", proceed_to_analysis=True, rationale=reason
-            )
+            decision = PlannerDecision(action="proceed", rationale=reason)
             publish_progress("news_agent", f"Research planning: {reason}")
             return {
                 "planner_decision": decision,
@@ -227,7 +223,6 @@ class NewsAnalysisAgent(AbstractAgent):
         ):
             decision = PlannerDecision(
                 action="web_search",
-                proceed_to_analysis=False,
                 queries=[DomainQuery(domain="company", query=goal)],
                 rationale=(
                     f"Cannot proceed yet: fewer than {_MIN_RELEVANT_DISTINCT_SOURCES} "
@@ -277,7 +272,6 @@ class NewsAnalysisAgent(AbstractAgent):
             if state.research_iteration == 0:
                 decision = PlannerDecision(
                     action="newsapi",
-                    proceed_to_analysis=False,
                     queries=[DomainQuery(domain="company", query=goal)],
                     rationale="Fallback to NewsAPI on planner failure.",
                     max_results=settings.NEWS_FETCH_MAX_ARTICLES,
@@ -285,19 +279,15 @@ class NewsAnalysisAgent(AbstractAgent):
             else:
                 decision = PlannerDecision(
                     action="web_search",
-                    proceed_to_analysis=False,
                     queries=[DomainQuery(domain="company", query=goal)],
                     rationale="Fallback web search after planner failure.",
                     max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
                 )
 
-        if decision.action != "proceed" and not decision.queries:
+        if decision.action not in {"proceed", "bypass"} and not decision.queries:
             decision = decision.model_copy(
                 update={"queries": [DomainQuery(domain="company", query=goal)]}
             )
-
-        if decision.action == "proceed":
-            decision = decision.model_copy(update={"proceed_to_analysis": True})
 
         if decision.action == "newsapi":
             max_results = max(
@@ -315,22 +305,38 @@ class NewsAnalysisAgent(AbstractAgent):
             filtered_chunks = state.final_chunks
 
         logger.info(
-            "_planner_node: iter=%d action=%s proceed=%s queries=%d",
+            "_planner_node: iter=%d action=%s queries=%d",
             state.research_iteration,
             decision.action,
-            decision.proceed_to_analysis,
             len(decision.queries),
         )
+        if decision.action == "bypass":
+            tools_used = ResearchStepLog._list_unique_actions(state.research_logs)
+            return {
+                "planner_decision": decision,
+                "is_information_sufficient": True,
+                "final_chunks": filtered_chunks,
+                "analysis": "",
+                "sources": [],
+                "entities_enriched": [],
+                "relationships_extracted": False,
+                "memory_summary": {
+                    "bypassed": True,
+                    "reason": (decision.rationale or "").strip(),
+                    "research_actions": tools_used,
+                    "tools_used": tools_used,
+                },
+            }
         return {
             "planner_decision": decision,
-            "is_information_sufficient": decision.proceed_to_analysis,
+            "is_information_sufficient": decision.action in {"proceed", "bypass"},
             "final_chunks": filtered_chunks,
         }
 
     async def _retrieve_memory_node(self, state: NewsAgentState) -> dict:
         """Retrieve relevant chunks from semantic memory using planner queries."""
         decision = state.planner_decision
-        if decision is None or decision.action == "proceed":
+        if decision is None or decision.action in {"proceed", "bypass"}:
             return {"memory_chunks": []}
 
         domain_queries: Dict[str, str] = {
@@ -370,7 +376,7 @@ class NewsAnalysisAgent(AbstractAgent):
     async def _fetch_and_ingest_node(self, state: NewsAgentState) -> dict:
         """Fetch articles for planner queries in parallel, then ingest and score."""
         decision = state.planner_decision
-        if decision is None or decision.action == "proceed":
+        if decision is None or decision.action in {"proceed", "bypass"}:
             return {"retrieved_chunks": state.retrieved_chunks}
 
         goal = state.goal

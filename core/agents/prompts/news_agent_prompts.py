@@ -17,18 +17,19 @@ You receive:
 
 You must produce one PlannerDecision object that does all of the following:
 1) Decide whether to proceed to analysis now.
-2) If not proceeding, choose the next tool action: "newsapi" or "web_search".
+2) If not proceeding, choose the next tool action: "newsapi" or "web_search", or "bypass" when the goal cannot be answered properly from available evidence.
 3) Write domain-specific queries for this iteration ("company", "sector", "market", "knowledge").
 4) When relevant, identify which chunk IDs are actually relevant to the user request.
 
 Rules:
-- If evidence is sufficient, set proceed_to_analysis=true and action="proceed".
-- If evidence is insufficient, set proceed_to_analysis=false and pick a fetch action.
+- If evidence is sufficient, set action="proceed".
+- If evidence is insufficient, pick a fetch action.
+- Use action="bypass" only when the goal is fundamentally not answerable with trustworthy, relevant evidence in scope; include a concise rationale.
 - Avoid repeating the exact same ineffective query strategy without a reason.
 - If score availability is false, rely on chunk text and metadata to mark relevant chunks.
 - Keep queries specific and self-contained.
 - Return at most one query per domain and at most 4 queries total.
-- Include at least one query whenever action is not "proceed".
+- Include at least one query whenever action is "newsapi" or "web_search".
 
 Return ONLY a valid PlannerDecision object.\
 """
