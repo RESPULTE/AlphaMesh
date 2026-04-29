@@ -21,7 +21,6 @@ Usage (standalone / testing):
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
@@ -117,7 +116,6 @@ def _call_tavily_search_via_sdk(
         topic=topic,
         search_depth=search_depth,
         max_results=max_results,
-        include_raw_content=True,
         include_domains=include_domains,
     )
     if not isinstance(response, dict):
@@ -128,11 +126,7 @@ def _call_tavily_search_via_sdk(
 def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
     url = str(result.get("url") or "").strip()
     title = str(result.get("title") or "").strip() or "Untitled"
-    snippet = str(result.get("content") or "").strip()
-    raw_content = result.get("raw_content")
-    if isinstance(raw_content, dict):
-        raw_content = json.dumps(raw_content, ensure_ascii=True)
-    content = str(raw_content or snippet).strip()
+    content = str(result.get("content") or "").strip()
     published_at = _normalise_published_at(
         result.get("published_date") or result.get("published_at")
     )
@@ -142,8 +136,8 @@ def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
 
     return {
         "title": title,
-        "description": snippet[:500],
-        "content": content or snippet,
+        "description": content[:500],
+        "content": content,
         "url": url,
         "urlToImage": None,
         "publishedAt": published_at,
