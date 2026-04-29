@@ -229,7 +229,6 @@ class ServiceManager:
 
     def get_retriever(self):
         from core.memory.retrieval.dual_store_retriever import DualStoreRetriever
-        from core.memory.retrieval.tracing import NetworkXRetrievalTraceSink
 
         if self._retriever is None:
             try:
@@ -237,6 +236,7 @@ class ServiceManager:
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
                     prefilter=self.get_prefilter(),
+                    reranker=self.get_reranker(),
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreRetriever: {e}")
@@ -268,9 +268,7 @@ class ServiceManager:
         """
         Return the TwoStageReranker singleton.
 
-        Used at the final selection point (_rendezvous_node) where all chunk
-        sources are combined and the Jina cross-encoder makes the definitive
-        top-k selection.
+        Used by DualStoreRetriever for domain-level semantic reranking.
         """
         from core.memory.retrieval.reranker import TwoStageReranker
 

@@ -204,7 +204,7 @@ def build_planner_relevance_context_block(
     for chunk in chunks:
         chunk_id = str(getattr(chunk, "chunk_id", "") or "")
         normalized_chunk_id = chunk_id_alias_map.get(chunk_id, chunk_id or "?")
-        relevance = getattr(chunk, "reranker_relevance_score", None)
+        relevance = getattr(chunk, "relevance_score", None)
         relevance_text = "N/A" if relevance is None else f"{float(relevance):.4f}"
         chunk_text = str(getattr(chunk, "text", "") or "")
         if not chunk_text:

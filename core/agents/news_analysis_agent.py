@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Type
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Overwrite, Send
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.models.base_agent_models import AgentSentiment, BaseAgentInput
@@ -32,10 +31,8 @@ from core.agents.prompts.news_agent_prompts import (
 )
 from core.agents.utils import (
     build_analysis_context_prefix,
-    coerce_entity_tuple,
     constrain_date_range,
     get_default_date_range,
-    normalize_entity_tuple,
     remap_numeric_citations,
 )
 from core.agents.working_memory.news_working_memory import NewsWorkingMemoryManager
@@ -47,47 +44,18 @@ from core.memory.retrieval.models import RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
 logger = get_logger(__name__)
-_ENTITY_CACHE: Dict[str, Dict[Tuple[str, str], Tuple[str, str]]] = {}
-_ENTITY_CACHE_TS: Dict[str, float] = {}
 
-_MIN_RELEVANT_DISTINCT_SOURCES: int = 2
+_TARGET_MIN_CHUNKS_PER_SOURCE = 3
 
 
 class NewsAnalysisStructuredOutput(BaseModel):
-    analysis: str
+    model_config = ConfigDict(extra="ignore")
+
+    is_context_sufficient: bool = False
+    analysis: str = ""
+    missing_information_goal: str = ""
+    persist_chunk_ids: List[int | str] = Field(default_factory=list)
     sentiment: Optional[AgentSentiment] = None
-
-
-def _get_cached_entities(conversation_id: str) -> List[Tuple[str, str]]:
-    if not conversation_id:
-        return []
-    now = time.time()
-    ts = _ENTITY_CACHE_TS.get(conversation_id)
-    if ts is None or now - ts > settings.SUBGRAPH_TTL_SECONDS:
-        _ENTITY_CACHE.pop(conversation_id, None)
-        _ENTITY_CACHE_TS.pop(conversation_id, None)
-        return []
-    cache = _ENTITY_CACHE.setdefault(conversation_id, {})
-    normalized_cache: Dict[Tuple[str, str], Tuple[str, str]] = {}
-    for raw in list(cache.values()):
-        normalized = coerce_entity_tuple(raw)
-        if normalized is None:
-            continue
-        normalized_cache[normalized] = normalized
-    _ENTITY_CACHE[conversation_id] = normalized_cache
-    return list(normalized_cache.values())
-
-
-def _merge_cached_entities(conversation_id: str, entities: List[Any]) -> None:
-    if not conversation_id:
-        return
-    cache = _ENTITY_CACHE.setdefault(conversation_id, {})
-    for entity in entities:
-        normalized = coerce_entity_tuple(entity)
-        if normalized is None:
-            continue
-        cache[normalized] = normalized
-    _ENTITY_CACHE_TS[conversation_id] = time.time()
 
 
 class NewsAnalysisAgent(AbstractAgent):
@@ -117,7 +85,7 @@ class NewsAnalysisAgent(AbstractAgent):
         return NewsAgentOutput
 
     @staticmethod
-    def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
+    def render_memory_summary(memory_summary: Dict[str, object]) -> str:
         return NewsWorkingMemoryManager.render_memory_summary(memory_summary)
 
     @classmethod
@@ -129,15 +97,6 @@ class NewsAnalysisAgent(AbstractAgent):
         return NewsWorkingMemoryManager.build_context_from_history_summaries(
             history_turns, window=window
         )
-
-    @staticmethod
-    def _build_fallback_findings_summary(chunks: List[RetrievedChunk]) -> str:
-        snippets: List[str] = []
-        for chunk in chunks[:2]:
-            text = str(chunk.text or "").strip()
-            if text:
-                snippets.append(text[:220].strip())
-        return " ".join(snippets)
 
     @classmethod
     def _build_missing_goal_output(cls) -> NewsAgentOutput:
@@ -160,13 +119,34 @@ class NewsAnalysisAgent(AbstractAgent):
     @staticmethod
     def _resolve_selected_chunks(
         chunks: List[RetrievedChunk],
-        relevant_chunks: List[int | str] | List[str],
+        selected_chunk_ids: List[str],
     ) -> List[RetrievedChunk]:
-        selected_ids = {str(chunk_id).strip() for chunk_id in (relevant_chunks or [])}
+        selected_ids = {str(chunk_id).strip() for chunk_id in (selected_chunk_ids or [])}
         if not selected_ids:
             return chunks
         filtered = [chunk for chunk in chunks if chunk.chunk_id in selected_ids]
         return filtered or chunks
+
+    @staticmethod
+    def _dedupe_chunks(chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        by_id: Dict[str, RetrievedChunk] = {}
+        fallback_chunks: List[RetrievedChunk] = []
+        for chunk in chunks:
+            chunk_id = (chunk.chunk_id or "").strip()
+            if not chunk_id:
+                fallback_chunks.append(chunk)
+                continue
+            existing = by_id.get(chunk_id)
+            if existing is None:
+                by_id[chunk_id] = chunk
+                continue
+            incoming_score = chunk.relevance_score
+            existing_score = existing.relevance_score
+            if incoming_score is not None and (
+                existing_score is None or incoming_score > existing_score
+            ):
+                by_id[chunk_id] = chunk
+        return list(by_id.values()) + fallback_chunks
 
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
@@ -184,6 +164,9 @@ class NewsAnalysisAgent(AbstractAgent):
             conversation_id=conversation_id,
             incoming_memory_context=input_data.agent_memory_context,
         )
+        working_memory_chunks = self._working_memory.get_working_memory_chunks(
+            conversation_id
+        )
 
         initial_state = NewsAgentState(
             query="",
@@ -195,6 +178,7 @@ class NewsAnalysisAgent(AbstractAgent):
             turn_id=input_data.turn_id,
             agent_memory_context=effective_memory_context,
             company_context=input_data.company_context,
+            final_chunks=working_memory_chunks,
         )
 
         final_state = await self._graph.ainvoke(initial_state.model_dump())
@@ -215,9 +199,6 @@ class NewsAnalysisAgent(AbstractAgent):
             conversation_id=conversation_id,
             turn_index=turn_index,
             chunks=final_chunks,
-            score_unavailable=bool(
-                final_state.get("rendezvous_score_unavailable", False)
-            ),
             source_key_fn=RetrievedChunk._source_key,
         )
         return output
@@ -232,89 +213,59 @@ class NewsAnalysisAgent(AbstractAgent):
         workflow.add_node("rendezvous", self._rendezvous_node)
         workflow.add_node("analyse_news", self._analyse_news_node)
 
-        workflow.add_edge(START, "planner")
+        workflow.add_conditional_edges(
+            START,
+            self._route_from_start,
+            ["analyse_news", "planner"],
+        )
         workflow.add_conditional_edges(
             "planner",
             self._route_after_planner,
-            ["analyse_news", "retrieve_memory", "fetch_and_ingest", END],
+            ["retrieve_memory", "fetch_and_ingest"],
         )
         workflow.add_edge("fetch_and_ingest", "rendezvous")
         workflow.add_edge("retrieve_memory", "rendezvous")
-        workflow.add_edge("rendezvous", "planner")
-        workflow.add_edge("analyse_news", END)
+        workflow.add_edge("rendezvous", "analyse_news")
+        workflow.add_conditional_edges(
+            "analyse_news",
+            self._route_after_analysis,
+            ["planner", END],
+        )
         return workflow.compile()
 
     @staticmethod
+    def _route_from_start(state: NewsAgentState) -> str:
+        return "analyse_news" if state.final_chunks else "planner"
+
+    @staticmethod
     def _route_after_planner(state: NewsAgentState):
-        decision = state.planner_decision
-        if decision is not None and decision.action == "bypass":
-            return END
-        if decision is None or decision.action == "proceed":
-            return "analyse_news"
         return [
             Send("retrieve_memory", state),
             Send("fetch_and_ingest", state),
         ]
 
+    @staticmethod
+    def _route_after_analysis(state: NewsAgentState):
+        if state.is_context_sufficient:
+            return END
+        return "planner"
+
     async def _planner_node(self, state: NewsAgentState) -> dict:
-        """Planner node: decides proceed/fetch and writes per-domain queries."""
-        at_limit = (
-            state.research_iteration >= settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS
-        )
-        goal = state.goal
-        if at_limit:
-            reason = f"Reached research iteration limit ({settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS})."
-            decision = PlannerDecision(action="proceed", findings_summary=reason)
-            publish_progress("news_agent", f"Research planning: {reason}")
-            return {
-                "planner_decision": decision,
-                "is_information_sufficient": True,
-            }
-
-        # Enforce rendezvous source gate in code before planner LLM.
-        if (
-            not state.rendezvous_score_unavailable
-            and state.final_chunks
-            and not state.rendezvous_has_minimum_sources
-        ):
-            decision = PlannerDecision(
-                action="web_search",
-                queries=[DomainQuery(domain="company", query=goal)],
-                findings_summary=(
-                    f"Cannot proceed yet: fewer than {_MIN_RELEVANT_DISTINCT_SOURCES} "
-                    "distinct relevant sources above threshold."
-                ),
-                max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
-            )
-            return {
-                "planner_decision": decision,
-                "is_information_sufficient": False,
-                "final_chunks": state.final_chunks,
-            }
-
-        conversation_id = state.conversation_id or ""
-        chunk_id_to_alias, alias_to_chunk_id = RetrievedChunk._build_chunk_alias_maps(
-            state.final_chunks
-        )
-        candidate_chunks_block = RetrievedChunk._render_candidate_chunks(
-            state.final_chunks,
-            chunk_id_to_alias,
-        )
+        """Planner node: chooses fetch action and writes per-domain queries."""
+        goal = (state.missing_information_goal or state.goal or "").strip()
         planner_prompt = (
             f"Goal: {goal}\n"
             f"Ticker: {state.ticker or 'N/A'}\n"
             f"Iteration index: {state.research_iteration} (max={settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS})\n"
             "\n"
-            f"Iteration history:\n{ResearchStepLog._history_block(state.research_logs)}\n\n"
-            f"Current candidate chunks:\n{candidate_chunks_block}\n\n"
-            f"Working memory (prior finalized turns):\n"
-            f"{self._working_memory.render_working_memory_block(conversation_id, turn_limit=4)}\n"
+            f"Current turn tool-call history:\n{ResearchStepLog._history_block(state.research_logs)}\n"
+            "\n"
+            "Return only PlannerDecision."
         )
-        planner_prompt += "\nReturn only PlannerDecision."
 
         publish_progress(
             "news_agent",
-            f"Planning research (iteration {state.research_iteration})...",
+            f"Planning retrieval strategy (iteration {state.research_iteration})...",
         )
 
         try:
@@ -327,55 +278,14 @@ class NewsAnalysisAgent(AbstractAgent):
             )
         except Exception:
             logger.exception("_planner_node: LLM call failed; using fallback")
-            if state.research_iteration == 0:
-                decision = PlannerDecision(
-                    action="newsapi",
-                    queries=[DomainQuery(domain="company", query=goal)],
-                    findings_summary="Fallback to NewsAPI on planner failure.",
-                    max_results=settings.NEWS_FETCH_MAX_ARTICLES,
-                )
-            else:
-                decision = PlannerDecision(
-                    action="web_search",
-                    queries=[DomainQuery(domain="company", query=goal)],
-                    findings_summary="Fallback web search after planner failure.",
-                    max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
-                )
+            decision = PlannerDecision(
+                action="newsapi",
+                queries=[DomainQuery(domain="company", query=goal)],
+            )
 
-        decision = decision._normalize_planner_selection_ids(alias_to_chunk_id)
-
-        if decision.action not in {"proceed", "bypass"} and not decision.queries:
+        if not decision.queries:
             decision = decision.model_copy(
                 update={"queries": [DomainQuery(domain="company", query=goal)]}
-            )
-
-        if decision.action == "newsapi":
-            max_results = max(
-                1, min(decision.max_results, settings.NEWS_FETCH_MAX_ARTICLES)
-            )
-        else:
-            max_results = max(1, min(decision.max_results, 20))
-        decision = decision.model_copy(update={"max_results": max_results})
-
-        filtered_chunks = self._resolve_selected_chunks(
-            state.final_chunks,
-            decision.relevant_chunks,
-        )
-        logger.info(
-            "_planner_node: selection requested=%d resolved=%d total=%d",
-            len(decision.relevant_chunks or []),
-            len(filtered_chunks),
-            len(state.final_chunks),
-        )
-
-        if decision.action == "proceed":
-            findings_summary = (decision.findings_summary or "").strip()
-            if not findings_summary:
-                findings_summary = self._build_fallback_findings_summary(
-                    filtered_chunks
-                )
-            decision = decision.model_copy(
-                update={"findings_summary": findings_summary}
             )
 
         logger.info(
@@ -384,40 +294,21 @@ class NewsAnalysisAgent(AbstractAgent):
             decision.action,
             len(decision.queries),
         )
-        if decision.action == "bypass":
-            tools_used = ResearchStepLog._list_unique_actions(state.research_logs)
-            return {
-                "planner_decision": decision,
-                "is_information_sufficient": True,
-                "final_chunks": filtered_chunks,
-                "analysis": "",
-                "sources": [],
-                "entities_enriched": [],
-                "relationships_extracted": False,
-                "memory_summary": {
-                    "bypassed": True,
-                    "reason": (decision.findings_summary or "").strip(),
-                    "research_actions": tools_used,
-                    "tools_used": tools_used,
-                },
-            }
         return {
             "planner_decision": decision,
-            "is_information_sufficient": decision.action in {"proceed", "bypass"},
-            "final_chunks": filtered_chunks,
         }
 
     async def _retrieve_memory_node(self, state: NewsAgentState) -> dict:
         """Retrieve relevant chunks from semantic memory using planner queries."""
         decision = state.planner_decision
-        if decision is None or decision.action in {"proceed", "bypass"}:
+        if decision is None:
             return {"memory_chunks": []}
 
         domain_queries: Dict[str, str] = {
             q.domain: q.query for q in decision.queries if q.query
         }
         active_domains = list(domain_queries.keys())
-        goal = state.goal
+        goal = (state.missing_information_goal or state.goal or "").strip()
         if not active_domains:
             domain_queries["company"] = goal
             active_domains = ["company"]
@@ -450,10 +341,10 @@ class NewsAnalysisAgent(AbstractAgent):
     async def _fetch_and_ingest_node(self, state: NewsAgentState) -> dict:
         """Fetch articles for planner queries in parallel, then ingest and score."""
         decision = state.planner_decision
-        if decision is None or decision.action in {"proceed", "bypass"}:
-            return {"retrieved_chunks": state.retrieved_chunks}
+        if decision is None:
+            return {"retrieved_chunks": []}
 
-        goal = state.goal
+        goal = (state.missing_information_goal or state.goal or "").strip()
         queries = decision.queries or [DomainQuery(domain="company", query=goal)]
         action = decision.action
         iter_label = state.research_iteration + 1
@@ -483,7 +374,16 @@ class NewsAnalysisAgent(AbstractAgent):
         results_per_query: List[List[dict]] = await asyncio.gather(
             *(_fetch_one(q) for q in queries)
         )
-        all_fetched = [article for batch in results_per_query for article in batch]
+
+        all_fetched: List[dict] = []
+        per_query_target = max(
+            _TARGET_MIN_CHUNKS_PER_SOURCE,
+            settings.NEWS_FETCH_MAX_ARTICLES
+            if action == "newsapi"
+            else settings.TAVILY_SEARCH_MAX_RESULTS,
+        )
+        for batch in results_per_query:
+            all_fetched.extend(batch[:per_query_target])
 
         seen_urls = set(state.seen_urls or [])
         newly_seen_urls: List[str] = []
@@ -498,7 +398,6 @@ class NewsAnalysisAgent(AbstractAgent):
         log_row = ResearchStepLog(
             iteration=iter_label,
             action=action,
-            query="; ".join(f"{q.domain}:{q.query[:40]}" for q in queries),
             queries=queries,
             total_fetched_articles=len(all_fetched),
             newly_fetched_articles=len(new_articles),
@@ -535,8 +434,16 @@ class NewsAnalysisAgent(AbstractAgent):
                 "retrieved_chunks": [],
             }
 
+        tavily_score_by_url: Dict[str, float] = {}
+        for article in new_articles:
+            raw_score = article.get("tavily_relevance_score")
+            url = str(article.get("url") or "").strip()
+            if url and isinstance(raw_score, (int, float)):
+                tavily_score_by_url[url] = float(raw_score)
+
         async def _score_chunks(
-            chunk_ids: List[str], domain: str
+            chunk_ids: List[str],
+            default_relevance_source: str,
         ) -> List[RetrievedChunk]:
             if not chunk_ids:
                 return []
@@ -545,16 +452,40 @@ class NewsAnalysisAgent(AbstractAgent):
                 n_results=settings.RETRIEVER_SEED_TOP_K,
                 where={"chunk_id": {"$in": chunk_ids}},
             )
-            return [
-                RetrievedChunk.from_document(
-                    doc, score=score, source="vector", domain=domain
+            chunks: List[RetrievedChunk] = []
+            for doc, vector_score in docs_with_scores:
+                chunk = RetrievedChunk.from_document(
+                    doc,
+                    score=vector_score,
+                    source="vector",
+                    domain="new",
+                    relevance_source="vector",
                 )
-                for doc, score in docs_with_scores
-            ]
+                if action == "web_search":
+                    source_url = str(
+                        chunk.source_url or (chunk.metadata or {}).get("source_url") or ""
+                    ).strip()
+                    tavily_score = tavily_score_by_url.get(source_url)
+                    if tavily_score is not None:
+                        chunk = chunk.model_copy(
+                            update={
+                                "relevance_score": tavily_score,
+                                "relevance_source": "tavily",
+                            }
+                        )
+                elif default_relevance_source == "vector":
+                    chunk = chunk.model_copy(
+                        update={
+                            "relevance_score": vector_score,
+                            "relevance_source": "vector",
+                        }
+                    )
+                chunks.append(chunk)
+            return chunks
 
         new_chunks, existing_chunks = await asyncio.gather(
-            _score_chunks(new_chunk_ids, "new"),
-            _score_chunks(existing_chunk_ids, "existing"),
+            _score_chunks(new_chunk_ids, "vector"),
+            _score_chunks(existing_chunk_ids, "vector"),
         )
 
         existing_ids = {c.chunk_id for c in state.retrieved_chunks if c.chunk_id}
@@ -571,179 +502,88 @@ class NewsAnalysisAgent(AbstractAgent):
         }
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
-        """Merge parallel branches, rerank, apply threshold gate, then loop to planner."""
+        """Merge tool results, memory retrieval, and working memory chunks."""
         conversation_id = state.conversation_id or ""
-        all_candidates = (
-            list(state.retrieved_chunks)
+        merged = self._dedupe_chunks(
+            list(state.final_chunks)
+            + list(state.retrieved_chunks)
             + list(state.memory_chunks)
             + self._working_memory.get_working_memory_chunks(conversation_id)
         )
-        publish_progress(
-            "news_agent", f"Reranking {len(all_candidates)} candidate chunk(s)..."
-        )
-
-        goal = state.goal
-        final_ranked = await service_manager.get_reranker().rank(goal, all_candidates)
-        score_available = any(
-            chunk.reranker_relevance_score is not None for chunk in final_ranked
-        )
-        threshold = settings.NEWS_AGENT_MIN_RELEVANCE_SCORE
-        if score_available:
-            relevant_chunks = [
-                chunk
-                for chunk in final_ranked
-                if chunk.reranker_relevance_score is not None
-                and chunk.reranker_relevance_score >= threshold
-            ]
-        else:
-            relevant_chunks = list(final_ranked)
-
-        relevant_sources, _ = RetrievedChunk._build_deduplicated_sources(
-            relevant_chunks
-        )
-        distinct_source_keys = {
-            f"{src.title}|{src.url}"
-            for src in relevant_sources
-            if (src.title or "").strip() or (src.url or "").strip()
-        }
-        has_minimum_sources = (
-            score_available
-            and len(distinct_source_keys) >= _MIN_RELEVANT_DISTINCT_SOURCES
-            and len(relevant_chunks) > 0
-        )
-
-        # Entity enrichment from graph store.
-        merged_entity_tuples: List[Tuple[str, str]] = []
-        final_ranked_chunk_ids = list(
-            dict.fromkeys(chunk.chunk_id for chunk in relevant_chunks if chunk.chunk_id)
-        )
-        if final_ranked_chunk_ids:
-            try:
-                rows = (
-                    await service_manager.get_neo4j_adapter().get_entities_for_chunks(
-                        final_ranked_chunk_ids
-                    )
-                )
-                for row in rows:
-                    parsed = normalize_entity_tuple(
-                        row.get("entity_name"), row.get("entity_type")
-                    )
-                    if parsed is not None:
-                        merged_entity_tuples.append(parsed)
-            except Exception:
-                logger.exception(
-                    "_rendezvous_node: failed to fetch entity tuples for relevant chunks"
-                )
-
-        if conversation_id and merged_entity_tuples:
-            _merge_cached_entities(conversation_id, merged_entity_tuples)
-
-        # Enqueue chunk-entity extraction for any PENDING chunks.
-        pending_chunk_ids = list(
-            dict.fromkeys(
-                chunk.chunk_id
-                for chunk in relevant_chunks
-                if chunk.chunk_id and chunk.extraction_status == "PENDING"
-            )
-        )
-        if pending_chunk_ids and conversation_id:
-            turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
-            try:
-                task = make_extraction_task(
-                    turn_id=turn_id,
-                    conversation_id=conversation_id,
-                    source_agent=self.name(),
-                    extraction_text=None,
-                    system_prompt=None,
-                    immediate=settings.EXTRACTION_IMMEDIATE,
-                    task_kind="chunk_entities",
-                    chunk_ids=pending_chunk_ids,
-                )
-                await service_manager.get_graph_queue_manager().enqueue(task)
-            except Exception:
-                logger.exception(
-                    "_rendezvous_node: failed to enqueue chunk entity extraction"
-                )
 
         updated_logs = list(state.research_logs)
-        no_relevant_note = ""
-        if score_available and len(relevant_chunks) == 0:
-            no_relevant_note = f"No chunks met relevance threshold {threshold:.2f} from this iteration's results."
-        elif (
-            score_available
-            and len(distinct_source_keys) < _MIN_RELEVANT_DISTINCT_SOURCES
-        ):
-            no_relevant_note = (
-                f"Relevant chunks found but only {len(distinct_source_keys)} distinct source(s); "
-                f"need at least {_MIN_RELEVANT_DISTINCT_SOURCES}."
-            )
-
-        if updated_logs and updated_logs[-1].action in {"newsapi", "web_search"}:
+        if updated_logs:
             last = updated_logs[-1]
-            updated_logs[-1] = last.model_copy(
-                update={
-                    "relevant_chunk_count": len(relevant_chunks),
-                    "relevant_source_count": len(distinct_source_keys),
-                    "score_unavailable": not score_available,
-                    "no_relevant_note": no_relevant_note,
-                }
-            )
+            updated_logs[-1] = last.model_copy(update={"merged_chunk_count": len(merged)})
 
-        logger.info(
-            "_rendezvous_node: iter=%d total_chunks=%d ranked=%d relevant=%d sources=%d score_available=%s",
-            state.research_iteration,
-            len(all_candidates),
-            len(final_ranked),
-            len(relevant_chunks),
-            len(distinct_source_keys),
-            score_available,
-        )
         return {
-            "final_chunks": relevant_chunks,
-            "sources": relevant_sources,
+            "final_chunks": merged,
             "memory_chunks": Overwrite(value=[]),
+            "retrieved_chunks": Overwrite(value=[]),
             "research_logs": Overwrite(value=updated_logs),
-            "rendezvous_has_minimum_sources": has_minimum_sources,
-            "rendezvous_score_unavailable": not score_available,
-            "rendezvous_relevant_chunk_count": len(relevant_chunks),
-            "rendezvous_relevant_source_count": len(distinct_source_keys),
             "research_iteration": state.research_iteration + 1,
         }
 
     async def _analyse_news_node(self, state: NewsAgentState) -> dict:
-        """Generate a grounded financial analysis from retrieved chunks."""
-        chunks = state.final_chunks
+        """Check context sufficiency and generate grounded analysis when possible."""
+        chunks = self._dedupe_chunks(state.final_chunks)
+        forced_final_pass = (
+            state.research_iteration >= settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS
+        )
+
         if not chunks:
+            if forced_final_pass:
+                return {
+                    "analysis": "Insufficient context after maximum retrieval iterations. No relevant news data was found.",
+                    "sources": [],
+                    "is_context_sufficient": True,
+                    "memory_summary": {
+                        "research_actions": ResearchStepLog._list_unique_actions(
+                            state.research_logs
+                        ),
+                        "tools_used": ResearchStepLog._list_unique_actions(
+                            state.research_logs
+                        ),
+                        "source_count": 0,
+                        "missing_information_goal": state.missing_information_goal
+                        or state.goal,
+                    },
+                    "final_chunks": [],
+                }
             return {
-                "analysis": "No relevant news data was found for this goal.",
-                "sources": [],
-                "entities_enriched": [],
+                "is_context_sufficient": False,
+                "missing_information_goal": state.missing_information_goal
+                or state.goal,
+                "persist_chunk_ids": [],
+                "final_chunks": [],
             }
 
         publish_progress(
             "news_agent",
-            f"Generating grounded news analysis ({len(chunks)} chunk(s))...",
+            f"Evaluating context sufficiency ({len(chunks)} chunk(s))...",
         )
+
         sources, _ = RetrievedChunk._build_deduplicated_sources(chunks)
-        chunk_id_to_alias, _ = RetrievedChunk._build_chunk_alias_maps(chunks)
+        chunk_id_to_alias, alias_to_chunk_id = RetrievedChunk._build_chunk_alias_maps(chunks)
         context_block = RetrievedChunk._render_candidate_chunks(
             chunks,
             chunk_id_to_alias,
         )
 
-        conversation_id = state.conversation_id or ""
-        cached_entities = _get_cached_entities(conversation_id)
         context_prefix = build_analysis_context_prefix(
             company_context=state.company_context,
             agent_memory_context=state.agent_memory_context,
-            cached_entities=cached_entities,
+            cached_entities=[],
         )
 
         messages = [
             SystemMessage(content=NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT),
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
-                    goal=state.goal,
+                    goal=state.missing_information_goal or state.goal,
+                    iteration=state.research_iteration,
+                    max_iterations=settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS,
+                    forced_final_pass=str(forced_final_pass).lower(),
                     entities_section=context_prefix,
                     context=context_block,
                 )
@@ -756,18 +596,51 @@ class NewsAnalysisAgent(AbstractAgent):
             structured_llm = self._llm.with_structured_output(
                 NewsAnalysisStructuredOutput
             )
-            response = await structured_llm.ainvoke(messages)
-            analysis_text = (response.analysis or "").strip()
-            sentiment = response.sentiment
-            if not analysis_text:
-                analysis_text = (
-                    "Analysis could not be generated due to an internal error."
-                )
-            else:
-                publish_success("news_agent", "News analysis complete.")
+            response: NewsAnalysisStructuredOutput = await structured_llm.ainvoke(messages)
         except Exception as exc:
             logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
-            analysis_text = "Analysis could not be generated due to an internal error."
+            response = NewsAnalysisStructuredOutput(
+                is_context_sufficient=forced_final_pass,
+                analysis=(
+                    "Insufficient context to answer comprehensively."
+                    if not forced_final_pass
+                    else "Best-effort analysis could not be generated due to an internal error."
+                ),
+                missing_information_goal=state.missing_information_goal or state.goal,
+                persist_chunk_ids=[],
+                sentiment=None,
+            )
+
+        selected_chunk_ids = [
+            alias_to_chunk_id.get(str(item).strip(), str(item).strip())
+            for item in (response.persist_chunk_ids or [])
+        ]
+        persisted_chunks = self._resolve_selected_chunks(chunks, selected_chunk_ids)
+
+        if not response.is_context_sufficient and not forced_final_pass:
+            missing_goal = (response.missing_information_goal or "").strip()
+            if not missing_goal:
+                missing_goal = state.missing_information_goal or state.goal
+            return {
+                "is_context_sufficient": False,
+                "missing_information_goal": missing_goal,
+                "persist_chunk_ids": selected_chunk_ids,
+                "final_chunks": persisted_chunks,
+                "analysis": "",
+                "sources": [],
+            }
+
+        analysis_text = (response.analysis or "").strip()
+        if not analysis_text:
+            analysis_text = (
+                "Best-effort analysis generated with limited context; key information gaps remain."
+            )
+        if not response.is_context_sufficient:
+            analysis_text = (
+                "Context is still incomplete after maximum retrieval iterations. "
+                "The following is a best-effort analysis based on available evidence.\n\n"
+                + analysis_text
+            )
 
         analysis_text, sources = remap_numeric_citations(analysis_text, sources)
 
@@ -801,25 +674,22 @@ class NewsAnalysisAgent(AbstractAgent):
             "tools_used": tools_used,
             "source_count": len(sources),
             "top_references": top_references,
-            "sentiment": sentiment.model_dump() if sentiment is not None else {},
-            "findings_summary": (
-                (
-                    state.planner_decision.findings_summary
-                    if state.planner_decision is not None
-                    else ""
-                )
-                or ""
-            ).strip(),
+            "sentiment": response.sentiment.model_dump() if response.sentiment else {},
+            "missing_information_goal": (response.missing_information_goal or "").strip(),
         }
+
         result = {
             "analysis": analysis_text,
             "sources": sources,
             "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
-            "sentiment": sentiment,
+            "sentiment": response.sentiment,
             "memory_summary": memory_summary,
+            "is_context_sufficient": True,
+            "final_chunks": chunks,
         }
+        if response.sentiment is not None:
+            result["sentiment"] = response.sentiment
 
-        if sentiment is not None:
-            result["sentiment"] = sentiment
+        publish_success("news_agent", "News analysis complete.")
         return result

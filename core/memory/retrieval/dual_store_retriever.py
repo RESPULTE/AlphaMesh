@@ -22,7 +22,7 @@ from core.memory.retrieval.models import (
     RetrieverState,
     RewrittenQueries,
 )
-from core.memory.retrieval.reranker import CompositePrefilter
+from core.memory.retrieval.reranker import CompositePrefilter, TwoStageReranker
 from core.memory.retrieval.tracing import (
     NetworkXRetrievalTraceSink,
     NullRetrievalTraceSink,
@@ -32,17 +32,6 @@ from core.memory.retrieval.tracing import (
 from core.memory.retrieval.traversal_policy import TraversalPolicy
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
-
-
-def _normalize_entity_tuple(
-    name: Any,
-    entity_type: Any,
-) -> Optional[tuple[str, str]]:
-    normalized_name = str(name or "").strip()
-    normalized_type = str(entity_type or "").strip()
-    if not normalized_name or not normalized_type:
-        return None
-    return normalized_name, normalized_type
 
 
 def _parse_neighbor(row: dict) -> Optional[NeighborCandidate]:
@@ -122,10 +111,12 @@ class DualStoreRetriever:
         neo4j_adapter: Neo4jAdapter,
         chroma_adapter: ChromaDBAdapter,
         prefilter: CompositePrefilter,
+        reranker: TwoStageReranker,
     ) -> None:
         self._neo4j_adapter = neo4j_adapter
         self._chroma_adapter = chroma_adapter
         self._prefilter = prefilter
+        self._reranker = reranker
         if settings.RETRIEVAL_TRACE_ENABLED:
             self._trace_sink = NetworkXRetrievalTraceSink(
                 max_runs=settings.RETRIEVAL_TRACE_MAX_RUNS
@@ -276,7 +267,7 @@ class DualStoreRetriever:
                 "chunks": [
                     {
                         "chunk_id": chunk.chunk_id,
-                        "score": chunk.score,
+                        "score": chunk.relevance_score,
                         "chunk_text": chunk.text,
                         "article_title": chunk.article_title
                         or (chunk.metadata or {}).get("article_title")
@@ -461,7 +452,6 @@ class DualStoreRetriever:
                 chunk = RetrievedChunk(
                     chunk_id=parsed.chunk_id,
                     text=parsed.chunk_text,
-                    score=None,
                     source="graph",
                     graph_depth=hop_depth,
                     extraction_status=parsed.extraction_status,
@@ -570,7 +560,7 @@ class DualStoreRetriever:
         self, rewritten_queries: RewrittenQueries
     ) -> MemoryContext:
         """
-        Fan out retrieval across active domain queries, deduplicate, prefilter.
+        Fan out retrieval across active domain queries, per-domain rerank, then merge.
         """
         domain_map = {
             "company": rewritten_queries.company_query,
@@ -588,7 +578,6 @@ class DualStoreRetriever:
             return MemoryContext(
                 chunks=[],
                 rewritten_queries=rewritten_queries,
-                entity_tuples=[],
             )
 
         parent_run_id = str(uuid4())
@@ -622,19 +611,43 @@ class DualStoreRetriever:
                 continue
             if not isinstance(result, list):
                 continue
-            for chunk in result:
-                if not isinstance(chunk, RetrievedChunk):
-                    continue
-                normalized = RetrievedChunk.normalize_for_reranking(chunk, domain)
-                existing = chunk_map.get(normalized.chunk_id)
+            domain_query = active_queries.get(domain, "")
+            normalized_domain_chunks: List[RetrievedChunk] = [
+                RetrievedChunk.normalize_for_reranking(chunk, domain)
+                for chunk in result
+                if isinstance(chunk, RetrievedChunk)
+            ]
+            if not normalized_domain_chunks:
+                continue
+            try:
+                reranked_domain_chunks = await self._reranker.rank(
+                    domain_query,
+                    normalized_domain_chunks,
+                )
+            except Exception as exc:
+                self._logger.error(
+                    "Jina rerank failed for domain '%s': %s; fallback to prefilter only.",
+                    domain,
+                    exc,
+                )
+                reranked_domain_chunks = self._prefilter.score(normalized_domain_chunks)
+
+            for reranked in reranked_domain_chunks:
+                existing = chunk_map.get(reranked.chunk_id)
                 if (
                     existing is None
-                    or normalized.embedding_score > existing.embedding_score
+                    or (
+                        reranked.relevance_score is not None
+                        and (
+                            existing.relevance_score is None
+                            or reranked.relevance_score > existing.relevance_score
+                        )
+                    )
                 ):
-                    chunk_map[normalized.chunk_id] = normalized
+                    chunk_map[reranked.chunk_id] = reranked
 
-        pre_rerank_count = len(chunk_map)
-        prefiltered = self._prefilter.score(
+        merged_count = len(chunk_map)
+        merged = self._prefilter.score(
             list(chunk_map.values()),
             trace_context=PrefilterTraceContext(
                 run_id=parent_run_id,
@@ -647,39 +660,17 @@ class DualStoreRetriever:
         )
 
         self._logger.info(
-            "Comprehensive retrieve: domains=%s unique_chunks=%d prefiltered=%d",
+            "Comprehensive retrieve: domains=%s unique_chunks=%d merged=%d",
             list(active_queries.keys()),
-            pre_rerank_count,
-            len(prefiltered),
+            merged_count,
+            len(merged),
         )
         self._maybe_auto_export_trace_graph(
             run_id=parent_run_id,
             domain="comprehensive",
         )
 
-        entity_tuples: List[tuple[str, str]] = []
-        chunk_ids = list(dict.fromkeys(c.chunk_id for c in prefiltered if c.chunk_id))
-        if chunk_ids:
-            try:
-                rows = await self._neo4j_adapter.get_entities_for_chunks(chunk_ids)
-                seen_tuples: set[tuple[str, str]] = set()
-                for row in rows:
-                    parsed = _normalize_entity_tuple(
-                        row.get("entity_name"),
-                        row.get("entity_type"),
-                    )
-                    if parsed is None or parsed in seen_tuples:
-                        continue
-                    seen_tuples.add(parsed)
-                    entity_tuples.append(parsed)
-            except Exception as exc:
-                self._logger.error(
-                    "Comprehensive retrieve: failed to fetch entity tuples: %s",
-                    exc,
-                )
-
         return MemoryContext(
-            chunks=prefiltered,
+            chunks=merged,
             rewritten_queries=rewritten_queries,
-            entity_tuples=entity_tuples,
         )

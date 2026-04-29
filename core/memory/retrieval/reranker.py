@@ -44,9 +44,8 @@ class CompositePrefilter:
 
     Used as stage 1 of TwoStageReranker, and also directly by
     DualStoreRetriever for intermediate memory-chunk ordering inside
-    comprehensive_retrieve — where the Jina call happens later in
-    _rendezvous_node on the fully-combined pool, making a second Jina call
-    here redundant.
+    comprehensive_retrieve, and by domain-level memory retrieval before
+    agent-side rendezvous merges memory/tool/working-memory chunks.
     """
 
     def __init__(self, alpha: float, beta: float, prefilter_k: int) -> None:
@@ -227,7 +226,10 @@ class TwoStageReranker:
                     relevance_score = float(raw_score)
                 reranked.append(
                     chunks[idx].model_copy(
-                        update={"reranker_relevance_score": relevance_score}
+                        update={
+                            "relevance_score": relevance_score,
+                            "relevance_source": "jina",
+                        }
                     )
                 )
 

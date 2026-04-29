@@ -137,6 +137,8 @@ def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
         result.get("published_date") or result.get("published_at")
     )
     source_name = _extract_domain(url) or "web"
+    raw_score = result.get("score")
+    tavily_score = float(raw_score) if isinstance(raw_score, (int, float)) else None
 
     return {
         "title": title,
@@ -147,6 +149,7 @@ def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
         "publishedAt": published_at,
         "source": {"id": None, "name": source_name},
         "content_source": "tavily",
+        "tavily_relevance_score": tavily_score,
     }
 
 

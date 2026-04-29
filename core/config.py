@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     NEWS_FETCH_MAX_ARTICLES: int = 8
     TAVILY_API_KEY: Optional[str] = None
     TAVILY_SEARCH_API_URL: str = "https://api.tavily.com/search"
-    TAVILY_SEARCH_MAX_RESULTS: int = 5
+    TAVILY_SEARCH_MAX_RESULTS: int = 3
     TAVILY_SEARCH_DEPTH: str = "basic"
     TAVILY_TOPIC: str = "news"
 

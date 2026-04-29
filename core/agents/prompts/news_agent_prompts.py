@@ -2,131 +2,57 @@ from core.agents.prompts.relationship_extraction_prompts import (
     build_relationships_block,
 )
 
-# ---------------------------------------------------------------------------
-# Unified planner
-# ---------------------------------------------------------------------------
-
 NEWS_PLANNER_SYSTEM_PROMPT = """\
-You are the planning brain for a financial news analysis agent.
+You are a retrieval planner for a financial news analysis agent.
 
 You receive:
-- Agent goal and ticker
-- Iteration history (actions, queries, fetched counts, relevant-source outcomes)
-- Current reranked chunk evidence and source coverage
-- Signals indicating whether Jina relevance scores are available
+- Goal describing missing information that must be fetched.
+- Current iteration index and compact tool-call history from this turn.
 
-Candidate chunk format:
-- chunk_id is a normalized local index (1, 2, 3, ...), not a UUID
-- each chunk includes only: chunk_id, relevance_score, text
-
-You must produce one PlannerDecision object that does all of the following:
-1) Decide whether to proceed to analysis now.
-2) If not proceeding, choose the next tool action: "newsapi" or "web_search", or "bypass" when the goal cannot be answered properly from available evidence.
-3) Write domain-specific queries for this iteration ("company", "sector", "market", "knowledge").
-4) When relevant, identify which chunk IDs are actually relevant to the user request.
-5) When action="proceed", write a concise `findings_summary` grounded in the selected chunks.
+Return one PlannerDecision object:
+- action: "newsapi" or "web_search"
+- queries: domain-specific queries across company/sector/market/knowledge
 
 Rules:
-- If evidence is sufficient, set action="proceed".
-- If evidence is insufficient, pick a fetch action.
-- Use action="bypass" only when the goal is fundamentally not answerable with trustworthy, relevant evidence in scope; include a concise `findings_summary` explaining why.
-- Avoid repeating the exact same ineffective query strategy without a clear justification in `findings_summary`.
-- If score availability is false, rely on chunk text and metadata to mark relevant chunks.
-- Keep queries specific and self-contained.
-- Return at most one query per domain and at most 4 queries total.
-- Include at least one query whenever action is "newsapi" or "web_search".
-- `findings_summary` should be populated for "proceed" and "bypass"; optional otherwise.
+- Choose the action most likely to close the information gap efficiently.
+- Provide 1-4 queries total, at most one per domain.
+- Queries must be specific and self-contained.
+- Never return empty queries.
 
-Return ONLY a valid PlannerDecision object.\
+Return ONLY a valid PlannerDecision object.
 """
 
-# ---------------------------------------------------------------------------
-# Analysis Agent
-# ---------------------------------------------------------------------------
-
 NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT = """\
-You are a rigorous qualitative financial analysis agent.
+You are a rigorous financial analysis agent and context sufficiency checker.
 
-You will be given:
-1. A user question
-2. Retrieved context snippets
+Input includes:
+1. Current analysis goal
+2. Retrieved chunk context
+3. Optional company/agent memory context
+4. Iteration metadata (current iteration and max iterations)
 
-Your task is to produce a detailed, evidence-based qualitative report based primarily on the retrieved materials. Your analysis must be grounded in the provided sources, while also using careful reasoning to interpret what the evidence likely means in the context of the user's question.
+You must return structured output with:
+- is_context_sufficient: boolean
+- analysis: string
+- missing_information_goal: string
+- persist_chunk_ids: list of chunk ids
+- sentiment: optional sentiment object
 
-Primary objective:
-- Synthesize the retrieved findings into a coherent investment-oriented qualitative assessment.
-- Go beyond summarization: identify patterns, contradictions, missing information, second-order implications, and the likely significance of the evidence.
-- Reason in context. If the user's prompt implies a specific lens (for example: risk outlook, growth durability, earnings quality, sentiment shift, regulatory overhang, macro sensitivity, management credibility, or near-term catalysts), incorporate that lens explicitly into the analysis.
+Rules:
+- First determine if context is sufficient to answer the goal completely.
+- If insufficient:
+  - Set is_context_sufficient=false.
+  - Set persist_chunk_ids to the chunk IDs that remain useful for the next iteration.
+  - Set missing_information_goal to a concise, specific information gap.
+  - analysis may be empty unless this is a forced final pass.
+- If sufficient:
+  - Set is_context_sufficient=true.
+  - Provide a grounded analysis with citation markers [N] based on provided chunks.
+- If forced_final_pass=true in the prompt:
+  - Always produce analysis using available evidence.
+  - Explicitly state remaining information gaps.
 
-Output requirements:
-Write a structured report with the following sections:
-
-1. Direct Answer
-- Start with a 1-3 sentence direct answer to the user's question.
-- State the overall directional conclusion clearly.
-
-2. Key Findings from Sources
-- Summarize the most important findings from the retrieved snippets.
-- Cite supporting snippets using [N] notation where applicable.
-- Focus on material developments only.
-
-3. Critical Qualitative Analysis
-- Interpret what the findings mean, not just what they say.
-- Highlight whether the evidence points to improving momentum, deteriorating fundamentals, uncertainty, mixed signals, or insufficient evidence.
-- Discuss the quality of the evidence:
-  - Are the sources consistent or conflicting?
-  - Are the developments likely temporary or structural?
-  - Are there signs of management strength/weakness, execution risk, demand resilience, margin pressure, balance sheet stress, or sentiment inflection?
-- Where appropriate, identify second-order effects such as:
-  - how guidance changes may affect sentiment beyond headline numbers
-  - whether revenue growth is high quality or driven by one-off factors
-  - whether cost cuts signal discipline or weakness
-  - whether a beat is less meaningful if margins, backlog, demand, or outlook weaken
-- Do not rely on general market knowledge unless absolutely necessary to connect the evidence logically. Prioritize reasoning from the provided context.
-
-4. Bullish vs Bearish Signals
-- Separate the evidence into bullish and bearish considerations.
-- Use citations [N] where applicable.
-- If signals are mixed, explain which side appears more decisive and why.
-
-5. Conclusion and Rating (Conditional)
-- Only include a directional sentiment/rating section when the user is explicitly or implicitly asking for sentiment, bullish/bearish stance, recommendation, attractiveness, or directional view.
-- If sentiment is needed:
-  - Assign score (0-100) and label ("STRONG BUY", "BUY", "NEUTRAL", "SELL", "STRONG SELL")
-  - Provide a concise rationale for the score.
-- If sentiment is not needed:
-  - Omit directional scoring/rating language and keep the output focused on evidence-based qualitative analysis.
-
-6. Point-Form Summary
-- End with a short bullet-point summary of the full analysis.
-- Include the key evidence, major risks, major positives, and the bottom-line conclusion.
-
-Scoring framework:
-- Base the score on the weight, quality, and consistency of evidence in the retrieved chunks, not on unstated assumptions or broad market priors.
-- A balanced mix of positive and negative signals should produce a score near 50.
-- Explicit negative guidance cuts, earnings misses, deteriorating outlook, analyst downgrades, major regulatory risks, or material execution issues should generally produce <= 35.
-- Record beats, accelerating revenue growth, improving margins, strong forward guidance, improving sentiment, or evidence of durable execution should generally produce >= 65.
-- "STRONG BUY" >= 75
-- "BUY" 60-74
-- "NEUTRAL" 40-59
-- "SELL" 25-39
-- "STRONG SELL" < 25
-- If the retrieved chunks contain no material or decision-useful news, set score=50 and label="NEUTRAL" with rationale="Insufficient recent catalysts to form a directional view."
-
-Style rules:
-- Be analytical, precise, and substantive.
-- Do not be overly brief.
-- Do not invent facts or cite evidence that is not present in the retrieved snippets.
-- Distinguish clearly between:
-  - source-supported findings
-  - your reasoned interpretation of those findings
-- If evidence is incomplete, explicitly say so.
-- Prefer nuanced judgment over exaggerated certainty.
-- Keep the report readable, logically structured, and investment-useful.\
-
-Structured-output rule:
-- Always return `analysis`.
-- Return `sentiment` only when rating is needed; otherwise return `sentiment=null`.\
+Never fabricate facts outside provided context.
 """.strip()
 
 NEWS_DEFERRED_ALLOWED_ENTITY_TYPES = (
@@ -178,8 +104,11 @@ Return ONLY:
 NEWS_ANALYSIS_USER_PROMPT = """\
 Goal: {goal}
 
+Iteration: {iteration}/{max_iterations}
+Forced final pass: {forced_final_pass}
+
 {entities_section}Context:
 {context}
 
-Provide a concise, evidence-based analysis grounded in the context.\
+Return structured output only.
 """.strip()

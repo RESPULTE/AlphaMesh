@@ -17,7 +17,6 @@ class NewsTurnRelevantMemory(TurnRelevantMemoryBase):
     turn_index: int = 0
     chunk_ids: List[str] = field(default_factory=list)
     source_urls: List[str] = field(default_factory=list)
-    score_unavailable: bool = False
 
 
 @dataclass
@@ -47,7 +46,6 @@ class NewsWorkingMemoryManager(
         conversation_id: str,
         turn_index: int,
         chunks: List[RetrievedChunk],
-        score_unavailable: bool,
         source_key_fn: Callable[[RetrievedChunk], str],
     ) -> None:
         if not conversation_id:
@@ -66,7 +64,6 @@ class NewsWorkingMemoryManager(
                 turn_index=turn_index,
                 chunk_ids=[chunk.chunk_id for chunk in chunks if chunk.chunk_id],
                 source_urls=source_urls,
-                score_unavailable=score_unavailable,
             ),
         )
 
@@ -83,8 +80,7 @@ class NewsWorkingMemoryManager(
             lines.append(
                 f"- turn_index={row.turn_index}\n"
                 f"  relevant_chunks={len(row.chunk_ids)}\n"
-                f"  relevant_sources={len(row.source_urls)}\n"
-                f"  score_unavailable={row.score_unavailable}"
+                f"  relevant_sources={len(row.source_urls)}"
             )
         return "\n".join(lines)
 
@@ -104,14 +100,16 @@ class NewsWorkingMemoryManager(
         if isinstance(sentiment, dict):
             sentiment_label = str(sentiment.get("label") or "").strip()
         source_count = int(memory_summary.get("source_count") or 0)
-        findings_summary = trim_text(
-            memory_summary.get("findings_summary") or "",
+        summary_text = trim_text(
+            memory_summary.get("missing_information_goal")
+            or memory_summary.get("findings_summary")
+            or "",
             max_chars=200,
         )
         return (
             f"actions={','.join(str(a) for a in actions[:4]) or 'none'}; "
             f"sources={source_count}; sentiment={sentiment_label or 'N/A'}; "
-            f"summary={findings_summary or 'N/A'}"
+            f"summary={summary_text or 'N/A'}"
         )
 
     @classmethod
