@@ -683,7 +683,7 @@ export default function DashboardTurnPanel({
           </div>
         </div>
 
-        <SynthesisHeroCard data={data} isStreaming={isStreaming} />
+        {!stableShowAnalytics && <SynthesisHeroCard data={data} isStreaming={isStreaming} />}
 
         <AnimatePresence mode="sync">
           {stableShowAnalytics && (
