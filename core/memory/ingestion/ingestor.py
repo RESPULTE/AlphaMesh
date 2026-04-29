@@ -30,9 +30,9 @@ from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.models import (
     _EXTRACTABLE_ENTITY_TYPES,
+    FINANCIAL_CONCEPT_CATEGORIES,
     BatchEntityExtractionResult,
     ChunkEntityExtractionResult,
-    FINANCIAL_CONCEPT_CATEGORIES,
     DocumentMetadata,
     DocumentNode,
     EntityNode,
@@ -373,9 +373,7 @@ class DualStoreIngestor:
         if entity.entity_type != "FinancialEvent":
             return
         try:
-            await self._nodeset_manager.assign_to_node(
-                entity.id, "Entity", nodeset_id
-            )
+            await self._nodeset_manager.assign_to_node(entity.id, "Entity", nodeset_id)
         except Exception:
             self._logger.exception(
                 "Failed to link FinancialEvent '%s' to GlobalFinancialEvents nodeset",

@@ -95,6 +95,13 @@ class CompositePrefilter:
                         "composite_score": chunk.composite_score,
                         "rank": idx,
                         "selected": chunk.chunk_id in selected_ids,
+                        "chunk_text": chunk.text,
+                        "article_title": chunk.article_title
+                        or (chunk.metadata or {}).get("article_title")
+                        or "",
+                        "source_url": chunk.source_url
+                        or (chunk.metadata or {}).get("source_url")
+                        or "",
                     }
                 )
             try:

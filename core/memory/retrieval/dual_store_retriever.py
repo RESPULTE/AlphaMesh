@@ -274,7 +274,17 @@ class DualStoreRetriever:
             payload={
                 "query": query,
                 "chunks": [
-                    {"chunk_id": chunk.chunk_id, "score": chunk.score}
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "score": chunk.score,
+                        "chunk_text": chunk.text,
+                        "article_title": chunk.article_title
+                        or (chunk.metadata or {}).get("article_title")
+                        or "",
+                        "source_url": chunk.source_url
+                        or (chunk.metadata or {}).get("source_url")
+                        or "",
+                    }
                     for chunk in retrieved
                 ],
             },
@@ -495,6 +505,19 @@ class DualStoreRetriever:
                         "chunk_id": chunk_id,
                     }
                     for supporting_entity_id, chunk_id in sorted(trace_links)
+                ],
+                "chunks": [
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "chunk_text": chunk.text,
+                        "article_title": chunk.article_title
+                        or (chunk.metadata or {}).get("article_title")
+                        or "",
+                        "source_url": chunk.source_url
+                        or (chunk.metadata or {}).get("source_url")
+                        or "",
+                    }
+                    for chunk in new_chunks
                 ],
                 "new_chunk_ids": list(new_chunk_ids),
             },
