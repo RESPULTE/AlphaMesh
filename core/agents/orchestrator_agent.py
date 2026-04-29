@@ -190,10 +190,10 @@ class OrchestratorAgent:
         return "synthesiser"
 
     def _enrichment_router(self, state: OrchestratorState) -> str:
-        if state.plan and state.plan.final_answer is not None:
-            return "direct_answer"
         if state.plan and state.plan.target_agents:
             return "execute_agents"
+        if state.plan and state.plan.final_answer is not None:
+            return "direct_answer"
         return "synthesiser"
 
     def _build_graph(self):
@@ -533,7 +533,6 @@ class OrchestratorAgent:
             t for t, info in results.items() if info.is_valid and info.is_equity
         ]
 
-        # â”€â”€ Re-publish ticker_resolved with validated symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Defensive: covers the case where _plan_node ran on a different async
         # context before the sink was registered, or ticker casing differed.
         if confirmed_tickers:

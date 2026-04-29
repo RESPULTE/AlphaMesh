@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
+from urllib.parse import urlsplit, urlunsplit
 
 from langchain_core.documents import Document
 from pydantic import BaseModel, ConfigDict, Field
@@ -217,6 +219,45 @@ class RetrievedChunk:
         return str(metadata.get("source_url") or self.source_url or "").strip()
 
     @staticmethod
+    def _canonicalize_source_url_key(url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        parsed = urlsplit(raw)
+        if not parsed.scheme and not parsed.netloc:
+            return raw.split("?", 1)[0].split("#", 1)[0].strip()
+        normalized_path = parsed.path or ""
+        if normalized_path != "/" and normalized_path.endswith("/"):
+            normalized_path = normalized_path.rstrip("/")
+        return urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                normalized_path,
+                "",
+                "",
+            )
+        ).strip()
+
+    @staticmethod
+    def _normalize_text_key(text: str) -> str:
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return ""
+        return re.sub(r"\s+", " ", raw)
+
+    @classmethod
+    def _article_key(cls, chunk: "RetrievedChunk") -> str:
+        metadata = chunk.metadata or {}
+        source_url = str(metadata.get("source_url") or chunk.source_url or "").strip()
+        canonical_url = cls._canonicalize_source_url_key(source_url)
+        if canonical_url:
+            return f"url:{canonical_url}"
+        title = str(metadata.get("article_title") or chunk.article_title or "").strip()
+        normalized_title = cls._normalize_text_key(title) or "unknown title"
+        return f"title:{normalized_title}"
+
+    @staticmethod
     def _build_deduplicated_sources(
         chunks: List["RetrievedChunk"],
     ) -> Tuple[List[CitedSource], Dict[int, int]]:
@@ -274,6 +315,32 @@ class RetrievedChunk:
             ):
                 by_id[chunk_id] = chunk
         return list(by_id.values()) + fallback_chunks
+
+    @classmethod
+    def _dedupe_chunks_by_article_text(
+        cls, chunks: List["RetrievedChunk"]
+    ) -> List["RetrievedChunk"]:
+        deduped: List[RetrievedChunk] = []
+        key_to_index: Dict[Tuple[str, str], int] = {}
+        for chunk in chunks:
+            article_key = cls._article_key(chunk)
+            text_key = cls._normalize_text_key(chunk.text)
+            dedupe_key = (article_key, text_key)
+
+            existing_idx = key_to_index.get(dedupe_key)
+            if existing_idx is None:
+                key_to_index[dedupe_key] = len(deduped)
+                deduped.append(chunk)
+                continue
+
+            existing_chunk = deduped[existing_idx]
+            existing_score = existing_chunk.relevance_score
+            incoming_score = chunk.relevance_score
+            if incoming_score is not None and (
+                existing_score is None or incoming_score > existing_score
+            ):
+                deduped[existing_idx] = chunk
+        return deduped
 
     @staticmethod
     def _build_chunk_alias_maps(

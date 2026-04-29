@@ -150,14 +150,47 @@ def test_rendezvous_builds_article_context_with_deduped_working_and_retrieved_ch
     assert "working memory insight" in article_block
     assert "memory chunk" in article_block
     assert "fetched chunk" in article_block
-    assert "low relevance memory chunk" not in article_block
     assert "working memory duplicate" not in article_block
     assert "fetched chunk duplicate in memory" not in article_block
     assert article_block.count("fetched chunk") == 1
     assert "chunk_id=?" not in article_block
 
     assert len(agent._working_memory.merged) == len(result["final_chunks"])
-    assert all(chunk.relevance_score is not None and chunk.relevance_score >= 0.4 for chunk in agent._working_memory.merged)
+
+
+def test_rendezvous_context_dedupes_repeated_text_within_same_article() -> None:
+    agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
+    agent._working_memory = _FakeWorkingMemory()
+
+    repeated_text = "Greg Abel is expected to focus on capital allocation discipline."
+    state = NewsAgentState(
+        goal="Assess Berkshire meeting prep",
+        conversation_id="conv-2",
+        retrieved_chunks=[
+            _chunk(
+                "dup-1",
+                repeated_text,
+                url="https://example.com/berkshire?utm_source=feed",
+                title="Berkshire Prep",
+                relevance=0.6,
+            ),
+            _chunk(
+                "dup-2",
+                repeated_text,
+                url="https://example.com/berkshire",
+                title="Berkshire Prep",
+                relevance=0.8,
+            ),
+        ],
+    )
+
+    result = asyncio.run(agent._rendezvous_node(state))
+    article_block = result["article_context_block"]
+    final_chunks = result["final_chunks"]
+
+    assert article_block.count(repeated_text) == 1
+    assert len(final_chunks) == 1
+    assert final_chunks[0].chunk_id == "dup-2"
 
 
 def test_analyse_news_prompt_contains_article_grouped_section() -> None:

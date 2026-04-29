@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable, List
-from urllib.parse import urlsplit, urlunsplit
 
 from core.agents.working_memory.base import (
     ConversationWorkingMemoryBase,
@@ -57,21 +56,7 @@ class NewsWorkingMemoryManager(
 
     @staticmethod
     def canonicalize_url_key(url: str) -> str:
-        raw = str(url or "").strip()
-        if not raw:
-            return ""
-        parsed = urlsplit(raw)
-        if not parsed.scheme and not parsed.netloc:
-            return raw.split("?", 1)[0].split("#", 1)[0].strip()
-        return urlunsplit(
-            (
-                parsed.scheme.lower(),
-                parsed.netloc.lower(),
-                parsed.path or "",
-                "",
-                "",
-            )
-        ).strip()
+        return RetrievedChunk._canonicalize_source_url_key(url)
 
     def get_seen_url_keys(self, conversation_id: str) -> List[str]:
         if not conversation_id:

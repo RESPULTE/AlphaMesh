@@ -109,14 +109,14 @@ def _call_tavily_search_via_sdk(
     topic: str,
     search_depth: str,
     max_results: int,
-    include_domains: List[str],
+    # include_domains: List[str],
 ) -> Dict[str, Any]:
     response = client.search(
         query=query,
         topic=topic,
         search_depth=search_depth,
         max_results=max_results,
-        include_domains=include_domains,
+        # include_domains=include_domains,
     )
     if not isinstance(response, dict):
         raise TypeError("Tavily SDK returned a non-dict search response.")
@@ -136,7 +136,7 @@ def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
 
     return {
         "title": title,
-        "description": content[:500],
+        "description": "",
         "content": content,
         "url": url,
         "urlToImage": None,
@@ -176,7 +176,7 @@ async def fetch_articles_from_tavily(
                 topic=topic,
                 search_depth=settings.TAVILY_SEARCH_DEPTH,
                 max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
-                include_domains=settings.INCLUDE_DOMAINS,
+                # include_domains=settings.INCLUDE_DOMAINS,
             ),
             timeout=settings._SCRAPE_TIMEOUT,
         )

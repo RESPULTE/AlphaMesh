@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     EMBEDDING_API_KEY: Optional[str] = Field(
         default=None, validation_alias="EMBEDDING_API_KEY"
     )
-    LLM_MODEL: str = "gemini-2.5-flash-lite"
+    LLM_MODEL: str = "gemini-flash-latest"
     EMBEDDING_MODEL: str = "gemini-embedding-001"
 
     # ── Neo4j ─────────────────────────────────────────────────────────────────
@@ -124,6 +124,8 @@ class Settings(BaseSettings):
         "investing.com",
         "morningstar.com",
         "barrons.com",
+        "investopedia.com",
+        "reddit.com",
     ]
 
     # ── Scraping ──────────────────────────────────────────────────────────────

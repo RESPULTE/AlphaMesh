@@ -44,8 +44,6 @@ from core.services import service_manager
 
 logger = get_logger(__name__)
 
-_TARGET_MIN_CHUNKS_PER_SOURCE = 3
-
 
 def _history_block(logs: List[ResearchStepLog], limit: int = 6) -> str:
     if not logs:
@@ -80,6 +78,15 @@ class NewsAnalysisStructuredOutput(BaseModel):
     analysis: str = ""
     missing_information_goal: str = ""
     persist_chunk_ids: List[int | str] = Field(default_factory=list)
+    source_chunk_ids: List[int | str] = Field(default_factory=list)
+    sentiment: Optional[AgentSentiment] = None
+
+
+class NewsAnalysisStructuredOutputForced(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    is_context_sufficient: bool = True
+    analysis: str = ""
     source_chunk_ids: List[int | str] = Field(default_factory=list)
     sentiment: Optional[AgentSentiment] = None
 
@@ -127,36 +134,37 @@ class NewsAnalysisAgent(AbstractAgent):
         filtered = [chunk for chunk in chunks if chunk.chunk_id in selected_ids]
         return filtered or chunks
 
-
-
     @classmethod
     def _rank_chunks(cls, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
         def _is_tavily_chunk(chunk: RetrievedChunk) -> bool:
             return str(chunk.relevance_source or "").strip() == "tavily"
-        
-        deduped_chunks = RetrievedChunk._dedupe_chunks(chunks)
-        tavily_chunks = [
-            chunk for chunk in deduped_chunks if _is_tavily_chunk(chunk)
-        ]
+
+        deduped_chunks = RetrievedChunk._dedupe_chunks_by_article_text(
+            RetrievedChunk._dedupe_chunks(chunks)
+        )
+        tavily_chunks = [chunk for chunk in deduped_chunks if _is_tavily_chunk(chunk)]
         non_tavily_chunks = [
             chunk
             for chunk in deduped_chunks
             if not _is_tavily_chunk(chunk)
-            if chunk.relevance_score is not None and chunk.relevance_score >= settings.NEWS_AGENT_MIN_RELEVANCE_SCORE
+            if chunk.relevance_score is not None
+            and chunk.relevance_score >= settings.NEWS_AGENT_MIN_RELEVANCE_SCORE
         ]
         ranked_non_tavily = sorted(
             non_tavily_chunks,
             key=lambda chunk: chunk.relevance_score or 0.0,
             reverse=True,
         )
-        return RetrievedChunk._dedupe_chunks(tavily_chunks + ranked_non_tavily)
+        return RetrievedChunk._dedupe_chunks_by_article_text(
+            RetrievedChunk._dedupe_chunks(tavily_chunks + ranked_non_tavily)
+        )
 
     @staticmethod
     def _source_url_key(chunk: RetrievedChunk) -> str:
         source_url = str(
             chunk.source_url or (chunk.metadata or {}).get("source_url") or ""
         ).strip()
-        return NewsWorkingMemoryManager.canonicalize_url_key(source_url)
+        return RetrievedChunk._canonicalize_source_url_key(source_url)
 
     @classmethod
     def _with_chunk_metadata(
@@ -223,12 +231,16 @@ class NewsAnalysisAgent(AbstractAgent):
             grouped[group_key].append(chunk)
 
         lines: List[str] = []
-        for group_key in group_order:
+        for i, group_key in enumerate(group_order, 1):
             chunks = grouped.get(group_key, [])
             if not chunks:
                 continue
-            deduped = RetrievedChunk._dedupe_chunks(chunks)
-            lines.append(f"[{group_labels.get(group_key, 'Unknown Title')}]")
+            deduped = RetrievedChunk._dedupe_chunks_by_article_text(
+                RetrievedChunk._dedupe_chunks(chunks)
+            )
+            lines.append(
+                f"Article {i}: [{group_labels.get(group_key, 'Unknown Title')}]"
+            )
             for chunk in deduped:
                 chunk_alias = chunk_id_to_alias.get((chunk.chunk_id or "").strip(), "")
                 if not chunk_alias:
@@ -682,8 +694,8 @@ class NewsAnalysisAgent(AbstractAgent):
         """Check context sufficiency and generate grounded analysis when possible."""
         chunks = self._rank_chunks(state.final_chunks)
         forced_final_pass = (
-            state.research_iteration >= settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS
-        )
+            state.research_iteration + 1
+        ) >= settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS
 
         if not chunks:
             if forced_final_pass:
@@ -715,13 +727,7 @@ class NewsAnalysisAgent(AbstractAgent):
             f"Evaluating context sufficiency ({len(chunks)} chunk(s))...",
         )
 
-        chunk_id_to_alias, alias_to_chunk_id = RetrievedChunk._build_chunk_alias_maps(
-            chunks
-        )
-        article_context_block = (
-            state.article_context_block or ""
-        ).strip() or RetrievedChunk._render_candidate_chunks(chunks, chunk_id_to_alias)
-
+        _, alias_to_chunk_id = RetrievedChunk._build_chunk_alias_maps(chunks)
         context_prefix = build_analysis_context_prefix(
             company_context=state.company_context,
             agent_memory_context=state.agent_memory_context,
@@ -732,46 +738,68 @@ class NewsAnalysisAgent(AbstractAgent):
             SystemMessage(content=NEWS_ANALYSIS_AGENT_SYSTEM_PROMPT),
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
-                    goal=state.missing_information_goal or state.goal,
-                    iteration=state.research_iteration,
+                    goal=state.goal,
+                    iteration=state.research_iteration + 1,
                     max_iterations=settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS,
                     forced_final_pass=str(forced_final_pass).lower(),
                     entities_section=context_prefix,
-                    article_context=article_context_block,
+                    article_context=state.article_context_block,
                 )
             ),
         ]
 
         relationships_extracted = False
+        response_model = (
+            NewsAnalysisStructuredOutputForced
+            if forced_final_pass
+            else NewsAnalysisStructuredOutput
+        )
         try:
-            structured_llm = self._llm.with_structured_output(
-                NewsAnalysisStructuredOutput
-            )
-            response: NewsAnalysisStructuredOutput = await structured_llm.ainvoke(
-                messages
-            )
+            structured_llm = self._llm.with_structured_output(response_model)
+            response = await structured_llm.ainvoke(messages)
         except Exception as exc:
             logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
-            response = NewsAnalysisStructuredOutput(
-                is_context_sufficient=forced_final_pass,
-                analysis=(
-                    "Insufficient context to answer comprehensively."
-                    if not forced_final_pass
-                    else "Best-effort analysis could not be generated due to an internal error."
-                ),
-                missing_information_goal=state.missing_information_goal or state.goal,
-                persist_chunk_ids=[],
-                sentiment=None,
-            )
+            if forced_final_pass:
+                response = NewsAnalysisStructuredOutputForced(
+                    is_context_sufficient=True,
+                    analysis=(
+                        "Best-effort analysis could not be generated due to an internal error."
+                    ),
+                    source_chunk_ids=[],
+                    sentiment=None,
+                )
+            else:
+                response = NewsAnalysisStructuredOutput(
+                    is_context_sufficient=False,
+                    analysis="Insufficient context to answer comprehensively.",
+                    missing_information_goal=state.missing_information_goal
+                    or state.goal,
+                    persist_chunk_ids=[],
+                    sentiment=None,
+                )
 
-        selected_chunk_ids = [
-            alias_to_chunk_id.get(str(item).strip(), str(item).strip())
-            for item in (response.persist_chunk_ids or [])
-        ]
-        persisted_chunks = self._resolve_selected_chunks(chunks, selected_chunk_ids)
+        available_chunk_ids = {
+            str(chunk.chunk_id).strip()
+            for chunk in chunks
+            if str(chunk.chunk_id).strip()
+        }
+
+        def _normalize_selected_chunk_ids(raw_ids: List[int | str]) -> List[str]:
+            mapped_ids = [
+                alias_to_chunk_id.get(str(item).strip(), str(item).strip())
+                for item in (raw_ids or [])
+                if str(item).strip()
+            ]
+            return [
+                chunk_id for chunk_id in mapped_ids if chunk_id in available_chunk_ids
+            ]
+
+        response_missing_goal = str(getattr(response, "missing_information_goal", ""))
+        response_persist_chunk_ids = list(getattr(response, "persist_chunk_ids", []))
+        selected_chunk_ids = _normalize_selected_chunk_ids(response_persist_chunk_ids)
 
         if not response.is_context_sufficient and not forced_final_pass:
-            missing_goal = (response.missing_information_goal or "").strip()
+            missing_goal = response_missing_goal.strip()
             if not missing_goal:
                 missing_goal = state.missing_information_goal or state.goal
             missing_goal = self._build_instructional_missing_goal(
@@ -782,18 +810,16 @@ class NewsAnalysisAgent(AbstractAgent):
                 "is_context_sufficient": False,
                 "missing_information_goal": missing_goal,
                 "persist_chunk_ids": selected_chunk_ids,
-                "final_chunks": persisted_chunks,
+                "final_chunks": chunks,
                 "analysis": "",
                 "sources": [],
             }
 
-        selected_source_chunk_ids = [
-            alias_to_chunk_id.get(str(item).strip(), str(item).strip())
-            for item in (response.source_chunk_ids or response.persist_chunk_ids or [])
-        ]
+        selected_source_chunk_ids = _normalize_selected_chunk_ids(
+            response.source_chunk_ids or response_persist_chunk_ids or []
+        )
         if not selected_chunk_ids and selected_source_chunk_ids:
             selected_chunk_ids = list(selected_source_chunk_ids)
-            persisted_chunks = self._resolve_selected_chunks(chunks, selected_chunk_ids)
         selected_source_chunks = self._resolve_selected_chunks(
             chunks,
             selected_source_chunk_ids,
@@ -836,9 +862,7 @@ class NewsAnalysisAgent(AbstractAgent):
             "source_count": len(sources),
             "top_references": top_references,
             "sentiment": response.sentiment.model_dump() if response.sentiment else {},
-            "missing_information_goal": (
-                response.missing_information_goal or ""
-            ).strip(),
+            "missing_information_goal": response_missing_goal.strip(),
             "persist_chunk_ids": selected_chunk_ids,
         }
 
@@ -851,7 +875,7 @@ class NewsAnalysisAgent(AbstractAgent):
             "memory_summary": memory_summary,
             "is_context_sufficient": True,
             "persist_chunk_ids": selected_chunk_ids,
-            "final_chunks": persisted_chunks,
+            "final_chunks": chunks,
         }
         if response.sentiment is not None:
             result["sentiment"] = response.sentiment
