@@ -197,6 +197,7 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
   if (tickerResult) {
     response.ticker = tickerResult.ticker || '';
     response.companyName = tickerResult.ticker || '';
+    response.chartData = tickerResult.market_chart ?? [];
     response.fundamentalData = tickerResult.financial_data ?? null;
     response.fundamentalsVisualization = tickerResult.fundamentals_visualization ?? null;
   }

@@ -25,111 +25,19 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
-from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 import trafilatura
 from newsapi import NewsApiClient
 
+try:
+    from tavily import TavilyClient
+except Exception:  # pragma: no cover - optional dependency in local/dev environments
+    TavilyClient = None
+
 from core.config import settings
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Trusted financial-news domains (passed as `domains=` to NewsAPI).
-# NewsAPI accepts a comma-separated list; max 20 sources on paid plans.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 1. Query builder
-# ---------------------------------------------------------------------------
-
-
-# def build_news_query(
-#     ticker: str,
-#     *,
-#     company_name: Optional[str] = None,
-#     must_include: Optional[List[str]] = None,
-#     must_exclude: Optional[List[str]] = None,
-#     any_of: Optional[List[str]] = None,
-#     exact_phrase: Optional[str] = None,
-# ) -> str:
-#     """
-#     Build an advanced NewsAPI `q` string using boolean operators.
-
-#     NewsAPI supports:
-#       • "phrase"      → exact match
-#       • +word         → must appear
-#       • -word         → must NOT appear
-#       • AND / OR / NOT and parentheses for grouping
-
-#     Examples
-#     --------
-#     >>> build_news_query("AAPL", must_include=["earnings"], must_exclude=["rumour"])
-#     '(AAPL OR Apple) +earnings -rumour'
-
-#     >>> build_news_query(
-#     ...     "MSFT",
-#     ...     company_name="Microsoft",
-#     ...     any_of=["Azure", "cloud", "AI"],
-#     ...     must_exclude=["lawsuit"],
-#     ...     exact_phrase="quarterly results",
-#     ... )
-#     '(MSFT OR Microsoft) AND (Azure OR cloud OR AI) +"quarterly results" -lawsuit'
-
-#     Parameters
-#     ----------
-#     ticker:         Stock ticker (always included).
-#     company_name:   Human-readable company name (ORed with ticker).
-#     must_include:   Words/phrases that MUST appear (+prefix).
-#     must_exclude:   Words/phrases that must NOT appear (-prefix).
-#     any_of:         Words that should match at least one (OR group).
-#     exact_phrase:   An exact phrase wrapped in quotes.
-
-#     Returns
-#     -------
-#     A URL-safe query string (NewsAPI handles URL encoding internally).
-#     Max 500 chars — truncated with a warning if exceeded.
-#     """
-#     parts: List[str] = []
-
-#     # Core subject: ticker OR company name
-#     if company_name:
-#         parts.append(f"({ticker} OR {company_name})")
-#     else:
-#         parts.append(ticker)
-
-#     # Optional OR group
-#     if any_of:
-#         group = " OR ".join(any_of)
-#         parts.append(f"AND ({group})")
-
-#     # Exact phrase
-#     if exact_phrase:
-#         parts.append(f'+"{exact_phrase}"')
-
-#     # Must-include terms (+prefix)
-#     for word in must_include or []:
-#         parts.append(f"+{word}")
-
-#     # Must-exclude terms (-prefix)
-#     for word in must_exclude or []:
-#         parts.append(f"-{word}")
-
-#     q = " ".join(parts)
-
-#     if len(q) > 500:
-#         logger.warning("NewsAPI query exceeds 500 chars (%d). Truncating.", len(q))
-#         q = q[:500]
-
-#     return q
-
-
-# ---------------------------------------------------------------------------
-# 2. Full-content scraper (trafilatura, async)
-# ---------------------------------------------------------------------------
 
 
 async def _scrape_url(
@@ -195,19 +103,26 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
-def _call_tavily_search(
-    payload: Dict[str, Any],
-    timeout_seconds: int,
+def _call_tavily_search_via_sdk(
+    client: Any,
+    *,
+    query: str,
+    topic: str,
+    search_depth: str,
+    max_results: int,
+    include_domains: List[str],
 ) -> Dict[str, Any]:
-    req = Request(
-        settings.TAVILY_SEARCH_API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    response = client.search(
+        query=query,
+        topic=topic,
+        search_depth=search_depth,
+        max_results=max_results,
+        include_raw_content=True,
+        include_domains=include_domains,
     )
-    with urlopen(req, timeout=timeout_seconds) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body)
+    if not isinstance(response, dict):
+        raise TypeError("Tavily SDK returned a non-dict search response.")
+    return response
 
 
 def _normalise_tavily_result_to_article(result: Dict[str, Any]) -> dict:
@@ -249,30 +164,44 @@ async def fetch_articles_from_tavily(
     if not settings.TAVILY_API_KEY:
         logger.warning("TAVILY_API_KEY not configured. Skipping Tavily web search.")
         return []
+    if TavilyClient is None:
+        logger.warning("tavily package not installed. Skipping Tavily web search.")
+        return []
 
-    payload: Dict[str, Any] = {
-        "api_key": settings.TAVILY_API_KEY,
-        "query": query,
-        "topic": topic,
-        "search_depth": settings.TAVILY_SEARCH_DEPTH,
-        "max_results": settings.TAVILY_SEARCH_MAX_RESULTS,
-        "include_raw_content": True,
-        "include_domains": settings.INCLUDE_DOMAINS,
-    }
+    client = TavilyClient(api_key=settings.TAVILY_API_KEY)
+
     try:
-        response: Dict[str, Any] = await asyncio.to_thread(
-            _call_tavily_search,
-            payload,
-            settings._SCRAPE_TIMEOUT,
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                _call_tavily_search_via_sdk,
+                client,
+                query=query,
+                topic=topic,
+                search_depth=settings.TAVILY_SEARCH_DEPTH,
+                max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
+                include_domains=settings.INCLUDE_DOMAINS,
+            ),
+            timeout=settings._SCRAPE_TIMEOUT,
         )
-    except URLError as exc:
-        logger.error("Tavily request failed for query '%s': %s", query, exc)
+    except asyncio.TimeoutError:
+        logger.error(
+            "Tavily SDK request timed out after %ss for query '%s'.",
+            settings._SCRAPE_TIMEOUT,
+            query,
+        )
         return []
     except Exception as exc:
-        logger.error("Unexpected Tavily failure for query '%s': %s", query, exc)
+        logger.error("Tavily SDK request failed for query '%s': %s", query, exc)
         return []
 
-    results = response.get("results") or []
+    results = response.get("results", [])
+    if not isinstance(results, list):
+        logger.warning(
+            "Tavily SDK returned unexpected `results` type for query '%s': %s",
+            query,
+            type(results).__name__,
+        )
+        return []
     articles = [
         _normalise_tavily_result_to_article(r)
         for r in results
@@ -344,7 +273,7 @@ async def fetch_articles_from_newsapi(
                 sort_by=sort_by,
                 page=page,
                 page_size=settings.NEWS_FETCH_MAX_ARTICLES,
-                domains=settings.INCLUDE_DOMAINS,
+                domains=",".join(settings.INCLUDE_DOMAINS),
             ),
         )
     except Exception as exc:

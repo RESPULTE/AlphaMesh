@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
@@ -194,7 +194,7 @@ class AnalysisRunner:
         event_queue: asyncio.Queue,
         request_id: str,
         ticker: str,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         market_svc = service_manager.get_market_data_service()
         try:
             quote, chart = await asyncio.wait_for(
@@ -204,12 +204,14 @@ class AnalysisRunner:
                 ),
                 timeout=10.0,
             )
+            chart_payload = chart if isinstance(chart, list) else []
             await event_queue.put(
                 {"event_type": "init", "request_id": request_id, "quote": quote}
             )
             await event_queue.put(
-                {"event_type": "chart", "request_id": request_id, "chart": chart}
+                {"event_type": "chart", "request_id": request_id, "chart": chart_payload}
             )
+            return chart_payload
         except asyncio.TimeoutError:
             await event_queue.put(
                 {
@@ -218,6 +220,7 @@ class AnalysisRunner:
                     "quote": {"ticker": ticker, "companyName": ticker},
                 }
             )
+            return []
         except Exception as exc:
             logger.warning("Market data fetch failed: %s", exc)
             await event_queue.put(
@@ -227,6 +230,7 @@ class AnalysisRunner:
                     "quote": {"ticker": ticker, "companyName": ticker},
                 }
             )
+            return []
 
     async def _refresh_conversation_memory_index(
         self,
@@ -272,6 +276,8 @@ class AnalysisRunner:
         loop = asyncio.get_running_loop()
         t_start = time.monotonic()
         market_data_emitted = False
+        market_data_task: Optional[asyncio.Task[None]] = None
+        market_chart: list[dict[str, Any]] = []
 
         # -- 1. Register response group + SSE sink -----------------------------
         response_label = queue.start_response("orchestrator")
@@ -290,13 +296,19 @@ class AnalysisRunner:
         token = _current_response_label.set(response_label)
 
         # -- 2a. Market data fetch is driven by validated ticker events ---------
+        async def _emit_and_capture_market_data(ticker: str) -> None:
+            nonlocal market_chart
+            chart_payload = await self._emit_market_data(event_queue, request_id, ticker)
+            if chart_payload:
+                market_chart = chart_payload
+
         def _schedule_market_data(ticker: str) -> None:
-            nonlocal market_data_emitted
+            nonlocal market_data_emitted, market_data_task
             if market_data_emitted:
                 return
             market_data_emitted = True
-            asyncio.create_task(
-                self._emit_market_data(event_queue, request_id, ticker),
+            market_data_task = asyncio.create_task(
+                _emit_and_capture_market_data(ticker),
                 name=f"market_{request_id[:8]}",
             )
 
@@ -374,7 +386,10 @@ class AnalysisRunner:
 
             final_ticker = (getattr(final_response, "tickers", []) or [None])[0]
             if final_ticker and not market_data_emitted:
-                await self._emit_market_data(event_queue, request_id, final_ticker)
+                market_data_emitted = True
+                await _emit_and_capture_market_data(final_ticker)
+            elif market_data_task is not None and not market_data_task.done():
+                await market_data_task
 
             # -- 5. Emit metrics payload (if available) ------------------------
             visualization_payload = _build_fundamentals_visualization_payload(
@@ -407,6 +422,7 @@ class AnalysisRunner:
                 final_response=final_response,
                 duration_ms=duration_ms,
                 fundamentals_visualization_payload=visualization_payload,
+                market_chart=market_chart,
             )
 
             # -- 7. Persist rich conversation turn -----------------------------
@@ -482,6 +498,7 @@ def _build_final_result(
     final_response,  # core.agents.models.orchestrator_models.FinalResponse
     duration_ms: float,
     fundamentals_visualization_payload: Optional[FundamentalsVisualizationPayload] = None,
+    market_chart: Optional[list[dict[str, Any]]] = None,
 ) -> FinalResult:
     """
     Map OrchestratorAgent's FinalResponse ? API-layer FinalResult.
@@ -523,6 +540,7 @@ def _build_final_result(
     ticker_result = TickerResult(
         ticker=tickers[0] if tickers else "",
         analysis_text=primary_analysis,
+        market_chart=market_chart or [],
         financial_data=financial_payload,
         fundamentals_visualization=(
             fundamentals_visualization_payload

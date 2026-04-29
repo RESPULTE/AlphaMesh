@@ -113,7 +113,7 @@ export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisRespo
     priceChange: null,
     priceChangePercent: null,
     marketStatus: 'MARKET DATA UNAVAILABLE',
-    chartData: [],
+    chartData: primary?.market_chart ?? [],
     fundamentalData: financialData,
     fundamentalsVisualization,
     agents,

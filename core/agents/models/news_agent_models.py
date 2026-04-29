@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional
+import operator
+from typing import Annotated, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,7 +40,7 @@ class PlannerDecision(BaseModel):
     queries: List[DomainQuery] = Field(default_factory=list)
     findings_summary: str = Field(default="")
     max_results: int = Field(default=5, ge=1, le=20)
-    relevant_chunks: List[str] = Field(default_factory=list)
+    relevant_chunks: List[int | str] = Field(default_factory=list)
 
     def _normalize_planner_selection_ids(
         self,
@@ -49,11 +50,9 @@ class PlannerDecision(BaseModel):
             return self
         normalized = []
         for selection in self.relevant_chunks:
-            raw_chunk_id = (selection.chunk_id or "").strip()
-            mapped_chunk_id = alias_to_chunk_id.get(raw_chunk_id, raw_chunk_id)
-            normalized.append(
-                selection.model_copy(update={"chunk_id": mapped_chunk_id})
-            )
+            selection_key = str(selection).strip()
+            mapped_chunk_id = alias_to_chunk_id.get(selection_key, selection_key)
+            normalized.append(mapped_chunk_id)
         return self.model_copy(update={"relevant_chunks": normalized})
 
 
@@ -114,8 +113,10 @@ class NewsAgentState(BaseAgentInput):
     model_config = ConfigDict(extra="ignore")
 
     planner_decision: Optional[PlannerDecision] = None
-    research_logs: List[ResearchStepLog] = Field(default_factory=list)
-    seen_urls: List[str] = Field(default_factory=list)
+    research_logs: Annotated[List[ResearchStepLog], operator.add] = Field(
+        default_factory=list
+    )
+    seen_urls: Annotated[List[str], operator.add] = Field(default_factory=list)
     research_iteration: int = 0
     is_information_sufficient: bool = False
 
@@ -126,9 +127,13 @@ class NewsAgentState(BaseAgentInput):
     rendezvous_relevant_source_count: int = 0
 
     # Chunks accumulated from the online fetch+ingest branch across all iterations.
-    retrieved_chunks: List[RetrievedChunk] = Field(default_factory=list)
+    retrieved_chunks: Annotated[List[RetrievedChunk], operator.add] = Field(
+        default_factory=list
+    )
     # Chunks returned by retrieve_memory for the current iteration.
-    memory_chunks: List[RetrievedChunk] = Field(default_factory=list)
+    memory_chunks: Annotated[List[RetrievedChunk], operator.add] = Field(
+        default_factory=list
+    )
     # Definitive chunks considered by planner for this iteration.
     final_chunks: List[RetrievedChunk] = Field(default_factory=list)
 

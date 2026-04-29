@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.types import Overwrite, Send
 from pydantic import BaseModel
 
 from core.agents.base_agent import AbstractAgent
@@ -117,6 +117,20 @@ class NewsAnalysisAgent(AbstractAgent):
         return NewsAgentOutput
 
     @staticmethod
+    def render_memory_summary(memory_summary: Dict[str, Any]) -> str:
+        return NewsWorkingMemoryManager.render_memory_summary(memory_summary)
+
+    @classmethod
+    def build_memory_context_from_history(
+        cls,
+        history_turns: List[dict],
+        window: int = 8,
+    ) -> str:
+        return NewsWorkingMemoryManager.build_context_from_history_summaries(
+            history_turns, window=window
+        )
+
+    @staticmethod
     def _build_fallback_findings_summary(chunks: List[RetrievedChunk]) -> str:
         snippets: List[str] = []
         for chunk in chunks[:2]:
@@ -125,30 +139,70 @@ class NewsAnalysisAgent(AbstractAgent):
                 snippets.append(text[:220].strip())
         return " ".join(snippets)
 
+    @classmethod
+    def _build_missing_goal_output(cls) -> NewsAgentOutput:
+        reason = (
+            "news_agent requires a non-empty goal. "
+            "Goal is now mandatory and query-only execution is deprecated."
+        )
+        return NewsAgentOutput(
+            analysis="News analysis skipped: missing execution goal.",
+            sources=[],
+            entities_enriched=[],
+            memory_summary={
+                "bypassed": True,
+                "reason": reason,
+                "research_actions": [],
+                "tools_used": [],
+            },
+        )
+
+    @staticmethod
+    def _resolve_selected_chunks(
+        chunks: List[RetrievedChunk],
+        relevant_chunks: List[int | str] | List[str],
+    ) -> List[RetrievedChunk]:
+        selected_ids = {str(chunk_id).strip() for chunk_id in (relevant_chunks or [])}
+        if not selected_ids:
+            return chunks
+        filtered = [chunk for chunk in chunks if chunk.chunk_id in selected_ids]
+        return filtered or chunks
+
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
+        if not input_data.goal:
+            logger.warning("run: missing goal; skipping news execution.")
+            return self._build_missing_goal_output()
+
         start_date, end_date = get_default_date_range(
             input_data.start_date, input_data.end_date
         )
         start_date, end_date = constrain_date_range(start_date, end_date)
 
         conversation_id = (input_data.conversation_id or "").strip()
-        incoming_memory_context = (input_data.agent_memory_context or "").strip()
+        effective_memory_context = self._working_memory.resolve_agent_memory_context(
+            conversation_id=conversation_id,
+            incoming_memory_context=input_data.agent_memory_context,
+        )
 
         initial_state = NewsAgentState(
-            query=input_data.query,
+            query="",
             goal=input_data.goal,
             ticker=input_data.ticker or "",
             start_date=start_date,
             end_date=end_date,
             conversation_id=conversation_id or None,
             turn_id=input_data.turn_id,
-            agent_memory_context=incoming_memory_context,
+            agent_memory_context=effective_memory_context,
             company_context=input_data.company_context,
         )
 
         final_state = await self._graph.ainvoke(initial_state.model_dump())
         output = NewsAgentOutput(**final_state)
+        self._working_memory.persist_agent_memory_summary(
+            conversation_id=conversation_id,
+            rendered_summary=self.render_memory_summary(output.memory_summary),
+        )
 
         final_chunks: List[RetrievedChunk] = final_state.get("final_chunks") or []
         existing_memory = self._working_memory.get_existing_conversation_memory(
@@ -303,12 +357,16 @@ class NewsAnalysisAgent(AbstractAgent):
             max_results = max(1, min(decision.max_results, 20))
         decision = decision.model_copy(update={"max_results": max_results})
 
-        selected_ids = {s.chunk_id for s in decision.relevant_chunks if s.chunk_id}
-        filtered_chunks = [
-            chunk for chunk in state.final_chunks if chunk.chunk_id in selected_ids
-        ]
-        if not filtered_chunks:
-            filtered_chunks = state.final_chunks
+        filtered_chunks = self._resolve_selected_chunks(
+            state.final_chunks,
+            decision.relevant_chunks,
+        )
+        logger.info(
+            "_planner_node: selection requested=%d resolved=%d total=%d",
+            len(decision.relevant_chunks or []),
+            len(filtered_chunks),
+            len(state.final_chunks),
+        )
 
         if decision.action == "proceed":
             findings_summary = (decision.findings_summary or "").strip()
@@ -428,12 +486,14 @@ class NewsAnalysisAgent(AbstractAgent):
         all_fetched = [article for batch in results_per_query for article in batch]
 
         seen_urls = set(state.seen_urls or [])
+        newly_seen_urls: List[str] = []
         new_articles: List[dict] = []
         for article in all_fetched:
             url = str(article.get("url") or "").strip()
             if url and url not in seen_urls:
                 new_articles.append(article)
                 seen_urls.add(url)
+                newly_seen_urls.append(url)
 
         log_row = ResearchStepLog(
             iteration=iter_label,
@@ -451,9 +511,9 @@ class NewsAnalysisAgent(AbstractAgent):
 
         if not new_articles:
             return {
-                "seen_urls": list(seen_urls),
-                "research_logs": list(state.research_logs) + [log_row],
-                "retrieved_chunks": state.retrieved_chunks,
+                "seen_urls": newly_seen_urls,
+                "research_logs": [log_row],
+                "retrieved_chunks": [],
             }
 
         publish_progress(
@@ -470,9 +530,9 @@ class NewsAnalysisAgent(AbstractAgent):
         except Exception:
             logger.exception("_fetch_and_ingest_node: ingestion failed")
             return {
-                "seen_urls": list(seen_urls),
-                "research_logs": list(state.research_logs) + [log_row],
-                "retrieved_chunks": state.retrieved_chunks,
+                "seen_urls": newly_seen_urls,
+                "research_logs": [log_row],
+                "retrieved_chunks": [],
             }
 
         async def _score_chunks(
@@ -497,17 +557,17 @@ class NewsAnalysisAgent(AbstractAgent):
             _score_chunks(existing_chunk_ids, "existing"),
         )
 
-        chunk_map: Dict[str, RetrievedChunk] = {
-            c.chunk_id: c for c in state.retrieved_chunks if c.chunk_id
-        }
+        existing_ids = {c.chunk_id for c in state.retrieved_chunks if c.chunk_id}
+        newly_scored_chunks: List[RetrievedChunk] = []
         for chunk in new_chunks + existing_chunks:
-            if chunk.chunk_id and chunk.chunk_id not in chunk_map:
-                chunk_map[chunk.chunk_id] = chunk
+            if chunk.chunk_id and chunk.chunk_id not in existing_ids:
+                existing_ids.add(chunk.chunk_id)
+                newly_scored_chunks.append(chunk)
 
         return {
-            "seen_urls": list(seen_urls),
-            "research_logs": list(state.research_logs) + [log_row],
-            "retrieved_chunks": list(chunk_map.values()),
+            "seen_urls": newly_seen_urls,
+            "research_logs": [log_row],
+            "retrieved_chunks": newly_scored_chunks,
         }
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
@@ -641,8 +701,8 @@ class NewsAnalysisAgent(AbstractAgent):
         return {
             "final_chunks": relevant_chunks,
             "sources": relevant_sources,
-            "memory_chunks": [],
-            "research_logs": updated_logs,
+            "memory_chunks": Overwrite(value=[]),
+            "research_logs": Overwrite(value=updated_logs),
             "rendezvous_has_minimum_sources": has_minimum_sources,
             "rendezvous_score_unavailable": not score_available,
             "rendezvous_relevant_chunk_count": len(relevant_chunks),

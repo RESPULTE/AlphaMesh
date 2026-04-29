@@ -134,6 +134,10 @@ class TickerResult(BaseModel):
 
     ticker: str
     analysis_text: str = Field(description="Per-agent or combined narrative analysis.")
+    market_chart: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Intraday market chart points as sent to the frontend.",
+    )
     financial_data: Optional[DataFramePayload] = Field(
         default=None,
         description="Serialised financial DataFrame; null when no EDGAR data was fetched.",
