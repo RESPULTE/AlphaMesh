@@ -14,6 +14,13 @@ const STORAGE_CONVERSATION_ID = 'alphamesh.active_conversation_id';
 const STORAGE_SESSION_ID = 'alphamesh.active_session_id';
 
 type PartialAnalysis = Partial<AnalysisResponse> | null;
+export type StreamPhase =
+  | 'idle'
+  | 'starting'
+  | 'awaiting_ticker'
+  | 'streaming'
+  | 'completed'
+  | 'error';
 
 function emptySummary() {
   return {
@@ -21,32 +28,6 @@ function emptySummary() {
     agentConsensus: [],
     verdict: { label: '', description: '' }
   };
-}
-
-function placeholderAgents(): AgentAnalysis[] {
-  return [
-    {
-      id: 'news',
-      name: 'News Analysis Agent',
-      icon: 'news',
-      category: 'Intelligence Unit',
-      recentCatalyst: { title: '', description: '', timeAgo: '' },
-      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
-      fullReport: '',
-      references: []
-    },
-    {
-      id: 'fundamental',
-      name: 'Fundamental Agent',
-      icon: 'analytics',
-      category: 'Financial Lab',
-      recentCatalyst: { title: '', description: '', timeAgo: '' },
-      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
-      metrics: [],
-      quote: '',
-      fullReport: ''
-    }
-  ];
 }
 
 function baseResponse(): AnalysisResponse {
@@ -60,7 +41,7 @@ function baseResponse(): AnalysisResponse {
     chartData: [],
     fundamentalData: null,
     fundamentalsVisualization: null,
-    agents: placeholderAgents(),
+    agents: [],
     summary: emptySummary()
   };
 }
@@ -118,7 +99,7 @@ function buildTable(payload?: DataFramePayload | null): AgentAnalysis['tableData
     const rowLabel = payload.index[r];
     const rowValues = payload.data[r]
       .slice(columnStart)
-      .map((val) => (val == null ? '�' : formatValue(val)));
+      .map((val) => (val == null ? '-' : formatValue(val)));
     rows.push([rowLabel, ...rowValues]);
   }
   return { title: 'Financial Data', headers, rows };
@@ -141,7 +122,7 @@ function updateFundamentalAgent(prev: AnalysisResponse, payload: DataFramePayloa
   const tableData = buildTable(payload);
   if (!metrics && !tableData) return prev;
 
-  const agents = prev.agents.length ? [...prev.agents] : placeholderAgents();
+  const agents = [...prev.agents];
   const idx = agents.findIndex((agent) => agent.id === 'fundamental');
   if (idx === -1) {
     agents.push({
@@ -191,7 +172,7 @@ function updateFundamentalVisualization(
   const tablePayload = payload.raw_data ?? prev.fundamentalData;
   const metrics = buildMetrics(tablePayload);
   const tableData = buildTable(tablePayload);
-  const agents = prev.agents.length ? [...prev.agents] : placeholderAgents();
+  const agents = [...prev.agents];
   const idx = agents.findIndex((agent) => agent.id === 'fundamental');
 
   if (idx >= 0) {
@@ -264,7 +245,7 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
     });
   }
 
-  response.agents = agents.length ? agents : placeholderAgents();
+  response.agents = agents;
   response.summary = {
     coreNarrative: result.synthesis || tickerResult?.analysis_text || '',
     agentConsensus: deriveConsensus(agentAnalyses),
@@ -297,9 +278,10 @@ function mergeFinalWithLive(next: AnalysisResponse, prev?: AnalysisResponse | nu
   };
 }
 
-export function useAnalysisStream(query: string | null) {
+export function useAnalysisStream(query: string | null, requestVersion = 0) {
   const [data, setData] = useState<PartialAnalysis>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [streamPhase, setStreamPhase] = useState<StreamPhase>('idle');
   const [conversationId, setConversationId] = useState<string | null>(
     typeof window !== 'undefined'
       ? window.localStorage.getItem(STORAGE_CONVERSATION_ID)
@@ -329,6 +311,7 @@ export function useAnalysisStream(query: string | null) {
 
     let isMounted = true;
     setIsStreaming(true);
+    setStreamPhase('starting');
     setRequestId(null);
     setData(baseResponse());
     resolvedTickerRef.current = '';
@@ -414,12 +397,14 @@ export function useAnalysisStream(query: string | null) {
 
           if (payload.event_type === 'progress') {
             setIsStreaming(true);
+            setStreamPhase((prev) => (prev === 'awaiting_ticker' ? prev : 'streaming'));
             return;
           }
 
           if (payload.event_type === 'init') {
             const resolvedTicker = resolvedTickerRef.current;
             if (!resolvedTicker) {
+              setStreamPhase('awaiting_ticker');
               pendingQuoteRef.current = {
                 ...(pendingQuoteRef.current ?? baseResponse()),
                 ticker: payload.quote.ticker ?? '',
@@ -454,6 +439,7 @@ export function useAnalysisStream(query: string | null) {
           if (payload.event_type === 'chart') {
             const resolvedTicker = resolvedTickerRef.current;
             if (!resolvedTicker) {
+              setStreamPhase('awaiting_ticker');
               pendingChartRef.current = payload.chart ?? [];
               return;
             }
@@ -464,6 +450,7 @@ export function useAnalysisStream(query: string | null) {
             const resolved = (payload.ticker || payload.tickers?.[0] || '').toUpperCase();
             if (resolved) {
               resolvedTickerRef.current = resolved;
+              setStreamPhase('streaming');
               const pendingQuote = pendingQuoteRef.current;
               if (
                 pendingQuote &&
@@ -561,11 +548,13 @@ export function useAnalysisStream(query: string | null) {
               return merged;
             });
             setIsStreaming(false);
+            setStreamPhase('completed');
             closeStream();
           }
 
           if (payload.event_type === 'error') {
             setIsStreaming(false);
+            setStreamPhase('error');
             closeStream();
           }
         };
@@ -573,11 +562,13 @@ export function useAnalysisStream(query: string | null) {
         es.onerror = () => {
           if (!isMounted) return;
           setIsStreaming(false);
+          setStreamPhase('error');
           closeStream();
         };
       } catch {
         if (!isMounted) return;
         setIsStreaming(false);
+        setStreamPhase('error');
       }
     };
 
@@ -587,7 +578,7 @@ export function useAnalysisStream(query: string | null) {
       isMounted = false;
       closeStream();
     };
-  }, [query, stableEmail]);
+  }, [query, requestVersion, stableEmail]);
 
-  return { data, isStreaming, conversationId, requestId };
+  return { data, isStreaming, streamPhase, conversationId, requestId };
 }

@@ -7,11 +7,13 @@ import FullConversationView from './FullConversationView';
 
 interface HistoryProps {
   query?: string | null;
+  queryVersion?: number;
   onClearQuery?: () => void;
   dashboardConversationId?: string | null;
   onClearDashboardConversation?: () => void;
   initialExpandedId?: string | null;
   onContinueConversation?: (conversationId: string) => void;
+  onStreamingChange?: (isStreaming: boolean) => void;
 }
 
 const DEV_USER_EMAIL = 'demo@alphamesh.local';
@@ -31,11 +33,13 @@ function truncateLabel(text: string, max = 72): string {
 
 export default function History({
   query,
+  queryVersion = 0,
   onClearQuery,
   dashboardConversationId,
   onClearDashboardConversation,
   initialExpandedId,
   onContinueConversation,
+  onStreamingChange,
 }: HistoryProps) {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
@@ -161,7 +165,9 @@ export default function History({
     return (
       <AnalysisDashboard
         query={query}
+        queryVersion={queryVersion}
         conversationIdOverride={dashboardConversationId}
+        onStreamingChange={onStreamingChange}
         onBack={() => {
           onClearQuery?.();
           onClearDashboardConversation?.();

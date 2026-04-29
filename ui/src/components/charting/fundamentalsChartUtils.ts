@@ -51,9 +51,10 @@ export function buildChartSelectorOptions(
   marketData: ChartDataPoint[] | undefined,
   visualization: FundamentalsVisualizationPayload | null | undefined
 ): ChartSelectorOption[] {
-  const options: ChartSelectorOption[] = [
-    { id: 'market-price', label: 'Market Price', kind: 'market' }
-  ];
+  const options: ChartSelectorOption[] = [];
+  if ((marketData?.length ?? 0) > 0) {
+    options.push({ id: 'market-price', label: 'Market Price', kind: 'market' });
+  }
 
   const charts = visualization?.charts ?? [];
   charts.forEach((chart, index) => {
@@ -69,8 +70,6 @@ export function buildChartSelectorOptions(
       spec: safeChart
     });
   });
-
-  void marketData;
   return options;
 }
 

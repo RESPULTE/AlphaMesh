@@ -10,6 +10,7 @@ import ChatInput from './components/ChatInput';
 export default function App() {
   const [currentTab, setCurrentTab] = useState('Chat');
   const [analysisQuery, setAnalysisQuery] = useState<string | null>(null);
+  const [analysisQueryVersion, setAnalysisQueryVersion] = useState(0);
   const [dashboardConversationId, setDashboardConversationId] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   /** Conversation ID to auto-expand in History when navigating from Chat */
@@ -17,11 +18,11 @@ export default function App() {
 
   const handleAnalyze = (query: string) => {
     setAnalysisQuery(query);
+    setAnalysisQueryVersion((prev) => prev + 1);
     setDashboardConversationId(null);
     setOpenConversationId(null);
     setCurrentTab('History');
     setIsStreaming(true);
-    setTimeout(() => setIsStreaming(false), 5000);
   };
 
   const handleOpenConversation = (conversationId: string) => {
@@ -74,11 +75,13 @@ export default function App() {
             <History
               key="history"
               query={analysisQuery}
+              queryVersion={analysisQueryVersion}
               dashboardConversationId={dashboardConversationId}
               onClearQuery={() => setAnalysisQuery(null)}
               onClearDashboardConversation={() => setDashboardConversationId(null)}
               initialExpandedId={openConversationId}
               onContinueConversation={handleContinueConversation}
+              onStreamingChange={setIsStreaming}
             />
           )}
         </AnimatePresence>

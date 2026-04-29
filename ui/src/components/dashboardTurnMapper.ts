@@ -57,32 +57,6 @@ function buildMetrics(payload?: DataFramePayload | null): AgentAnalysis['metrics
   return metrics.length ? metrics : undefined;
 }
 
-function placeholderAgents(): AgentAnalysis[] {
-  return [
-    {
-      id: 'news',
-      name: 'News Analysis Agent',
-      icon: 'news',
-      category: 'Intelligence Unit',
-      recentCatalyst: { title: '', description: '', timeAgo: '' },
-      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
-      fullReport: '',
-      references: [],
-    },
-    {
-      id: 'fundamental',
-      name: 'Fundamental Agent',
-      icon: 'analytics',
-      category: 'Financial Lab',
-      recentCatalyst: { title: '', description: '', timeAgo: '' },
-      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
-      metrics: [],
-      quote: '',
-      fullReport: '',
-    },
-  ];
-}
-
 export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisResponse {
   const primary = turn.ticker_results?.[0];
   const ticker = turn.tickers?.[0] || primary?.ticker || '';
@@ -90,8 +64,7 @@ export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisRespo
     primary?.financial_data ?? primary?.fundamentals_visualization?.raw_data ?? null;
   const fundamentalsVisualization = primary?.fundamentals_visualization ?? null;
   const newsText = turn.agent_analyses?.news_agent || '';
-  const fundamentalsText =
-    turn.agent_analyses?.fundamentals_agent || primary?.analysis_text || '';
+  const fundamentalsText = turn.agent_analyses?.fundamentals_agent || '';
   const synthesis = turn.assistant_synthesis || primary?.analysis_text || '';
 
   const agents: AgentAnalysis[] = [];
@@ -135,7 +108,7 @@ export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisRespo
 
   return {
     ticker,
-    companyName: ticker || 'Company',
+    companyName: ticker || '',
     currentPrice: null,
     priceChange: null,
     priceChangePercent: null,
@@ -143,7 +116,7 @@ export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisRespo
     chartData: [],
     fundamentalData: financialData,
     fundamentalsVisualization,
-    agents: agents.length ? agents : placeholderAgents(),
+    agents,
     summary: {
       coreNarrative: synthesis,
       agentConsensus: [

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { motion } from 'motion/react';
+import { AnimatePresence, motion } from 'motion/react';
 import { ArrowLeft } from 'lucide-react';
 import { useAnalysisStream } from '../hooks/useAnalysisStream';
 import type { AnalysisResponse, ConversationTurn, ConversationTurnsResponse } from '../types/api';
@@ -8,20 +8,86 @@ import { mapTurnToAnalysisResponse } from './dashboardTurnMapper';
 
 interface AnalysisDashboardProps {
   query?: string | null;
+  queryVersion?: number;
   conversationIdOverride?: string | null;
   onBack?: () => void;
+  onStreamingChange?: (isStreaming: boolean) => void;
 }
 
 const DEV_USER_EMAIL = 'demo@alphamesh.local';
 const HISTORY_PAGE_SIZE = 8;
+const LIVE_PANEL_OFFSET_TOP = 96;
+const FAR_SCROLL_DISTANCE = 900;
+
+const EMPTY_LIVE_RESPONSE: AnalysisResponse = {
+  ticker: '',
+  companyName: '',
+  currentPrice: null,
+  priceChange: null,
+  priceChangePercent: null,
+  marketStatus: 'MARKET DATA UNAVAILABLE',
+  chartData: [],
+  fundamentalData: null,
+  fundamentalsVisualization: null,
+  agents: [],
+  summary: {
+    coreNarrative: '',
+    agentConsensus: [],
+    verdict: { label: '', description: '' },
+  },
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+function cubicBezierProgress(
+  t: number,
+  p1x: number,
+  p1y: number,
+  p2x: number,
+  p2y: number
+): number {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+
+  const cx = 3 * p1x;
+  const bx = 3 * (p2x - p1x) - cx;
+  const ax = 1 - cx - bx;
+  const cy = 3 * p1y;
+  const by = 3 * (p2y - p1y) - cy;
+  const ay = 1 - cy - by;
+
+  const sampleCurveX = (u: number) => ((ax * u + bx) * u + cx) * u;
+  const sampleCurveY = (u: number) => ((ay * u + by) * u + cy) * u;
+  const sampleCurveDerivativeX = (u: number) => (3 * ax * u + 2 * bx) * u + cx;
+
+  let u = t;
+  for (let i = 0; i < 6; i++) {
+    const x = sampleCurveX(u) - t;
+    const dx = sampleCurveDerivativeX(u);
+    if (Math.abs(dx) < 1e-6) break;
+    u -= x / dx;
+    u = clamp(u, 0, 1);
+  }
+
+  return sampleCurveY(u);
+}
 
 export default function AnalysisDashboard({
   query,
+  queryVersion = 0,
   conversationIdOverride,
   onBack,
+  onStreamingChange,
 }: AnalysisDashboardProps) {
-  const { data, isStreaming, conversationId: streamedConversationId, requestId } = useAnalysisStream(
-    query ?? null
+  const {
+    data,
+    isStreaming,
+    streamPhase,
+    conversationId: streamedConversationId,
+    requestId,
+  } = useAnalysisStream(
+    query ?? null,
+    queryVersion
   );
   const conversationId = conversationIdOverride ?? streamedConversationId;
   const [historicalTurns, setHistoricalTurns] = useState<ConversationTurn[]>([]);
@@ -32,8 +98,11 @@ export default function AnalysisDashboard({
     null
   );
   const topSentinelRef = useRef<HTMLDivElement>(null);
+  const liveAnchorRef = useRef<HTMLDivElement>(null);
   const prevStreamingRef = useRef(false);
   const autoScrolledConversationRef = useRef<string | null>(null);
+  const scrollAnimationRef = useRef<number | null>(null);
+  const lastAutoScrollQueryVersionRef = useRef<number | null>(null);
 
   const loadHistoryPage = useCallback(
     async (opts?: { reset?: boolean; beforeTurnId?: string | null }) => {
@@ -88,7 +157,9 @@ export default function AnalysisDashboard({
     const wasStreaming = prevStreamingRef.current;
     prevStreamingRef.current = isStreaming;
     if (wasStreaming && !isStreaming && conversationId) {
-      void loadHistoryPage({ reset: true });
+      // Delay slightly so the backend has time to commit the turn before we re-fetch.
+      const timer = setTimeout(() => void loadHistoryPage({ reset: true }), 800);
+      return () => clearTimeout(timer);
     }
   }, [isStreaming, conversationId, loadHistoryPage]);
 
@@ -114,18 +185,86 @@ export default function AnalysisDashboard({
     return historicalTurns.some((turn) => turn.request_id === requestId);
   }, [historicalTurns, requestId]);
 
-  const filteredHistoricalTurns = useMemo(() => {
-    if (!requestId) return historicalTurns;
-    return historicalTurns.filter((turn) => turn.request_id !== requestId);
-  }, [historicalTurns, requestId]);
-
   const hasLiveData = Boolean(data);
   const hasActiveStreamQuery = Boolean(query);
+  const isStreamFinished = streamPhase === 'completed' || streamPhase === 'error';
+  const shouldHideLiveTurn = !hasActiveStreamQuery || (isStreamFinished && liveTurnAlreadyPersisted);
 
   useEffect(() => {
+    onStreamingChange?.(isStreaming);
+  }, [isStreaming, onStreamingChange]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollAnimationRef.current != null) {
+        cancelAnimationFrame(scrollAnimationRef.current);
+      }
+      onStreamingChange?.(false);
+    };
+  }, [onStreamingChange]);
+
+  const smoothScrollTo = useCallback((targetY: number) => {
+    const startY = window.scrollY;
+    const distance = Math.abs(targetY - startY);
+    if (distance < 4) return;
+
+    if (scrollAnimationRef.current != null) {
+      cancelAnimationFrame(scrollAnimationRef.current);
+    }
+
+    const duration = clamp(980 - 0.28 * distance, 560, 980);
+    const startTime = performance.now();
+    const bezier =
+      distance >= FAR_SCROLL_DISTANCE
+        ? ([0.2, 0.7, 0.1, 1] as const)
+        : ([0.22, 0.61, 0.36, 1] as const);
+
+    const step = (now: number) => {
+      const elapsed = now - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      const eased = cubicBezierProgress(progress, bezier[0], bezier[1], bezier[2], bezier[3]);
+      const nextY = startY + (targetY - startY) * eased;
+      window.scrollTo({ top: nextY, behavior: 'auto' });
+      if (progress < 1) {
+        scrollAnimationRef.current = requestAnimationFrame(step);
+      } else {
+        scrollAnimationRef.current = null;
+      }
+    };
+
+    scrollAnimationRef.current = requestAnimationFrame(step);
+  }, []);
+
+  useEffect(() => {
+    if (!hasActiveStreamQuery) return;
+    if (lastAutoScrollQueryVersionRef.current === queryVersion) return;
+    const targetEl = liveAnchorRef.current;
+    if (!targetEl) return;
+    lastAutoScrollQueryVersionRef.current = queryVersion;
+
+    // Delay measuring until after the full layout flush — a plain RAF fires before
+    // Framer Motion's layout pass completes, giving a stale rect.
+    const timer = setTimeout(() => {
+      if (!liveAnchorRef.current) return;
+      const rect = liveAnchorRef.current.getBoundingClientRect();
+      const targetTop = Math.max(0, window.scrollY + rect.top - LIVE_PANEL_OFFSET_TOP);
+      const distance = Math.abs(targetTop - window.scrollY);
+
+      // If the anchor is already close to the current viewport bottom, let Framer
+      // Motion's `layout` prop animate the gentle push-up — no explicit scroll needed.
+      if (distance <= 250) return;
+
+      smoothScrollTo(targetTop);
+    }, 100);
+
+    return () => clearTimeout(timer);
+  }, [hasActiveStreamQuery, queryVersion, smoothScrollTo]);
+
+  useEffect(() => {
+    if (hasActiveStreamQuery) return;
     if (!conversationId || historyLoadedForConversation !== conversationId) return;
     if (autoScrolledConversationRef.current === conversationId) return;
-    if (!hasLiveData && filteredHistoricalTurns.length === 0) return;
+    if (!hasLiveData && historicalTurns.length === 0) return;
 
     requestAnimationFrame(() => {
       window.scrollTo({
@@ -137,22 +276,10 @@ export default function AnalysisDashboard({
   }, [
     conversationId,
     historyLoadedForConversation,
+    hasActiveStreamQuery,
     hasLiveData,
-    filteredHistoricalTurns.length,
+    historicalTurns.length,
   ]);
-
-  if (hasActiveStreamQuery && !hasLiveData) {
-    return (
-      <div className="pt-32 pb-24 px-6 md:px-12 flex flex-col items-center justify-center min-h-screen w-full max-w-[1600px] mx-auto">
-        <motion.div
-          animate={{ rotate: 360 }}
-          transition={{ repeat: Infinity, duration: 2, ease: 'linear' }}
-          className="w-12 h-12 border-4 border-primary/20 border-t-primary rounded-full"
-        />
-        <p className="mt-4 text-on-surface-variant font-medium">Initializing AlphaMesh Agents...</p>
-      </div>
-    );
-  }
 
   return (
     <motion.main
@@ -185,23 +312,37 @@ export default function AnalysisDashboard({
       )}
 
       <div className="space-y-8 md:space-y-10">
-        {filteredHistoricalTurns.map((turn) => (
-          <DashboardTurnPanel
-            key={turn.turn_id}
-            query={turn.user_message}
-            data={mapTurnToAnalysisResponse(turn)}
-            isStreaming={false}
-          />
+        {historicalTurns.map((turn) => (
+          <div key={turn.turn_id}>
+            <DashboardTurnPanel
+              query={turn.user_message}
+              data={mapTurnToAnalysisResponse(turn)}
+              isStreaming={false}
+              streamPhase="completed"
+            />
+          </div>
         ))}
 
-        {hasLiveData && hasActiveStreamQuery && !liveTurnAlreadyPersisted && (
-          <DashboardTurnPanel
-            key={`live-${requestId ?? query}`}
-            query={query ?? ''}
-            data={data as AnalysisResponse}
-            isStreaming={isStreaming}
-          />
-        )}
+        {hasActiveStreamQuery && <div ref={liveAnchorRef} className="h-1" />}
+
+        <AnimatePresence initial={false}>
+          {!shouldHideLiveTurn && (
+            <motion.div
+              key={`live-${queryVersion}`}
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15, ease: 'easeOut' }}
+            >
+              <DashboardTurnPanel
+                query={query ?? ''}
+                data={(data as AnalysisResponse) ?? EMPTY_LIVE_RESPONSE}
+                isStreaming={isStreaming}
+                streamPhase={streamPhase}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </motion.main>
   );
