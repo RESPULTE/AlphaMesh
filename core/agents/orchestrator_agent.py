@@ -722,7 +722,7 @@ class OrchestratorAgent:
             ]
             response = await self._llm.ainvoke(messages)
             publish_success("orchestrator", "Synthesis complete.")
-            return self._extract_response_text(response.content if response else "")
+            return self._extract_response_text(response.text if response else "")
         except Exception:
             logger.exception("_synthesize_node: LLM synthesis failed")
             return (

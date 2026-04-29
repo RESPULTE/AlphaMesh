@@ -159,6 +159,40 @@ class NewsAnalysisAgent(AbstractAgent):
             RetrievedChunk._dedupe_chunks(tavily_chunks + ranked_non_tavily)
         )
 
+    async def _rank_chunks_with_reranker(
+        self,
+        *,
+        query: str,
+        chunks: List[RetrievedChunk],
+    ) -> List[RetrievedChunk]:
+        baseline_ranked = self._rank_chunks(chunks)
+        rerank_query = str(query or "").strip()
+        if not baseline_ranked or not rerank_query:
+            return baseline_ranked
+
+        normalized_chunks = [
+            RetrievedChunk.normalize_for_reranking(chunk, "new")
+            for chunk in baseline_ranked
+        ]
+        try:
+            reranked = await service_manager.get_reranker().rank(
+                rerank_query, normalized_chunks
+            )
+            logger.info(
+                "_rank_chunks_with_reranker: reranked %d chunks into %d",
+                len(normalized_chunks),
+                len(reranked),
+            )
+        except Exception:
+            logger.exception(
+                "_rank_chunks_with_reranker: failed to rerank; using baseline rank"
+            )
+            return baseline_ranked
+
+        if not reranked:
+            return baseline_ranked
+        return self._rank_chunks(reranked)
+
     @staticmethod
     def _source_url_key(chunk: RetrievedChunk) -> str:
         source_url = str(
@@ -659,10 +693,24 @@ class NewsAnalysisAgent(AbstractAgent):
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge tool results, memory retrieval, and working memory chunks."""
-        ranked = self._rank_chunks(
-            list(state.final_chunks)
-            + list(state.retrieved_chunks)
-            + list(state.memory_chunks)
+        rerank_query = str(state.missing_information_goal or state.goal or "").strip()
+        if rerank_query.lower().startswith("retrieval objective:"):
+            rerank_query = str(state.goal or "").strip()
+
+        ranked = await self._rank_chunks_with_reranker(
+            query=rerank_query,
+            chunks=(
+                list(state.final_chunks)
+                + list(state.retrieved_chunks)
+                + list(state.memory_chunks)
+            ),
+        )
+        logger.info(
+            "_rendezvous_node: merged %d working memory + %d retrieved + %d planner chunks into %d ranked",
+            len(state.final_chunks),
+            len(state.retrieved_chunks),
+            len(state.memory_chunks),
+            len(ranked),
         )
         article_context_block, _ = self._build_article_context_block(
             final_chunks=ranked,
@@ -694,7 +742,7 @@ class NewsAnalysisAgent(AbstractAgent):
         """Check context sufficiency and generate grounded analysis when possible."""
         chunks = self._rank_chunks(state.final_chunks)
         forced_final_pass = (
-            state.research_iteration + 1
+            state.research_iteration
         ) >= settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS
 
         if not chunks:
@@ -739,7 +787,7 @@ class NewsAnalysisAgent(AbstractAgent):
             HumanMessage(
                 content=NEWS_ANALYSIS_USER_PROMPT.format(
                     goal=state.goal,
-                    iteration=state.research_iteration + 1,
+                    iteration=state.research_iteration,
                     max_iterations=settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS,
                     forced_final_pass=str(forced_final_pass).lower(),
                     entities_section=context_prefix,
