@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import Any, List, Tuple
 from uuid import uuid4
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -26,27 +26,38 @@ class ArticleChunker:
         )
         self._logger = get_logger(__name__)
 
-    def _parse_published_at(self, value: str) -> datetime:
-        """Parse an ISO8601 timestamp from NewsAPI."""
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            self._logger.exception("Failed to parse publishedAt: %s", value)
+    def _parse_published_at(self, value: Any) -> datetime:
+        """Parse and normalize an article timestamp to UTC."""
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return datetime.now(timezone.utc)
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                self._logger.warning("Failed to parse publishedAt: %s", value)
+                return datetime.now(timezone.utc)
+        else:
+            self._logger.warning(
+                "Unsupported publishedAt type: %s", type(value).__name__
+            )
             return datetime.now(timezone.utc)
 
-    def chunk_article(self, article: dict) -> Tuple[DocumentMetadata, List[RetrievedChunk]]:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def chunk_article(
+        self, article: dict
+    ) -> Tuple[DocumentMetadata, List[RetrievedChunk]]:
         """Split a NewsAPI article into document metadata and chunk nodes."""
         title = (article.get("title") or "").strip()
         description = (article.get("description") or "").strip()
         content = (article.get("content") or "").strip()
         source_url = (article.get("url") or "").strip()
-        published_at_raw = (article.get("publishedAt") or "").strip()
-
-        published_at = (
-            self._parse_published_at(published_at_raw)
-            if published_at_raw
-            else datetime.now(timezone.utc)
-        )
+        published_at = self._parse_published_at(article.get("publishedAt"))
 
         document_id = str(uuid4())
         full_text = "\n\n".join(
@@ -79,6 +90,3 @@ class ArticleChunker:
             )
 
         return document_meta, chunk_records
-
-
-
