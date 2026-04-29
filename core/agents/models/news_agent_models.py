@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,15 +28,6 @@ class DomainQuery(BaseModel):
     )
 
 
-class RelevantChunkSelection(BaseModel):
-    """Planner-selected relevant chunk for analysis."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    chunk_id: str
-    reason: str = ""
-
-
 class PlannerDecision(BaseModel):
     """Single planner output for one research iteration."""
 
@@ -46,9 +37,24 @@ class PlannerDecision(BaseModel):
         default="proceed"
     )
     queries: List[DomainQuery] = Field(default_factory=list)
-    rationale: str = Field(default="")
+    findings_summary: str = Field(default="")
     max_results: int = Field(default=5, ge=1, le=20)
-    relevant_chunks: List[RelevantChunkSelection] = Field(default_factory=list)
+    relevant_chunks: List[str] = Field(default_factory=list)
+
+    def _normalize_planner_selection_ids(
+        self,
+        alias_to_chunk_id: Dict[str, str],
+    ) -> PlannerDecision:
+        if not self.relevant_chunks:
+            return self
+        normalized = []
+        for selection in self.relevant_chunks:
+            raw_chunk_id = (selection.chunk_id or "").strip()
+            mapped_chunk_id = alias_to_chunk_id.get(raw_chunk_id, raw_chunk_id)
+            normalized.append(
+                selection.model_copy(update={"chunk_id": mapped_chunk_id})
+            )
+        return self.model_copy(update={"relevant_chunks": normalized})
 
 
 class ResearchStepLog(BaseModel):
@@ -60,7 +66,6 @@ class ResearchStepLog(BaseModel):
     action: Literal["newsapi", "web_search", "proceed", "none"]
     query: str = ""
     queries: List[DomainQuery] = Field(default_factory=list)
-    rationale: str = ""
     total_fetched_articles: int = 0
     newly_fetched_articles: int = 0
     relevant_chunk_count: int = 0

@@ -14,6 +14,7 @@ from core.memory.retrieval.models import RetrievedChunk
 
 @dataclass
 class NewsTurnRelevantMemory(TurnRelevantMemoryBase):
+    turn_index: int = 0
     chunk_ids: List[str] = field(default_factory=list)
     source_urls: List[str] = field(default_factory=list)
     score_unavailable: bool = False
@@ -44,8 +45,7 @@ class NewsWorkingMemoryManager(
         self,
         *,
         conversation_id: str,
-        turn_id: str,
-        query: str,
+        turn_index: int,
         chunks: List[RetrievedChunk],
         score_unavailable: bool,
         source_key_fn: Callable[[RetrievedChunk], str],
@@ -61,8 +61,9 @@ class NewsWorkingMemoryManager(
         self.append_turn_record(
             conversation_id=conversation_id,
             record=NewsTurnRelevantMemory(
-                turn_id=turn_id,
-                query=query,
+                turn_id=str(turn_index),
+                query="",
+                turn_index=turn_index,
                 chunk_ids=[chunk.chunk_id for chunk in chunks if chunk.chunk_id],
                 source_urls=source_urls,
                 score_unavailable=score_unavailable,
@@ -79,10 +80,8 @@ class NewsWorkingMemoryManager(
             return "(none)"
         lines: List[str] = []
         for row in memory.turn_records[-turn_limit:]:
-            ts = row.created_at.isoformat()
             lines.append(
-                f"- turn={row.turn_id} at={ts}\n"
-                f"  query={row.query}\n"
+                f"- turn_index={row.turn_index}\n"
                 f"  relevant_chunks={len(row.chunk_ids)}\n"
                 f"  relevant_sources={len(row.source_urls)}\n"
                 f"  score_unavailable={row.score_unavailable}"
@@ -105,11 +104,14 @@ class NewsWorkingMemoryManager(
         if isinstance(sentiment, dict):
             sentiment_label = str(sentiment.get("label") or "").strip()
         source_count = int(memory_summary.get("source_count") or 0)
-        catalyst = trim_text(memory_summary.get("main_catalyst") or "", max_chars=200)
+        findings_summary = trim_text(
+            memory_summary.get("findings_summary") or "",
+            max_chars=200,
+        )
         return (
             f"actions={','.join(str(a) for a in actions[:4]) or 'none'}; "
             f"sources={source_count}; sentiment={sentiment_label or 'N/A'}; "
-            f"catalyst={catalyst or 'N/A'}"
+            f"summary={findings_summary or 'N/A'}"
         )
 
     @classmethod

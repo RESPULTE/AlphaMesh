@@ -197,20 +197,21 @@ def coerce_entity_tuple(entity: Any) -> tuple[str, str] | None:
 
 def build_planner_relevance_context_block(
     chunks: List[Any],
-    mapping: Dict[int, int],
-    rationale_by_chunk_id: Dict[str, str] | None = None,
+    chunk_id_alias_map: Dict[str, str] | None = None,
 ) -> str:
-    rationale_by_chunk_id = rationale_by_chunk_id or {}
+    chunk_id_alias_map = chunk_id_alias_map or {}
     lines: List[str] = []
-    for idx, chunk in enumerate(chunks):
-        source_id = mapping.get(idx, "?")
+    for chunk in chunks:
         chunk_id = str(getattr(chunk, "chunk_id", "") or "")
-        rationale = rationale_by_chunk_id.get(chunk_id, "").strip()
-        if not rationale:
-            rationale = "Selected by planner as relevant to the query."
+        normalized_chunk_id = chunk_id_alias_map.get(chunk_id, chunk_id or "?")
+        relevance = getattr(chunk, "reranker_relevance_score", None)
+        relevance_text = "N/A" if relevance is None else f"{float(relevance):.4f}"
         chunk_text = str(getattr(chunk, "text", "") or "")
+        if not chunk_text:
+            chunk_text = "(empty)"
         lines.append(
-            f"[{source_id}] Planner relevance rationale: {rationale}\n{chunk_text}"
+            f"chunk_id={normalized_chunk_id} | relevance_score={relevance_text}\n"
+            f"text={chunk_text}"
         )
     return "\n\n".join(lines)
 

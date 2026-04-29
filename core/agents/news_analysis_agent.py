@@ -32,10 +32,8 @@ from core.agents.prompts.news_agent_prompts import (
 )
 from core.agents.utils import (
     build_analysis_context_prefix,
-    build_planner_relevance_context_block,
     coerce_entity_tuple,
     constrain_date_range,
-    extract_first_sentence,
     get_default_date_range,
     normalize_entity_tuple,
     remap_numeric_citations,
@@ -118,6 +116,15 @@ class NewsAnalysisAgent(AbstractAgent):
     def get_output_schema_class() -> Type[BaseModel]:
         return NewsAgentOutput
 
+    @staticmethod
+    def _build_fallback_findings_summary(chunks: List[RetrievedChunk]) -> str:
+        snippets: List[str] = []
+        for chunk in chunks[:2]:
+            text = str(chunk.text or "").strip()
+            if text:
+                snippets.append(text[:220].strip())
+        return " ".join(snippets)
+
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
         start_date, end_date = get_default_date_range(
@@ -126,10 +133,7 @@ class NewsAnalysisAgent(AbstractAgent):
         start_date, end_date = constrain_date_range(start_date, end_date)
 
         conversation_id = (input_data.conversation_id or "").strip()
-        effective_memory_context = self._working_memory.resolve_agent_memory_context(
-            conversation_id=conversation_id,
-            incoming_memory_context=input_data.agent_memory_context,
-        )
+        incoming_memory_context = (input_data.agent_memory_context or "").strip()
 
         initial_state = NewsAgentState(
             query=input_data.query,
@@ -139,7 +143,7 @@ class NewsAnalysisAgent(AbstractAgent):
             end_date=end_date,
             conversation_id=conversation_id or None,
             turn_id=input_data.turn_id,
-            agent_memory_context=effective_memory_context,
+            agent_memory_context=incoming_memory_context,
             company_context=input_data.company_context,
         )
 
@@ -147,22 +151,20 @@ class NewsAnalysisAgent(AbstractAgent):
         output = NewsAgentOutput(**final_state)
 
         final_chunks: List[RetrievedChunk] = final_state.get("final_chunks") or []
-        turn_id = (input_data.turn_id or "").strip() or str(uuid4())
+        existing_memory = self._working_memory.get_existing_conversation_memory(
+            conversation_id
+        )
+        turn_index = (
+            len(existing_memory.turn_records) if existing_memory is not None else 0
+        ) + 1
         self._working_memory.persist_finalized_turn(
             conversation_id=conversation_id,
-            turn_id=turn_id,
-            query=input_data.goal,
+            turn_index=turn_index,
             chunks=final_chunks,
             score_unavailable=bool(
                 final_state.get("rendezvous_score_unavailable", False)
             ),
             source_key_fn=RetrievedChunk._source_key,
-        )
-        self._working_memory.persist_agent_memory_summary(
-            conversation_id=conversation_id,
-            rendered_summary=NewsWorkingMemoryManager.render_memory_summary(
-                output.memory_summary
-            ),
         )
         return output
 
@@ -208,7 +210,7 @@ class NewsAnalysisAgent(AbstractAgent):
         goal = state.goal
         if at_limit:
             reason = f"Reached research iteration limit ({settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS})."
-            decision = PlannerDecision(action="proceed", rationale=reason)
+            decision = PlannerDecision(action="proceed", findings_summary=reason)
             publish_progress("news_agent", f"Research planning: {reason}")
             return {
                 "planner_decision": decision,
@@ -224,7 +226,7 @@ class NewsAnalysisAgent(AbstractAgent):
             decision = PlannerDecision(
                 action="web_search",
                 queries=[DomainQuery(domain="company", query=goal)],
-                rationale=(
+                findings_summary=(
                     f"Cannot proceed yet: fewer than {_MIN_RELEVANT_DISTINCT_SOURCES} "
                     "distinct relevant sources above threshold."
                 ),
@@ -237,21 +239,23 @@ class NewsAnalysisAgent(AbstractAgent):
             }
 
         conversation_id = state.conversation_id or ""
+        chunk_id_to_alias, alias_to_chunk_id = RetrievedChunk._build_chunk_alias_maps(
+            state.final_chunks
+        )
+        candidate_chunks_block = RetrievedChunk._render_candidate_chunks(
+            state.final_chunks,
+            chunk_id_to_alias,
+        )
         planner_prompt = (
             f"Goal: {goal}\n"
             f"Ticker: {state.ticker or 'N/A'}\n"
             f"Iteration index: {state.research_iteration} (max={settings.NEWS_AGENT_MAX_RESEARCH_ITERATIONS})\n"
             "\n"
             f"Iteration history:\n{ResearchStepLog._history_block(state.research_logs)}\n\n"
-            f"Current candidate chunks:\n{RetrievedChunk._chunks_block(state.final_chunks)}\n\n"
+            f"Current candidate chunks:\n{candidate_chunks_block}\n\n"
             f"Working memory (prior finalized turns):\n"
             f"{self._working_memory.render_working_memory_block(conversation_id, turn_limit=4)}\n"
         )
-        if state.agent_memory_context:
-            planner_prompt += (
-                "\nAgent memory context (summarized prior turns):\n"
-                f"{state.agent_memory_context}\n"
-            )
         planner_prompt += "\nReturn only PlannerDecision."
 
         publish_progress(
@@ -273,16 +277,18 @@ class NewsAnalysisAgent(AbstractAgent):
                 decision = PlannerDecision(
                     action="newsapi",
                     queries=[DomainQuery(domain="company", query=goal)],
-                    rationale="Fallback to NewsAPI on planner failure.",
+                    findings_summary="Fallback to NewsAPI on planner failure.",
                     max_results=settings.NEWS_FETCH_MAX_ARTICLES,
                 )
             else:
                 decision = PlannerDecision(
                     action="web_search",
                     queries=[DomainQuery(domain="company", query=goal)],
-                    rationale="Fallback web search after planner failure.",
+                    findings_summary="Fallback web search after planner failure.",
                     max_results=settings.TAVILY_SEARCH_MAX_RESULTS,
                 )
+
+        decision = decision._normalize_planner_selection_ids(alias_to_chunk_id)
 
         if decision.action not in {"proceed", "bypass"} and not decision.queries:
             decision = decision.model_copy(
@@ -304,6 +310,16 @@ class NewsAnalysisAgent(AbstractAgent):
         if not filtered_chunks:
             filtered_chunks = state.final_chunks
 
+        if decision.action == "proceed":
+            findings_summary = (decision.findings_summary or "").strip()
+            if not findings_summary:
+                findings_summary = self._build_fallback_findings_summary(
+                    filtered_chunks
+                )
+            decision = decision.model_copy(
+                update={"findings_summary": findings_summary}
+            )
+
         logger.info(
             "_planner_node: iter=%d action=%s queries=%d",
             state.research_iteration,
@@ -322,7 +338,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 "relationships_extracted": False,
                 "memory_summary": {
                     "bypassed": True,
-                    "reason": (decision.rationale or "").strip(),
+                    "reason": (decision.findings_summary or "").strip(),
                     "research_actions": tools_used,
                     "tools_used": tools_used,
                 },
@@ -424,7 +440,6 @@ class NewsAnalysisAgent(AbstractAgent):
             action=action,
             query="; ".join(f"{q.domain}:{q.query[:40]}" for q in queries),
             queries=queries,
-            rationale=decision.rationale,
             total_fetched_articles=len(all_fetched),
             newly_fetched_articles=len(new_articles),
         )
@@ -649,19 +664,11 @@ class NewsAnalysisAgent(AbstractAgent):
             "news_agent",
             f"Generating grounded news analysis ({len(chunks)} chunk(s))...",
         )
-        sources, chunk_to_source_id = RetrievedChunk._build_deduplicated_sources(chunks)
-        planner_reasons: Dict[str, str] = {}
-        decision = state.planner_decision
-        if decision is not None:
-            for selected in decision.relevant_chunks:
-                chunk_id = (selected.chunk_id or "").strip()
-                if not chunk_id:
-                    continue
-                planner_reasons[chunk_id] = (selected.reason or "").strip()
-        context_block = build_planner_relevance_context_block(
+        sources, _ = RetrievedChunk._build_deduplicated_sources(chunks)
+        chunk_id_to_alias, _ = RetrievedChunk._build_chunk_alias_maps(chunks)
+        context_block = RetrievedChunk._render_candidate_chunks(
             chunks,
-            chunk_to_source_id,
-            planner_reasons,
+            chunk_id_to_alias,
         )
 
         conversation_id = state.conversation_id or ""
@@ -735,7 +742,14 @@ class NewsAnalysisAgent(AbstractAgent):
             "source_count": len(sources),
             "top_references": top_references,
             "sentiment": sentiment.model_dump() if sentiment is not None else {},
-            "main_catalyst": extract_first_sentence(analysis_text),
+            "findings_summary": (
+                (
+                    state.planner_decision.findings_summary
+                    if state.planner_decision is not None
+                    else ""
+                )
+                or ""
+            ).strip(),
         }
         result = {
             "analysis": analysis_text,

@@ -234,6 +234,43 @@ class RetrievedChunk(BaseModel):
             )
         return sources, chunk_to_source_id
 
+    @staticmethod
+    def _build_chunk_alias_maps(
+        chunks: List[RetrievedChunk],
+    ) -> tuple[Dict[str, str], Dict[str, str]]:
+        chunk_id_to_alias: Dict[str, str] = {}
+        alias_to_chunk_id: Dict[str, str] = {}
+        alias_index = 1
+        for chunk in chunks:
+            chunk_id = (chunk.chunk_id or "").strip()
+            if not chunk_id or chunk_id in chunk_id_to_alias:
+                continue
+            alias = str(alias_index)
+            alias_index += 1
+            chunk_id_to_alias[chunk_id] = alias
+            alias_to_chunk_id[alias] = chunk_id
+        return chunk_id_to_alias, alias_to_chunk_id
+
+    @staticmethod
+    def _render_candidate_chunks(
+        chunks: List[RetrievedChunk],
+        chunk_id_to_alias: Dict[str, str],
+    ) -> str:
+        if not chunks:
+            return "(none)"
+        lines: List[str] = []
+        for chunk in chunks:
+            chunk_id = (chunk.chunk_id or "").strip()
+            normalized_chunk_id = chunk_id_to_alias.get(chunk_id, "?")
+            relevance = chunk.reranker_relevance_score
+            relevance_text = "N/A" if relevance is None else f"{relevance:.4f}"
+            chunk_text = str(chunk.text or "").strip() or "(empty)"
+            lines.append(
+                f"- chunk_id={normalized_chunk_id} | relevance_score={relevance_text}\n"
+                f"  text={chunk_text}"
+            )
+        return "\n".join(lines)
+
 
 class MemoryContext(BaseModel):
     chunks: List[RetrievedChunk]

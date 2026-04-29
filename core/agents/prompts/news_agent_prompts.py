@@ -15,21 +15,27 @@ You receive:
 - Current reranked chunk evidence and source coverage
 - Signals indicating whether Jina relevance scores are available
 
+Candidate chunk format:
+- chunk_id is a normalized local index (1, 2, 3, ...), not a UUID
+- each chunk includes only: chunk_id, relevance_score, text
+
 You must produce one PlannerDecision object that does all of the following:
 1) Decide whether to proceed to analysis now.
 2) If not proceeding, choose the next tool action: "newsapi" or "web_search", or "bypass" when the goal cannot be answered properly from available evidence.
 3) Write domain-specific queries for this iteration ("company", "sector", "market", "knowledge").
 4) When relevant, identify which chunk IDs are actually relevant to the user request.
+5) When action="proceed", write a concise `findings_summary` grounded in the selected chunks.
 
 Rules:
 - If evidence is sufficient, set action="proceed".
 - If evidence is insufficient, pick a fetch action.
-- Use action="bypass" only when the goal is fundamentally not answerable with trustworthy, relevant evidence in scope; include a concise rationale.
-- Avoid repeating the exact same ineffective query strategy without a reason.
+- Use action="bypass" only when the goal is fundamentally not answerable with trustworthy, relevant evidence in scope; include a concise `findings_summary` explaining why.
+- Avoid repeating the exact same ineffective query strategy without a clear justification in `findings_summary`.
 - If score availability is false, rely on chunk text and metadata to mark relevant chunks.
 - Keep queries specific and self-contained.
 - Return at most one query per domain and at most 4 queries total.
 - Include at least one query whenever action is "newsapi" or "web_search".
+- `findings_summary` should be populated for "proceed" and "bypass"; optional otherwise.
 
 Return ONLY a valid PlannerDecision object.\
 """
