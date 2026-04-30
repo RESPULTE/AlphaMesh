@@ -153,15 +153,15 @@ async def _build_interest_relationships(
     ) -> None:
         relationships.append(
             {
-                "from_name": edge_id,
-                "from_type": "UserInterestEdge",
+                "from_name": domain_id,
+                "from_type": "UserInterestDomain",
                 "relation": "HAS_INTEREST_IN",
-                "to_name": domain_id,
-                "to_type": "UserInterestDomain",
+                "to_name": edge_id,
+                "to_type": "UserInterestEdge",
                 "confidence": "high",
                 "reason": "",
-                "from_node_props": edge_props,
-                "to_node_props": domain_props,
+                "from_node_props": domain_props,
+                "to_node_props": edge_props,
             }
         )
         relationships.append(

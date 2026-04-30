@@ -894,6 +894,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     allowed_entity_types=allowed_entity_types,
                     allowed_relationship_types=allowed_relationship_types,
                     llm_config={"temperature": getattr(self._llm, "temperature", 0.7)},
+                    allow_create=True,
                 )
                 task_id = await service_manager.get_graph_queue_manager().enqueue(task)
             except Exception:

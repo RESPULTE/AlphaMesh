@@ -577,19 +577,27 @@ class Neo4jAdapter:
         """
         Merge a UserInterestDomain node.
         ON CREATE: full props written.
-        ON MATCH:  only last_seen_at updated � category and domain_type are immutable.
+        ON MATCH: only last_seen_at updated; category and domain_type are immutable.
         """
+        belongs_to = RelationshipType.BELONGS_TO_NODESET.value
         cypher = (
             "MERGE (d:UserInterestDomain {id: $id}) "
             "ON CREATE SET d += $props "
-            "ON MATCH SET d.last_seen_at = $now"
+            "ON MATCH SET d.last_seen_at = $now "
+            "WITH d "
+            "FOREACH (_ IN CASE WHEN $nodeset_id IS NULL THEN [] ELSE [1] END | "
+            "  MERGE (s:NodeSet {id: $nodeset_id}) "
+            f"  MERGE (d)-[:{belongs_to}]->(s)"
+            ")"
         )
+        nodeset_id = str(props.get("nodeset_id") or "").strip() or None
         clean = {k: v for k, v in props.items() if k != "nodeset_id"}
         await self._execute_write(
             cypher,
             {
                 "id": domain_id,
                 "props": clean,
+                "nodeset_id": nodeset_id,
                 "now": datetime.now(timezone.utc).isoformat(),
             },
         )

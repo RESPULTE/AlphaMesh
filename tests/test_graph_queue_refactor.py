@@ -84,6 +84,7 @@ class FakeWriter:
     def __init__(self) -> None:
         self.write_calls: List[Tuple[List[dict], Dict[Tuple[str, str], str]]] = []
         self.user_domains: List[str] = []
+        self.user_domain_props: List[dict] = []
         self.user_edges: List[str] = []
         self.turn_nodes: List[str] = []
 
@@ -118,8 +119,9 @@ class FakeWriter:
                 written += 1
         return written
 
-    async def merge_user_interest_domain(self, domain_id: str, _props: dict) -> None:
+    async def merge_user_interest_domain(self, domain_id: str, props: dict) -> None:
         self.user_domains.append(domain_id)
+        self.user_domain_props.append(dict(props))
 
     async def merge_user_interest_edge(
         self,
@@ -225,13 +227,13 @@ def test_pipeline_upserts_user_scoped_nodes_before_edge_write(
 
         relationships = [
             {
-                "from_name": "edge-1",
-                "from_type": "UserInterestEdge",
+                "from_name": "domain-1",
+                "from_type": "UserInterestDomain",
                 "relation": "HAS_INTEREST_IN",
-                "to_name": "domain-1",
-                "to_type": "UserInterestDomain",
-                "from_node_props": {"id": "edge-1", "operation": "reinforce"},
-                "to_node_props": {"id": "domain-1"},
+                "to_name": "edge-1",
+                "to_type": "UserInterestEdge",
+                "from_node_props": {"id": "domain-1", "nodeset_id": "nodeset-1"},
+                "to_node_props": {"id": "edge-1", "operation": "reinforce"},
             },
             {
                 "from_name": "edge-1",
@@ -262,6 +264,7 @@ def test_pipeline_upserts_user_scoped_nodes_before_edge_write(
         assert domain_written == 0
         assert user_written == 3
         assert writer.user_domains == ["domain-1"]
+        assert writer.user_domain_props[0].get("nodeset_id") == "nodeset-1"
         assert writer.user_edges == ["edge-1"]
         assert writer.turn_nodes == ["turn-42"]
         assert resolver.batch_calls

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
@@ -71,17 +71,39 @@ class RelationshipExtractor:
                 HumanMessage(content=text),
             ]
         )
-        return self._parse_relationships(str(response.content or ""))
+
+        content_raw = self._coerce_response_text(getattr(response, "content", ""))
+        parsed = self._parse_relationships(content_raw, source="content")
+        if parsed is not None:
+            return parsed
+
+        text_raw = self._coerce_response_text(getattr(response, "text", ""))
+        if text_raw and text_raw != content_raw:
+            parsed = self._parse_relationships(text_raw, source="text")
+            if parsed is not None:
+                return parsed
+
+        return []
 
     @staticmethod
-    def _parse_relationships(raw: str) -> List[dict]:
+    def _coerce_response_text(value: object) -> str:
+        if value is None:
+            return ""
+        return str(value)
+
+    @staticmethod
+    def _parse_relationships(raw: str, *, source: str) -> Optional[List[dict]]:
         parsed = parse_relationships_block(raw)
         if parsed is None:
             if "<relationships" not in raw.lower():
-                logger.debug("RelationshipExtractor: no <relationships> block found")
+                logger.debug(
+                    "RelationshipExtractor: no <relationships> block found in %s",
+                    source,
+                )
             else:
                 logger.warning(
-                    "RelationshipExtractor: failed to parse relationships block as JSON array"
+                    "RelationshipExtractor: failed to parse relationships block as JSON array from %s",
+                    source,
                 )
-            return []
+            return None
         return parsed

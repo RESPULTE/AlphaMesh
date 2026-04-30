@@ -12,7 +12,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import chat, conversations, health, stream
+from api.routers import stream
+from api.routers import chat
+from api.routers import conversations
+from api.routers import health
 from api.services.analysis_runner import AnalysisRunner
 from api.services.conversation_jsonl_store import JsonlConversationStore
 from api.services.conversation_service import ConversationStore

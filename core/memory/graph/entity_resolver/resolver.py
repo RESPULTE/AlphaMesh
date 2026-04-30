@@ -50,6 +50,14 @@ def _normalize_neo4j_fuzzy_threshold(raw: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _normalize_rapidfuzz_threshold(raw: float) -> float:
+    """Ensure RapidFuzz threshold is normalized to [0, 1] regardless of input scale."""
+    value = float(raw)
+    if value > 1.0:
+        value = value / 100.0
+    return max(0.0, min(1.0, value))
+
+
 def _normalize_vector_distance_threshold(semantic_threshold: float) -> float:
     """Convert a [0, 1] similarity threshold to a cosine distance threshold."""
     similarity = max(0.0, min(1.0, float(semantic_threshold)))
@@ -91,7 +99,7 @@ class EntityResolver:
             ),
             # Stored as [0, 1]; multiplied by 100 when passed to rapidfuzz
             # (which returns scores in [0, 100]).
-            rapidfuzz_threshold=max(0.0, min(1.0, float(rapidfuzz_threshold))),
+            rapidfuzz_threshold=_normalize_rapidfuzz_threshold(rapidfuzz_threshold),
             vector_distance_threshold=max(0.0, min(1.0, vector_distance_threshold)),
             strong_fuzzy_threshold=_DEFAULT_STRONG_FUZZY_THRESHOLD,
         )

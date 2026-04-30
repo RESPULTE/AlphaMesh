@@ -8,8 +8,9 @@ from tenacity.wait import wait_none
 
 
 class _FakeResponse:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: object, text: object = "") -> None:
         self.content = content
+        self.text = text
 
 
 class _FakeLLM:
@@ -24,6 +25,8 @@ class _FakeLLM:
         next_response = self._responses.pop(0)
         if isinstance(next_response, Exception):
             raise next_response
+        if isinstance(next_response, _FakeResponse):
+            return next_response
         return _FakeResponse(str(next_response))
 
 
@@ -119,4 +122,42 @@ def test_extract_with_retry_budget_one_does_not_retry() -> None:
     )
 
     assert result == []
+    assert llm.calls == 1
+
+
+def test_extract_parses_from_response_text_when_content_unusable() -> None:
+    extractor = RelationshipExtractor(retry_attempts=1)
+    llm = _FakeLLM(
+        [
+            _FakeResponse(
+                content="[{'type': 'text', 'text': 'not-parseable-json-like-content'}]",
+                text='<relationships>[{"id":"from-text"}]</relationships>',
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        extractor.extract(text="input", llm=llm, system_prompt="system")
+    )
+
+    assert result == [{"id": "from-text"}]
+    assert llm.calls == 1
+
+
+def test_extract_uses_content_when_valid_even_if_text_exists() -> None:
+    extractor = RelationshipExtractor(retry_attempts=1)
+    llm = _FakeLLM(
+        [
+            _FakeResponse(
+                content='<relationships>[{"id":"from-content"}]</relationships>',
+                text='<relationships>[{"id":"from-text"}]</relationships>',
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        extractor.extract(text="input", llm=llm, system_prompt="system")
+    )
+
+    assert result == [{"id": "from-content"}]
     assert llm.calls == 1

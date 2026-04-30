@@ -196,6 +196,39 @@ def test_vector_candidate_below_threshold_falls_back_to_create_when_allowed() ->
     asyncio.run(_run())
 
 
+def test_rapidfuzz_threshold_percent_input_is_applied_as_expected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _run() -> None:
+        neo4j = FakeNeo4jAdapter()
+        candidate_id = "candidate-1"
+        neo4j.fuzzy_candidates["Acme Labs"] = [
+            {"id": candidate_id, "name": "Acme Labs Holdings", "similarity": 0.95}
+        ]
+
+        resolver = EntityResolver(
+            neo4j_adapter=neo4j,
+            entity_chroma_adapter=None,
+            rapidfuzz_threshold=69.0,
+        )
+        assert resolver._thresholds.rapidfuzz_threshold == pytest.approx(0.69)
+
+        monkeypatch.setattr(
+            "core.memory.graph.entity_resolver.resolver.fuzz.token_sort_ratio",
+            lambda _a, _b: 75.0,
+        )
+
+        resolved = await resolver.resolve_entity(
+            name="Acme Labs",
+            entity_type="Company",
+            allow_create=False,
+        )
+        assert resolved.entity_id == candidate_id
+        assert resolved.match_stage == "fuzzy"
+
+    asyncio.run(_run())
+
+
 def test_resolve_batch_deduplicates_inputs_and_reuses_cache() -> None:
     async def _run() -> None:
         neo4j = FakeNeo4jAdapter()
