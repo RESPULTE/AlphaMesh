@@ -693,7 +693,7 @@ class NewsAnalysisAgent(AbstractAgent):
 
     async def _rendezvous_node(self, state: NewsAgentState) -> dict:
         """Merge tool results, memory retrieval, and working memory chunks."""
-        rerank_query = str(state.missing_information_goal or state.goal or "").strip()
+        rerank_query = ", ".join([q.query for q in state.planner_decision.queries])
         if rerank_query.lower().startswith("retrieval objective:"):
             rerank_query = str(state.goal or "").strip()
 
