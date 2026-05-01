@@ -241,6 +241,14 @@ def test_chunk_entity_extraction_filters_pending_and_updates_status() -> None:
         "c1": "PENDING",
         "c2": "EXTRACTED",
     }
+    neo4j.get_entities_for_chunks.return_value = [
+        {
+            "entity_id": "entity-1",
+            "entity_name": "Apple",
+            "entity_type": "Company",
+            "source_chunk_id": "c1",
+        }
+    ]
     chroma = AsyncMock()
     chroma.get_documents_by_ids.side_effect = [
         [Document(id="c1", page_content="chunk text", metadata={"chunk_id": "c1"})],
@@ -289,12 +297,143 @@ def test_chunk_entity_extraction_filters_pending_and_updates_status() -> None:
     neo4j.get_chunk_extraction_status.assert_awaited_once_with(["c1", "c2"])
     chroma.get_documents_by_ids.assert_any_await(["c1"])
     neo4j.merge_relationship.assert_awaited_once()
+    neo4j.get_entities_for_chunks.assert_awaited_once_with(["c1"])
     neo4j.update_chunk_extraction_status.assert_awaited_once_with("c1", "EXTRACTED")
     chroma.update_metadata.assert_awaited_once()
 
 
+def test_chunk_entity_extraction_treats_missing_status_rows_as_pending() -> None:
+    neo4j = AsyncMock()
+    neo4j.get_chunk_extraction_status.return_value = {}
+    neo4j.get_entities_for_chunks.return_value = [
+        {
+            "entity_id": "entity-1",
+            "entity_name": "Apple",
+            "entity_type": "Company",
+            "source_chunk_id": "c1",
+        }
+    ]
+    chroma = AsyncMock()
+    chroma.get_documents_by_ids.side_effect = [
+        [Document(id="c1", page_content="chunk text", metadata={"chunk_id": "c1"})],
+        [Document(id="c1", page_content="chunk text", metadata={"chunk_id": "c1"})],
+    ]
+    nodeset_manager = AsyncMock()
+    nodeset_manager.get_global_financial_events_id.return_value = "nodeset-1"
+    entity_resolver = AsyncMock()
+    entity_resolver.resolve_entity.return_value = SimpleNamespace(entity_id="entity-1")
+    llm = _FakeChunkLLM(
+        BatchEntityExtractionResult(
+            results=[
+                ChunkEntityExtractionResult(
+                    chunk_id="c1",
+                    entities=[
+                        EntityNode(
+                            id="",
+                            name="Apple",
+                            entity_type="Company",
+                            description="Apple description",
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+    extractor = RelationshipExtractor(
+        neo4j_adapter=neo4j,
+        chroma_adapter=chroma,
+        nodeset_manager=nodeset_manager,
+        entity_resolver=entity_resolver,
+        llm=llm,
+        retry_attempts=1,
+    )
+
+    entities = asyncio.run(
+        extractor.extract(
+            mode="chunk_entities",
+            chunk_ids=["c1"],
+            llm=llm,
+        )
+    )
+
+    assert len(entities) == 1
+    neo4j.get_chunk_extraction_status.assert_awaited_once_with(["c1"])
+    neo4j.merge_relationship.assert_awaited_once()
+    neo4j.get_entities_for_chunks.assert_awaited_once_with(["c1"])
+    neo4j.update_chunk_extraction_status.assert_awaited_once_with("c1", "EXTRACTED")
+
+
+def test_chunk_entity_extraction_verification_failure_marks_chunk_pending() -> None:
+    neo4j = AsyncMock()
+    neo4j.get_chunk_extraction_status.return_value = {"c1": "PENDING"}
+    neo4j.get_entities_for_chunks.return_value = []
+    chroma = AsyncMock()
+    chroma.get_documents_by_ids.side_effect = [
+        [Document(id="c1", page_content="chunk text", metadata={"chunk_id": "c1"})],
+        [Document(id="c1", page_content="chunk text", metadata={"chunk_id": "c1"})],
+    ]
+    nodeset_manager = AsyncMock()
+    nodeset_manager.get_global_financial_events_id.return_value = "nodeset-1"
+    entity_resolver = AsyncMock()
+    entity_resolver.resolve_entity.return_value = SimpleNamespace(entity_id="entity-1")
+    llm = _FakeChunkLLM(
+        BatchEntityExtractionResult(
+            results=[
+                ChunkEntityExtractionResult(
+                    chunk_id="c1",
+                    entities=[
+                        EntityNode(
+                            id="",
+                            name="Apple",
+                            entity_type="Company",
+                            description="Apple description",
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+    extractor = RelationshipExtractor(
+        neo4j_adapter=neo4j,
+        chroma_adapter=chroma,
+        nodeset_manager=nodeset_manager,
+        entity_resolver=entity_resolver,
+        llm=llm,
+        retry_attempts=1,
+    )
+
+    entities = asyncio.run(
+        extractor.extract(
+            mode="chunk_entities",
+            chunk_ids=["c1"],
+            llm=llm,
+        )
+    )
+
+    assert entities == []
+    neo4j.merge_relationship.assert_awaited_once()
+    assert neo4j.get_entities_for_chunks.await_count >= 1
+    for call in neo4j.get_entities_for_chunks.await_args_list:
+        assert call.args == (["c1"],)
+    status_calls = [
+        call.args
+        for call in neo4j.update_chunk_extraction_status.await_args_list
+    ]
+    assert ("c1", "EXTRACTED") not in status_calls
+    assert ("c1", "PENDING") in status_calls
+    chroma.update_metadata.assert_awaited()
+
+
 def test_chunk_entity_extraction_force_ignores_status_filter() -> None:
     neo4j = AsyncMock()
+    neo4j.get_entities_for_chunks.return_value = [
+        {
+            "entity_id": "entity-2",
+            "entity_name": "TSMC",
+            "entity_type": "Company",
+            "source_chunk_id": "c2",
+        }
+    ]
     chroma = AsyncMock()
     chroma.get_documents_by_ids.side_effect = [
         [Document(id="c2", page_content="chunk text", metadata={"chunk_id": "c2"})],
@@ -341,6 +480,7 @@ def test_chunk_entity_extraction_force_ignores_status_filter() -> None:
 
     assert len(entities) == 1
     neo4j.get_chunk_extraction_status.assert_not_called()
+    neo4j.get_entities_for_chunks.assert_awaited_once_with(["c2"])
 
 
 def test_upsert_with_retry_marks_chunk_pending_on_failure() -> None:
@@ -365,6 +505,14 @@ def test_upsert_with_retry_marks_chunk_pending_on_failure() -> None:
 def test_chunk_entity_extraction_uses_runtime_system_prompt_override() -> None:
     neo4j = AsyncMock()
     neo4j.get_chunk_extraction_status.return_value = {"c3": "PENDING"}
+    neo4j.get_entities_for_chunks.return_value = [
+        {
+            "entity_id": "entity-3",
+            "entity_name": "Intel",
+            "entity_type": "Company",
+            "source_chunk_id": "c3",
+        }
+    ]
     chroma = AsyncMock()
     chroma.get_documents_by_ids.side_effect = [
         [Document(id="c3", page_content="chunk text", metadata={"chunk_id": "c3"})],
@@ -412,3 +560,4 @@ def test_chunk_entity_extraction_uses_runtime_system_prompt_override() -> None:
     assert len(entities) == 1
     assert llm.system_prompts
     assert llm.system_prompts[0] == custom_prompt
+    neo4j.get_entities_for_chunks.assert_awaited_once_with(["c3"])

@@ -246,7 +246,7 @@ class RelationshipExtractor:
         else:
             status_map = await self._neo4j_adapter.get_chunk_extraction_status(chunk_ids)
             pending_chunk_ids = [
-                cid for cid in chunk_ids if status_map.get(cid) == "PENDING"
+                cid for cid in chunk_ids if status_map.get(cid, "PENDING") == "PENDING"
             ]
 
         if not pending_chunk_ids:
@@ -337,6 +337,16 @@ class RelationshipExtractor:
             if chunk_failed:
                 continue
 
+            expected_entity_ids = list(chunk_entities.keys())
+            if not await self._upsert_with_retry(
+                lambda cid=result.chunk_id, expected_ids=expected_entity_ids: self._verify_chunk_entity_links(
+                    chunk_id=cid,
+                    expected_entity_ids=expected_ids,
+                ),
+                result.chunk_id,
+            ):
+                continue
+
             if not await self._upsert_with_retry(
                 lambda cid=result.chunk_id: self._neo4j_adapter.update_chunk_extraction_status(
                     cid, "EXTRACTED"
@@ -350,6 +360,28 @@ class RelationshipExtractor:
                 deduped_entities[entity_id] = entity
 
         return list(deduped_entities.values())
+
+    async def _verify_chunk_entity_links(
+        self,
+        *,
+        chunk_id: str,
+        expected_entity_ids: List[str],
+    ) -> None:
+        if not expected_entity_ids:
+            return
+
+        rows = await self._neo4j_adapter.get_entities_for_chunks([chunk_id])
+        linked_ids = {
+            str(row.get("entity_id") or "").strip()
+            for row in list(rows or [])
+            if str(row.get("entity_id") or "").strip()
+        }
+        missing = [entity_id for entity_id in expected_entity_ids if entity_id not in linked_ids]
+        if missing:
+            missing_rendered = ", ".join(sorted(missing))
+            raise RuntimeError(
+                f"MENTIONS_ENTITY links missing for chunk {chunk_id}: {missing_rendered}"
+            )
 
     async def _upsert_with_retry(
         self,
