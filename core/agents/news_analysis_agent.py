@@ -523,42 +523,38 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         url_key_to_domains: Dict[str, List[str]] = {}
+        seen_url_keys = set(state.seen_url_keys or [])
+        newly_seen_url_keys: List[str] = []
+        new_articles: List[dict] = []
+        all_fetched_count = 0
         for domain_query, batch in zip(queries, results_per_query, strict=False):
+            all_fetched_count += len(batch)
             for article in batch:
                 url = str(article.get("url") or "").strip()
                 url_key = NewsWorkingMemoryManager.canonicalize_url_key(url)
                 if not url_key:
                     continue
+
                 domains = url_key_to_domains.setdefault(url_key, [])
                 if domain_query.domain not in domains:
                     domains.append(domain_query.domain)
 
-        all_fetched: List[dict] = []
-        for batch in results_per_query:
-            all_fetched.extend(batch)
-
-        seen_url_keys = set(state.seen_url_keys or [])
-        newly_seen_url_keys: List[str] = []
-        new_articles: List[dict] = []
-        for article in all_fetched:
-            url = str(article.get("url") or "").strip()
-            url_key = NewsWorkingMemoryManager.canonicalize_url_key(url)
-            if not url_key or url_key in seen_url_keys:
-                continue
-            new_articles.append(article)
-            seen_url_keys.add(url_key)
-            newly_seen_url_keys.append(url_key)
+                if url_key in seen_url_keys:
+                    continue
+                new_articles.append(article)
+                seen_url_keys.add(url_key)
+                newly_seen_url_keys.append(url_key)
 
         log_row = ResearchStepLog(
             iteration=iter_label,
             action=action,
             queries=queries,
-            total_fetched_articles=len(all_fetched),
+            total_fetched_articles=all_fetched_count,
             newly_fetched_articles=len(new_articles),
         )
         publish_success(
             "news_agent",
-            f"Research iter {iter_label}: {action} fetched={len(all_fetched)} "
+            f"Research iter {iter_label}: {action} fetched={all_fetched_count} "
             f"new={len(new_articles)} across {len(queries)} domain query/queries",
         )
 
