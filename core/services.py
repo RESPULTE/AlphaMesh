@@ -47,6 +47,8 @@ class ServiceManager:
                     model=settings.LLM_MODEL,
                     temperature=temperature,
                     google_api_key=settings.GOOGLE_API_KEY,
+                    thinking_budget=0,  # disable thinking for Gemini 2.5 Flash family
+                    include_thoughts=False,
                 )
             except Exception as e:
                 print(f"Error initializing LLM: {e}")
