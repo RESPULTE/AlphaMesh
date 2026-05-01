@@ -1,19 +1,20 @@
 import { useState } from 'react';
-import { motion } from 'motion/react';
-import { ArrowRight, Sparkles } from 'lucide-react';
+import { AnimatePresence, motion } from 'motion/react';
+import { ArrowRight } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext';
+import BrandMark from './BrandMark';
 
 type AuthMode = 'login' | 'signup';
 
 const MODE_LABELS: Record<AuthMode, { title: string; subtitle: string; cta: string }> = {
   login: {
-    title: 'Welcome Back',
-    subtitle: 'Sign in to continue your AlphaMesh analysis workspace.',
+    title: 'Welcome back',
+    subtitle: 'Access your AlphaMesh workspace.',
     cta: 'Sign In',
   },
   signup: {
-    title: 'Create Access',
-    subtitle: 'Set up your AlphaMesh identity to start personalized analysis.',
+    title: 'Create account',
+    subtitle: 'Set up secure workspace access.',
     cta: 'Create Account',
   },
 };
@@ -62,26 +63,24 @@ export default function AuthGate() {
         >
           <div className="relative flex flex-col justify-between border-b border-outline-variant/20 p-7 md:border-b-0 md:border-r md:p-10">
             <div>
-              <p className="font-label text-[11px] uppercase tracking-[0.22em] text-primary">AlphaMesh Access</p>
-              <h1 className="mt-4 font-headline text-4xl font-black tracking-tight md:text-5xl">Signal Starts Here</h1>
+              <BrandMark size="auth" />
+              <p className="mt-8 font-label text-[11px] uppercase tracking-[0.22em] text-primary">Analysis Workspace</p>
+              <h1 className="mt-4 font-headline text-4xl font-black tracking-tight md:text-5xl">Secure Access</h1>
               <p className="mt-4 max-w-md text-sm text-on-surface-variant md:text-base">
-                Authenticated sessions keep your conversation history and portfolio context aligned across analysis runs.
-              </p>
-            </div>
-
-            <div className="mt-10 space-y-3 rounded-2xl border border-outline-variant/20 bg-surface-container-low p-5">
-              <div className="flex items-center gap-3 text-primary">
-                <Sparkles className="h-4 w-4" />
-                <p className="font-label text-[11px] uppercase tracking-[0.18em]">Identity-linked workflows</p>
-              </div>
-              <p className="text-sm text-on-surface-variant">
-                Your email identity is embedded in API session tokens so chat, history, and portfolio stay scoped to you.
+                Continue with your email to access conversation and portfolio context.
               </p>
             </div>
           </div>
 
           <div className="p-7 md:p-10">
-            <div className="mb-7 flex rounded-xl border border-outline-variant/25 bg-surface-container-low p-1">
+            <div className="relative mb-7 grid grid-cols-2 rounded-xl border border-outline-variant/25 bg-surface-container-low p-1">
+              <motion.div
+                aria-hidden="true"
+                initial={false}
+                animate={{ x: mode === 'login' ? '0%' : '100%', opacity: 1 }}
+                transition={{ type: 'spring', stiffness: 320, damping: 30, mass: 0.8 }}
+                className="absolute left-1 top-1 h-[calc(100%-0.5rem)] w-[calc(50%-0.25rem)] rounded-lg bg-primary shadow-[0_8px_24px_rgba(0,200,5,0.25)]"
+              />
               {(['login', 'signup'] as const).map((entry) => {
                 const active = mode === entry;
                 return (
@@ -92,10 +91,10 @@ export default function AuthGate() {
                       setMode(entry);
                       setError(null);
                     }}
-                    className={`w-1/2 rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                    className={`relative z-10 rounded-lg px-3 py-2 text-sm font-semibold transition-all duration-300 ${
                       active
-                        ? 'bg-primary text-on-primary shadow-[0_8px_24px_rgba(0,200,5,0.25)]'
-                        : 'text-on-surface-variant hover:text-on-surface'
+                        ? 'text-on-primary opacity-100'
+                        : 'text-on-surface-variant opacity-60 hover:opacity-100 hover:text-on-surface'
                     }`}
                   >
                     {entry === 'login' ? 'Sign In' : 'Sign Up'}
@@ -104,12 +103,22 @@ export default function AuthGate() {
               })}
             </div>
 
-            <h2 className="font-headline text-2xl font-extrabold tracking-tight md:text-3xl">{labels.title}</h2>
-            <p className="mt-2 text-sm text-on-surface-variant">{labels.subtitle}</p>
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div
+                key={mode}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                transition={{ duration: 0.2, ease: 'easeOut' }}
+              >
+                <h2 className="font-headline text-2xl font-extrabold tracking-tight md:text-3xl">{labels.title}</h2>
+                <p className="mt-2 text-sm text-on-surface-variant">{labels.subtitle}</p>
+              </motion.div>
+            </AnimatePresence>
 
             <form onSubmit={handleSubmit} className="mt-8 space-y-5">
               <label className="block">
-                <span className="mb-2 block font-label text-[11px] uppercase tracking-[0.18em] text-outline">Email Address</span>
+                <span className="mb-2 block font-label text-[11px] uppercase tracking-[0.18em] text-outline">Email</span>
                 <input
                   value={email}
                   onChange={(event) => setEmail(event.target.value)}

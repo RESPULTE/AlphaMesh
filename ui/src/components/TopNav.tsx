@@ -1,6 +1,7 @@
 import { Bell, LogOut, User } from 'lucide-react';
 import { motion } from 'motion/react';
 import clsx from 'clsx';
+import BrandMark from './BrandMark';
 
 interface TopNavProps {
   currentTab: string;
@@ -15,13 +16,7 @@ export default function TopNav({ currentTab, setTab, userEmail, onLogout }: TopN
   return (
     <header className="fixed top-0 left-0 right-0 z-50 bg-surface/80 backdrop-blur-md border-b border-outline-variant/10">
       <nav className="flex items-center w-full px-6 py-4 max-w-7xl mx-auto relative">
-        <div className="flex items-center gap-2 md:gap-3 text-xl md:text-2xl font-extrabold tracking-tighter text-on-surface font-headline antialiased mr-auto">
-          <div className="relative w-6 h-6 md:w-8 md:h-8 flex items-center justify-center text-primary">
-            <div className="absolute w-full h-full border-2 border-current rotate-45 opacity-30" />
-            <div className="absolute w-[60%] h-[60%] bg-current rotate-45" style={{ clipPath: 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)' }} />
-          </div>
-          <span>AlphaMesh</span>
-        </div>
+        <BrandMark size="nav" className="mr-auto" />
 
         <div className="hidden md:flex items-center gap-10 font-headline antialiased tracking-tight absolute left-1/2 -translate-x-1/2">
           {tabs.map((tab) => (
