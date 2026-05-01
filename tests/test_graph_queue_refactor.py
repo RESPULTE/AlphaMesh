@@ -149,8 +149,10 @@ class FakeRelationshipExtractor:
         return []
 
 
-async def fake_entity_extractor(chunk_ids: List[str]) -> None:
-    _ = chunk_ids
+    async def extract_entities_for_chunks(
+        self, chunk_ids: List[str], force: bool = False
+    ) -> None:
+        _ = (chunk_ids, force)
 
 
 def fake_llm_provider(_config: Optional[dict]):
@@ -167,7 +169,6 @@ def test_enqueue_immediate_uses_source_based_allow_create(
         entity_resolver=resolver,
         graph_writer=writer,
         relationship_extractor=FakeRelationshipExtractor(),
-        entity_extractor=fake_entity_extractor,
         llm_provider=fake_llm_provider,
         db_path=str(tmp_path / "graph_tasks.db"),
     )
@@ -220,7 +221,6 @@ def test_pipeline_upserts_user_scoped_nodes_before_edge_write(
             entity_resolver=resolver,
             graph_writer=writer,
             relationship_extractor=FakeRelationshipExtractor(),
-            entity_extractor=fake_entity_extractor,
             llm_provider=fake_llm_provider,
             prompt_registry=prompt_registry,
         )
@@ -281,7 +281,6 @@ def test_ttl_eviction_closes_idle_live_workers(
         entity_resolver=FakeResolver(),
         graph_writer=FakeWriter(),
         relationship_extractor=FakeRelationshipExtractor(),
-        entity_extractor=fake_entity_extractor,
         llm_provider=fake_llm_provider,
         db_path=str(tmp_path / "graph_tasks.db"),
     )
@@ -307,7 +306,6 @@ def test_enqueue_skips_invalid_chunk_and_empty_tasks(
         entity_resolver=FakeResolver(),
         graph_writer=FakeWriter(),
         relationship_extractor=FakeRelationshipExtractor(),
-        entity_extractor=fake_entity_extractor,
         llm_provider=fake_llm_provider,
         db_path=str(tmp_path / "graph_tasks.db"),
     )
@@ -359,7 +357,6 @@ def test_recover_pending_tasks_applies_allow_create_policy(
         entity_resolver=resolver,
         graph_writer=writer,
         relationship_extractor=FakeRelationshipExtractor(),
-        entity_extractor=fake_entity_extractor,
         llm_provider=fake_llm_provider,
         db_path=str(tmp_path / "graph_tasks.db"),
     )
@@ -508,7 +505,6 @@ def test_pipeline_drops_out_of_scope_extracted_relationships(tmp_path: Path) -> 
             entity_resolver=resolver,
             graph_writer=writer,
             relationship_extractor=ScopedExtractor(),
-            entity_extractor=fake_entity_extractor,
             llm_provider=fake_llm_provider,
             prompt_registry=prompt_registry,
         )
@@ -542,3 +538,4 @@ def test_pipeline_drops_out_of_scope_extracted_relationships(tmp_path: Path) -> 
         assert written_relationships[0]["relation"] in ALLOWED_RELATIONSHIP_TYPES
 
     asyncio.run(_run())
+

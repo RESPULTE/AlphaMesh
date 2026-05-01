@@ -44,7 +44,6 @@ class GraphQueueManager:
         entity_resolver: EntityResolver,
         graph_writer: Neo4jAdapter,
         relationship_extractor: RelationshipExtractor,
-        entity_extractor: Callable[[List[str]], Any],
         llm_provider: Callable[[Optional[dict]], Any],
         db_path: str = settings.GRAPH_QUEUE_DB_PATH,
     ) -> None:
@@ -54,7 +53,6 @@ class GraphQueueManager:
             entity_resolver=entity_resolver,
             graph_writer=graph_writer,
             relationship_extractor=relationship_extractor,
-            entity_extractor=entity_extractor,
             llm_provider=llm_provider,
             prompt_registry=self._prompt_registry,
         )

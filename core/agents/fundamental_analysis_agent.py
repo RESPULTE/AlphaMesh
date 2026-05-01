@@ -52,12 +52,11 @@ from core.agents.financial_db import FinancialDatabase
 from core.agents.financial_tools import TOOL_REGISTRY, ToolResult, get_tool_descriptions
 from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.fundamental_agent_models import (
-    ChartSpec,
     CompletionReviewDecision,
     ExecutorBatchLog,
     ExecutorToolLog,
-    FundamentalTaskSummary,
     FundamentalAnalysisOutput,
+    FundamentalTaskSummary,
     IterativeToolPlan,
     ToolCallBatch,
     ToolCallSpec,
@@ -65,20 +64,21 @@ from core.agents.models.fundamental_agent_models import (
     _AgentState,
 )
 from core.agents.prompts.fundamental_agent_prompts import (
-    FUNDAMENTAL_DEFERRED_ALLOWED_ENTITY_TYPES,
-    FUNDAMENTAL_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
-    FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     _ANALYST_SYSTEM,
     _COMPLETION_REVIEW_SYSTEM,
     _COMPLETION_REVIEW_USER,
     _TOOL_PLANNER_SYSTEM,
     _TOOL_PLANNER_USER,
+    FUNDAMENTAL_DEFERRED_ALLOWED_ENTITY_TYPES,
+    FUNDAMENTAL_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
+    FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
 )
+from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.agents.utils import (
     effective_goal,
     executor_logs_to_text,
-    extract_relevant_rows,
     extract_first_sentence,
+    extract_relevant_rows,
     sanitize_visualization_plan,
     tool_results_to_text,
 )
@@ -86,7 +86,6 @@ from core.agents.working_memory.fundamental_working_memory import (
     FundamentalWorkingMemoryManager,
 )
 from core.config import settings
-from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.logger import get_logger
 from core.memory.graph.graph_queue import make_extraction_task
 from core.services import service_manager
@@ -544,8 +543,13 @@ class FundamentalAnalysisAgent(AbstractAgent):
             tool_plan.data_summary,
         )
         if tool_plan.batch_count() > tasklist_cap:
-            tool_plan = tool_plan.model_copy(update={"batches": tool_plan.batches[:tasklist_cap]})
-            logger.info("[tool_planner] Truncated plan to tasklist cap=%d batch(es).", tasklist_cap)
+            tool_plan = tool_plan.model_copy(
+                update={"batches": tool_plan.batches[:tasklist_cap]}
+            )
+            logger.info(
+                "[tool_planner] Truncated plan to tasklist cap=%d batch(es).",
+                tasklist_cap,
+            )
         for i, batch in enumerate(tool_plan.batches):
             logger.info(
                 "  Batch %d (%d call(s)): %s",
@@ -758,7 +762,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
         1) completion checking against executor logs + resulting DataFrame
         2) chart/raw-row selection for downstream frontend visualisation
         """
-        df = state.financial_data if state.financial_data is not None else pd.DataFrame()
+        df = (
+            state.financial_data if state.financial_data is not None else pd.DataFrame()
+        )
         max_rows_per_chart = max(1, int(settings.FUNDAMENTAL_VIZ_MAX_ROWS_PER_CHART))
         max_raw_rows = max(1, int(settings.FUNDAMENTAL_RAW_DISPLAY_MAX_ROWS))
 
@@ -834,7 +840,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
             and state.iteration_count < MAX_TOOL_ITERATIONS
         )
         if should_replan:
-            logger.info("[completion_review] Task incomplete, scheduling one replan pass.")
+            logger.info(
+                "[completion_review] Task incomplete, scheduling one replan pass."
+            )
 
         return {
             "task_completed": decision.task_completed,
@@ -955,7 +963,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
                     source_agent=self.name(),
                     extraction_text=analysis_text,
                     system_prompt=FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
-                    allowed_entity_types=list(FUNDAMENTAL_DEFERRED_ALLOWED_ENTITY_TYPES),
+                    allowed_entity_types=list(
+                        FUNDAMENTAL_DEFERRED_ALLOWED_ENTITY_TYPES
+                    ),
                     allowed_relationship_types=list(
                         FUNDAMENTAL_DEFERRED_ALLOWED_RELATIONSHIP_TYPES
                     ),
@@ -978,7 +988,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
         memory_summary = {
             "tools_used": tools_used,
             "key_rows": [str(row) for row in list(filtered_df.index)[:8]],
-            "computed_rows": [str(row) for row in (state.computed_row_labels or [])[:8]],
+            "computed_rows": [
+                str(row) for row in (state.computed_row_labels or [])[:8]
+            ],
             "task_completed": bool(state.task_completed),
             "task_completion_reason": state.task_completion_reason or "",
             "main_conclusion": extract_first_sentence(analysis_text),
@@ -997,4 +1009,3 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "visualization_plan": state.visualization_plan,
             "raw_display_data": state.raw_display_data,
         }
-

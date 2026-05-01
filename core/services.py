@@ -175,7 +175,13 @@ class ServiceManager:
         from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
 
         if self._relationship_extractor is None:
-            self._relationship_extractor = RelationshipExtractor()
+            self._relationship_extractor = RelationshipExtractor(
+                neo4j_adapter=self.get_neo4j_adapter(),
+                chroma_adapter=self.get_chroma_adapter(),
+                nodeset_manager=self.get_nodeset_manager(),
+                entity_resolver=self.get_entity_resolver(),
+                llm=self.get_agent(),
+            )
         return self._relationship_extractor
 
     # -- GraphQueueManager -----------------------------------------------------
@@ -196,7 +202,6 @@ class ServiceManager:
                     entity_resolver=self.get_entity_resolver(),
                     graph_writer=self.get_neo4j_adapter(),
                     relationship_extractor=self.get_relationship_extractor(),
-                    entity_extractor=self.get_ingestor().extract_entities_for_chunks,
                     llm_provider=_llm_provider,
                 )
             except Exception as e:
@@ -218,11 +223,8 @@ class ServiceManager:
                 self._dual_store_ingestor = DualStoreIngestor(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
-                    entity_chroma_adapter=self.get_entity_chroma_adapter(),
                     nodeset_manager=self.get_nodeset_manager(),
-                    entity_resolver=self.get_entity_resolver(),
                     chunker=chunker,
-                    llm=self.get_agent(),
                 )
             except Exception as e:
                 print(f"Error initializing DualStoreIngestor: {e}")

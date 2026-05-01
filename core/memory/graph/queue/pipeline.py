@@ -39,14 +39,12 @@ class GraphWritePipeline:
         entity_resolver: EntityResolver,
         graph_writer: Neo4jAdapter,
         relationship_extractor: RelationshipExtractor,
-        entity_extractor: Callable[[List[str]], Any],
         llm_provider: Callable[[Optional[dict]], Any],
         prompt_registry: PromptRegistry,
     ) -> None:
         self._resolver = entity_resolver
         self._writer = graph_writer
         self._extractor = relationship_extractor
-        self._entity_extractor = entity_extractor
         self._llm_provider = llm_provider
         self._prompt_registry = prompt_registry
 
@@ -198,7 +196,7 @@ class GraphWritePipeline:
         if not chunk_ids:
             return
         try:
-            await self._entity_extractor(chunk_ids)
+            await self._extractor.extract_entities_for_chunks(chunk_ids)
         except Exception:
             logger.exception(
                 "GraphWritePipeline: chunk entity extraction failed for %d chunk(s)",

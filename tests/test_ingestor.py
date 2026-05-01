@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,7 +13,6 @@ from core.memory.ingestion.ingestor import DualStoreIngestor
 @pytest.fixture
 def mock_adapters():
     neo4j = AsyncMock()
-    neo4j.get_chunk_extraction_status.return_value = {}
 
     chroma = AsyncMock()
     chroma.get_chunks_with_source_url.return_value = []
@@ -22,21 +22,14 @@ def mock_adapters():
     nodeset_manager.get_global_financial_events_id.return_value = "global_id"
     nodeset_manager.assign_to_chunk_metadata = MagicMock(side_effect=lambda x, y: x)
 
-    embedding_func = AsyncMock()
-
     chunker = MagicMock()
 
-    llm = AsyncMock()
-
-    return neo4j, chroma, nodeset_manager, embedding_func, chunker, llm
+    return neo4j, chroma, nodeset_manager, chunker
 
 
-@pytest.mark.asyncio
-async def test_ingest_articles_skips_existing(mock_adapters):
-    neo4j, chroma, nodeset_manager, embedding_func, chunker, llm = mock_adapters
-    ingestor = DualStoreIngestor(
-        neo4j, chroma, chroma, nodeset_manager, embedding_func, chunker, llm=llm
-    )
+def test_ingest_articles_skips_existing(mock_adapters):
+    neo4j, chroma, nodeset_manager, chunker = mock_adapters
+    ingestor = DualStoreIngestor(neo4j, chroma, nodeset_manager, chunker)
 
     chroma.get_chunks_with_source_url.return_value = [
         Document(page_content="text", metadata={}, id="c1")
@@ -46,8 +39,8 @@ async def test_ingest_articles_skips_existing(mock_adapters):
     ]
 
     articles = [{"url": "https://example.com"}]
-    chunk_ids, existing_chunk_ids, involved_chunks = await ingestor.ingest_articles(
-        articles
+    chunk_ids, existing_chunk_ids, involved_chunks = asyncio.run(
+        ingestor.ingest_articles(articles)
     )
 
     assert chunk_ids == []
@@ -57,12 +50,9 @@ async def test_ingest_articles_skips_existing(mock_adapters):
     neo4j.merge_document_node.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_ingest_articles_processes_new(mock_adapters):
-    neo4j, chroma, nodeset_manager, embedding_func, chunker, llm = mock_adapters
-    ingestor = DualStoreIngestor(
-        neo4j, chroma, chroma, nodeset_manager, embedding_func, chunker, llm=llm
-    )
+def test_ingest_articles_processes_new(mock_adapters):
+    neo4j, chroma, nodeset_manager, chunker = mock_adapters
+    ingestor = DualStoreIngestor(neo4j, chroma, nodeset_manager, chunker)
 
     doc_meta = DocumentMetadata(
         document_id="d1",
@@ -80,7 +70,6 @@ async def test_ingest_articles_processes_new(mock_adapters):
         article_title="title",
         source_url="https://example.com/2",
         published_at=datetime.now(timezone.utc),
-        companies_involved=["TEST"],
     )
 
     chunker.chunk_article.return_value = (doc_meta, [chunk])
@@ -89,8 +78,8 @@ async def test_ingest_articles_processes_new(mock_adapters):
     ]
 
     articles = [{"url": "https://example.com/2"}]
-    chunk_ids, existing_chunk_ids, involved_chunks = await ingestor.ingest_articles(
-        articles
+    chunk_ids, existing_chunk_ids, involved_chunks = asyncio.run(
+        ingestor.ingest_articles(articles)
     )
 
     assert chunk_ids == ["c1"]

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import core.memory.graph.queue.relationship_extractor as extractor_module
+from langchain_core.documents import Document
+from langchain_core.runnables import RunnableLambda
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
+from core.memory.graph.models import (
+    BatchEntityExtractionResult,
+    ChunkEntityExtractionResult,
+    EntityNode,
+)
 from tenacity.wait import wait_none
 
 
@@ -28,6 +37,14 @@ class _FakeLLM:
         if isinstance(next_response, _FakeResponse):
             return next_response
         return _FakeResponse(str(next_response))
+
+
+class _FakeChunkLLM:
+    def __init__(self, result: BatchEntityExtractionResult) -> None:
+        self._result = result
+
+    def with_structured_output(self, _schema: object) -> RunnableLambda:
+        return RunnableLambda(lambda _payload: self._result)
 
 
 def test_extract_skips_blank_text_without_llm_call() -> None:
@@ -161,3 +178,117 @@ def test_extract_uses_content_when_valid_even_if_text_exists() -> None:
 
     assert result == [{"id": "from-content"}]
     assert llm.calls == 1
+
+
+def test_chunk_entity_extraction_filters_pending_and_updates_status() -> None:
+    neo4j = AsyncMock()
+    neo4j.get_chunk_extraction_status.return_value = {
+        "c1": "PENDING",
+        "c2": "EXTRACTED",
+    }
+    chroma = AsyncMock()
+    chroma.get_documents_by_ids.side_effect = [
+        [Document(id="c1", page_content="chunk text", metadata={"chunk_id": "c1"})],
+        [Document(id="c1", page_content="chunk text", metadata={"chunk_id": "c1"})],
+    ]
+    nodeset_manager = AsyncMock()
+    nodeset_manager.get_global_financial_events_id.return_value = "nodeset-1"
+    entity_resolver = AsyncMock()
+    entity_resolver.resolve_entity.return_value = SimpleNamespace(entity_id="entity-1")
+    llm = _FakeChunkLLM(
+        BatchEntityExtractionResult(
+            results=[
+                ChunkEntityExtractionResult(
+                    chunk_id="c1",
+                    entities=[
+                        EntityNode(
+                            id="",
+                            name="Apple",
+                            entity_type="Company",
+                            description="Apple description",
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+    extractor = RelationshipExtractor(
+        neo4j_adapter=neo4j,
+        chroma_adapter=chroma,
+        nodeset_manager=nodeset_manager,
+        entity_resolver=entity_resolver,
+        llm=llm,
+        retry_attempts=1,
+    )
+
+    entities = asyncio.run(extractor.extract_entities_for_chunks(["c1", "c2"]))
+
+    assert len(entities) == 1
+    assert entities[0].id == "entity-1"
+    neo4j.get_chunk_extraction_status.assert_awaited_once_with(["c1", "c2"])
+    chroma.get_documents_by_ids.assert_any_await(["c1"])
+    neo4j.merge_relationship.assert_awaited_once()
+    neo4j.update_chunk_extraction_status.assert_awaited_once_with("c1", "EXTRACTED")
+    chroma.update_metadata.assert_awaited_once()
+
+
+def test_chunk_entity_extraction_force_ignores_status_filter() -> None:
+    neo4j = AsyncMock()
+    chroma = AsyncMock()
+    chroma.get_documents_by_ids.side_effect = [
+        [Document(id="c2", page_content="chunk text", metadata={"chunk_id": "c2"})],
+        [Document(id="c2", page_content="chunk text", metadata={"chunk_id": "c2"})],
+    ]
+    nodeset_manager = AsyncMock()
+    nodeset_manager.get_global_financial_events_id.return_value = "nodeset-1"
+    entity_resolver = AsyncMock()
+    entity_resolver.resolve_entity.return_value = SimpleNamespace(entity_id="entity-2")
+    llm = _FakeChunkLLM(
+        BatchEntityExtractionResult(
+            results=[
+                ChunkEntityExtractionResult(
+                    chunk_id="c2",
+                    entities=[
+                        EntityNode(
+                            id="",
+                            name="TSMC",
+                            entity_type="Company",
+                            description="TSMC description",
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+    extractor = RelationshipExtractor(
+        neo4j_adapter=neo4j,
+        chroma_adapter=chroma,
+        nodeset_manager=nodeset_manager,
+        entity_resolver=entity_resolver,
+        llm=llm,
+        retry_attempts=1,
+    )
+
+    entities = asyncio.run(extractor.extract_entities_for_chunks(["c2"], force=True))
+
+    assert len(entities) == 1
+    neo4j.get_chunk_extraction_status.assert_not_called()
+
+
+def test_upsert_with_retry_marks_chunk_pending_on_failure() -> None:
+    extractor = RelationshipExtractor(retry_attempts=1)
+    extractor._mark_chunk_pending = AsyncMock()  # type: ignore[method-assign]
+
+    async def _raise() -> None:
+        raise RuntimeError("boom")
+
+    ok = asyncio.run(
+        extractor._upsert_with_retry(  # type: ignore[attr-defined]
+            _raise,
+            chunk_id="c-fail",
+            max_attempts=1,
+        )
+    )
+
+    assert ok is False
+    extractor._mark_chunk_pending.assert_awaited_once_with("c-fail")
