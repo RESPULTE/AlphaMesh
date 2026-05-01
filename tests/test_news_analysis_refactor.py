@@ -328,6 +328,164 @@ def test_rendezvous_node_returns_all_when_score_unavailable(
     assert result["rendezvous_has_minimum_sources"] is False
 
 
+def test_rendezvous_node_enqueues_chunk_entity_task_for_ranked_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import news_analysis_agent as news_module
+
+    queue = _FakeGraphQueueManager(enqueued=[])
+    monkeypatch.setattr(
+        news_module.service_manager, "get_graph_queue_manager", lambda: queue
+    )
+
+    captured_task_kwargs = {}
+
+    def _fake_make_extraction_task(**kwargs):
+        captured_task_kwargs.update(kwargs)
+        return {"kind": "chunk_entities", **kwargs}
+
+    monkeypatch.setattr(news_module, "make_extraction_task", _fake_make_extraction_task)
+
+    ranked = [
+        _make_chunk(
+            "chunk-1",
+            "first",
+            title="A",
+            url="https://example.com/a",
+            extraction_status="PENDING",
+        ),
+        _make_chunk(
+            "chunk-2",
+            "second",
+            title="B",
+            url="https://example.com/b",
+            extraction_status="EXTRACTED",
+        ),
+        _make_chunk(
+            "chunk-1",
+            "duplicate",
+            title="A2",
+            url="https://example.com/a2",
+            extraction_status="PENDING",
+        ),
+    ]
+
+    async def _fake_rank(*, query, chunks):
+        _ = (query, chunks)
+        return ranked
+
+    agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
+    agent._rank_chunks_with_reranker = _fake_rank
+
+    state = NewsAgentState(
+        goal="check pending extraction",
+        turn_id="turn-rendezvous",
+        conversation_id="conv-rendezvous",
+        planner_decision=PlannerDecision(
+            action="newsapi",
+            queries=[DomainQuery(domain="company", query="AAPL")],
+        ),
+    )
+
+    result = asyncio.run(agent._rendezvous_node(state))
+
+    assert result["final_chunks"] == ranked
+    assert queue.enqueued
+    assert captured_task_kwargs["task_kind"] == news_module.TASK_KIND_CHUNK_ENTITIES
+    assert captured_task_kwargs["conversation_id"] == "conv-rendezvous"
+    assert captured_task_kwargs["source_agent"] == "news_agent"
+    assert captured_task_kwargs["turn_id"] == "turn-rendezvous"
+    assert captured_task_kwargs["chunk_ids"] == ["chunk-1", "chunk-2"]
+
+
+def test_rendezvous_node_skips_enqueue_when_ranked_chunks_have_no_valid_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import news_analysis_agent as news_module
+
+    queue = _FakeGraphQueueManager(enqueued=[])
+    monkeypatch.setattr(
+        news_module.service_manager, "get_graph_queue_manager", lambda: queue
+    )
+
+    async def _fake_rank(*, query, chunks):
+        _ = (query, chunks)
+        return [
+            _make_chunk("", "no id", title="A", url="https://example.com/a"),
+            _make_chunk("   ", "blank id", title="B", url="https://example.com/b"),
+        ]
+
+    agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
+    agent._rank_chunks_with_reranker = _fake_rank
+
+    state = NewsAgentState(
+        goal="skip empty ids",
+        conversation_id="conv-rendezvous",
+        planner_decision=PlannerDecision(
+            action="newsapi",
+            queries=[DomainQuery(domain="company", query="AAPL")],
+        ),
+    )
+
+    _ = asyncio.run(agent._rendezvous_node(state))
+
+    assert queue.enqueued == []
+
+
+def test_rendezvous_node_enqueue_failure_does_not_interrupt_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import news_analysis_agent as news_module
+
+    class _FailingGraphQueueManager:
+        async def enqueue(self, task):
+            _ = task
+            raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(
+        news_module.service_manager,
+        "get_graph_queue_manager",
+        lambda: _FailingGraphQueueManager(),
+    )
+
+    ranked = [
+        _make_chunk("chunk-1", "first", title="A", url="https://example.com/a"),
+        _make_chunk("chunk-2", "second", title="B", url="https://example.com/b"),
+    ]
+
+    async def _fake_rank(*, query, chunks):
+        _ = (query, chunks)
+        return ranked
+
+    agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
+    agent._rank_chunks_with_reranker = _fake_rank
+
+    state = NewsAgentState(
+        goal="queue failure resilience",
+        conversation_id="conv-rendezvous",
+        planner_decision=PlannerDecision(
+            action="newsapi",
+            queries=[DomainQuery(domain="company", query="AAPL")],
+        ),
+        research_logs=[
+            ResearchStepLog(
+                iteration=1,
+                action="newsapi",
+                queries=[DomainQuery(domain="company", query="AAPL")],
+            )
+        ],
+    )
+
+    result = asyncio.run(agent._rendezvous_node(state))
+
+    assert [chunk.chunk_id for chunk in result["final_chunks"]] == ["chunk-1", "chunk-2"]
+    updated_logs = result["research_logs"].value
+    assert updated_logs[-1].merged_chunk_count == 2
+
+
 def test_planner_node_filters_selected_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

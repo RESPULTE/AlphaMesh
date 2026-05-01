@@ -38,7 +38,10 @@ from core.agents.working_memory.news_working_memory import NewsWorkingMemoryMana
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
-from core.memory.graph.graph_queue import make_extraction_task
+from core.memory.graph.graph_queue import (
+    TASK_KIND_CHUNK_ENTITIES,
+    make_extraction_task,
+)
 from core.memory.retrieval.models import RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
@@ -711,6 +714,29 @@ class NewsAnalysisAgent(AbstractAgent):
         article_context_block, _ = self._build_article_context_block(
             final_chunks=ranked,
         )
+
+        selected_chunk_ids = list(
+            dict.fromkeys(
+                str(chunk.chunk_id or "").strip()
+                for chunk in ranked
+                if str(chunk.chunk_id or "").strip()
+            )
+        )
+        if state.conversation_id and selected_chunk_ids:
+            turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
+            try:
+                chunk_entity_task = make_extraction_task(
+                    turn_id=turn_id,
+                    conversation_id=state.conversation_id,
+                    source_agent=self.name(),
+                    task_kind=TASK_KIND_CHUNK_ENTITIES,
+                    chunk_ids=selected_chunk_ids,
+                )
+                await service_manager.get_graph_queue_manager().enqueue(chunk_entity_task)
+            except Exception:
+                logger.exception(
+                    "_rendezvous_node: failed to enqueue chunk entity extraction task"
+                )
 
         if state.conversation_id:
             self._working_memory.merge_working_chunks(
