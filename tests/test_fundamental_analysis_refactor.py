@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -319,6 +321,100 @@ def test_run_reuses_cached_agent_memory_context() -> None:
     assert second.memory_summary["main_conclusion"] == "Margins are stable."
 
 
+def test_data_prep_uses_cached_dataframe_when_coverage_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    cfg = SimpleNamespace(
+        start_dt=datetime(2022, 1, 1),
+        end_dt=datetime(2024, 12, 31),
+        periods=[2022, 2023, 2024],
+    )
+    monkeypatch.setattr(module, "_resolve_date_range", lambda _state: cfg)
+
+    fetch_calls = {"count": 0}
+
+    async def _unexpected_fetch(*_args, **_kwargs):
+        fetch_calls["count"] += 1
+        raise AssertionError("_fetch_raw_data should not be called on cache hit")
+
+    monkeypatch.setattr(module, "_fetch_raw_data", _unexpected_fetch)
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
+    agent.db = object()
+
+    cached_df = _sample_df()
+    agent._working_memory.upsert_cached_financial_data(
+        conversation_id="conv-cache-hit",
+        ticker="aapl",
+        granularity="yearly",
+        financial_data=cached_df,
+    )
+
+    state = _AgentState(
+        ticker="AAPL",
+        granularity="yearly",
+        conversation_id="conv-cache-hit",
+    )
+    result = asyncio.run(agent._data_prep_node(state))
+
+    assert fetch_calls["count"] == 0
+    assert result["financial_data"].equals(cached_df)
+    assert result["available_concepts"] == list(cached_df.index)
+
+
+def test_data_prep_cache_miss_when_requested_range_exceeds_cached_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    cfg = SimpleNamespace(
+        start_dt=datetime(2021, 1, 1),
+        end_dt=datetime(2024, 12, 31),
+        periods=[2021, 2022, 2023, 2024],
+    )
+    monkeypatch.setattr(module, "_resolve_date_range", lambda _state: cfg)
+
+    fetch_calls = {"count": 0}
+    fetched_df = pd.DataFrame(
+        [[80.0, 90.0, 100.0, 110.0]],
+        index=["Revenues"],
+        columns=["2021-12-31", "2022-12-31", "2023-12-31", "2024-12-31"],
+    )
+
+    async def _fake_fetch(*_args, **_kwargs):
+        fetch_calls["count"] += 1
+        return fetched_df.copy(deep=True), pd.DataFrame()
+
+    monkeypatch.setattr(module, "_fetch_raw_data", _fake_fetch)
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
+    agent.db = object()
+    agent._working_memory.upsert_cached_financial_data(
+        conversation_id="conv-cache-miss",
+        ticker="AAPL",
+        granularity="yearly",
+        financial_data=pd.DataFrame(
+            [[90.0, 100.0, 110.0]],
+            index=["Revenues"],
+            columns=["2022-12-31", "2023-12-31", "2024-12-31"],
+        ),
+    )
+
+    state = _AgentState(
+        ticker="AAPL",
+        granularity="yearly",
+        conversation_id="conv-cache-miss",
+    )
+    result = asyncio.run(agent._data_prep_node(state))
+
+    assert fetch_calls["count"] == 1
+    assert result["financial_data"].equals(fetched_df)
+
+
 def test_tool_executor_populates_structured_result_detail_fields() -> None:
     state = _AgentState(
         query="Compute margin trend",
@@ -350,6 +446,49 @@ def test_tool_executor_populates_structured_result_detail_fields() -> None:
     assert call_log.added_row_count >= 0
     assert isinstance(call_log.series_values, dict)
     assert hasattr(call_log, "scalar_value")
+
+
+def test_tool_executor_updates_working_memory_dataframe_cache() -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
+
+    state = _AgentState(
+        query="Compute margin trend",
+        ticker="AAPL",
+        conversation_id="conv-tool-cache",
+        granularity="yearly",
+        financial_data=_sample_df(),
+        tool_plan=IterativeToolPlan(
+            batches=[
+                ToolCallBatch(
+                    calls=[
+                        ToolCallSpec(
+                            tool_name="cagr",
+                            parameters={"metric": "Revenues"},
+                            reasoning="Measure long-term growth.",
+                        )
+                    ],
+                    batch_reasoning="Run CAGR on revenue baseline.",
+                )
+            ],
+            data_summary="Compute one growth metric.",
+        ),
+        current_batch_index=0,
+    )
+
+    result = asyncio.run(agent._tool_executor_node(state))
+
+    cached_df = agent._working_memory.resolve_cached_financial_data(
+        conversation_id="conv-tool-cache",
+        ticker="AAPL",
+        granularity="yearly",
+    )
+    assert cached_df is not None
+    assert cached_df.equals(result["financial_data"])
+    for row_label in result["computed_row_labels"]:
+        assert row_label in cached_df.index
 
 
 def test_tool_planner_includes_prior_working_memory_block_in_prompt(
