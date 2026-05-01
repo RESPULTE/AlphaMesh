@@ -11,9 +11,6 @@ Everything else is unchanged from the previous version.
 """
 
 import asyncio
-import json
-import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -33,7 +30,17 @@ from core.agents.prompts.orchestrator_agent_prompts import (
     ORCHESTRATOR_PLANNER_SYSTEM_PROMPT,
     SYNTHESISER_PROMPT,
 )
-from core.agents.ticker_validation import TickerInfo
+from core.agents.utility.orchestrator_helpers import (
+    _collect_latest_agent_memory_summaries,
+    _collect_synthesis_inputs,
+    _coerce_final_response,
+    _extract_response_text,
+    _flush_graph_turn,
+    _load_portfolio_block,
+    _open_graph_session,
+    _warm_user_context_cache,
+    validate_and_enrich_plan_tickers,
+)
 from core.agents.utils import (
     _build_combined_company_context,
     _extract_last_human_message,
@@ -44,7 +51,6 @@ from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
 from core.memory.graph.graph_queue import make_graph_task
-from core.memory.retrieval.models import CitedSource
 from core.memory.user_signal_writeback import (
     process_user_signal_writeback,
 )
@@ -58,67 +64,6 @@ _PLANNER_TURN_WINDOW: int = 12
 _AGENT_MEMORY_WINDOW: int = 8
 
 
-def _build_clarification_message(needs_confirmation: Dict[str, "TickerInfo"]) -> str:
-    """Format a user-facing message asking for ticker confirmation."""
-    lines = ["Before proceeding, I want to confirm the securities you're asking about:"]
-    for ticker, info in needs_confirmation.items():
-        if not info.is_valid and info.suggestions:
-            suggestions_str = ", ".join(f"**{s}**" for s in info.suggestions[:3])
-            lines.append(
-                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
-                f"Did you mean one of: {suggestions_str}?"
-            )
-        elif not info.is_valid:
-            lines.append(
-                f"• **{ticker}** wasn't recognised as a valid ticker symbol. "
-                f"Please double-check the symbol and try again."
-            )
-        else:
-            # Valid but non-equity (ETF, MUTUALFUND, etc.)
-            qt = info.quote_type or "unknown type"
-            lines.append(
-                f"• **{ticker}** appears to be a `{qt}` rather than a common equity. "
-                f"Is this correct, or did you mean a different symbol?"
-            )
-    lines.append("\nPlease reply with the correct ticker symbol(s) and I'll proceed.")
-    return "\n".join(lines)
-
-
-def _sanitize_portfolio_user_email(user_email: str) -> str:
-    value = (user_email or "").strip().lower()
-    safe = re.sub(r"[^a-z0-9._-]+", "_", value).strip("._-")
-    if not safe:
-        raise ValueError("Invalid user_email")
-    return safe
-
-
-def _get_user_portfolio_path(base_path: str, user_email: str) -> Path:
-    base = Path(base_path)
-    safe_user = _sanitize_portfolio_user_email(user_email)
-    return base.parent / f"{base.stem}_{safe_user}.json"
-
-
-def get_portfolio_for_user(base_path: str, user_email: Optional[str]) -> List[dict]:
-    if not user_email:
-        return []
-    try:
-        path = _get_user_portfolio_path(base_path, user_email)
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except FileNotFoundError:
-        logger.warning("Portfolio file not found for user '%s' at %s", user_email, path)
-        return []
-    except ValueError:
-        logger.warning(
-            "Invalid portfolio user_email for path resolution: %s", user_email
-        )
-        return []
-    except Exception:
-        logger.exception("Failed to load portfolio for user '%s'", user_email)
-        return []
-
-
 class OrchestratorAgent:
     def __init__(self):
         self._llm = service_manager.get_agent(temperature=0)
@@ -127,25 +72,8 @@ class OrchestratorAgent:
         }
         self._graph = self._build_graph()
 
-    _get_user_portfolio_path = staticmethod(_get_user_portfolio_path)
-    get_portfolio_for_user = staticmethod(get_portfolio_for_user)
-
     def name(self) -> str:
         return "Orchestrator Agent"
-
-    @staticmethod
-    def _collect_latest_agent_memory_summaries(
-        turns: List[dict],
-    ) -> Dict[str, Dict[str, Any]]:
-        latest: Dict[str, Dict[str, Any]] = {}
-        for turn in turns:
-            summaries = turn.get("agent_memory_summaries") or {}
-            if not isinstance(summaries, dict):
-                continue
-            for agent_name, payload in summaries.items():
-                if isinstance(payload, dict):
-                    latest[str(agent_name)] = payload
-        return latest
 
     def _build_runtime_agent_memory_contexts(
         self,
@@ -184,36 +112,19 @@ class OrchestratorAgent:
         if state.plan.final_answer is not None:
             return "direct_answer"
         if state.plan.target_agents:
-            return "validate_and_enrich"
-        return "synthesiser"
-
-    def _enrichment_router(self, state: OrchestratorState) -> str:
-        if state.plan and state.plan.target_agents:
             return "execute_agents"
-        if state.plan and state.plan.final_answer is not None:
-            return "direct_answer"
         return "synthesiser"
 
     def _build_graph(self):
         workflow = StateGraph(OrchestratorState, output_schema=FinalResponse)
         workflow.add_node("planner", self._plan_node)
         workflow.add_node("direct_answer", self._direct_answer_node)
-        workflow.add_node("validate_and_enrich", self._validate_and_enrich_node)
         workflow.add_node("execute_agents", self._execute_node)
         workflow.add_node("synthesiser", self._synthesize_node)
         workflow.add_edge(START, "planner")
         workflow.add_conditional_edges(
             "planner",
             self._router,
-            {
-                "direct_answer": "direct_answer",
-                "validate_and_enrich": "validate_and_enrich",
-                "synthesiser": "synthesiser",
-            },
-        )
-        workflow.add_conditional_edges(
-            "validate_and_enrich",
-            self._enrichment_router,
             {
                 "direct_answer": "direct_answer",
                 "execute_agents": "execute_agents",
@@ -237,36 +148,6 @@ class OrchestratorAgent:
             )
             return "USER CONTEXT: None"
 
-    @staticmethod
-    def _load_portfolio_block(user_email: Optional[str]) -> str:
-        portfolio = get_portfolio_for_user(settings.PORTFOLIO_JSON_PATH, user_email)
-        return json.dumps(portfolio, indent=2) if portfolio else "[]"
-
-    @staticmethod
-    async def _open_graph_session(conversation_id: Optional[str]) -> None:
-        if not conversation_id:
-            return
-        try:
-            await service_manager.get_graph_queue_manager().open_session(
-                conversation_id
-            )
-        except Exception:
-            logger.exception(
-                "run: failed to open graph queue session for '%s'", conversation_id
-            )
-
-    @staticmethod
-    async def _flush_graph_turn(conversation_id: Optional[str], turn_id: str) -> None:
-        if not conversation_id:
-            return
-        try:
-            await service_manager.get_graph_queue_manager().flush_turn(
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-            )
-        except Exception:
-            logger.exception("run: failed to flush graph queue turn_id='%s'", turn_id)
-
     def _build_initial_state(
         self,
         *,
@@ -284,25 +165,15 @@ class OrchestratorAgent:
             conversation_id=conversation_id,
             user_email=user_email,
             history_turns=normalized_history_turns,
-            agent_memory_summaries=self._collect_latest_agent_memory_summaries(
+            agent_memory_summaries=_collect_latest_agent_memory_summaries(
                 normalized_history_turns
             ),
             conversation_memory_block=(conversation_memory_block or "(none)"),
             conversation_memory_hits=list(conversation_memory_hits or []),
             user_context_block=self._load_user_context_block(user_email),
-            portfolio_block=self._load_portfolio_block(user_email),
+            portfolio_block=_load_portfolio_block(user_email),
             turn_id=turn_id,
         )
-
-    @staticmethod
-    async def _warm_user_context_cache(user_email: Optional[str]) -> None:
-        if not user_email:
-            return
-        try:
-            svc = service_manager.get_user_context_service()
-            await svc.load_for_user(user_email)
-        except Exception:
-            logger.exception("run: failed to warm user context cache for %s", user_email)
 
     async def run(
         self,
@@ -326,8 +197,8 @@ class OrchestratorAgent:
         turn_id = str(uuid4())
         logger.info("run: turn_id=%s", turn_id)
 
-        await self._open_graph_session(conversation_id)
-        await self._warm_user_context_cache(user_email)
+        await _open_graph_session(conversation_id)
+        await _warm_user_context_cache(user_email)
 
         initial_state = self._build_initial_state(
             messages=messages,
@@ -361,53 +232,9 @@ class OrchestratorAgent:
                 turn_id=turn_id,
             )
 
-        await self._flush_graph_turn(conversation_id, turn_id)
+        await _flush_graph_turn(conversation_id, turn_id)
 
-        return self._coerce_final_response(raw)
-
-    @staticmethod
-    def _coerce_final_response(raw: Any) -> FinalResponse:
-        if raw is None:
-            return FinalResponse(summary="")
-        if isinstance(raw, FinalResponse):
-            return raw
-        if isinstance(raw, dict):
-            return FinalResponse(
-                summary=raw.get("summary") or "",
-                fundamental_data=raw.get("fundamental_data"),
-                fundamentals_visualization=raw.get("fundamentals_visualization"),
-                fundamentals_raw_display_data=raw.get("fundamentals_raw_display_data"),
-                fundamentals_task_completed=raw.get(
-                    "fundamentals_task_completed", True
-                ),
-                fundamentals_task_completion_reason=raw.get(
-                    "fundamentals_task_completion_reason", ""
-                ),
-                sources=raw.get("sources") or [],
-                agent_analyses=raw.get("agent_analyses") or {},
-                agent_memory_summaries=raw.get("agent_memory_summaries") or {},
-                tickers=raw.get("tickers") or [],
-                turn_id=raw.get("turn_id") or "",
-            )
-        return FinalResponse(
-            summary=getattr(raw, "summary", "") or "",
-            fundamental_data=getattr(raw, "fundamental_data", None),
-            fundamentals_visualization=getattr(raw, "fundamentals_visualization", None),
-            fundamentals_raw_display_data=getattr(
-                raw, "fundamentals_raw_display_data", None
-            ),
-            fundamentals_task_completed=getattr(
-                raw, "fundamentals_task_completed", True
-            ),
-            fundamentals_task_completion_reason=getattr(
-                raw, "fundamentals_task_completion_reason", ""
-            ),
-            sources=getattr(raw, "sources", []) or [],
-            agent_analyses=getattr(raw, "agent_analyses", {}) or {},
-            agent_memory_summaries=getattr(raw, "agent_memory_summaries", {}) or {},
-            tickers=getattr(raw, "tickers", []) or [],
-            turn_id=getattr(raw, "turn_id", "") or "",
-        )
+        return _coerce_final_response(raw)
 
     def _build_synthesis_system_prompt(
         self,
@@ -420,10 +247,6 @@ class OrchestratorAgent:
         )
         context_block = "\n\nAgent Findings:\n" + "\n\n".join(context_parts)
         return rendered + context_block
-
-    @staticmethod
-    def _extract_response_text(raw: str) -> str:
-        return raw.strip()
 
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
         available_agents_desc = "\n".join(
@@ -486,7 +309,9 @@ class OrchestratorAgent:
                 plan.final_answer is not None,
                 plan.ticker,
             )
-            return {"plan": plan}
+            state_update: Dict[str, Any] = {"plan": plan}
+            state_update.update(await validate_and_enrich_plan_tickers(plan))
+            return state_update
 
         except Exception:
             logger.exception("_plan_node: LLM call failed â€” using safe fallback plan")
@@ -504,75 +329,6 @@ class OrchestratorAgent:
             "fundamentals_task_completion_reason": "",
             "agent_memory_summaries": {},
             "turn_id": state.turn_id,
-        }
-
-    async def _validate_and_enrich_node(
-        self, state: OrchestratorState
-    ) -> Dict[str, Any]:
-        from core.agents.ticker_validation import TickerInfo
-
-        plan = state.plan
-        tickers: List[str] = getattr(plan, "tickers", []) if plan else []
-        if not tickers:
-            return {"company_context_blocks": {}}
-
-        try:
-            publish_progress(
-                "orchestrator", f"Validating ticker(s): {', '.join(tickers)}"
-            )
-            validator = service_manager.get_ticker_validator()
-            results: Dict[str, TickerInfo] = await validator.validate_and_enrich(
-                tickers
-            )
-        except Exception:
-            logger.exception("_validate_and_enrich_node: validation failed")
-            return {"company_context_blocks": {}}
-
-        needing_confirmation = {
-            t: info
-            for t, info in results.items()
-            if info.needs_confirmation or not info.is_valid
-        }
-        if needing_confirmation:
-            clarification = _build_clarification_message(needing_confirmation)
-            updated_plan = plan.model_copy(update={"final_answer": clarification})
-            return {"plan": updated_plan, "company_context_blocks": {}}
-
-        confirmed_tickers = [
-            t for t, info in results.items() if info.is_valid and info.is_equity
-        ]
-
-        # Defensive: covers the case where _plan_node ran on a different async
-        # context before the sink was registered, or ticker casing differed.
-        if confirmed_tickers:
-            from core.event_queue import publish_frontend_event
-
-            publish_frontend_event(
-                "orchestrator",
-                "ticker_resolved",
-                {"ticker": confirmed_tickers[0], "tickers": confirmed_tickers},
-            )
-
-        company_context_blocks: Dict[str, str] = {}
-        for t, info in results.items():
-            if info.is_valid and info.is_equity:
-                block = info.to_context_block()
-                if block:
-                    company_context_blocks[t] = block
-
-        ticker_metadata: Dict[str, dict] = {}
-        for t, info in results.items():
-            if info.is_valid and info.is_equity:
-                ticker_metadata[t] = {
-                    "long_name": info.long_name,
-                    "sector": info.sector,
-                    "industry": info.industry,
-                    "description": info.description,
-                }
-
-        return {
-            "company_context_blocks": company_context_blocks,
-            "ticker_metadata": ticker_metadata,
         }
 
     async def _execute_node(self, state: OrchestratorState) -> Dict[str, Any]:
@@ -630,58 +386,6 @@ class OrchestratorAgent:
 
         return {"agent_outputs": outputs}
 
-    @staticmethod
-    def _collect_synthesis_inputs(
-        agent_outputs: Dict[str, BaseAgentOutput],
-    ) -> Dict[str, Any]:
-        context_parts: List[str] = []
-        fundamental_df = None
-        fundamentals_visualization = None
-        fundamentals_raw_display_data = None
-        fundamentals_task_completed = True
-        fundamentals_task_completion_reason = ""
-        news_sources: List[CitedSource] = []
-        agent_memory_summaries: Dict[str, Dict[str, Any]] = {}
-        per_agent_analyses: Dict[str, str] = {}
-
-        for name, output in agent_outputs.items():
-            try:
-                context_parts.append(output.get_llm_context_str())
-            except Exception:
-                logger.exception(
-                    "_synthesize_node: get_llm_context_str failed for '%s'", name
-                )
-            if name == "fundamentals_agent":
-                fundamental_df = getattr(output, "financial_data", None)
-                fundamentals_visualization = getattr(output, "visualization_plan", None)
-                fundamentals_raw_display_data = getattr(
-                    output, "raw_display_data", None
-                )
-                fundamentals_task_completed = bool(
-                    getattr(output, "task_completed", True)
-                )
-                fundamentals_task_completion_reason = (
-                    getattr(output, "task_completion_reason", "") or ""
-                )
-            if name == "news_agent":
-                news_sources = getattr(output, "sources", []) or []
-            memory_summary = getattr(output, "memory_summary", {}) or {}
-            if isinstance(memory_summary, dict) and memory_summary:
-                agent_memory_summaries[name] = memory_summary
-            per_agent_analyses[name] = getattr(output, "analysis", "") or ""
-
-        return {
-            "context_parts": context_parts,
-            "fundamental_df": fundamental_df,
-            "fundamentals_visualization": fundamentals_visualization,
-            "fundamentals_raw_display_data": fundamentals_raw_display_data,
-            "fundamentals_task_completed": fundamentals_task_completed,
-            "fundamentals_task_completion_reason": fundamentals_task_completion_reason,
-            "news_sources": news_sources,
-            "agent_memory_summaries": agent_memory_summaries,
-            "per_agent_analyses": per_agent_analyses,
-        }
-
     async def _build_synthesis_text(
         self,
         *,
@@ -731,7 +435,7 @@ class OrchestratorAgent:
             ]
             response = await self._llm.ainvoke(messages)
             publish_success("orchestrator", "Synthesis complete.")
-            return self._extract_response_text(response.text if response else "")
+            return _extract_response_text(response.text if response else "")
         except Exception:
             logger.exception("_synthesize_node: LLM synthesis failed")
             return (
@@ -771,7 +475,7 @@ class OrchestratorAgent:
                 )
 
     async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
-        synthesis_inputs = self._collect_synthesis_inputs(state.agent_outputs)
+        synthesis_inputs = _collect_synthesis_inputs(state.agent_outputs)
         analysis_text = await self._build_synthesis_text(
             state=state,
             context_parts=synthesis_inputs["context_parts"],
@@ -799,3 +503,4 @@ class OrchestratorAgent:
             "tickers": state.plan.tickers if state.plan else [],
             "turn_id": state.turn_id,
         }
+

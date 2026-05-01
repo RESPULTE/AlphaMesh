@@ -163,7 +163,7 @@ class OrchestratorState(BaseModel):
     portfolio_block: str = "[]"
 
     # Keyed by ticker symbol; values are formatted context blocks from yfinance.
-    # Built by _validate_and_enrich_node and read by _execute_node.
+    # Populated during planner-time ticker enrichment and read by _execute_node.
     company_context_blocks: Dict[str, str] = Field(default_factory=dict)
 
     summary: str = ""
@@ -185,7 +185,7 @@ class OrchestratorState(BaseModel):
         description=(
             "Per-ticker enrichment from yfinance, keyed by ticker symbol. "
             "Values: {long_name, sector, industry, description}. "
-            "Populated by _validate_and_enrich_node; current turn only."
+            "Populated during planner-time ticker enrichment; current turn only."
         ),
     )
 

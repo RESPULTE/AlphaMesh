@@ -8,11 +8,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from core.agents.models.orchestrator_models import OrchestratorPlan, OrchestratorState
 from core.agents.orchestrator_agent import OrchestratorAgent
+from core.agents.ticker_validation import TickerInfo
+from core.agents.utility.orchestrator_helpers import (
+    _get_user_portfolio_path,
+    get_portfolio_for_user,
+)
 from core.services import service_manager
 
 
 def test_user_portfolio_path_resolution_uses_sanitized_email() -> None:
-    path = OrchestratorAgent._get_user_portfolio_path(
+    path = _get_user_portfolio_path(
         "data/portfolio.json",
         "Demo+User@AlphaMesh.Local",
     )
@@ -23,7 +28,7 @@ def test_user_portfolio_path_resolution_uses_sanitized_email() -> None:
 
 def test_get_portfolio_for_user_returns_empty_for_missing_file(tmp_path) -> None:
     base_path = str(tmp_path / "portfolio.json")
-    holdings = OrchestratorAgent.get_portfolio_for_user(
+    holdings = get_portfolio_for_user(
         base_path=base_path,
         user_email="missing@example.com",
     )
@@ -33,11 +38,11 @@ def test_get_portfolio_for_user_returns_empty_for_missing_file(tmp_path) -> None
 def test_get_portfolio_for_user_returns_empty_for_non_list_json(tmp_path) -> None:
     base_path = str(tmp_path / "portfolio.json")
     user_email = "demo@example.com"
-    path = OrchestratorAgent._get_user_portfolio_path(base_path, user_email)
+    path = _get_user_portfolio_path(base_path, user_email)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{\"ticker\": \"AAPL\"}", encoding="utf-8")
 
-    holdings = OrchestratorAgent.get_portfolio_for_user(
+    holdings = get_portfolio_for_user(
         base_path=base_path,
         user_email=user_email,
     )
@@ -46,7 +51,7 @@ def test_get_portfolio_for_user_returns_empty_for_non_list_json(tmp_path) -> Non
 
 def test_get_portfolio_for_user_returns_empty_for_no_user_email(tmp_path) -> None:
     base_path = str(tmp_path / "portfolio.json")
-    holdings = OrchestratorAgent.get_portfolio_for_user(
+    holdings = get_portfolio_for_user(
         base_path=base_path,
         user_email=None,
     )
@@ -71,7 +76,7 @@ def test_run_populates_portfolio_block_from_per_user_file(monkeypatch, tmp_path)
     monkeypatch.setattr("core.config.settings.PORTFOLIO_JSON_PATH", base_path, raising=False)
     monkeypatch.setattr(service_manager, "get_user_context_service", lambda: FakeUserContextService())
 
-    portfolio_path = OrchestratorAgent._get_user_portfolio_path(
+    portfolio_path = _get_user_portfolio_path(
         base_path,
         "demo@alphamesh.local",
     )
@@ -200,3 +205,118 @@ def test_synthesize_node_uses_state_portfolio_block() -> None:
         and "prefers concise summaries" in str(m.content)
         for m in system_messages
     )
+
+
+def test_plan_node_sets_clarification_on_invalid_ticker(monkeypatch) -> None:
+    class FakeStructuredLLM:
+        async def ainvoke(self, _messages):
+            return OrchestratorPlan(
+                query="check this ticker",
+                target_agents=["news_agent"],
+                tickers=["AAPL"],
+            )
+
+    class FakeLLM:
+        def with_structured_output(self, _schema):
+            return FakeStructuredLLM()
+
+    class FakeTickerValidator:
+        async def validate_and_enrich(self, tickers):
+            assert tickers == ["AAPL"]
+            return {
+                "AAPL": TickerInfo(
+                    ticker="AAPL",
+                    is_valid=False,
+                    is_equity=False,
+                    quote_type=None,
+                    needs_confirmation=True,
+                    suggestions=["AAPL"],
+                )
+            }
+
+    monkeypatch.setattr(
+        service_manager, "get_ticker_validator", lambda: FakeTickerValidator()
+    )
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._llm = FakeLLM()
+    agent._agents = {}
+
+    state = OrchestratorState(
+        messages=[HumanMessage(content="Analyze AAPL please")],
+        user_context_block="USER CONTEXT: None",
+        portfolio_block="[]",
+    )
+
+    payload = asyncio.run(agent._plan_node(state))
+
+    assert payload["plan"] is not None
+    assert payload["plan"].final_answer is not None
+    assert "confirm the securities" in payload["plan"].final_answer
+    assert payload["company_context_blocks"] == {}
+    assert payload["ticker_metadata"] == {}
+
+
+def test_plan_node_populates_enrichment_for_valid_equity(monkeypatch) -> None:
+    class FakeStructuredLLM:
+        async def ainvoke(self, _messages):
+            return OrchestratorPlan(
+                query="analyze apple",
+                target_agents=["news_agent"],
+                tickers=["AAPL"],
+            )
+
+    class FakeLLM:
+        def with_structured_output(self, _schema):
+            return FakeStructuredLLM()
+
+    class FakeTickerValidator:
+        async def validate_and_enrich(self, tickers):
+            assert tickers == ["AAPL"]
+            return {
+                "AAPL": TickerInfo(
+                    ticker="AAPL",
+                    is_valid=True,
+                    is_equity=True,
+                    quote_type="EQUITY",
+                    long_name="Apple Inc.",
+                    description="Consumer electronics company.",
+                    sector="Technology",
+                    industry="Consumer Electronics",
+                )
+            }
+
+    events: list[tuple[str, str, dict]] = []
+
+    monkeypatch.setattr(
+        service_manager, "get_ticker_validator", lambda: FakeTickerValidator()
+    )
+    monkeypatch.setattr(
+        "core.agents.utility.orchestrator_helpers.publish_frontend_event",
+        lambda source, event_type, payload: events.append((source, event_type, payload)),
+    )
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._llm = FakeLLM()
+    agent._agents = {}
+
+    state = OrchestratorState(
+        messages=[HumanMessage(content="Analyze AAPL please")],
+        user_context_block="USER CONTEXT: None",
+        portfolio_block="[]",
+    )
+
+    payload = asyncio.run(agent._plan_node(state))
+
+    assert payload["plan"] is not None
+    assert payload["plan"].final_answer is None
+    assert "AAPL" in payload["company_context_blocks"]
+    assert "COMPANY BACKGROUND: Apple Inc. (AAPL)" in payload["company_context_blocks"]["AAPL"]
+    assert payload["ticker_metadata"]["AAPL"]["long_name"] == "Apple Inc."
+    assert events == [
+        (
+            "orchestrator",
+            "ticker_resolved",
+            {"ticker": "AAPL", "tickers": ["AAPL"]},
+        )
+    ]
