@@ -34,7 +34,6 @@ def make_graph_task(
     source_agent: str,
     relationships: List[dict],
     immediate: bool = False,
-    allow_create: Optional[bool] = None,
 ) -> GraphTask:
     return GraphTask(
         task_id=str(uuid4()),
@@ -43,7 +42,6 @@ def make_graph_task(
         source_agent=source_agent,
         immediate=immediate,
         relationships=relationships,
-        allow_create=allow_create,
     )
 
 
@@ -59,7 +57,6 @@ def make_extraction_task(
     chunk_ids: Optional[List[str]] = None,
     allowed_entity_types: Optional[List[str]] = None,
     allowed_relationship_types: Optional[List[str]] = None,
-    allow_create: Optional[bool] = None,
 ) -> GraphTask:
     normalized_entity_types = normalize_allowed_entity_types(allowed_entity_types)
     normalized_relationship_types = normalize_allowed_relationship_types(
@@ -99,5 +96,4 @@ def make_extraction_task(
         allowed_entity_types=normalized_entity_types or None,
         allowed_relationship_types=normalized_relationship_types or None,
         llm_config=llm_config,
-        allow_create=allow_create,
     )

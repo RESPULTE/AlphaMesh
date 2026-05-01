@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
@@ -10,23 +11,32 @@ from core.logger import get_logger
 from core.memory.graph.nodeset_manager import NodeSetManager
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
-CACHE_MAX_INTERESTS = 20  # raised from 10 to accommodate domain-grouped entries
-_MAX_WEIGHT = 10.0  # normalization cap for score computation
+CACHE_MAX_INTERESTS = 40
+_MAX_WEIGHT = 12.0
+_RECENCY_WINDOW_DAYS = 60.0
+_CONTEXT_TOKEN_BUDGET = 320
+_ACTIVE_SLOT_CAP = 6
+_CONFLICT_SLOT_CAP = 4
+_NUDGE_SLOT_CAP = 2
 
 
 @dataclass
 class InterestCacheEntry:
-    """One user interest signal, ready for prompt injection and cache ranking."""
+    """One user-interest aggregate for prompt injection and cache ranking."""
 
     kind: Literal["investment", "learning"]
-    category: str  # domain category (sector name or concept category)
+    category: str
+    entity_id: str
     entity_name: str
     entity_type: str
-    weight: float  # cumulative confidence weight from all reinforcing turns
-    status: Literal["Active", "Invalidated", "Paused"]
-    invalidated: bool
+    cumulative_weight: float
+    reinforcement_count: int
+    invalidation_count: int
+    current_stance: Literal["positive", "negative"]
+    previous_stance: Optional[Literal["positive", "negative"]]
+    last_changed_at: datetime
     cached_at: datetime
-    reason: Optional[str] = None  # excerpt from user message that created this
+    reason: Optional[str] = None
 
 
 class UserContext(BaseModel):
@@ -46,8 +56,25 @@ class UserContextService:
         self._logger = get_logger(__name__)
         self._cache: Dict[str, Dict[str, object]] = {}
 
-    def _normalize_email(self, user_email: str) -> str:
+    @staticmethod
+    def _normalize_email(user_email: str) -> str:
         return str(user_email or "").strip().lower()
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(text) // 4)
+
+    @staticmethod
+    def _parse_datetime(value: Any, default: datetime) -> datetime:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = datetime.fromisoformat(value.strip())
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return default
+        return default
 
     def _build_user_context(self, entries: List[InterestCacheEntry]) -> UserContext:
         return UserContext(
@@ -55,31 +82,24 @@ class UserContextService:
             learning_entries=[e for e in entries if e.kind == "learning"],
         )
 
-    def _rank_and_cap(
-        self, entries: List[InterestCacheEntry]
-    ) -> List[InterestCacheEntry]:
-        """
-        Composite score: 60% normalized weight + 40% recency (30-day linear decay).
-        Invalidated entries are penalized (×0.3) but retained for context.
-        """
+    def _entry_score(self, entry: InterestCacheEntry) -> float:
         now_ts = datetime.now(timezone.utc).timestamp()
+        age_days = max(0.0, (now_ts - entry.last_changed_at.timestamp()) / 86400.0)
+        recency = max(0.0, 1.0 - (age_days / _RECENCY_WINDOW_DAYS))
+        weight = min(1.0, max(0.0, entry.cumulative_weight) / _MAX_WEIGHT)
+        reinforcement = min(1.0, max(0, entry.reinforcement_count) / 6.0)
+        conflict = 0.15 if entry.previous_stance and entry.previous_stance != entry.current_stance else 0.0
+        score = 0.5 * weight + 0.3 * recency + 0.2 * reinforcement + conflict
+        if entry.current_stance == "negative":
+            score *= 0.9
+        return score
 
-        def _score(e: InterestCacheEntry) -> float:
-            age_days = max(0.0, (now_ts - e.cached_at.timestamp()) / 86400.0)
-            recency_score = max(0.0, 1.0 - age_days / 30.0)
-            normalized_weight = min(1.0, e.weight / _MAX_WEIGHT)
-            base = 0.6 * normalized_weight + 0.4 * recency_score
-            return base * 0.3 if e.invalidated else base
-
-        entries.sort(key=_score, reverse=True)
+    def _rank_and_cap(self, entries: List[InterestCacheEntry]) -> List[InterestCacheEntry]:
+        entries.sort(key=self._entry_score, reverse=True)
         return entries[:CACHE_MAX_INTERESTS]
 
     async def load_for_user(self, user_email: str) -> UserContext:
-        """
-        Load interest data from Neo4j into the in-memory cache.
-        Traverses NodeSet → UserInterestDomain → UserInterestEdge → Entity.
-        Safe to call multiple times — returns cached result if already warm.
-        """
+        """Load user-interest aggregates from Neo4j into the in-memory cache."""
         normalized = self._normalize_email(user_email)
         if not normalized:
             return UserContext()
@@ -88,34 +108,51 @@ class UserContextService:
         if cached and "entries" in cached:
             return self._build_user_context(cached["entries"])  # type: ignore[arg-type]
 
-        _, nodeset_id = await self._nodeset_manager.get_or_create_user_nodeset(
-            normalized
-        )
-
+        _, nodeset_id = await self._nodeset_manager.get_or_create_user_nodeset(normalized)
         rows = await self._neo4j_adapter.get_user_interest_data(normalized, nodeset_id)
 
         now = datetime.now(timezone.utc)
         entries: List[InterestCacheEntry] = []
-
         for row in rows or []:
             d = dict(row.get("d") or {})
             e = dict(row.get("e") or {})
             entity = dict(row.get("entity") or {})
-
+            latest_event = dict(row.get("latest_event") or {})
+            previous_event = dict(row.get("previous_event") or {})
             if not d or not e or not entity:
                 continue
+
+            current_stance = str(e.get("current_stance") or "").strip().lower()
+            if current_stance not in {"positive", "negative"}:
+                continue
+
+            previous_stance = str(previous_event.get("stance") or "").strip().lower()
+            if previous_stance not in {"positive", "negative"}:
+                previous_stance = None
+            elif previous_stance == current_stance:
+                previous_stance = None
+
+            last_changed_at = self._parse_datetime(
+                e.get("last_changed_at") or latest_event.get("observed_at") or e.get("last_updated_at"),
+                now,
+            )
+            cumulative_weight = float(e.get("cumulative_weight") or 0.0)
 
             entries.append(
                 InterestCacheEntry(
                     kind=d.get("domain_type", "investment"),
                     category=d.get("category", "general"),
-                    entity_name=entity.get("name", ""),
-                    entity_type=entity.get("entity_type", ""),
-                    weight=float(e.get("weight", 0.0)),
-                    status=e.get("status", "Active"),
-                    invalidated=bool(e.get("invalidated", False)),
-                    cached_at=now,
-                    reason=None,
+                    entity_id=str(e.get("entity_id") or entity.get("id") or ""),
+                    entity_name=str(entity.get("name") or ""),
+                    entity_type=str(entity.get("entity_type") or ""),
+                    cumulative_weight=cumulative_weight,
+                    reinforcement_count=int(e.get("reinforcement_count") or 0),
+                    invalidation_count=int(e.get("invalidation_count") or 0),
+                    current_stance=current_stance,  # type: ignore[arg-type]
+                    previous_stance=previous_stance,  # type: ignore[arg-type]
+                    last_changed_at=last_changed_at,
+                    cached_at=last_changed_at,
+                    reason=(str(latest_event.get("source_excerpt") or "").strip() or None),
                 )
             )
 
@@ -123,23 +160,8 @@ class UserContextService:
         self._cache[normalized] = {"entries": ranked, "loaded_at": now}
         return self._build_user_context(ranked)
 
-    def update_cache(
-        self,
-        new_entries: List[InterestCacheEntry],
-        user_email: str,
-    ) -> None:
-        """
-        Merge new interest entries into the in-memory cache without any graph write.
-
-        Called immediately after schedule() dispatches the background graph task
-        so that get_formatted_context() in subsequent turns of the same session
-        reflects new signals without waiting for Neo4j.
-
-        Merge semantics:
-        - Reinforce: accumulate weight on existing entry.
-        - Invalidate: replace entry with invalidated=True version.
-        - New entity: insert fresh entry.
-        """
+    def update_cache(self, new_entries: List[InterestCacheEntry], user_email: str) -> None:
+        """Merge new user-interest aggregate deltas into in-memory cache."""
         normalized = self._normalize_email(user_email)
         if not normalized:
             return
@@ -150,45 +172,73 @@ class UserContextService:
             if cached and "entries" in cached
             else []
         )
-
-        # Key: (kind, category, entity_name) — uniquely identifies one interest edge
         existing_map: Dict[tuple, InterestCacheEntry] = {
-            (e.kind, e.category, e.entity_name): e for e in existing
+            (e.kind, e.category, e.entity_id or e.entity_name.lower()): e for e in existing
         }
 
         for new_entry in new_entries:
-            key = (new_entry.kind, new_entry.category, new_entry.entity_name)
-            existing_entry = existing_map.get(key)
-            if existing_entry:
-                if new_entry.invalidated:
-                    # Invalidation always wins — replace entirely
-                    existing_map[key] = new_entry
-                else:
-                    # Reinforce: accumulate weight, refresh timestamp
-                    existing_entry.weight += new_entry.weight
-                    existing_entry.status = new_entry.status
-                    existing_entry.cached_at = new_entry.cached_at
-                    if new_entry.reason:
-                        existing_entry.reason = new_entry.reason
-            else:
+            key = (new_entry.kind, new_entry.category, new_entry.entity_id or new_entry.entity_name.lower())
+            old = existing_map.get(key)
+            if not old:
                 existing_map[key] = new_entry
+                continue
+
+            old.cumulative_weight += max(0.0, new_entry.cumulative_weight)
+            old.reinforcement_count += max(0, new_entry.reinforcement_count)
+            old.invalidation_count += max(0, new_entry.invalidation_count)
+            if old.current_stance != new_entry.current_stance:
+                old.previous_stance = old.current_stance  # keep immediate conflict context
+                old.current_stance = new_entry.current_stance
+            if new_entry.previous_stance and new_entry.previous_stance != old.current_stance:
+                old.previous_stance = new_entry.previous_stance
+            if new_entry.last_changed_at > old.last_changed_at:
+                old.last_changed_at = new_entry.last_changed_at
+            if new_entry.cached_at > old.cached_at:
+                old.cached_at = new_entry.cached_at
+            if new_entry.reason:
+                old.reason = new_entry.reason
 
         merged = self._rank_and_cap(list(existing_map.values()))
-        self._cache[normalized] = {
-            "entries": merged,
-            "loaded_at": datetime.now(timezone.utc),
-        }
+        self._cache[normalized] = {"entries": merged, "loaded_at": datetime.now(timezone.utc)}
 
-    def get_formatted_context(
-        self, user_email: Optional[str], limit: int = CACHE_MAX_INTERESTS
-    ) -> str:
-        """
-        Format cached interest data into a structured block for LLM prompt injection.
+    def _build_conflict_nudges(self, entries: List[InterestCacheEntry]) -> List[dict]:
+        conflicts = [
+            e
+            for e in entries
+            if e.previous_stance and e.previous_stance != e.current_stance
+        ]
+        conflicts.sort(key=self._entry_score, reverse=True)
+        nudges: List[dict] = []
+        for entry in conflicts[:_NUDGE_SLOT_CAP]:
+            old = entry.previous_stance or "unknown"
+            new = entry.current_stance
+            if old == "positive" and new == "negative":
+                prompt = (
+                    f"You previously liked {entry.entity_name} but moved away from it. "
+                    "Would you like to revisit your current view?"
+                )
+            elif old == "negative" and new == "positive":
+                prompt = (
+                    f"You previously avoided {entry.entity_name} but recently showed renewed interest. "
+                    "Should we update your strategy assumptions?"
+                )
+            else:
+                prompt = f"Your preference for {entry.entity_name} changed recently. Should we reconfirm it?"
+            nudges.append(
+                {
+                    "entity": entry.entity_name,
+                    "domain_type": entry.kind,
+                    "old_stance": old,
+                    "new_stance": new,
+                    "last_change_at": entry.last_changed_at.isoformat(),
+                    "nudge_score": round(self._entry_score(entry), 4),
+                    "suggested_prompt": prompt,
+                }
+            )
+        return nudges
 
-        Groups active entries by domain category. Invalidated entries are listed
-        separately with a directive to only surface them when highly relevant
-        and to ask the user before doing so.
-        """
+    def get_formatted_context(self, user_email: Optional[str], limit: int = CACHE_MAX_INTERESTS) -> str:
+        """Format cached user-interest context + structured nudge candidates."""
         if not user_email:
             return "USER CONTEXT: None"
         normalized = self._normalize_email(user_email)
@@ -200,63 +250,53 @@ class UserContextService:
         if not entries:
             return "USER CONTEXT: None"
 
-        def _format_section(
-            kind_entries: List[InterestCacheEntry],
-            section_title: str,
-        ) -> str:
-            if not kind_entries:
-                return ""
+        for_section = sorted(entries, key=self._entry_score, reverse=True)
+        active_lines: List[str] = []
+        conflict_lines: List[str] = []
 
-            active = [e for e in kind_entries if not e.invalidated]
-            invalidated = [e for e in kind_entries if e.invalidated]
-            lines = [section_title]
-
-            # Group active by category
-            from collections import defaultdict
-
-            by_category: Dict[str, List[InterestCacheEntry]] = defaultdict(list)
-            for e in active:
-                by_category[e.category].append(e)
-
-            for category, cat_entries in sorted(by_category.items()):
-                total_weight = sum(e.weight for e in cat_entries)
-                lines.append(
-                    f"\n{category.replace('_', ' ').title()} "
-                    f"(total weight: {total_weight:.1f}):"
+        active_count = 0
+        conflict_count = 0
+        for entry in for_section:
+            if (
+                entry.previous_stance
+                and entry.previous_stance != entry.current_stance
+                and conflict_count < _CONFLICT_SLOT_CAP
+            ):
+                conflict_lines.append(
+                    f"- {entry.kind}:{entry.category}: user used to be {entry.previous_stance} on "
+                    f"{entry.entity_name}, now {entry.current_stance} (changed {entry.last_changed_at.isoformat()})."
                 )
-                for e in sorted(cat_entries, key=lambda x: x.weight, reverse=True):
-                    reason_tail = f" — {e.reason[:80]}" if e.reason else ""
-                    lines.append(
-                        f"  • {e.entity_name} [{e.status}, weight={e.weight:.1f}]"
-                        f"{reason_tail}"
-                    )
+                conflict_count += 1
+                continue
+            if active_count >= _ACTIVE_SLOT_CAP:
+                continue
+            active_lines.append(
+                f"- {entry.kind}:{entry.category}: {entry.entity_name} "
+                f"[stance={entry.current_stance}, weight={entry.cumulative_weight:.2f}, "
+                f"reinforced={entry.reinforcement_count}, invalidated={entry.invalidation_count}]"
+            )
+            active_count += 1
 
-            if invalidated:
-                lines.append(
-                    "\n[Previously invalidated — surface ONLY if highly relevant. "
-                    "If you reference these, first ask the user whether they would "
-                    "like to continue with this topic:]"
-                )
-                for e in sorted(invalidated, key=lambda x: x.weight, reverse=True):
-                    lines.append(
-                        f"  • {e.entity_name} "
-                        f"[weight={e.weight:.1f} before invalidation, {e.category}]"
-                    )
+        nudge_candidates = self._build_conflict_nudges(for_section)
+        blocks: List[str] = []
+        if active_lines:
+            blocks.append("USER INTEREST PROFILE:\n" + "\n".join(active_lines))
+        if conflict_lines:
+            blocks.append("INTEREST CONFLICT TIMELINE:\n" + "\n".join(conflict_lines))
+        if nudge_candidates:
+            blocks.append(
+                "NUDGE_CANDIDATES_JSON:\n"
+                + json.dumps(nudge_candidates, ensure_ascii=True, separators=(",", ":"))
+            )
 
-            return "\n".join(lines)
+        rendered = "\n\n".join(blocks) if blocks else "USER CONTEXT: None"
+        if rendered == "USER CONTEXT: None":
+            return rendered
 
-        investment_entries = [e for e in entries if e.kind == "investment"]
-        learning_entries = [e for e in entries if e.kind == "learning"]
-
-        blocks = []
-        inv = _format_section(investment_entries, "USER INVESTMENT PROFILE:")
-        if inv:
-            blocks.append(inv)
-        learn = _format_section(learning_entries, "USER LEARNING PROFILE:")
-        if learn:
-            blocks.append(learn)
-
-        return "\n\n".join(blocks) if blocks else "USER CONTEXT: None"
+        lines = rendered.splitlines()
+        while lines and self._estimate_tokens("\n".join(lines)) > _CONTEXT_TOKEN_BUDGET:
+            lines.pop()
+        return "\n".join(lines) if lines else "USER CONTEXT: None"
 
     def invalidate(self, user_email: str) -> None:
         """Evict a user's cache entry (e.g. on explicit session reset)."""

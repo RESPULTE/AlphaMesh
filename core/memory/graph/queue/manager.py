@@ -9,10 +9,6 @@ from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.queue.pipeline import GraphWritePipeline
-from core.memory.graph.queue.policies import (
-    parse_source_allowlist,
-    resolve_allow_create,
-)
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
 from core.memory.graph.queue.types import TASK_KIND_RELATIONSHIPS, GraphTask
@@ -55,10 +51,6 @@ class GraphQueueManager:
             relationship_extractor=relationship_extractor,
             llm_provider=llm_provider,
             prompt_registry=self._prompt_registry,
-        )
-
-        self._allow_create_sources = parse_source_allowlist(
-            settings.GRAPH_ALLOW_CREATE_SOURCES
         )
 
         self._queues: Dict[str, ConversationQueueWorker] = {}
@@ -193,8 +185,6 @@ class GraphQueueManager:
         logger.info("GraphQueueManager: recovering %d pending task(s)", len(rows))
 
         tasks: List[GraphTask] = [GraphTask.from_payload(row) for row in rows]
-        for task in tasks:
-            self._apply_allow_create_policy(task)
 
         grouped: Dict[Tuple[str, str], List[GraphTask]] = {}
         for task in tasks:
@@ -230,14 +220,6 @@ class GraphQueueManager:
         except Exception:
             logger.exception("GraphQueueManager: failed to purge old processed tasks")
 
-    def _apply_allow_create_policy(self, task: GraphTask) -> None:
-        task.allow_create = resolve_allow_create(
-            source_agent=task.source_agent,
-            task_allow_create=task.allow_create,
-            explicit_allow_create=None,
-            default_allow_create_sources=self._allow_create_sources,
-        )
-
     async def _prepare_task(self, task: GraphTask) -> bool:
         is_chunk_entities = is_chunk_entities_task(task)
 
@@ -251,8 +233,6 @@ class GraphQueueManager:
             task.system_prompt_id = await self._prompt_registry.register(
                 task.system_prompt
             )
-
-        self._apply_allow_create_policy(task)
 
         if is_chunk_entities and not has_chunk_ids(task):
             logger.warning(

@@ -34,13 +34,18 @@ class GraphTaskSqlStore(SQLiteAdapter):
                 llm_config      TEXT,
                 task_kind       TEXT,
                 chunk_ids       TEXT,
-                allow_create    INTEGER,
                 status          TEXT NOT NULL DEFAULT 'PENDING',
                 created_at      REAL NOT NULL,
                 processed_at    REAL,
                 error_message   TEXT
             )
             """
+        )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gt_status_created ON graph_tasks(status, created_at)"
+        )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gt_conversation ON graph_tasks(conversation_id, turn_id)"
         )
         await self.execute(
             """
@@ -51,33 +56,13 @@ class GraphTaskSqlStore(SQLiteAdapter):
             )
             """
         )
-        await self.execute(
-            "CREATE INDEX IF NOT EXISTS idx_gt_status_created ON graph_tasks(status, created_at)"
-        )
-        await self.execute(
-            "CREATE INDEX IF NOT EXISTS idx_gt_conversation ON graph_tasks(conversation_id, turn_id)"
-        )
-        rows = await self.fetchall("PRAGMA table_info(graph_tasks)")
-        existing_cols = {str(row["name"]) for row in rows}
-        for col, col_type in [
-            ("extraction_text", "TEXT"),
-            ("system_prompt_id", "TEXT"),
-            ("allowed_entity_types", "TEXT"),
-            ("allowed_relationship_types", "TEXT"),
-            ("llm_config", "TEXT"),
-            ("task_kind", "TEXT"),
-            ("chunk_ids", "TEXT"),
-            ("allow_create", "INTEGER"),
-        ]:
-            if col not in existing_cols:
-                await self.execute(f"ALTER TABLE graph_tasks ADD COLUMN {col} {col_type}")
         self._initialized = True
 
     async def persist_task(self, task_payload: Dict[str, Any]) -> None:
         await self.execute(
             """INSERT OR IGNORE INTO graph_tasks
-               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, allow_create, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
+               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
             (
                 task_payload["task_id"],
                 task_payload["turn_id"],
@@ -107,11 +92,6 @@ class GraphTaskSqlStore(SQLiteAdapter):
                     if task_payload.get("chunk_ids")
                     else None
                 ),
-                (
-                    1
-                    if task_payload.get("allow_create") is True
-                    else (0 if task_payload.get("allow_create") is False else None)
-                ),
                 float(task_payload.get("created_at", time.time())),
             ),
         )
@@ -127,14 +107,11 @@ class GraphTaskSqlStore(SQLiteAdapter):
 
     async def load_pending_tasks(self) -> List[Dict[str, Any]]:
         rows = await self.fetchall(
-            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, allow_create, created_at "
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, created_at "
             "FROM graph_tasks WHERE status='PENDING' ORDER BY created_at ASC"
         )
         tasks: List[Dict[str, Any]] = []
         for row in rows:
-            allow_create = row.get("allow_create")
-            if allow_create is not None:
-                allow_create = bool(int(allow_create))
             tasks.append(
                 {
                     "task_id": row["task_id"],
@@ -161,7 +138,6 @@ class GraphTaskSqlStore(SQLiteAdapter):
                     "chunk_ids": (
                         json.loads(row["chunk_ids"]) if row["chunk_ids"] else None
                     ),
-                    "allow_create": allow_create,
                     "created_at": row["created_at"],
                 }
             )

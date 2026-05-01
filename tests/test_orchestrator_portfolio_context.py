@@ -60,6 +60,9 @@ def test_run_populates_portfolio_block_from_per_user_file(monkeypatch, tmp_path)
             return {"summary": "ok"}
 
     class FakeUserContextService:
+        async def load_for_user(self, _user_email: str):
+            return None
+
         def get_formatted_context(self, _user_email: str) -> str:
             return "USER CONTEXT: from test cache"
 
@@ -173,7 +176,7 @@ def test_synthesize_node_uses_state_portfolio_block() -> None:
     class FakeLLM:
         async def ainvoke(self, messages):
             captured["messages"] = messages
-            return SimpleNamespace(content="synthesised output")
+            return SimpleNamespace(text="synthesised output")
 
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
     agent._llm = FakeLLM()

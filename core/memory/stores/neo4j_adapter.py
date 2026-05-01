@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from neo4j import AsyncDriver, AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
@@ -488,26 +488,6 @@ class Neo4jAdapter:
         )
         return records
 
-    async def update_targets_last_analysis_summary(
-        self, user_email: str, target_entity_id: str, summary: str
-    ) -> None:
-        if not user_email or not target_entity_id:
-            return
-        cypher = (
-            "MATCH (u)-[r:TARGETS]->(t:Entity {id: $target_id}) "
-            "WHERE (u:UserInvestmentInterestNode OR u:UserLearningInterestNode) "
-            "AND u.user_email = $user_email "
-            "SET r.last_analysis_summary = $summary"
-        )
-        await self._execute_write(
-            cypher,
-            {
-                "user_email": user_email,
-                "target_id": target_entity_id,
-                "summary": summary,
-            },
-        )
-
     async def close(self) -> None:
         """Close the underlying Neo4j driver."""
         if self._driver is not None:
@@ -517,61 +497,6 @@ class Neo4jAdapter:
     async def run_traversal(self, cypher: str, params: dict) -> List[dict]:
         """Run a read-only traversal query."""
         return await self._execute_read(cypher, params)
-
-    async def get_user_investment_interests(self, user_email: str) -> List[dict]:
-        """Fetch user investment interests with targets."""
-        targets = RelationshipType.TARGETS.value
-        cypher = (
-            "MATCH (u:UserInvestmentInterestNode {user_email: $user_email}) "
-            f"OPTIONAL MATCH (u)-[:{targets}]->(t:Entity) "
-            "RETURN u AS node, "
-            "collect({id: t.id, name: t.name, entity_type: t.entity_type}) AS targets "
-            "ORDER BY u.updated_at DESC"
-        )
-        records = await self._execute_read(cypher, {"user_email": user_email})
-        return records
-
-    async def get_user_learning_interests(self, user_email: str) -> List[dict]:
-        """Fetch user learning interests with targets."""
-        targets = RelationshipType.TARGETS.value
-        cypher = (
-            "MATCH (u:UserLearningInterestNode {user_email: $user_email}) "
-            f"OPTIONAL MATCH (u)-[:{targets}]->(t:Entity) "
-            "RETURN u AS node, "
-            "collect({id: t.id, name: t.name, entity_type: t.entity_type}) AS targets "
-            "ORDER BY u.updated_at DESC"
-        )
-        records = await self._execute_read(cypher, {"user_email": user_email})
-        return records
-
-    async def upsert_user_connected_nodes(self, node: Any, nodeset_id: str) -> None:
-        """Upsert a user-connected node and its relationships."""
-        label = node.__class__.__name__
-        belongs_to = RelationshipType.BELONGS_TO_NODESET.value
-        targets = RelationshipType.TARGETS.value
-
-        cypher = (
-            f"MERGE (u:{label} {{id: $id}}) "
-            "SET u += $props "
-            "WITH u "
-            f"MERGE (s:NodeSet {{id: $nodeset_id}}) "
-            f"MERGE (u)-[:{belongs_to}]->(s) "
-            "WITH u "
-            f"FOREACH (tid IN $target_ids | "
-            f"  MERGE (t:Entity {{id: tid}}) "
-            f"  MERGE (u)-[:{targets}]->(t)"
-            ")"
-        )
-        props = {k: v for k, v in node.model_dump().items() if k != "id"}
-        await self._execute_write(
-            cypher,
-            {
-                "id": str(node.id),
-                "props": props,
-                "nodeset_id": nodeset_id,
-                "target_ids": getattr(node, "target_entity_ids", []) or [],
-            },
-        )
 
     async def merge_user_interest_domain(self, domain_id: str, props: dict) -> None:
         """
@@ -609,31 +534,40 @@ class Neo4jAdapter:
         operation: str,
         weight_delta: float,
     ) -> None:
-        """
-        Merge a UserInterestEdge with operation-specific MATCH behaviour.
+        """Merge a UserInterestEdge aggregate from immutable events."""
+        observed_at = str(props.get("event_observed_at") or "").strip()
+        if not observed_at:
+            observed_at = datetime.now(timezone.utc).isoformat()
 
-        operation="reinforce": increments weight, ensures Active status (unless
-                            already invalidated by user � in that case status
-                            is left alone so invalidation is not silently reversed).
-        operation="invalidate": sets invalidated=True and status=Invalidated.
-        """
         if operation == "reinforce":
             cypher = (
                 "MERGE (e:UserInterestEdge {id: $id}) "
-                "ON CREATE SET e += $props, e.weight = $weight_delta, "
-                "              e.status = 'Active', e.invalidated = false "
-                "ON MATCH SET  e.weight = e.weight + $weight_delta, "
+                "ON CREATE SET e += $props, "
+                "              e.cumulative_weight = $weight_delta, "
+                "              e.reinforcement_count = 1, "
+                "              e.invalidation_count = 0, "
+                "              e.current_stance = 'positive', "
+                "              e.last_changed_at = $observed_at "
+                "ON MATCH SET  e.cumulative_weight = coalesce(e.cumulative_weight, 0.0) + $weight_delta, "
+                "              e.reinforcement_count = coalesce(e.reinforcement_count, 0) + 1, "
                 "              e.last_updated_at = $now, "
-                "              e.status = CASE WHEN e.invalidated THEN e.status "
-                "                              ELSE 'Active' END"
+                "              e.last_changed_at = $observed_at, "
+                "              e.current_stance = 'positive'"
             )
         else:  # invalidate
             cypher = (
                 "MERGE (e:UserInterestEdge {id: $id}) "
-                "ON CREATE SET e += $props, e.weight = 0.0, "
-                "              e.status = 'Invalidated', e.invalidated = true "
-                "ON MATCH SET  e.status = 'Invalidated', e.invalidated = true, "
-                "              e.last_updated_at = $now"
+                "ON CREATE SET e += $props, "
+                "              e.cumulative_weight = $weight_delta, "
+                "              e.reinforcement_count = 0, "
+                "              e.invalidation_count = 1, "
+                "              e.current_stance = 'negative', "
+                "              e.last_changed_at = $observed_at "
+                "ON MATCH SET  e.cumulative_weight = coalesce(e.cumulative_weight, 0.0) + $weight_delta, "
+                "              e.invalidation_count = coalesce(e.invalidation_count, 0) + 1, "
+                "              e.current_stance = 'negative', "
+                "              e.last_updated_at = $now, "
+                "              e.last_changed_at = $observed_at"
             )
         clean_props = {
             k: v for k, v in props.items() if k not in ("weight_delta", "operation")
@@ -644,17 +578,20 @@ class Neo4jAdapter:
                 "id": edge_id,
                 "props": clean_props,
                 "weight_delta": weight_delta,
+                "observed_at": observed_at,
                 "now": datetime.now(timezone.utc).isoformat(),
             },
         )
 
-    async def merge_turn_node(self, turn_id: str, props: dict) -> None:
-        """
-        Merge a TurnNode. Idempotent � the same turn may source multiple edges
-        so this is called once per turn per signal, not per relationship.
-        """
-        cypher = "MERGE (t:TurnNode {id: $id}) " "ON CREATE SET t += $props"
-        await self._execute_write(cypher, {"id": turn_id, "props": props})
+    async def merge_user_interest_event(self, node_id: str, props: dict) -> None:
+        """Merge immutable user interest event by deterministic ID."""
+        cypher = "MERGE (e:UserInterestEvent {id: $id}) ON CREATE SET e += $props"
+        await self._execute_write(cypher, {"id": node_id, "props": props})
+
+    async def merge_session_node(self, node_id: str, props: dict) -> None:
+        """Merge one lightweight session node per conversation."""
+        cypher = "MERGE (s:SessionNode {id: $id}) ON CREATE SET s += $props"
+        await self._execute_write(cypher, {"id": node_id, "props": props})
 
     async def get_entity_category(self, entity_id: str) -> Optional[str]:
         """Return the category field of an entity (used for FinancialConcept category)."""
@@ -671,20 +608,24 @@ class Neo4jAdapter:
         self, user_email: str, nodeset_id: str
     ) -> List[dict]:
         """
-        Full 3-hop read: NodeSet ? Domain ? Edge ? Entity + provenance turns.
-        Returns all edges including invalidated ones; caller filters as needed.
+        Full read: NodeSet -> Domain -> Edge -> Entity with latest event snapshots.
+        Returns all edges including conflicting/negative stances.
         """
         cypher = (
             "MATCH (ns:NodeSet {id: $nodeset_id})"
             "<-[:BELONGS_TO_NODESET]-(d:UserInterestDomain {user_email: $user_email})"
             "-[:HAS_INTEREST_IN]->(e:UserInterestEdge)"
             "-[:TARGETS]->(entity:Entity) "
-            "OPTIONAL MATCH (e)-[:SOURCED_FROM]->(t:TurnNode) "
-            "OPTIONAL MATCH (e)-[:INVALIDATED_BY]->(it:TurnNode) "
+            "OPTIONAL MATCH (e)-[:HAS_EVENT]->(ev:UserInterestEvent) "
+            "WITH d, e, entity, ev "
+            "ORDER BY ev.observed_at DESC "
+            "WITH d, e, entity, [x IN collect(ev) WHERE x IS NOT NULL] AS events "
             "RETURN d, e, entity, "
-            "       collect(DISTINCT t)  AS source_turns, "
-            "       collect(DISTINCT it) AS invalidating_turns "
-            "ORDER BY d.category ASC, e.weight DESC"
+            "       CASE WHEN size(events) > 0 THEN events[0] ELSE NULL END AS latest_event, "
+            "       CASE WHEN size(events) > 1 THEN events[1] ELSE NULL END AS previous_event "
+            "ORDER BY d.category ASC, "
+            "         coalesce(e.last_changed_at, e.last_updated_at, e.created_at) DESC, "
+            "         coalesce(e.cumulative_weight, 0.0) DESC"
         )
         return await self._execute_read(
             cypher,
@@ -693,3 +634,5 @@ class Neo4jAdapter:
                 "user_email": user_email,
             },
         )
+
+

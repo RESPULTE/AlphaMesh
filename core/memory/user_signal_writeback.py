@@ -1,32 +1,19 @@
-﻿"""
-core/memory/user_signal_writeback.py
+"""
+Unified user-signal writeback for investment + learning interests.
 
-Unified user signal write-back via GraphQueueManager.enqueue(task).
-
-Changes from previous version
-- Calls GraphQueueManager.enqueue(task) for entity persistence and edge writing,
-  with runtime behavior carried on GraphTask fields.
-- Entity pre-resolution (_build_interest_relationships) now calls
-  EntityResolver.resolve_entity() directly instead of
-  DualStoreIngestor.resolve_entity_id().
-- The _build_relationship_props helper is removed â€” Neo4jAdapter owns that now.
-  Relationship dicts are passed as-is to enqueue(task) which delegates
-  to Neo4jAdapter internally.
-
-Graph schema written here (unchanged)
-NodeSet (USER_{hash})
-  â†â”€BELONGS_TO_NODESETâ”€â”€â”€ UserInterestDomain {domain_type, category, user_email}
-                               â””â”€HAS_INTEREST_INâ”€â”€> UserInterestEdge {weight, status, ...}
-                                                         â”œâ”€TARGETSâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€> Entity
-                                                         â”œâ”€SOURCED_FROMâ”€â”€â”€â”€â”€> TurnNode (reinforce)
-                                                         â””â”€INVALIDATED_BYâ”€â”€> TurnNode (invalidate)
+Graph pattern:
+NodeSet <-[:BELONGS_TO_NODESET]- UserInterestDomain
+       -[:HAS_INTEREST_IN]-> UserInterestEdge
+       -[:TARGETS]-> Entity
+       -[:HAS_EVENT]-> UserInterestEvent
+UserInterestEvent -[:OBSERVED_IN]-> SessionNode
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 from core.logger import get_logger
 from core.memory.user_context_service import InterestCacheEntry
@@ -55,17 +42,6 @@ class LearningSignal:
 
 
 @dataclass
-class InterestEdge:
-    entity_name: str
-    entity_type: str
-    user_signal_type: str
-    target_entity_name: str
-    relationship: str
-    reason: str
-    confidence: str
-
-
-@dataclass
 class UserSignalPayload:
     user_email: str
     conversation_id: str
@@ -74,7 +50,7 @@ class UserSignalPayload:
     ticker_metadata: Dict[str, dict] = field(default_factory=dict)
     investment_signals: List[InvestmentSignal] = field(default_factory=list)
     learning_signals: List[LearningSignal] = field(default_factory=list)
-    interest_edges: List[InterestEdge] = field(default_factory=list)
+    session_started_at: Optional[str] = None
 
 
 def _derive_investment_category(
@@ -97,59 +73,88 @@ def _derive_investment_category(
     return "general"
 
 
-async def _derive_learning_category(
-    entity_type: str,
-    entity_id: str,
-    neo4j,
-) -> str:
+async def _derive_learning_category(entity_type: str, entity_id: str, neo4j) -> str:
     if entity_type == "FinancialConcept":
         try:
             category = await neo4j.get_entity_category(entity_id)
             if category:
                 return category
         except Exception:
-            pass
+            logger.exception("_derive_learning_category: get_entity_category failed")
     if entity_type == "FinancialEvent":
         return "market_events"
     return "general"
 
 
+def _signal_stance(kind: Literal["investment", "learning"], status: str) -> Literal["positive", "negative"]:
+    if kind == "investment":
+        return "negative" if status in {"Avoids", "Sold"} else "positive"
+    return "negative" if status == "Not Interested" else "positive"
+
+
+@dataclass
+class _NormalizedSignal:
+    kind: Literal["investment", "learning"]
+    status: str
+    confidence: float
+    target_entities: Sequence[DetectedEntity]
+
+
+def _iter_signals(payload: UserSignalPayload) -> List[_NormalizedSignal]:
+    normalized: List[_NormalizedSignal] = []
+    for signal in payload.investment_signals:
+        normalized.append(
+            _NormalizedSignal(
+                kind="investment",
+                status=signal.status,
+                confidence=float(signal.confidence or 0.0),
+                target_entities=signal.target_entities,
+            )
+        )
+    for signal in payload.learning_signals:
+        normalized.append(
+            _NormalizedSignal(
+                kind="learning",
+                status=signal.status,
+                confidence=float(signal.confidence or 0.0),
+                target_entities=signal.target_entities,
+            )
+        )
+    return normalized
+
+
 async def _build_interest_relationships(
     payload: UserSignalPayload,
-    entity_resolver,  # EntityResolver instance
+    entity_resolver,
     neo4j,
     nodeset_id: str,
 ) -> Tuple[List[dict], List[InterestCacheEntry]]:
-    """
-    Pre-resolve all domain entity IDs, then build the full relationship list.
-
-    Changes from previous version:
-    - Uses entity_resolver.resolve_entity() instead of ingestor.resolve_entity_id().
-    - The entity_cache dict is local to this call (not shared with the queue).
-    """
     from core.memory.graph.utils import generate_uuid5
 
     now = datetime.now(timezone.utc)
     now_str = now.isoformat()
+    session_id = payload.conversation_id
+    session_started_at = payload.session_started_at or now_str
     relationships: List[dict] = []
     cache_entries: List[InterestCacheEntry] = []
-    entity_cache: Dict = {}
+    entity_cache: Dict[Tuple[str, str], str] = {}
 
-    turn_node_props = {
-        "id": payload.turn_id,
-        "conversation_id": payload.conversation_id,
-        "user_message_excerpt": payload.user_message[:200],
-        "created_at": now_str,
+    session_node_props = {
+        "id": session_id,
+        "user_email": payload.user_email,
+        "started_at": session_started_at,
     }
 
-    def _build_rels_for_edge(
-        edge_id: str,
-        edge_props: dict,
+    def _append_rels(
+        *,
         domain_id: str,
         domain_props: dict,
+        edge_id: str,
+        edge_props: dict,
         entity_name: str,
         entity_type: str,
-        is_invalidation: bool,
+        event_id: str,
+        event_props: dict,
     ) -> None:
         relationships.append(
             {
@@ -177,28 +182,41 @@ async def _build_interest_relationships(
                 "to_node_props": {},
             }
         )
-        rel_type = "INVALIDATED_BY" if is_invalidation else "SOURCED_FROM"
         relationships.append(
             {
                 "from_name": edge_id,
                 "from_type": "UserInterestEdge",
-                "relation": rel_type,
-                "to_name": payload.turn_id,
-                "to_type": "TurnNode",
+                "relation": "HAS_EVENT",
+                "to_name": event_id,
+                "to_type": "UserInterestEvent",
                 "confidence": "high",
                 "reason": "",
                 "from_node_props": edge_props,
-                "to_node_props": turn_node_props,
+                "to_node_props": event_props,
+            }
+        )
+        relationships.append(
+            {
+                "from_name": event_id,
+                "from_type": "UserInterestEvent",
+                "relation": "OBSERVED_IN",
+                "to_name": session_id,
+                "to_type": "SessionNode",
+                "confidence": "high",
+                "reason": "",
+                "from_node_props": event_props,
+                "to_node_props": session_node_props,
             }
         )
 
-    async def _process_investment(signal: InvestmentSignal) -> None:
-        is_invalidation = signal.status in ("Avoids", "Sold")
-        operation = "invalidate" if is_invalidation else "reinforce"
+    event_ordinal = 0
+    for signal in _iter_signals(payload):
+        stance = _signal_stance(signal.kind, signal.status)
+        operation = "invalidate" if stance == "negative" else "reinforce"
 
         for entity in signal.target_entities:
-            # Use EntityResolver instead of ingestor.resolve_entity_id
-            resolved_id = entity_cache.get((entity.entity_name, entity.entity_type))
+            key = (entity.entity_name, entity.entity_type)
+            resolved_id = entity_cache.get(key)
             if resolved_id is None:
                 resolution = await entity_resolver.resolve_entity(
                     name=entity.entity_name,
@@ -206,22 +224,36 @@ async def _build_interest_relationships(
                 )
                 if resolution.entity_id:
                     resolved_id = resolution.entity_id
-                    entity_cache[(entity.entity_name, entity.entity_type)] = resolved_id
+                    entity_cache[key] = resolved_id
             if not resolved_id:
                 continue
 
-            category = _derive_investment_category(
-                entity.entity_name, entity.entity_type, payload.ticker_metadata
-            )
-            domain_id = generate_uuid5(f"{payload.user_email}::investment::{category}")
+            if signal.kind == "investment":
+                category = _derive_investment_category(
+                    entity.entity_name,
+                    entity.entity_type,
+                    payload.ticker_metadata,
+                )
+            else:
+                category = await _derive_learning_category(
+                    entity.entity_type,
+                    resolved_id,
+                    neo4j,
+                )
+
+            domain_id = generate_uuid5(f"{payload.user_email}::{signal.kind}::{category}")
             edge_id = generate_uuid5(
-                f"{payload.user_email}::investment::{category}::{resolved_id}"
+                f"{payload.user_email}::{signal.kind}::{category}::{resolved_id}"
             )
+            event_id = generate_uuid5(
+                f"{payload.turn_id}::{signal.kind}::{category}::{resolved_id}::{stance}::{event_ordinal}"
+            )
+            event_ordinal += 1
 
             domain_props = {
                 "id": domain_id,
                 "user_email": payload.user_email,
-                "domain_type": "investment",
+                "domain_type": signal.kind,
                 "category": category,
                 "created_at": now_str,
                 "nodeset_id": nodeset_id,
@@ -229,117 +261,54 @@ async def _build_interest_relationships(
             edge_props = {
                 "id": edge_id,
                 "user_email": payload.user_email,
-                "domain_type": "investment",
+                "domain_type": signal.kind,
                 "category": category,
                 "entity_id": resolved_id,
-                "weight_delta": signal.confidence,
+                "weight_delta": max(0.0, signal.confidence),
                 "operation": operation,
+                "event_observed_at": now_str,
                 "created_at": now_str,
                 "last_updated_at": now_str,
             }
+            event_props = {
+                "id": event_id,
+                "user_email": payload.user_email,
+                "domain_type": signal.kind,
+                "category": category,
+                "entity_id": resolved_id,
+                "stance": stance,
+                "confidence": max(0.0, signal.confidence),
+                "observed_at": now_str,
+                "source_excerpt": payload.user_message[:200],
+            }
 
-            _build_rels_for_edge(
-                edge_id,
-                edge_props,
-                domain_id,
-                domain_props,
-                entity.entity_name,
-                entity.entity_type,
-                is_invalidation,
+            _append_rels(
+                domain_id=domain_id,
+                domain_props=domain_props,
+                edge_id=edge_id,
+                edge_props=edge_props,
+                entity_name=entity.entity_name,
+                entity_type=entity.entity_type,
+                event_id=event_id,
+                event_props=event_props,
             )
             cache_entries.append(
                 InterestCacheEntry(
-                    kind="investment",
+                    kind=signal.kind,
                     category=category,
+                    entity_id=resolved_id,
                     entity_name=entity.entity_name,
                     entity_type=entity.entity_type,
-                    weight=signal.confidence,
-                    status="Invalidated" if is_invalidation else "Active",
-                    invalidated=is_invalidation,
+                    cumulative_weight=max(0.0, signal.confidence),
+                    reinforcement_count=1 if stance == "positive" else 0,
+                    invalidation_count=1 if stance == "negative" else 0,
+                    current_stance=stance,
+                    previous_stance=None,
+                    last_changed_at=now,
                     cached_at=now,
                     reason=payload.user_message[:200],
                 )
             )
-
-    async def _process_learning(signal: LearningSignal) -> None:
-        is_invalidation = signal.status == "Not Interested"
-        operation = "invalidate" if is_invalidation else "reinforce"
-
-        for entity in signal.target_entities:
-            resolved_id = entity_cache.get((entity.entity_name, entity.entity_type))
-            if resolved_id is None:
-                resolution = await entity_resolver.resolve_entity(
-                    name=entity.entity_name,
-                    entity_type=entity.entity_type,
-                )
-                if resolution.entity_id:
-                    resolved_id = resolution.entity_id
-                    entity_cache[(entity.entity_name, entity.entity_type)] = resolved_id
-            if not resolved_id:
-                continue
-
-            category = await _derive_learning_category(
-                entity.entity_type, resolved_id, neo4j
-            )
-            domain_id = generate_uuid5(f"{payload.user_email}::learning::{category}")
-            edge_id = generate_uuid5(
-                f"{payload.user_email}::learning::{category}::{resolved_id}"
-            )
-
-            domain_props = {
-                "id": domain_id,
-                "user_email": payload.user_email,
-                "domain_type": "learning",
-                "category": category,
-                "created_at": now_str,
-                "nodeset_id": nodeset_id,
-            }
-            edge_props = {
-                "id": edge_id,
-                "user_email": payload.user_email,
-                "domain_type": "learning",
-                "category": category,
-                "entity_id": resolved_id,
-                "weight_delta": signal.confidence,
-                "operation": operation,
-                "created_at": now_str,
-                "last_updated_at": now_str,
-            }
-
-            _build_rels_for_edge(
-                edge_id,
-                edge_props,
-                domain_id,
-                domain_props,
-                entity.entity_name,
-                entity.entity_type,
-                is_invalidation,
-            )
-            cache_entries.append(
-                InterestCacheEntry(
-                    kind="learning",
-                    category=category,
-                    entity_name=entity.entity_name,
-                    entity_type=entity.entity_type,
-                    weight=signal.confidence,
-                    status="Invalidated" if is_invalidation else "Active",
-                    invalidated=is_invalidation,
-                    cached_at=now,
-                    reason=payload.user_message[:200],
-                )
-            )
-
-    for signal in payload.investment_signals:
-        try:
-            await _process_investment(signal)
-        except Exception:
-            logger.exception("_build_interest_relationships: investment signal failed")
-
-    for signal in payload.learning_signals:
-        try:
-            await _process_learning(signal)
-        except Exception:
-            logger.exception("_build_interest_relationships: learning signal failed")
 
     return relationships, cache_entries
 
@@ -348,10 +317,9 @@ async def build_user_signal_relationships(
     payload: UserSignalPayload,
 ) -> Tuple[List[dict], List[InterestCacheEntry]]:
     """
-    Build all user interest relationships for a conversation turn.
+    Build all user-interest relationships for one turn/session writeback.
 
-    Returns (relationships, cache_entries). No graph writes or cache updates
-    are performed here.
+    Returns (relationships, cache_entries). No graph writes here.
     """
     logger.info(
         "build_user_signal_relationships: user='%s' turn='%s' investment=%d learning=%d",
@@ -363,7 +331,7 @@ async def build_user_signal_relationships(
 
     if not payload.user_email or not payload.conversation_id:
         logger.warning(
-            "build_user_signal_relationships: missing user_email or conversation_id â€” skipping"
+            "build_user_signal_relationships: missing user_email or conversation_id; skipping"
         )
         return [], []
 
@@ -371,31 +339,27 @@ async def build_user_signal_relationships(
         return [], []
 
     try:
-        from core.memory.graph.nodeset_manager import (
-            canonical_nodeset_id,
-            get_user_nodeset_name,
-        )
+        from core.memory.graph.nodeset_manager import canonical_nodeset_id, get_user_nodeset_name
         from core.services import service_manager
 
         entity_resolver = service_manager.get_entity_resolver()
         neo4j = service_manager.get_neo4j_adapter()
         nodeset_id = canonical_nodeset_id(get_user_nodeset_name(payload.user_email))
-
-        relationships, cache_entries = await _build_interest_relationships(
-            payload, entity_resolver, neo4j, nodeset_id
+        return await _build_interest_relationships(
+            payload=payload,
+            entity_resolver=entity_resolver,
+            neo4j=neo4j,
+            nodeset_id=nodeset_id,
         )
-        return relationships, cache_entries
     except Exception:
         logger.exception(
-            "build_user_signal_relationships: failed for user '%s'", payload.user_email
+            "build_user_signal_relationships: failed for user '%s'",
+            payload.user_email,
         )
         return [], []
 
 
-def update_user_signal_cache(
-    cache_entries: List[InterestCacheEntry],
-    user_email: str,
-) -> None:
+def update_user_signal_cache(cache_entries: List[InterestCacheEntry], user_email: str) -> None:
     if not cache_entries or not user_email:
         return
     try:
@@ -410,7 +374,6 @@ def update_user_signal_cache(
 def build_signal_payload(
     detected_investment_signals,
     detected_learning_signals,
-    interest_edges,
     user_message: str,
     user_email: Optional[str],
     conversation_id: Optional[str],
@@ -439,19 +402,6 @@ def build_signal_payload(
         )
         for s in (detected_learning_signals or [])
     ]
-    edges = [
-        InterestEdge(
-            entity_name=e.get("entity_name", ""),
-            entity_type=e.get("entity_type", ""),
-            user_signal_type=e.get("user_signal_type", "investment"),
-            target_entity_name=e.get("target_entity_name", ""),
-            relationship=e.get("relationship", "RELATED_TO"),
-            reason=e.get("reason", ""),
-            confidence=e.get("confidence", "low"),
-        )
-        for e in interest_edges
-        if e.get("entity_name") and e.get("target_entity_name")
-    ]
     return UserSignalPayload(
         user_email=user_email or "",
         conversation_id=conversation_id or "",
@@ -460,5 +410,5 @@ def build_signal_payload(
         ticker_metadata=ticker_metadata,
         investment_signals=investment_signals,
         learning_signals=learning_signals,
-        interest_edges=edges,
+        session_started_at=None,
     )

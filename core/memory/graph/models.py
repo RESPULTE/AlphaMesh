@@ -74,8 +74,8 @@ ALLOWED_RELATIONSHIP_TYPES = [
     "BELONGS_TO",
     "HAS_INTEREST_IN",
     "TARGETS",
-    "SOURCED_FROM",
-    "INVALIDATED_BY",
+    "HAS_EVENT",
+    "OBSERVED_IN",
 ]
 
 # ── RelationshipType literal: add BELONGS_TO ─────────────────────────────────
@@ -91,8 +91,8 @@ GlobalRelationshipType = Literal[
     "ACQUIRED_BY",
     "HAS_INTEREST_IN",
     "TARGETS",
-    "SOURCED_FROM",
-    "INVALIDATED_BY",
+    "HAS_EVENT",
+    "OBSERVED_IN",
     "REPORTED_BY",
     "RELATED_TO",
     "BELONGS_TO",
@@ -128,7 +128,8 @@ _USER_SCOPED_TYPES = frozenset(
     {
         "UserInterestDomain",
         "UserInterestEdge",
-        "TurnNode",
+        "UserInterestEvent",
+        "SessionNode",
     }
 )
 
@@ -149,7 +150,7 @@ class UserInterestDomain(BaseModel):
 class UserInterestEdge(BaseModel):
     """
     Reified edge tracking a user's interest in a specific entity.
-    Acts as a first-class node to carry provenance, weight, and status.
+    Acts as a first-class node to carry aggregate stance and influence metadata.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -158,24 +159,37 @@ class UserInterestEdge(BaseModel):
     domain_type: Literal["investment", "learning"]
     category: str
     entity_id: str  # resolved UUID of the target entity
-    weight: float = 0.0  # cumulative confidence signal; incremented on reinforce
-    status: Literal["Active", "Invalidated", "Paused"] = "Active"
-    invalidated: bool = False
+    cumulative_weight: float = 0.0
+    reinforcement_count: int = 0
+    invalidation_count: int = 0
+    current_stance: Literal["positive", "negative"] = "positive"
+    last_changed_at: Optional[datetime] = None
     created_at: datetime
     last_updated_at: datetime
 
 
-# class TurnNode(BaseModel):
-#     """
-#     Represents a single conversation turn for full provenance tracking.
-#     UserInterestEdge nodes link to TurnNodes via SOURCED_FROM / INVALIDATED_BY.
-#     """
+class SessionNode(BaseModel):
+    """Session-scoped provenance anchor for user-interest events."""
 
-#     model_config = ConfigDict(extra="ignore")
-#     id: str  # turn_id (uuid4 per OrchestratorAgent.run() call)
-#     conversation_id: str
-#     user_message_excerpt: str  # first 200 chars of user message
-#     created_at: datetime
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    started_at: datetime
+    user_email: str
+
+
+class UserInterestEvent(BaseModel):
+    """Immutable event emitted whenever user interest stance is observed."""
+
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    user_email: str
+    domain_type: Literal["investment", "learning"]
+    category: str
+    entity_id: str
+    stance: Literal["positive", "negative"]
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    observed_at: datetime
+    source_excerpt: str = ""
 
 
 class DocumentMetadata(BaseModel):
@@ -227,34 +241,6 @@ class EntityNode(BaseModel):
     ticker: Optional[str] = None
     concept_categories: List[str] = Field(default_factory=list)
     nodeset_ids: List[str] = Field(default_factory=list)
-
-
-class UserInvestmentInterestNode(BaseModel):
-    """User-scoped investment interest node (not a domain entity)."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    id: str
-    user_email: str
-    status: Literal["Bought", "Interested", "Sold", "Avoids"]
-    reason: str
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    updated_at: datetime
-    target_entity_ids: List[str] = Field(default_factory=list)
-
-
-class UserLearningInterestNode(BaseModel):
-    """User-scoped learning interest node (not a domain entity)."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    id: str
-    user_email: str
-    status: Literal["Interested", "Understood", "Confused", "Not Interested"]
-    reason: str
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    updated_at: datetime
-    target_entity_ids: List[str] = Field(default_factory=list)
 
 
 class ChunkEntityExtractionResult(BaseModel):

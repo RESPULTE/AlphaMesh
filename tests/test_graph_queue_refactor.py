@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 
-from core.config import settings
 from core.memory.graph.entity_resolver import EntityResolution, ResolvedEdgeBatch
 from core.memory.graph.graph_queue import (
     TASK_KIND_CHUNK_ENTITIES,
@@ -86,7 +85,8 @@ class FakeWriter:
         self.user_domains: List[str] = []
         self.user_domain_props: List[dict] = []
         self.user_edges: List[str] = []
-        self.turn_nodes: List[str] = []
+        self.user_events: List[str] = []
+        self.session_nodes: List[str] = []
 
     async def write_relationships(
         self,
@@ -103,9 +103,19 @@ class FakeWriter:
             to_name = normalize_entity_name(str(rel.get("to_name") or ""))
             to_type = str(rel.get("to_type") or "").strip()
 
-            if from_type not in {"UserInterestDomain", "UserInterestEdge", "TurnNode"}:
+            if from_type not in {
+                "UserInterestDomain",
+                "UserInterestEdge",
+                "UserInterestEvent",
+                "SessionNode",
+            }:
                 from_type = normalize_entity_type(from_type) or ""
-            if to_type not in {"UserInterestDomain", "UserInterestEdge", "TurnNode"}:
+            if to_type not in {
+                "UserInterestDomain",
+                "UserInterestEdge",
+                "UserInterestEvent",
+                "SessionNode",
+            }:
                 to_type = normalize_entity_type(to_type) or ""
 
             if (
@@ -133,8 +143,13 @@ class FakeWriter:
         _ = (props, operation, weight_delta)
         self.user_edges.append(edge_id)
 
-    async def merge_turn_node(self, turn_id: str, _props: dict) -> None:
-        self.turn_nodes.append(turn_id)
+    async def merge_user_interest_event(self, node_id: str, props: dict) -> None:
+        _ = props
+        self.user_events.append(node_id)
+
+    async def merge_session_node(self, node_id: str, props: dict) -> None:
+        _ = props
+        self.session_nodes.append(node_id)
 
 
 class FakeRelationshipExtractor:
@@ -169,10 +184,7 @@ def fake_llm_provider(_config: Optional[dict]):
     return object()
 
 
-def test_enqueue_immediate_uses_source_based_allow_create(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setattr(settings, "GRAPH_ALLOW_CREATE_SOURCES", "taxonomy_bootstrap")
+def test_enqueue_immediate_relationship_task_disables_creation(tmp_path: Path):
     resolver = FakeResolver()
     writer = FakeWriter()
     manager = GraphQueueManager(
@@ -204,14 +216,7 @@ def test_enqueue_immediate_uses_source_based_allow_create(
             assert task_id == task.task_id
             await manager.close_session(task.conversation_id)
             assert resolver.batch_calls
-            assert resolver.batch_calls[0][1] is True
-
-            rows = await manager._store.fetchall(
-                "SELECT allow_create FROM graph_tasks WHERE task_id = ?",
-                (task.task_id,),
-            )
-            assert rows
-            assert rows[0]["allow_create"] == 1
+            assert resolver.batch_calls[0][1] is False
         finally:
             await manager.shutdown()
 
@@ -257,11 +262,20 @@ def test_pipeline_upserts_user_scoped_nodes_before_edge_write(
             {
                 "from_name": "edge-1",
                 "from_type": "UserInterestEdge",
-                "relation": "SOURCED_FROM",
-                "to_name": "turn-42",
-                "to_type": "TurnNode",
+                "relation": "HAS_EVENT",
+                "to_name": "event-1",
+                "to_type": "UserInterestEvent",
                 "from_node_props": {"id": "edge-1", "operation": "reinforce"},
-                "to_node_props": {"id": "turn-42"},
+                "to_node_props": {"id": "event-1"},
+            },
+            {
+                "from_name": "event-1",
+                "from_type": "UserInterestEvent",
+                "relation": "OBSERVED_IN",
+                "to_name": "session-1",
+                "to_type": "SessionNode",
+                "from_node_props": {"id": "event-1"},
+                "to_node_props": {"id": "session-1"},
             },
         ]
 
@@ -272,21 +286,19 @@ def test_pipeline_upserts_user_scoped_nodes_before_edge_write(
             allow_create=False,
         )
         assert domain_written == 0
-        assert user_written == 3
+        assert user_written == 4
         assert writer.user_domains == ["domain-1"]
         assert writer.user_domain_props[0].get("nodeset_id") == "nodeset-1"
         assert writer.user_edges == ["edge-1"]
-        assert writer.turn_nodes == ["turn-42"]
+        assert writer.user_events == ["event-1"]
+        assert writer.session_nodes == ["session-1"]
         assert resolver.batch_calls
         assert resolver.batch_calls[0][1] is False
 
     asyncio.run(_run())
 
 
-def test_ttl_eviction_closes_idle_live_workers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setattr(settings, "GRAPH_ALLOW_CREATE_SOURCES", "")
+def test_ttl_eviction_closes_idle_live_workers(tmp_path: Path):
     manager = GraphQueueManager(
         entity_resolver=FakeResolver(),
         graph_writer=FakeWriter(),
@@ -308,10 +320,80 @@ def test_ttl_eviction_closes_idle_live_workers(
     asyncio.run(_run())
 
 
-def test_enqueue_skips_invalid_chunk_and_empty_tasks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_pipeline_upserts_session_and_event_nodes_before_edge_write(
+    tmp_path: Path,
 ):
-    monkeypatch.setattr(settings, "GRAPH_ALLOW_CREATE_SOURCES", "")
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+
+    async def _run() -> None:
+        await store.initialize()
+        prompt_registry = PromptRegistry(store)
+        pipeline = GraphWritePipeline(
+            entity_resolver=resolver,
+            graph_writer=writer,
+            relationship_extractor=FakeRelationshipExtractor(),
+            llm_provider=fake_llm_provider,
+            prompt_registry=prompt_registry,
+        )
+
+        relationships = [
+            {
+                "from_name": "domain-1",
+                "from_type": "UserInterestDomain",
+                "relation": "HAS_INTEREST_IN",
+                "to_name": "edge-1",
+                "to_type": "UserInterestEdge",
+                "from_node_props": {"id": "domain-1", "nodeset_id": "nodeset-1"},
+                "to_node_props": {"id": "edge-1", "operation": "reinforce"},
+            },
+            {
+                "from_name": "edge-1",
+                "from_type": "UserInterestEdge",
+                "relation": "HAS_EVENT",
+                "to_name": "event-1",
+                "to_type": "UserInterestEvent",
+                "from_node_props": {"id": "edge-1", "operation": "reinforce"},
+                "to_node_props": {"id": "event-1"},
+            },
+            {
+                "from_name": "event-1",
+                "from_type": "UserInterestEvent",
+                "relation": "OBSERVED_IN",
+                "to_name": "session-1",
+                "to_type": "SessionNode",
+                "from_node_props": {"id": "event-1"},
+                "to_node_props": {"id": "session-1"},
+            },
+            {
+                "from_name": "edge-1",
+                "from_type": "UserInterestEdge",
+                "relation": "TARGETS",
+                "to_name": "Apple",
+                "to_type": "Company",
+                "from_node_props": {"id": "edge-1", "operation": "reinforce"},
+                "to_node_props": {},
+            },
+        ]
+
+        domain_written, user_written = await pipeline.process_relationships(
+            relationships=relationships,
+            conversation_id="conversation-1",
+            source_agent="orchestrator",
+            allow_create=False,
+        )
+        assert domain_written == 0
+        assert user_written == 4
+        assert writer.user_domains == ["domain-1"]
+        assert writer.user_edges == ["edge-1"]
+        assert writer.user_events == ["event-1"]
+        assert writer.session_nodes == ["session-1"]
+
+    asyncio.run(_run())
+
+
+def test_enqueue_skips_invalid_chunk_and_empty_tasks(tmp_path: Path):
     manager = GraphQueueManager(
         entity_resolver=FakeResolver(),
         graph_writer=FakeWriter(),
@@ -356,11 +438,7 @@ def test_enqueue_skips_invalid_chunk_and_empty_tasks(
     asyncio.run(_run())
 
 
-def test_recover_pending_tasks_applies_allow_create_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setattr(settings, "GRAPH_ALLOW_CREATE_SOURCES", "taxonomy_bootstrap")
-
+def test_recover_pending_tasks_without_allow_create_policy(tmp_path: Path):
     resolver = FakeResolver()
     writer = FakeWriter()
     manager = GraphQueueManager(
@@ -370,8 +448,6 @@ def test_recover_pending_tasks_applies_allow_create_policy(
         llm_provider=fake_llm_provider,
         db_path=str(tmp_path / "graph_tasks.db"),
     )
-
-    recovered_allow_create: List[Optional[bool]] = []
 
     async def _run() -> None:
         await manager._store.initialize()
@@ -385,24 +461,20 @@ def test_recover_pending_tasks_applies_allow_create_policy(
                     "from_name": "Apple",
                     "from_type": "Company",
                     "relation": "BELONGS_TO",
-                    "to_name": "Technology",
-                    "to_type": "Sector",
+                "to_name": "Technology",
+                "to_type": "Sector",
                 }
             ],
-            allow_create=None,
         )
         await manager._store.persist_task(task.to_payload())
 
         async def _capture_process(tasks: List[object]) -> Dict[str, int]:
-            recovered_allow_create.extend(
-                getattr(candidate, "allow_create", None) for candidate in tasks
-            )
+            assert len(tasks) == 1
+            assert not hasattr(tasks[0], "allow_create")
             return {"domain_edges": 0, "user_edges": 0}
 
         manager._pipeline.process_tasks = _capture_process  # type: ignore[method-assign]
         await manager._recover_pending_tasks()
-
-        assert recovered_allow_create == [True]
 
     asyncio.run(_run())
 
@@ -532,7 +604,6 @@ def test_pipeline_drops_out_of_scope_extracted_relationships(tmp_path: Path) -> 
             system_prompt="extract relationships",
             allowed_entity_types=["Company", "Sector"],
             allowed_relationship_types=["BELONGS_TO"],
-            allow_create=False,
         )
         assert task.system_prompt is not None
         await prompt_registry.register(task.system_prompt)

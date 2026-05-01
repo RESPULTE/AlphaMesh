@@ -6,7 +6,7 @@ core/agents/orchestrator_agent.py
    This is the single addition required for the graph queue lifecycle.
 
 2. _synthesize_node() only returns analysis text and no longer enqueues
-   deferred relationship extraction; only investment-signal writeback is queued.
+   deferred relationship extraction; user-interest signal writeback is queued.
 Everything else is unchanged from the previous version.
 """
 
@@ -296,6 +296,16 @@ class OrchestratorAgent:
             turn_id=turn_id,
         )
 
+    @staticmethod
+    async def _warm_user_context_cache(user_email: Optional[str]) -> None:
+        if not user_email:
+            return
+        try:
+            svc = service_manager.get_user_context_service()
+            await svc.load_for_user(user_email)
+        except Exception:
+            logger.exception("run: failed to warm user context cache for %s", user_email)
+
     async def run(
         self,
         messages: List[BaseMessage],
@@ -319,6 +329,7 @@ class OrchestratorAgent:
         logger.info("run: turn_id=%s", turn_id)
 
         await self._open_graph_session(conversation_id)
+        await self._warm_user_context_cache(user_email)
 
         initial_state = self._build_initial_state(
             messages=messages,
@@ -730,11 +741,12 @@ class OrchestratorAgent:
                 "The raw data was retrieved but could not be summarised."
             )
 
-    async def _write_back_investment_signals(self, state: OrchestratorState) -> None:
+    async def _write_back_user_signals(self, state: OrchestratorState) -> None:
         if not (state.user_email and state.plan and state.conversation_id):
             return
         investment_signals = state.plan.detected_investment_signals or []
-        if not investment_signals:
+        learning_signals = state.plan.detected_learning_signals or []
+        if not investment_signals and not learning_signals:
             return
         user_message = _extract_last_human_message(state.messages)
         payload = build_signal_payload(
@@ -744,8 +756,7 @@ class OrchestratorAgent:
             ticker_metadata=state.ticker_metadata,
             user_message=user_message,
             detected_investment_signals=investment_signals,
-            detected_learning_signals=[],
-            interest_edges=[],
+            detected_learning_signals=learning_signals,
         )
         relationships, cache_entries = await build_user_signal_relationships(payload)
         if relationships:
@@ -770,7 +781,7 @@ class OrchestratorAgent:
             state=state,
             context_parts=synthesis_inputs["context_parts"],
         )
-        await self._write_back_investment_signals(state)
+        await self._write_back_user_signals(state)
 
         return {
             "summary": analysis_text,

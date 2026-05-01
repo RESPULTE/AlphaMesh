@@ -80,7 +80,7 @@ class GraphWritePipeline:
 
         await self._process_chunk_entity_tasks(tasks)
 
-        prepared_groups: Dict[Tuple[str, bool], List[Tuple[GraphTask, List[dict]]]] = {}
+        prepared_groups: Dict[str, List[Tuple[GraphTask, List[dict]]]] = {}
         for task in tasks:
             if task.task_kind == TASK_KIND_CHUNK_ENTITIES:
                 continue
@@ -93,16 +93,12 @@ class GraphWritePipeline:
                 relationships = self._filter_relationships_for_task(task, relationships)
                 task.relationships = relationships
             if relationships:
-                allow_create = self._normalize_allow_create(
-                    task.allow_create,
-                    task.task_id,
-                )
-                group_key = (task.conversation_id, allow_create)
+                group_key = task.conversation_id
                 prepared_groups.setdefault(group_key, []).append((task, relationships))
 
         total_domain = 0
         total_user = 0
-        for (conversation_id, allow_create), group in prepared_groups.items():
+        for conversation_id, group in prepared_groups.items():
             if not group:
                 continue
             merged_relationships: List[dict] = []
@@ -115,7 +111,7 @@ class GraphWritePipeline:
                 relationships=merged_relationships,
                 conversation_id=conversation_id,
                 source_agent=source_agent_label,
-                allow_create=allow_create,
+                allow_create=False,
             )
             total_domain += domain_count
             total_user += user_count
@@ -356,8 +352,12 @@ class GraphWritePipeline:
                 weight_delta=weight_delta,
             )
             return
-        if node_type == "TurnNode":
-            await self._writer.merge_turn_node(node_id, merged_props)
+        if node_type == "UserInterestEvent":
+            await self._writer.merge_user_interest_event(node_id=node_id, props=merged_props)
+            return
+        if node_type == "SessionNode":
+            await self._writer.merge_session_node(node_id=node_id, props=merged_props)
+            return
 
     @staticmethod
     def _normalize_user_interest_edge_update(node_props: dict) -> Tuple[str, float]:
@@ -369,16 +369,6 @@ class GraphWritePipeline:
         except (TypeError, ValueError):
             weight_delta = 0.0
         return operation, weight_delta
-
-    @staticmethod
-    def _normalize_allow_create(allow_create: Optional[bool], task_id: str) -> bool:
-        if allow_create is None:
-            logger.warning(
-                "GraphWritePipeline: missing allow_create on task '%s'; defaulting to False",
-                task_id,
-            )
-            return False
-        return bool(allow_create)
 
     def _filter_relationships_for_task(
         self,

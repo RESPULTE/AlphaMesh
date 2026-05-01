@@ -140,7 +140,6 @@ def test_analyse_news_node_uses_structured_output_and_defers_extraction(
     assert captured_task_kwargs["conversation_id"] == "conv-analysis"
     assert captured_task_kwargs["allowed_entity_types"]
     assert captured_task_kwargs["allowed_relationship_types"]
-    assert captured_task_kwargs["allow_create"] is True
 
 
 def test_analyse_news_node_includes_planner_chunk_rationales_in_prompt(
