@@ -34,7 +34,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from api.dependencies import get_broadcaster
+from api.dependencies import get_broadcaster, get_current_user
 from api.services.event_broadcaster import EventBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ _TERMINAL_EVENT_TYPES = frozenset({"complete", "error"})
 )
 async def stream_events(
     request_id: str,
+    _user_id: str = Depends(get_current_user),
     broadcaster: EventBroadcaster = Depends(get_broadcaster),
 ) -> StreamingResponse:
     queue = broadcaster.get(request_id)

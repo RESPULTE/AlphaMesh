@@ -199,6 +199,25 @@ class ChatAck(BaseModel):
     session_id: str
 
 
+class AuthResponse(BaseModel):
+    """Authentication payload returned by login/sign-up/refresh."""
+
+    access_token: str
+    refresh_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int = Field(
+        description="Access token expiry duration in seconds."
+    )
+    user_email: str
+    session_id: str
+
+
+class LogoutResponse(BaseModel):
+    """Response payload for stateless logout acknowledgement."""
+
+    status: Literal["ok"] = "ok"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SSE event envelope
 # ─────────────────────────────────────────────────────────────────────────────

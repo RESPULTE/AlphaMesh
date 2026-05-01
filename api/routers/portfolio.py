@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 import yfinance as yf
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from api.dependencies import get_current_user_optional
 from api.models.portfolio import (
     PortfolioHolding,
     PortfolioResponse,
@@ -14,6 +15,7 @@ from api.models.portfolio import (
     UpsertPortfolioHoldingRequest,
 )
 from api.services.portfolio_json_store import PortfolioJsonStore
+from core.config import settings
 
 router = APIRouter(prefix="/api/v1", tags=["portfolio"])
 
@@ -22,6 +24,20 @@ _SUPPORTED_ASSET_TYPES = {"EQUITY": "equity", "ETF": "etf"}
 
 def get_portfolio_store(request: Request) -> PortfolioJsonStore:
     return request.app.state.portfolio_store
+
+
+def _resolve_user_email(
+    user_id_from_token: str | None,
+    user_email_fallback: str | None,
+) -> str:
+    if user_id_from_token:
+        return user_id_from_token
+    if settings.DEV_ALLOW_USER_EMAIL_FALLBACK and user_email_fallback:
+        return user_email_fallback
+    raise HTTPException(
+        status_code=401,
+        detail="Missing user identity: provide Bearer token or dev user_email fallback.",
+    )
 
 
 def _normalize_asset_type(raw_quote_type: Any) -> Optional[str]:
@@ -102,11 +118,13 @@ def _run_yfinance_search(query: str, max_results: int) -> List[dict]:
     summary="Get user portfolio holdings",
 )
 async def get_portfolio(
-    user_email: str = Query(..., min_length=3, max_length=320),
+    user_id_from_token: str | None = Depends(get_current_user_optional),
+    user_email: str | None = Query(default=None, min_length=3, max_length=320),
     store: PortfolioJsonStore = Depends(get_portfolio_store),
 ) -> PortfolioResponse:
+    resolved_user_email = _resolve_user_email(user_id_from_token, user_email)
     try:
-        holdings = await store.get_holdings(user_email)
+        holdings = await store.get_holdings(resolved_user_email)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -114,7 +132,7 @@ async def get_portfolio(
             status_code=500,
             detail="Failed to load portfolio holdings",
         ) from exc
-    return PortfolioResponse(user_email=user_email, holdings=holdings)
+    return PortfolioResponse(user_email=resolved_user_email, holdings=holdings)
 
 
 @router.put(
@@ -124,8 +142,10 @@ async def get_portfolio(
 )
 async def upsert_portfolio_holding(
     body: UpsertPortfolioHoldingRequest,
+    user_id_from_token: str | None = Depends(get_current_user_optional),
     store: PortfolioJsonStore = Depends(get_portfolio_store),
 ) -> PortfolioResponse:
+    resolved_user_email = _resolve_user_email(user_id_from_token, body.user_email)
     holding = PortfolioHolding(
         ticker=body.ticker.upper(),
         company_name=body.company_name.strip(),
@@ -134,7 +154,7 @@ async def upsert_portfolio_holding(
         shares=body.shares,
     )
     try:
-        holdings = await store.upsert_holding(body.user_email, holding)
+        holdings = await store.upsert_holding(resolved_user_email, holding)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -142,7 +162,7 @@ async def upsert_portfolio_holding(
             status_code=500,
             detail="Failed to update portfolio holdings",
         ) from exc
-    return PortfolioResponse(user_email=body.user_email, holdings=holdings)
+    return PortfolioResponse(user_email=resolved_user_email, holdings=holdings)
 
 
 @router.get(

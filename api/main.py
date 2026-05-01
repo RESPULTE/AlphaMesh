@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routers import stream
+from api.routers import auth
 from api.routers import chat
 from api.routers import conversations
 from api.routers import health
@@ -114,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(sessions_router.router)
 
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(chat.router)
     app.include_router(stream.router)
     app.include_router(conversations.router)

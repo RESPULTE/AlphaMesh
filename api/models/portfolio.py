@@ -40,8 +40,12 @@ class PortfolioHolding(BaseModel):
 
 
 class UpsertPortfolioHoldingRequest(BaseModel):
-    user_email: str = Field(
-        description="User identity key for per-user portfolio files.",
+    user_email: Optional[str] = Field(
+        default=None,
+        description=(
+            "Deprecated compatibility field. "
+            "Authenticated token identity is preferred."
+        ),
         min_length=3,
         max_length=320,
     )
@@ -83,4 +87,3 @@ class TickerSearchResult(BaseModel):
 
 class TickerSearchResponse(BaseModel):
     results: List[TickerSearchResult] = Field(default_factory=list)
-

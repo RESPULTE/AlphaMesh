@@ -26,6 +26,16 @@ from core.services import service_manager
 bearer = HTTPBearer(auto_error=False)
 
 
+def _extract_token(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    if creds and creds.credentials:
+        return creds.credentials.strip()
+    query_token = (request.query_params.get("token") or "").strip()
+    return query_token or None
+
+
 def get_broadcaster(request: Request) -> EventBroadcaster:
     return request.app.state.broadcaster
 
@@ -39,6 +49,7 @@ def get_runner(request: Request) -> AnalysisRunner:
 
 
 def get_current_user(
+    request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(bearer),
 ) -> str:
     """
@@ -47,25 +58,28 @@ def get_current_user(
     Returns the user's email string on success.
     Raises HTTP 401 on missing or invalid token.
     """
-    if not creds:
+    token = _extract_token(request, creds)
+    if not token:
         raise HTTPException(status_code=401, detail="Authorization header missing")
 
-    email = get_auth_adapter().verify_access_token(creds.credentials)
+    email = get_auth_adapter().verify_access_token(token)
     if not email:
         raise HTTPException(status_code=401, detail="Invalid or expired access token")
     return email
 
 
 def get_current_user_optional(
+    request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(bearer),
 ) -> str | None:
     """
     Best-effort user extraction from Authorization header.
     Returns None when header is missing or invalid.
     """
-    if not creds:
+    token = _extract_token(request, creds)
+    if not token:
         return None
-    return get_auth_adapter().verify_access_token(creds.credentials)
+    return get_auth_adapter().verify_access_token(token)
 
 
 # -- Service dependencies -----------------------------------------------------
