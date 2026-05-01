@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List
 
+import pandas as pd
 from core.agents.working_memory.base import (
     ConversationWorkingMemoryBase,
     ConversationWorkingMemoryManagerBase,
@@ -45,10 +47,22 @@ class FundamentalTurnRelevantMemory(TurnRelevantMemoryBase):
 
 
 @dataclass
+class FundamentalTickerDataFrameCacheEntry:
+    ticker_key: str
+    granularity: str
+    financial_data: pd.DataFrame
+    min_period: pd.Timestamp | None = None
+    max_period: pd.Timestamp | None = None
+
+
+@dataclass
 class FundamentalConversationWorkingMemory(
     ConversationWorkingMemoryBase[FundamentalTurnRelevantMemory]
 ):
     turn_records: List[FundamentalTurnRelevantMemory] = field(default_factory=list)
+    financial_df_cache_by_ticker: dict[str, FundamentalTickerDataFrameCacheEntry] = (
+        field(default_factory=dict)
+    )
 
 
 class FundamentalWorkingMemoryManager(
@@ -64,6 +78,132 @@ class FundamentalWorkingMemoryManager(
             max_turns=max_turns,
             conversation_factory=FundamentalConversationWorkingMemory,
         )
+
+    @staticmethod
+    def normalize_ticker_key(ticker: str | None) -> str:
+        return str(ticker or "").strip().upper()
+
+    @staticmethod
+    def _normalize_granularity(granularity: str | None) -> str:
+        value = str(granularity or "").strip().lower()
+        return value if value in {"yearly", "quarterly"} else "yearly"
+
+    @staticmethod
+    def _extract_period_bounds(
+        financial_data: pd.DataFrame,
+    ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+        if financial_data.empty:
+            return None, None
+        parsed = pd.to_datetime(financial_data.columns, errors="coerce")
+        parsed = parsed[~parsed.isna()]
+        if len(parsed) == 0:
+            return None, None
+        return parsed.min(), parsed.max()
+
+    @staticmethod
+    def _to_timestamp(value: datetime | pd.Timestamp | None) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        try:
+            ts = pd.Timestamp(value)
+        except Exception:
+            return None
+        if ts.tz is not None:
+            ts = ts.tz_localize(None)
+        return ts
+
+    def upsert_cached_financial_data(
+        self,
+        *,
+        conversation_id: str,
+        ticker: str | None,
+        granularity: str | None,
+        financial_data: pd.DataFrame | None,
+    ) -> None:
+        if not conversation_id or financial_data is None or financial_data.empty:
+            return
+        ticker_key = self.normalize_ticker_key(ticker)
+        if not ticker_key:
+            return
+        normalized_granularity = self._normalize_granularity(granularity)
+        cached_df = financial_data.copy(deep=True)
+        min_period, max_period = self._extract_period_bounds(cached_df)
+        memory = self.get_conversation_memory(conversation_id)
+        memory.financial_df_cache_by_ticker[ticker_key] = (
+            FundamentalTickerDataFrameCacheEntry(
+                ticker_key=ticker_key,
+                granularity=normalized_granularity,
+                financial_data=cached_df,
+                min_period=min_period,
+                max_period=max_period,
+            )
+        )
+
+    def resolve_cached_financial_data(
+        self,
+        *,
+        conversation_id: str,
+        ticker: str | None,
+        granularity: str | None,
+        start_dt: datetime | pd.Timestamp | None = None,
+        end_dt: datetime | pd.Timestamp | None = None,
+    ) -> pd.DataFrame | None:
+        if not conversation_id:
+            return None
+        ticker_key = self.normalize_ticker_key(ticker)
+        if not ticker_key:
+            return None
+        memory = self.get_existing_conversation_memory(conversation_id)
+        if memory is None:
+            return None
+        entry = memory.financial_df_cache_by_ticker.get(ticker_key)
+        if entry is None:
+            return None
+        if entry.granularity != self._normalize_granularity(granularity):
+            return None
+
+        cached_df = entry.financial_data
+        if cached_df is None or cached_df.empty:
+            return None
+
+        requested_start = self._to_timestamp(start_dt)
+        requested_end = self._to_timestamp(end_dt)
+        if requested_start is not None or requested_end is not None:
+            min_period = entry.min_period
+            max_period = entry.max_period
+            if min_period is None or max_period is None:
+                min_period, max_period = self._extract_period_bounds(cached_df)
+            if min_period is None or max_period is None:
+                return None
+            granularity_key = self._normalize_granularity(granularity)
+            if granularity_key == "yearly":
+                if (
+                    requested_start is not None
+                    and requested_start.year < min_period.year
+                ):
+                    return None
+                if requested_end is not None and requested_end.year > max_period.year:
+                    return None
+            elif granularity_key == "quarterly":
+                min_quarter = min_period.to_period("Q")
+                max_quarter = max_period.to_period("Q")
+                if (
+                    requested_start is not None
+                    and requested_start.to_period("Q") < min_quarter
+                ):
+                    return None
+                if (
+                    requested_end is not None
+                    and requested_end.to_period("Q") > max_quarter
+                ):
+                    return None
+            else:
+                if requested_start is not None and requested_start < min_period:
+                    return None
+                if requested_end is not None and requested_end > max_period:
+                    return None
+
+        return cached_df.copy(deep=True)
 
     @staticmethod
     def _convert_batch_records(

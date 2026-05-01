@@ -377,6 +377,29 @@ class FundamentalAnalysisAgent(AbstractAgent):
         )
 
         # ── Step 2: concurrent fetch ──────────────────────────────────────────────
+        conversation_id = (state.conversation_id or "").strip()
+        working_memory = getattr(self, "_working_memory", None)
+        if working_memory is not None:
+            cached_df = working_memory.resolve_cached_financial_data(
+                conversation_id=conversation_id,
+                ticker=ticker,
+                granularity=granularity,
+                start_dt=cfg.start_dt,
+                end_dt=cfg.end_dt,
+            )
+            if cached_df is not None and not cached_df.empty:
+                logger.info(
+                    "[data_prep] Cache hit for %s (%s) with %d concepts x %d periods.",
+                    ticker,
+                    granularity,
+                    len(cached_df.index),
+                    len(cached_df.columns),
+                )
+                return {
+                    "financial_data": cached_df,
+                    "available_concepts": list(cached_df.index),
+                }
+
         financial_df, price_df = await _fetch_raw_data(self.db, ticker, cfg)
 
         # ── Step 3: trim + normalise ──────────────────────────────────────────────
@@ -404,6 +427,14 @@ class FundamentalAnalysisAgent(AbstractAgent):
             len(financial_df.columns),
             ticker,
         )
+
+        if working_memory is not None:
+            working_memory.upsert_cached_financial_data(
+                conversation_id=conversation_id,
+                ticker=ticker,
+                granularity=granularity,
+                financial_data=financial_df,
+            )
 
         return {
             "financial_data": financial_df,
@@ -682,6 +713,15 @@ class FundamentalAnalysisAgent(AbstractAgent):
                         persisted_count,
                         state.ticker,
                     )
+
+        working_memory = getattr(self, "_working_memory", None)
+        if working_memory is not None and not df.empty:
+            working_memory.upsert_cached_financial_data(
+                conversation_id=(state.conversation_id or "").strip(),
+                ticker=state.ticker,
+                granularity=state.granularity,
+                financial_data=df,
+            )
 
         updated_concepts = list(df.index) if not df.empty else state.available_concepts
         updated_computed = list(
