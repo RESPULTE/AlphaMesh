@@ -16,28 +16,23 @@ from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 from core.logger import get_logger
+from core.memory.user_interest_models import UserInterestEntityRef
 from core.memory.user_context_service import InterestCacheEntry
 
 logger = get_logger(__name__)
 
 
 @dataclass
-class DetectedEntity:
-    entity_name: str
-    entity_type: str
-
-
-@dataclass
 class InvestmentSignal:
     status: str  # "Bought" | "Interested" | "Sold" | "Avoids"
-    target_entities: List[DetectedEntity] = field(default_factory=list)
+    target_entities: List[UserInterestEntityRef] = field(default_factory=list)
     confidence: float = 0.5
 
 
 @dataclass
 class LearningSignal:
     status: str  # "Interested" | "Understood" | "Confused" | "Not Interested"
-    target_entities: List[DetectedEntity] = field(default_factory=list)
+    target_entities: List[UserInterestEntityRef] = field(default_factory=list)
     confidence: float = 0.5
 
 
@@ -103,7 +98,7 @@ class _NormalizedSignal:
     kind: Literal["investment", "learning"]
     status: str
     confidence: float
-    target_entities: Sequence[DetectedEntity]
+    target_entities: Sequence[UserInterestEntityRef]
 
 
 def _iter_signals(payload: UserSignalPayload) -> List[_NormalizedSignal]:
@@ -393,8 +388,10 @@ def _build_signal_payload(
         InvestmentSignal(
             status=s.status,
             confidence=getattr(s, "confidence", 0.5),
-            target_entities=[
-                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
+                target_entities=[
+                UserInterestEntityRef(
+                    entity_name=e.entity_name, entity_type=e.entity_type
+                )
                 for e in s.target_entities
             ],
         )
@@ -404,8 +401,10 @@ def _build_signal_payload(
         LearningSignal(
             status=s.status,
             confidence=getattr(s, "confidence", 0.5),
-            target_entities=[
-                DetectedEntity(entity_name=e.entity_name, entity_type=e.entity_type)
+                target_entities=[
+                UserInterestEntityRef(
+                    entity_name=e.entity_name, entity_type=e.entity_type
+                )
                 for e in s.target_entities
             ],
         )

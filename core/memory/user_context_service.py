@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.logger import get_logger
 from core.memory.graph.nodeset_manager import NodeSetManager
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
+from core.memory.user_interest_models import (
+    UserInterestQueryResult,
+    UserInterestQuerySpec,
+)
 
 CACHE_MAX_INTERESTS = 40
 _MAX_WEIGHT = 12.0
@@ -18,6 +23,11 @@ _CONTEXT_TOKEN_BUDGET = 320
 _ACTIVE_SLOT_CAP = 6
 _CONFLICT_SLOT_CAP = 4
 _NUDGE_SLOT_CAP = 2
+_TARGETED_INTEREST_CONTEXT_MAX_CHARS = 2200
+_TARGETED_INTEREST_DOMAIN_FALLBACK_LIMIT = 3
+_TARGETED_INTEREST_DOMAIN_LIMIT = 3
+_TARGETED_INTEREST_EDGE_LIMIT = 8
+_TARGETED_INTEREST_EXPANDED_ENTITY_LIMIT = 12
 
 
 @dataclass
@@ -55,6 +65,200 @@ class UserContextService:
         self._nodeset_manager = nodeset_manager
         self._logger = get_logger(__name__)
         self._cache: Dict[str, Dict[str, object]] = {}
+
+    @staticmethod
+    def _truncate_targeted_context(text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return "(none)"
+        if len(value) <= _TARGETED_INTEREST_CONTEXT_MAX_CHARS:
+            return value
+        return value[: _TARGETED_INTEREST_CONTEXT_MAX_CHARS - 3].rstrip() + "..."
+
+    @staticmethod
+    def _is_low_confidence_query_spec(spec: UserInterestQuerySpec) -> bool:
+        return not (
+            spec.domain_type
+            or (spec.category or "").strip()
+            or list(spec.target_entities or [])
+        )
+
+    def _render_interest_domain_summary_block(self, rows: List[dict]) -> str:
+        if not rows:
+            return "(none)"
+        lines: List[str] = ["Domain Summary:"]
+        for idx, row in enumerate(
+            rows[:_TARGETED_INTEREST_DOMAIN_FALLBACK_LIMIT], start=1
+        ):
+            domain = dict(row.get("domain") or {})
+            category = str(domain.get("category") or "general")
+            domain_type = str(domain.get("domain_type") or "investment")
+            positive_weight = float(row.get("positive_weight") or 0.0)
+            edge_count = int(row.get("edge_count") or 0)
+            last_changed = str(row.get("last_changed_at") or "unknown_time")
+            lines.append(
+                f"{idx}. {domain_type}:{category} | positive_weight={positive_weight:.2f} "
+                f"| edges={edge_count} | last_changed={last_changed}"
+            )
+        return self._truncate_targeted_context("\n".join(lines))
+
+    def _render_targeted_interest_block(self, *, rows: List[dict], hops: int) -> str:
+        if not rows:
+            return "(none)"
+
+        domain = dict(rows[0].get("domain") or {})
+        domain_type = str(domain.get("domain_type") or "investment")
+        category = str(domain.get("category") or "general")
+        lines: List[str] = [f"Matched Domain:\n- {domain_type}:{category}"]
+        lines.append("Top Interest Edges:")
+
+        for idx, row in enumerate(rows[:_TARGETED_INTEREST_EDGE_LIMIT], start=1):
+            edge = dict(row.get("edge") or {})
+            entity = dict(row.get("entity") or {})
+            entity_name = str(entity.get("name") or "unknown_entity")
+            entity_type = str(entity.get("entity_type") or "UnknownType")
+            stance = str(row.get("stance") or edge.get("current_stance") or "positive")
+            weight = float(edge.get("cumulative_weight") or 0.0)
+            changed = str(
+                row.get("edge_last_changed")
+                or edge.get("last_changed_at")
+                or "unknown_time"
+            )
+            lines.append(
+                f"{idx}. {entity_name} ({entity_type}) | stance={stance} "
+                f"| weight={weight:.2f} | last_changed={changed}"
+            )
+
+        if hops > 0:
+            expanded_set: set[Tuple[str, str]] = set()
+            for row in rows:
+                for neighbor in row.get("expanded_neighbors") or []:
+                    if not isinstance(neighbor, dict):
+                        continue
+                    neighbor_name = str(neighbor.get("name") or "").strip()
+                    neighbor_type = str(neighbor.get("entity_type") or "").strip()
+                    if not neighbor_name or not neighbor_type:
+                        continue
+                    expanded_set.add((neighbor_name, neighbor_type))
+
+            if expanded_set:
+                lines.append(f"Expanded Context (hops={hops}):")
+                for idx, (name, entity_type) in enumerate(
+                    sorted(expanded_set)[:_TARGETED_INTEREST_EXPANDED_ENTITY_LIMIT],
+                    start=1,
+                ):
+                    lines.append(f"{idx}. {name} ({entity_type})")
+
+        return self._truncate_targeted_context("\n".join(lines))
+
+    async def _build_targeted_query_spec(
+        self,
+        *,
+        latest_user_message: str,
+        baseline_user_context_block: str,
+        portfolio_block: str,
+        llm: Any,
+    ) -> UserInterestQuerySpec:
+        structured_llm = llm.with_structured_output(UserInterestQuerySpec)
+        messages: List[BaseMessage] = [
+            SystemMessage(
+                content=(
+                    "You select a compact user-interest graph query for the orchestrator. "
+                    "Infer domain_type ('investment'|'learning'), optional category, optional target_entities, "
+                    "and hops (0..2). Set broad_fallback=true when user intent is broad/uncertain. "
+                    "Set risk_or_avoidance_intent=true only when the user expresses avoidance, downside, or risk concern."
+                )
+            ),
+            SystemMessage(
+                content=f"USER CONTEXT:\n{baseline_user_context_block or 'USER CONTEXT: None'}"
+            ),
+            SystemMessage(content=f"PORTFOLIO:\n{portfolio_block or '[]'}"),
+            HumanMessage(content=latest_user_message),
+        ]
+        spec: UserInterestQuerySpec = await structured_llm.ainvoke(messages)
+        return spec.model_copy(update={"hops": max(0, min(2, int(spec.hops or 0)))})
+
+    async def build_targeted_orchestrator_context(
+        self,
+        *,
+        user_email: Optional[str],
+        latest_user_message: str,
+        baseline_user_context_block: str,
+        portfolio_block: str,
+        llm: Any,
+    ) -> UserInterestQueryResult:
+        if not user_email or not str(latest_user_message or "").strip():
+            return UserInterestQueryResult(context_block="(none)")
+
+        normalized = self._normalize_email(user_email)
+        if not normalized:
+            return UserInterestQueryResult(context_block="(none)")
+
+        try:
+            spec = await self._build_targeted_query_spec(
+                latest_user_message=latest_user_message.strip(),
+                baseline_user_context_block=baseline_user_context_block,
+                portfolio_block=portfolio_block,
+                llm=llm,
+            )
+            _, nodeset_id = await self._nodeset_manager.get_or_create_user_nodeset(
+                normalized
+            )
+            fallback_mode = bool(spec.broad_fallback) or self._is_low_confidence_query_spec(
+                spec
+            )
+
+            if fallback_mode:
+                rows = await self._neo4j_adapter.get_user_interest_domain_summary(
+                    user_email=normalized,
+                    nodeset_id=nodeset_id,
+                    limit=_TARGETED_INTEREST_DOMAIN_FALLBACK_LIMIT,
+                )
+                return UserInterestQueryResult(
+                    query_spec=spec,
+                    context_block=self._render_interest_domain_summary_block(rows),
+                    debug_payload={
+                        "mode": "fallback_domains_only",
+                        "domain_rows": len(rows),
+                        "hops": 0,
+                    },
+                )
+
+            rows = await self._neo4j_adapter.query_user_interest_context(
+                user_email=normalized,
+                nodeset_id=nodeset_id,
+                domain_type=spec.domain_type,
+                category=spec.category,
+                target_entities=[entity.model_dump() for entity in spec.target_entities],
+                hops=spec.hops,
+                risk_or_avoidance_intent=spec.risk_or_avoidance_intent,
+                domain_limit=_TARGETED_INTEREST_DOMAIN_LIMIT,
+                edge_limit=_TARGETED_INTEREST_EDGE_LIMIT,
+                expanded_entity_limit=_TARGETED_INTEREST_EXPANDED_ENTITY_LIMIT,
+            )
+            return UserInterestQueryResult(
+                query_spec=spec,
+                context_block=self._render_targeted_interest_block(
+                    rows=rows,
+                    hops=spec.hops,
+                ),
+                debug_payload={
+                    "mode": "targeted",
+                    "row_count": len(rows),
+                    "hops": spec.hops,
+                    "domain_type": spec.domain_type,
+                    "category": spec.category,
+                },
+            )
+        except Exception:
+            self._logger.exception(
+                "build_targeted_orchestrator_context: failed for user '%s'",
+                normalized,
+            )
+            return UserInterestQueryResult(
+                context_block="(none)",
+                debug_payload={"mode": "error"},
+            )
 
     @staticmethod
     def _normalize_email(user_email: str) -> str:

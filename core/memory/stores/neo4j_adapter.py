@@ -604,6 +604,145 @@ class Neo4jAdapter:
         records = await self._execute_read(cypher, {"id": entity_id})
         return records[0].get("category") if records else None
 
+    async def get_user_interest_domain_summary(
+        self,
+        user_email: str,
+        nodeset_id: str,
+        limit: int = 3,
+    ) -> List[dict]:
+        """
+        Return top user-interest domains only (no edge/entity expansion).
+
+        Ranked by positive stance weight then recency so broad fallback context
+        remains compact and avoids over-weighting stale negative edges.
+        """
+        safe_limit = max(1, min(10, int(limit or 3)))
+        cypher = (
+            "MATCH (ns:NodeSet {id: $nodeset_id})"
+            "<-[:BELONGS_TO_NODESET]-(d:UserInterestDomain {user_email: $user_email})"
+            "-[:HAS_INTEREST_IN]->(e:UserInterestEdge) "
+            "WITH d, "
+            "     count(e) AS edge_count, "
+            "     sum(CASE WHEN coalesce(e.current_stance, 'positive') = 'positive' "
+            "         THEN coalesce(e.cumulative_weight, 0.0) ELSE 0.0 END) AS positive_weight, "
+            "     sum(CASE WHEN coalesce(e.current_stance, 'positive') = 'negative' "
+            "         THEN coalesce(e.cumulative_weight, 0.0) ELSE 0.0 END) AS negative_weight, "
+            "     max(coalesce(e.last_changed_at, e.last_updated_at, e.created_at)) AS last_changed_at "
+            "RETURN d AS domain, edge_count, positive_weight, negative_weight, last_changed_at "
+            "ORDER BY positive_weight DESC, last_changed_at DESC "
+            "LIMIT $limit"
+        )
+        return await self._execute_read(
+            cypher,
+            {
+                "nodeset_id": nodeset_id,
+                "user_email": user_email,
+                "limit": safe_limit,
+            },
+        )
+
+    async def query_user_interest_context(
+        self,
+        *,
+        user_email: str,
+        nodeset_id: str,
+        domain_type: Optional[str] = None,
+        category: Optional[str] = None,
+        target_entities: Optional[List[dict]] = None,
+        hops: int = 0,
+        risk_or_avoidance_intent: bool = False,
+        domain_limit: int = 3,
+        edge_limit: int = 8,
+        expanded_entity_limit: int = 12,
+    ) -> List[dict]:
+        """
+        Targeted read for orchestrator personalization context.
+
+        Filters by domain type/category and optional entities, then returns
+        interest edges + target entities + hop-based expansion neighbors.
+        """
+        safe_hops = max(0, min(2, int(hops or 0)))
+        safe_domain_limit = max(1, min(10, int(domain_limit or 3)))
+        safe_edge_limit = max(1, min(20, int(edge_limit or 8)))
+        safe_expanded_limit = max(1, min(40, int(expanded_entity_limit or 12)))
+
+        normalized_domain_type = str(domain_type or "").strip().lower() or None
+        normalized_category = str(category or "").strip() or None
+        include_negative = bool(risk_or_avoidance_intent)
+
+        target_filters: List[dict] = []
+        for row in list(target_entities or []):
+            if not isinstance(row, dict):
+                continue
+            entity_name = str(row.get("entity_name") or row.get("name") or "").strip()
+            entity_type = str(row.get("entity_type") or "").strip()
+            if not entity_name or not entity_type:
+                continue
+            target_filters.append(
+                {
+                    "name_lower": entity_name.lower(),
+                    "entity_type": entity_type,
+                }
+            )
+
+        cypher = (
+            "MATCH (ns:NodeSet {id: $nodeset_id})"
+            "<-[:BELONGS_TO_NODESET]-(d:UserInterestDomain {user_email: $user_email}) "
+            "WHERE ($domain_type IS NULL OR d.domain_type = $domain_type) "
+            "  AND ($category IS NULL OR toLower(trim(d.category)) = toLower(trim($category))) "
+            "MATCH (d)-[:HAS_INTEREST_IN]->(rank_edge:UserInterestEdge) "
+            "WITH d, "
+            "     max(coalesce(rank_edge.last_changed_at, rank_edge.last_updated_at, rank_edge.created_at)) AS domain_last_changed, "
+            "     sum(CASE WHEN coalesce(rank_edge.current_stance, 'positive') = 'positive' "
+            "         THEN coalesce(rank_edge.cumulative_weight, 0.0) ELSE 0.0 END) AS domain_positive_weight "
+            "ORDER BY domain_positive_weight DESC, domain_last_changed DESC "
+            "LIMIT $domain_limit "
+            "MATCH (d)-[:HAS_INTEREST_IN]->(e:UserInterestEdge)-[:TARGETS]->(entity:Entity) "
+            "WHERE ($include_negative OR coalesce(e.current_stance, 'positive') = 'positive') "
+            "  AND (size($target_filters) = 0 "
+            "       OR any(tf IN $target_filters "
+            "              WHERE toLower(trim(entity.name)) = tf.name_lower "
+            "                AND entity.entity_type = tf.entity_type)) "
+            "WITH d, e, entity, "
+            "     coalesce(e.current_stance, 'positive') AS stance, "
+            "     coalesce(e.last_changed_at, e.last_updated_at, e.created_at) AS edge_last_changed "
+            "ORDER BY CASE WHEN stance = 'positive' THEN 0 ELSE 1 END, "
+            "         edge_last_changed DESC, "
+            "         coalesce(e.cumulative_weight, 0.0) DESC "
+            "WITH collect({d: d, e: e, entity: entity, stance: stance, edge_last_changed: edge_last_changed})[..$edge_limit] AS edge_rows, "
+            "     $hops AS hops, "
+            "     $expanded_entity_limit AS expanded_entity_limit "
+            "UNWIND edge_rows AS row "
+            "WITH row.d AS d, row.e AS e, row.entity AS entity, row.stance AS stance, row.edge_last_changed AS edge_last_changed, "
+            "     hops, expanded_entity_limit "
+            "CALL { "
+            "  WITH entity, hops, expanded_entity_limit "
+            "  WITH entity, hops, expanded_entity_limit WHERE hops > 0 "
+            "  MATCH path=(entity)-[*1..2]-(neighbor:Entity) "
+            "  WHERE length(path) <= hops "
+            "  RETURN collect(DISTINCT {id: neighbor.id, name: neighbor.name, entity_type: neighbor.entity_type})[..expanded_entity_limit] AS expanded_neighbors "
+            "  UNION "
+            "  WITH entity "
+            "  RETURN [] AS expanded_neighbors "
+            "} "
+            "RETURN d AS domain, e AS edge, entity AS entity, stance, edge_last_changed, expanded_neighbors"
+        )
+        return await self._execute_read(
+            cypher,
+            {
+                "nodeset_id": nodeset_id,
+                "user_email": user_email,
+                "domain_type": normalized_domain_type,
+                "category": normalized_category,
+                "target_filters": target_filters,
+                "include_negative": include_negative,
+                "domain_limit": safe_domain_limit,
+                "edge_limit": safe_edge_limit,
+                "hops": safe_hops,
+                "expanded_entity_limit": safe_expanded_limit,
+            },
+        )
+
     async def get_user_interest_data(
         self, user_email: str, nodeset_id: str
     ) -> List[dict]:

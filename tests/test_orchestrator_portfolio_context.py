@@ -6,13 +6,17 @@ from types import SimpleNamespace
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from core.agents.models.orchestrator_models import OrchestratorPlan, OrchestratorState
+from core.agents.models.orchestrator_models import (
+    OrchestratorPlan,
+    OrchestratorState,
+)
 from core.agents.orchestrator_agent import OrchestratorAgent
 from core.agents.ticker_validation import TickerInfo
 from core.agents.utility.orchestrator_helpers import (
     _get_user_portfolio_path,
     get_portfolio_for_user,
 )
+from core.memory.user_interest_models import UserInterestQuerySpec
 from core.services import service_manager
 
 
@@ -320,3 +324,129 @@ def test_plan_node_populates_enrichment_for_valid_equity(monkeypatch) -> None:
             {"ticker": "AAPL", "tickers": ["AAPL"]},
         )
     ]
+
+
+def test_build_graph_runs_preplanner_before_planner() -> None:
+    order: list[str] = []
+
+    async def _preplanner(_state):
+        order.append("preplanner")
+        return {"user_interest_graph_context_block": "(none)"}
+
+    async def _planner(_state):
+        order.append("planner")
+        return {"plan": OrchestratorPlan(query="x", final_answer="done")}
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._agents = {}
+    agent._prepare_user_interest_context_node = _preplanner  # type: ignore[method-assign]
+    agent._plan_node = _planner  # type: ignore[method-assign]
+    graph = agent._build_graph()
+
+    result = asyncio.run(
+        graph.ainvoke(
+            OrchestratorState(messages=[HumanMessage(content="hello")])
+        )
+    )
+
+    assert order == ["preplanner", "planner"]
+    assert result["summary"] == "done"
+
+
+def test_prepare_user_interest_context_delegates_to_user_context_service(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+
+    class FakeUserContextService:
+        async def build_targeted_orchestrator_context(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                query_spec=UserInterestQuerySpec(broad_fallback=True),
+                context_block="Domain Summary:\n1. investment:Technology",
+                debug_payload={"mode": "fallback_domains_only"},
+            )
+
+    monkeypatch.setattr(
+        service_manager, "get_user_context_service", lambda: FakeUserContextService()
+    )
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._llm = object()
+    agent._agents = {}
+
+    state = OrchestratorState(
+        user_email="demo@alphamesh.local",
+        messages=[HumanMessage(content="what are my interests these days?")],
+        user_context_block="USER CONTEXT: baseline",
+        portfolio_block='[{"ticker":"AAPL"}]',
+    )
+
+    payload = asyncio.run(agent._prepare_user_interest_context_node(state))
+
+    assert captured["user_email"] == "demo@alphamesh.local"
+    assert captured["latest_user_message"] == "what are my interests these days?"
+    assert captured["baseline_user_context_block"] == "USER CONTEXT: baseline"
+    assert captured["portfolio_block"] == '[{"ticker":"AAPL"}]'
+    assert captured["llm"] is agent._llm
+    assert payload["user_interest_graph_context_block"].startswith("Domain Summary")
+    assert payload["user_interest_query_debug"]["mode"] == "fallback_domains_only"
+
+
+def test_prepare_user_interest_context_service_error_returns_none_block(
+    monkeypatch,
+) -> None:
+    class FakeUserContextService:
+        async def build_targeted_orchestrator_context(self, **kwargs):
+            raise RuntimeError("service failed")
+
+    monkeypatch.setattr(
+        service_manager, "get_user_context_service", lambda: FakeUserContextService()
+    )
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._llm = object()
+    agent._agents = {}
+
+    state = OrchestratorState(
+        user_email="demo@alphamesh.local",
+        messages=[HumanMessage(content="check apple")],
+        user_context_block="USER CONTEXT: baseline",
+        portfolio_block="[]",
+    )
+    payload = asyncio.run(agent._prepare_user_interest_context_node(state))
+    assert payload["user_interest_graph_context_block"] == "(none)"
+    assert payload["user_interest_query_debug"]["mode"] == "error"
+
+
+def test_plan_node_receives_targeted_user_interest_context_message() -> None:
+    captured: dict = {}
+
+    class FakeStructuredLLM:
+        async def ainvoke(self, messages):
+            captured["messages"] = messages
+            return OrchestratorPlan(query="route this")
+
+    class FakeLLM:
+        def with_structured_output(self, _schema):
+            return FakeStructuredLLM()
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._llm = FakeLLM()
+    agent._agents = {}
+
+    state = OrchestratorState(
+        messages=[HumanMessage(content="How about my risk setup?")],
+        user_context_block="USER CONTEXT: baseline",
+        portfolio_block="[]",
+        user_interest_graph_context_block="Matched Domain:\n- investment:Technology",
+    )
+
+    _ = asyncio.run(agent._plan_node(state))
+
+    assert any(
+        isinstance(message, SystemMessage)
+        and "TARGETED USER-INTEREST GRAPH CONTEXT" in str(message.content)
+        and "investment:Technology" in str(message.content)
+        for message in captured["messages"]
+    )

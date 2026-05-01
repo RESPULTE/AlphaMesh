@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
 from core.agents.models.fundamental_agent_models import VisualizationPlan
+from core.memory.user_interest_models import UserInterestQuerySpec
 from core.memory.retrieval.models import CitedSource
 
 
@@ -161,6 +162,9 @@ class OrchestratorState(BaseModel):
     user_context_block: str = ""
     # Portfolio snapshot loaded once in run() from per-user JSON holdings.
     portfolio_block: str = "[]"
+    user_interest_query_spec: Optional[UserInterestQuerySpec] = None
+    user_interest_graph_context_block: str = "(none)"
+    user_interest_query_debug: Dict[str, Any] = Field(default_factory=dict)
 
     # Keyed by ticker symbol; values are formatted context blocks from yfinance.
     # Populated during planner-time ticker enrichment and read by _execute_node.

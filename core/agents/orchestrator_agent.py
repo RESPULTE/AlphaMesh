@@ -117,11 +117,15 @@ class OrchestratorAgent:
 
     def _build_graph(self):
         workflow = StateGraph(OrchestratorState, output_schema=FinalResponse)
+        workflow.add_node(
+            "prepare_user_interest_context", self._prepare_user_interest_context_node
+        )
         workflow.add_node("planner", self._plan_node)
         workflow.add_node("direct_answer", self._direct_answer_node)
         workflow.add_node("execute_agents", self._execute_node)
         workflow.add_node("synthesiser", self._synthesize_node)
-        workflow.add_edge(START, "planner")
+        workflow.add_edge(START, "prepare_user_interest_context")
+        workflow.add_edge("prepare_user_interest_context", "planner")
         workflow.add_conditional_edges(
             "planner",
             self._router,
@@ -248,6 +252,33 @@ class OrchestratorAgent:
         context_block = "\n\nAgent Findings:\n" + "\n\n".join(context_parts)
         return rendered + context_block
 
+    async def _prepare_user_interest_context_node(
+        self, state: OrchestratorState
+    ) -> Dict[str, Any]:
+        latest_human = _extract_last_human_message(state.messages).strip()
+        try:
+            user_context_service = service_manager.get_user_context_service()
+            result = await user_context_service.build_targeted_orchestrator_context(
+                user_email=state.user_email,
+                latest_user_message=latest_human,
+                baseline_user_context_block=state.user_context_block,
+                portfolio_block=state.portfolio_block,
+                llm=self._llm,
+            )
+            return {
+                "user_interest_query_spec": result.query_spec,
+                "user_interest_graph_context_block": result.context_block,
+                "user_interest_query_debug": result.debug_payload,
+            }
+        except Exception:
+            logger.exception(
+                "_prepare_user_interest_context_node: failed while delegating to UserContextService"
+            )
+            return {
+                "user_interest_graph_context_block": "(none)",
+                "user_interest_query_debug": {"mode": "error"},
+            }
+
     async def _plan_node(self, state: OrchestratorState) -> Dict[str, Any]:
         available_agents_desc = "\n".join(
             f"  {agent.name()}: {agent.description()}" for agent in AVAILABLE_AGENTS
@@ -269,6 +300,7 @@ class OrchestratorAgent:
             self._build_runtime_agent_memory_contexts(state.history_turns)
         )
         planner_conversation_memory_block = state.conversation_memory_block or "(none)"
+        user_interest_context_block = state.user_interest_graph_context_block or "(none)"
 
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
@@ -293,6 +325,12 @@ class OrchestratorAgent:
                         "Retrieved private conversation memory chunks "
                         "(use when relevant for continuity; do not treat as external facts):\n"
                         f"{planner_conversation_memory_block}"
+                    )
+                ),
+                SystemMessage(
+                    content=(
+                        "TARGETED USER-INTEREST GRAPH CONTEXT:\n"
+                        f"{user_interest_context_block}"
                     )
                 ),
                 HumanMessage(content=latest_human),
