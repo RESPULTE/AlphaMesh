@@ -2,14 +2,13 @@ import React, { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 import { Search, Sparkles, MessageSquare, ChevronRight } from 'lucide-react';
 import type { ConversationSummary } from '../types/api';
+import { useAuth } from '../auth/AuthContext';
 
 interface ChatProps {
   onAnalyze: (query: string) => void;
   /** Called when user wants to open an existing conversation by ID */
   onOpenConversation?: (conversationId: string) => void;
 }
-
-const DEV_USER_EMAIL = 'demo@alphamesh.local';
 
 function timeSince(isoString: string): string {
   if (!isoString) return '';
@@ -28,6 +27,7 @@ function timeSince(isoString: string): string {
 }
 
 export default function Chat({ onAnalyze, onOpenConversation }: ChatProps) {
+  const { authFetch } = useAuth();
   const [inputValue, setInputValue] = useState('');
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
@@ -37,9 +37,7 @@ export default function Chat({ onAnalyze, onOpenConversation }: ChatProps) {
     const fetchConversations = async () => {
       setIsLoadingConversations(true);
       try {
-        const res = await fetch(
-          `/api/v1/conversations?limit=10&user_email=${encodeURIComponent(DEV_USER_EMAIL)}`
-        );
+        const res = await authFetch('/api/v1/conversations?limit=10');
         if (!res.ok || cancelled) return;
         const rows = (await res.json()) as ConversationSummary[];
         if (!cancelled) setConversations(Array.isArray(rows) ? rows : []);
@@ -51,7 +49,7 @@ export default function Chat({ onAnalyze, onOpenConversation }: ChatProps) {
     };
     fetchConversations();
     return () => { cancelled = true; };
-  }, []);
+  }, [authFetch]);
 
   const handleSearch = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && e.currentTarget.value.trim()) {

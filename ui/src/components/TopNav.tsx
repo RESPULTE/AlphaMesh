@@ -1,13 +1,15 @@
-import { Bell, User, Search, Menu } from 'lucide-react';
+import { Bell, LogOut, User } from 'lucide-react';
 import { motion } from 'motion/react';
 import clsx from 'clsx';
 
 interface TopNavProps {
   currentTab: string;
   setTab: (tab: string) => void;
+  userEmail: string;
+  onLogout: () => void;
 }
 
-export default function TopNav({ currentTab, setTab }: TopNavProps) {
+export default function TopNav({ currentTab, setTab, userEmail, onLogout }: TopNavProps) {
   const tabs = ['Chat', 'Portfolio', 'History'];
 
   return (
@@ -46,15 +48,19 @@ export default function TopNav({ currentTab, setTab }: TopNavProps) {
         </div>
 
         <div className="flex items-center gap-1 md:gap-3 ml-auto">
-          <button className="hidden sm:flex bg-primary text-on-primary px-5 py-2 rounded-full font-bold text-sm shadow-md hover:shadow-lg transition-all active:scale-95">
-            Trade Now
-          </button>
-          <div className="h-6 w-px bg-outline-variant/30 mx-2 hidden sm:block"></div>
           <button className="p-2 hover:bg-surface-container-low rounded-lg transition-all text-on-surface-variant">
             <Bell className="w-5 h-5 md:w-5 md:h-5" />
           </button>
-          <button className="p-2 hover:bg-surface-container-low rounded-lg transition-all text-on-surface-variant">
-            <User className="w-5 h-5 md:w-5 md:h-5" />
+          <div className="hidden md:flex items-center gap-2 rounded-full border border-outline-variant/30 bg-surface-container-low px-3 py-1.5 text-xs">
+            <User className="h-3.5 w-3.5 text-on-surface-variant" />
+            <span className="max-w-[180px] truncate text-on-surface-variant">{userEmail}</span>
+          </div>
+          <button
+            onClick={onLogout}
+            className="inline-flex items-center gap-1 rounded-full bg-surface-container-low px-3 py-2 text-xs font-semibold text-on-surface-variant transition-all hover:bg-surface-container-high hover:text-on-surface"
+          >
+            <LogOut className="h-4 w-4" />
+            <span className="hidden sm:inline">Sign Out</span>
           </button>
         </div>
       </nav>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ArrowLeft } from 'lucide-react';
+import { useAuth } from '../auth/AuthContext';
 import { useAnalysisStream } from '../hooks/useAnalysisStream';
 import type { AnalysisResponse, ConversationTurn, ConversationTurnsResponse } from '../types/api';
 import DashboardTurnPanel from './DashboardTurnPanel';
@@ -14,7 +15,6 @@ interface AnalysisDashboardProps {
   onStreamingChange?: (isStreaming: boolean) => void;
 }
 
-const DEV_USER_EMAIL = 'demo@alphamesh.local';
 const HISTORY_PAGE_SIZE = 8;
 const LIVE_PANEL_OFFSET_TOP = 96;
 const FAR_SCROLL_DISTANCE = 900;
@@ -79,6 +79,7 @@ export default function AnalysisDashboard({
   onBack,
   onStreamingChange,
 }: AnalysisDashboardProps) {
+  const { authFetch } = useAuth();
   const {
     data,
     isStreaming,
@@ -112,14 +113,13 @@ export default function AnalysisDashboard({
       setIsLoadingHistory(true);
       try {
         const params = new URLSearchParams({
-          user_email: DEV_USER_EMAIL,
           limit: String(HISTORY_PAGE_SIZE),
         });
         if (!reset && opts?.beforeTurnId) {
           params.set('before_turn_id', opts.beforeTurnId);
         }
 
-        const res = await fetch(
+        const res = await authFetch(
           `/api/v1/conversations/${encodeURIComponent(conversationId)}/turns?${params.toString()}`
         );
         if (!res.ok) return;
@@ -140,7 +140,7 @@ export default function AnalysisDashboard({
         setIsLoadingHistory(false);
       }
     },
-    [conversationId, isLoadingHistory]
+    [authFetch, conversationId, isLoadingHistory]
   );
 
   useEffect(() => {

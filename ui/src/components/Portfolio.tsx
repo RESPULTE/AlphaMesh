@@ -2,6 +2,7 @@
 import { AnimatePresence, motion } from 'motion/react';
 import { Filter, Loader2, Plus, Search, TrendingDown, TrendingUp, X } from 'lucide-react';
 import clsx from 'clsx';
+import { useAuth } from '../auth/AuthContext';
 import type {
   MarketQuote,
   PortfolioHolding,
@@ -10,8 +11,6 @@ import type {
   TickerSearchResult,
   UpsertPortfolioHoldingRequest,
 } from '../types/api';
-
-const DEFAULT_USER_EMAIL = 'demo@alphamesh.local';
 
 function formatCurrency(value: number): string {
   return new Intl.NumberFormat('en-US', {
@@ -42,6 +41,7 @@ interface PortfolioRow {
 }
 
 export default function Portfolio() {
+  const { authFetch } = useAuth();
   const [holdings, setHoldings] = useState<PortfolioHolding[]>([]);
   const [quotesByTicker, setQuotesByTicker] = useState<Record<string, MarketQuote>>({});
   const [isLoading, setIsLoading] = useState(true);
@@ -62,7 +62,7 @@ export default function Portfolio() {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch(`/api/v1/portfolio?user_email=${encodeURIComponent(DEFAULT_USER_EMAIL)}`);
+      const response = await authFetch('/api/v1/portfolio');
       if (!response.ok) {
         throw new Error('Unable to load your portfolio holdings.');
       }
@@ -74,7 +74,7 @@ export default function Portfolio() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [authFetch]);
 
   useEffect(() => {
     void loadPortfolio();
@@ -94,7 +94,7 @@ export default function Portfolio() {
       const quoteEntries = await Promise.all(
         holdings.map(async (holding) => {
           try {
-            const response = await fetch(`/api/market/${encodeURIComponent(holding.ticker)}/quote`);
+            const response = await authFetch(`/api/market/${encodeURIComponent(holding.ticker)}/quote`);
             if (!response.ok) {
               return [holding.ticker, null] as const;
             }
@@ -124,7 +124,7 @@ export default function Portfolio() {
     return () => {
       cancelled = true;
     };
-  }, [holdings]);
+  }, [authFetch, holdings]);
 
   useEffect(() => {
     if (!isAddModalOpen) {
@@ -144,9 +144,9 @@ export default function Portfolio() {
       setIsSearching(true);
       setSearchError(null);
       try {
-        const response = await fetch(
+        const response = await authFetch(
           `/api/v1/tickers/search?q=${encodeURIComponent(trimmed)}&limit=8`,
-          { signal: controller.signal },
+          { signal: controller.signal }
         );
         if (!response.ok) {
           throw new Error('Ticker search failed.');
@@ -170,7 +170,7 @@ export default function Portfolio() {
       controller.abort();
       window.clearTimeout(timeoutId);
     };
-  }, [isAddModalOpen, searchQuery]);
+  }, [authFetch, isAddModalOpen, searchQuery]);
 
   const rows = useMemo<PortfolioRow[]>(() => {
     return holdings.map((holding) => {
@@ -239,7 +239,6 @@ export default function Portfolio() {
     setSaveError(null);
 
     const payload: UpsertPortfolioHoldingRequest = {
-      user_email: DEFAULT_USER_EMAIL,
       ticker: selectedTicker.ticker,
       company_name: selectedTicker.company_name,
       exchange: selectedTicker.exchange ?? null,
@@ -248,7 +247,7 @@ export default function Portfolio() {
     };
 
     try {
-      const response = await fetch('/api/v1/portfolio/holding', {
+      const response = await authFetch('/api/v1/portfolio/holding', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

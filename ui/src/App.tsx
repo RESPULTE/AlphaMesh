@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { AnimatePresence } from 'motion/react';
+import { useAuth } from './auth/AuthContext';
+import AuthGate from './components/AuthGate';
 import TopNav from './components/TopNav';
 import BottomNav from './components/BottomNav';
 import Chat from './components/Chat';
@@ -8,6 +10,7 @@ import History from './components/History';
 import ChatInput from './components/ChatInput';
 
 export default function App() {
+  const { isAuthenticated, userEmail, logout } = useAuth();
   const [currentTab, setCurrentTab] = useState('Chat');
   const [analysisQuery, setAnalysisQuery] = useState<string | null>(null);
   const [analysisQueryVersion, setAnalysisQueryVersion] = useState(0);
@@ -57,9 +60,18 @@ export default function App() {
     setCurrentTab(tab);
   };
 
+  if (!isAuthenticated) {
+    return <AuthGate />;
+  }
+
   return (
     <div className="min-h-screen bg-surface text-on-surface font-body selection:bg-primary-container/30 flex flex-col pb-20 md:pb-0">
-      <TopNav currentTab={currentTab} setTab={handleSetTab} />
+      <TopNav
+        currentTab={currentTab}
+        setTab={handleSetTab}
+        userEmail={userEmail || ''}
+        onLogout={() => void logout()}
+      />
 
       <div className="flex-grow flex flex-col relative">
         <AnimatePresence mode="wait">

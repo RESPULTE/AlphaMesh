@@ -65,12 +65,25 @@ export interface PortfolioResponse {
 }
 
 export interface UpsertPortfolioHoldingRequest {
-  user_email: string;
+  user_email?: string | null;
   ticker: string;
   company_name: string;
   exchange?: string | null;
   asset_type: PortfolioAssetType;
   shares: number;
+}
+
+export interface AuthRequest {
+  email: string;
+}
+
+export interface AuthResponse {
+  access_token: string;
+  refresh_token: string;
+  token_type: 'bearer';
+  expires_in: number;
+  user_email: string;
+  session_id: string;
 }
 
 export interface TickerSearchResult {

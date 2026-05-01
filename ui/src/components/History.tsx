@@ -2,6 +2,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { MessageSquare } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import type { ConversationSummary, ConversationTurn, ConversationTurnsResponse } from '../types/api';
+import { useAuth } from '../auth/AuthContext';
 import AnalysisDashboard from './AnalysisDashboard';
 import FullConversationView from './FullConversationView';
 
@@ -16,7 +17,6 @@ interface HistoryProps {
   onStreamingChange?: (isStreaming: boolean) => void;
 }
 
-const DEV_USER_EMAIL = 'demo@alphamesh.local';
 const STORAGE_CONVERSATION_ID = 'alphamesh.active_conversation_id';
 const TURN_PAGE_SIZE = 8;
 
@@ -41,6 +41,7 @@ export default function History({
   onContinueConversation,
   onStreamingChange,
 }: HistoryProps) {
+  const { authFetch } = useAuth();
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [loadingTurnsFor, setLoadingTurnsFor] = useState<string | null>(null);
@@ -62,9 +63,7 @@ export default function History({
     const load = async () => {
       setIsLoadingConversations(true);
       try {
-        const res = await fetch(
-          `/api/v1/conversations?limit=50&user_email=${encodeURIComponent(DEV_USER_EMAIL)}`
-        );
+        const res = await authFetch('/api/v1/conversations?limit=50');
         if (!res.ok || cancelled) return;
         const rows = (await res.json()) as ConversationSummary[];
         if (!cancelled) setConversations(Array.isArray(rows) ? rows : []);
@@ -77,7 +76,7 @@ export default function History({
     return () => {
       cancelled = true;
     };
-  }, [query, dashboardConversationId]);
+  }, [authFetch, query, dashboardConversationId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -104,13 +103,12 @@ export default function History({
     }
     try {
       const params = new URLSearchParams({
-        user_email: DEV_USER_EMAIL,
         limit: String(TURN_PAGE_SIZE),
       });
       if (!reset && opts?.beforeTurnId) {
         params.set('before_turn_id', opts.beforeTurnId);
       }
-      const res = await fetch(
+      const res = await authFetch(
         `/api/v1/conversations/${encodeURIComponent(conversationId)}/turns?${params.toString()}`
       );
       if (!res.ok) return;
