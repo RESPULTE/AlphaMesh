@@ -212,15 +212,15 @@ class ServiceManager:
     # -- Ingestor --------------------------------------------------------------
 
     def get_ingestor(self):
-        from core.memory.ingestion.chunker import ArticleChunker
-        from core.memory.ingestion.ingestor import DualStoreIngestor
+        from core.memory.graph.queue.chunker import ArticleChunker
+        from core.memory.graph.queue.ingestor import ArticleIngestor
 
         if self._dual_store_ingestor is None:
             try:
                 chunker = ArticleChunker(
                     chunk_size=settings.CHUNK_SIZE, chunk_overlap=settings.CHUNK_OVERLAP
                 )
-                self._dual_store_ingestor = DualStoreIngestor(
+                self._dual_store_ingestor = ArticleIngestor(
                     neo4j_adapter=self.get_neo4j_adapter(),
                     chroma_adapter=self.get_chroma_adapter(),
                     nodeset_manager=self.get_nodeset_manager(),

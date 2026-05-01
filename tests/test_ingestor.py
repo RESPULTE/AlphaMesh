@@ -6,8 +6,8 @@ import pytest
 from langchain_core.documents import Document
 
 from core.memory.graph.models import DocumentMetadata
+from core.memory.graph.queue.ingestor import ArticleIngestor
 from core.memory.retrieval.models import RetrievedChunk
-from core.memory.ingestion.ingestor import DualStoreIngestor
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def mock_adapters():
 
 def test_ingest_articles_skips_existing(mock_adapters):
     neo4j, chroma, nodeset_manager, chunker = mock_adapters
-    ingestor = DualStoreIngestor(neo4j, chroma, nodeset_manager, chunker)
+    ingestor = ArticleIngestor(neo4j, chroma, nodeset_manager, chunker)
 
     chroma.get_chunks_with_source_url.return_value = [
         Document(page_content="text", metadata={}, id="c1")
@@ -52,7 +52,7 @@ def test_ingest_articles_skips_existing(mock_adapters):
 
 def test_ingest_articles_processes_new(mock_adapters):
     neo4j, chroma, nodeset_manager, chunker = mock_adapters
-    ingestor = DualStoreIngestor(neo4j, chroma, nodeset_manager, chunker)
+    ingestor = ArticleIngestor(neo4j, chroma, nodeset_manager, chunker)
 
     doc_meta = DocumentMetadata(
         document_id="d1",
@@ -90,5 +90,3 @@ def test_ingest_articles_processes_new(mock_adapters):
     neo4j.merge_chunk_node.assert_called_once()
     chroma.upsert_chunks.assert_called_once()
     nodeset_manager.get_global_financial_events_id.assert_called()
-
-

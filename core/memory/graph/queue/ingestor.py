@@ -1,9 +1,9 @@
 """
-core/memory/ingestion/ingestor.py
+core/memory/graph/queue/ingestor.py
 
 Dual-store ingestion pipeline for news articles.
 
-DualStoreIngestor's single responsibility: ingest articles into Neo4j + ChromaDB.
+ArticleIngestor's single responsibility: ingest articles into Neo4j + ChromaDB.
 """
 
 from __future__ import annotations
@@ -15,15 +15,16 @@ from typing import List, Optional, Tuple
 from core.logger import get_logger
 from core.memory.graph.models import DocumentMetadata, DocumentNode
 from core.memory.graph.nodeset_manager import NodeSetManager
-from core.memory.ingestion.chunker import ArticleChunker
 from core.memory.retrieval.models import RetrievedChunk
 from core.memory.stores.chroma_adapter import ChromaDBAdapter
 from core.memory.stores.neo4j_adapter import Neo4jAdapter
 
+from .chunker import ArticleChunker
+
 logger = get_logger(__name__)
 
 
-class DualStoreIngestor:
+class ArticleIngestor:
     """Orchestrates article ingestion into Neo4j and ChromaDB."""
 
     def __init__(

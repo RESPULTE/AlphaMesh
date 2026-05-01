@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from core.memory.ingestion.chunker import ArticleChunker
+from core.memory.graph.queue.chunker import ArticleChunker
 
 
 def test_article_chunker_parses_published_at_correctly():

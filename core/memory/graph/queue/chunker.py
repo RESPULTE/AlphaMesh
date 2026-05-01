@@ -9,7 +9,6 @@ from uuid import uuid4
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from core import logger
 from core.logger import get_logger
 from core.memory.graph.models import DocumentMetadata
 from core.memory.retrieval.models import RetrievedChunk
