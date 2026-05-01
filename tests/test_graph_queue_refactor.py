@@ -138,21 +138,31 @@ class FakeWriter:
 
 
 class FakeRelationshipExtractor:
+    def __init__(self) -> None:
+        self.calls: List[dict] = []
+
     async def extract(
         self,
         *,
-        text: str,
-        llm,
-        system_prompt: str,
+        mode: str = "relationships",
+        text: Optional[str] = None,
+        chunk_ids: Optional[List[str]] = None,
+        llm=None,
+        system_prompt: Optional[str] = None,
+        force: bool = False,
     ) -> List[dict]:
-        _ = (text, llm, system_prompt)
+        self.calls.append(
+            {
+                "mode": mode,
+                "text": text,
+                "chunk_ids": list(chunk_ids or []),
+                "llm": llm,
+                "system_prompt": system_prompt,
+                "force": force,
+            }
+        )
+        _ = (mode, text, chunk_ids, llm, system_prompt, force)
         return []
-
-
-    async def extract_entities_for_chunks(
-        self, chunk_ids: List[str], force: bool = False
-    ) -> None:
-        _ = (chunk_ids, force)
 
 
 def fake_llm_provider(_config: Optional[dict]):
@@ -465,11 +475,16 @@ def test_pipeline_drops_out_of_scope_extracted_relationships(tmp_path: Path) -> 
         async def extract(
             self,
             *,
-            text: str,
-            llm,
-            system_prompt: str,
+            mode: str = "relationships",
+            text: Optional[str] = None,
+            chunk_ids: Optional[List[str]] = None,
+            llm=None,
+            system_prompt: Optional[str] = None,
+            force: bool = False,
         ) -> List[dict]:
-            _ = (text, llm, system_prompt)
+            _ = (mode, text, chunk_ids, llm, system_prompt, force)
+            if mode != "relationships":
+                return []
             return [
                 {
                     "from_name": "Apple",
@@ -536,6 +551,96 @@ def test_pipeline_drops_out_of_scope_extracted_relationships(tmp_path: Path) -> 
         assert written_relationships[0]["from_type"] in ALLOWED_ENTITY_TYPES
         assert written_relationships[0]["to_type"] in ALLOWED_ENTITY_TYPES
         assert written_relationships[0]["relation"] in ALLOWED_RELATIONSHIP_TYPES
+
+    asyncio.run(_run())
+
+
+def test_pipeline_groups_chunk_extraction_by_prompt_id(tmp_path: Path) -> None:
+    class RecordingExtractor:
+        def __init__(self) -> None:
+            self.chunk_calls: List[dict] = []
+
+        async def extract(
+            self,
+            *,
+            mode: str = "relationships",
+            text: Optional[str] = None,
+            chunk_ids: Optional[List[str]] = None,
+            llm=None,
+            system_prompt: Optional[str] = None,
+            force: bool = False,
+        ) -> List[dict]:
+            _ = (text, force)
+            if mode == "chunk_entities":
+                self.chunk_calls.append(
+                    {
+                        "chunk_ids": list(chunk_ids or []),
+                        "system_prompt": system_prompt,
+                        "llm": llm,
+                    }
+                )
+            return []
+
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+    extractor = RecordingExtractor()
+
+    async def _run() -> None:
+        await store.initialize()
+        prompt_registry = PromptRegistry(store)
+        pipeline = GraphWritePipeline(
+            entity_resolver=resolver,
+            graph_writer=writer,
+            relationship_extractor=extractor,
+            llm_provider=fake_llm_provider,
+            prompt_registry=prompt_registry,
+        )
+
+        prompt_a = "prompt A"
+        prompt_b = "prompt B"
+        prompt_a_id = await prompt_registry.register(prompt_a)
+        prompt_b_id = await prompt_registry.register(prompt_b)
+
+        tasks = [
+            make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                chunk_ids=["c1", "c2", "c1"],
+                system_prompt=prompt_a,
+            ),
+            make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                chunk_ids=["c3"],
+                system_prompt=prompt_b,
+            ),
+            make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                chunk_ids=["c4"],
+                system_prompt=None,
+            ),
+        ]
+        tasks[0].system_prompt_id = prompt_a_id
+        tasks[1].system_prompt_id = prompt_b_id
+
+        await pipeline.process_tasks(tasks)
+
+        assert len(extractor.chunk_calls) == 3
+        prompt_to_chunks = {
+            call["system_prompt"]: sorted(call["chunk_ids"])
+            for call in extractor.chunk_calls
+        }
+        assert prompt_to_chunks[prompt_a] == ["c1", "c2"]
+        assert prompt_to_chunks[prompt_b] == ["c3"]
+        assert prompt_to_chunks[None] == ["c4"]
 
     asyncio.run(_run())
 

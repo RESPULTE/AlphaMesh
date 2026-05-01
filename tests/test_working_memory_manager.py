@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import pandas as pd
 from core.agents.working_memory.base import (
     ConversationWorkingMemoryBase,
     ConversationWorkingMemoryManagerBase,
@@ -355,3 +356,57 @@ def test_fundamental_manager_build_context_from_history_summaries_is_stable() ->
     assert "tools=profitability_ratios" in block
     assert "tools=cagr" in block
     assert "conclusion=Trend is positive." in block
+
+
+def test_fundamental_manager_financial_cache_normalizes_ticker_key() -> None:
+    manager = FundamentalWorkingMemoryManager(max_turns=10)
+    df = pd.DataFrame(
+        [[100.0, 110.0]],
+        index=["Revenues"],
+        columns=["2023-12-31", "2024-12-31"],
+    )
+    manager.upsert_cached_financial_data(
+        conversation_id="conv-cache",
+        ticker="aapl",
+        granularity="yearly",
+        financial_data=df,
+    )
+
+    cached = manager.resolve_cached_financial_data(
+        conversation_id="conv-cache",
+        ticker="AAPL",
+        granularity="yearly",
+    )
+    assert cached is not None
+    assert list(cached.index) == ["Revenues"]
+
+
+def test_fundamental_manager_financial_cache_returns_copy() -> None:
+    manager = FundamentalWorkingMemoryManager(max_turns=10)
+    df = pd.DataFrame(
+        [[100.0, 110.0]],
+        index=["Revenues"],
+        columns=["2023-12-31", "2024-12-31"],
+    )
+    manager.upsert_cached_financial_data(
+        conversation_id="conv-copy",
+        ticker="AAPL",
+        granularity="yearly",
+        financial_data=df,
+    )
+
+    first = manager.resolve_cached_financial_data(
+        conversation_id="conv-copy",
+        ticker="AAPL",
+        granularity="yearly",
+    )
+    assert first is not None
+    first.loc["Revenues", "2023-12-31"] = 999.0
+
+    second = manager.resolve_cached_financial_data(
+        conversation_id="conv-copy",
+        ticker="AAPL",
+        granularity="yearly",
+    )
+    assert second is not None
+    assert second.loc["Revenues", "2023-12-31"] == 100.0

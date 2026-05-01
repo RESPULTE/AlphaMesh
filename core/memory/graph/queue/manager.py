@@ -247,7 +247,7 @@ class GraphQueueManager:
                 task
             )
 
-        if task.system_prompt is not None and not is_chunk_entities:
+        if task.system_prompt is not None:
             task.system_prompt_id = await self._prompt_registry.register(
                 task.system_prompt
             )

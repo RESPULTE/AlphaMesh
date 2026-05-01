@@ -47,6 +47,21 @@ class _FakeChunkLLM:
         return RunnableLambda(lambda _payload: self._result)
 
 
+class _PromptAwareChunkLLM:
+    def __init__(self, result: BatchEntityExtractionResult) -> None:
+        self._result = result
+        self.system_prompts: list[str] = []
+
+    def with_structured_output(self, _schema: object) -> RunnableLambda:
+        def _run(payload: object) -> BatchEntityExtractionResult:
+            messages = payload.to_messages() if hasattr(payload, "to_messages") else []
+            if messages:
+                self.system_prompts.append(str(messages[0].content))
+            return self._result
+
+        return RunnableLambda(_run)
+
+
 def test_extract_skips_blank_text_without_llm_call() -> None:
     extractor = RelationshipExtractor(retry_attempts=3)
     llm = _FakeLLM(
@@ -54,7 +69,12 @@ def test_extract_skips_blank_text_without_llm_call() -> None:
     )
 
     result = asyncio.run(
-        extractor.extract(text="   ", llm=llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="   ",
+            llm=llm,
+            system_prompt="system",
+        )
     )
 
     assert result == []
@@ -70,7 +90,12 @@ def test_extract_parses_relationship_array() -> None:
     )
 
     result = asyncio.run(
-        extractor.extract(text="input", llm=llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=llm,
+            system_prompt="system",
+        )
     )
 
     assert result == [
@@ -90,10 +115,20 @@ def test_extract_returns_empty_for_missing_or_invalid_blocks() -> None:
     invalid_json_llm = _FakeLLM(["<relationships>{not-json}</relationships>"])
 
     missing = asyncio.run(
-        extractor.extract(text="input", llm=missing_block_llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=missing_block_llm,
+            system_prompt="system",
+        )
     )
     invalid = asyncio.run(
-        extractor.extract(text="input", llm=invalid_json_llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=invalid_json_llm,
+            system_prompt="system",
+        )
     )
 
     assert missing == []
@@ -118,7 +153,12 @@ def test_extract_retries_until_success(monkeypatch) -> None:
     )
 
     result = asyncio.run(
-        extractor.extract(text="input", llm=llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=llm,
+            system_prompt="system",
+        )
     )
 
     assert result == [{"id": "ok"}]
@@ -135,7 +175,12 @@ def test_extract_with_retry_budget_one_does_not_retry() -> None:
     )
 
     result = asyncio.run(
-        extractor.extract(text="input", llm=llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=llm,
+            system_prompt="system",
+        )
     )
 
     assert result == []
@@ -154,7 +199,12 @@ def test_extract_parses_from_response_text_when_content_unusable() -> None:
     )
 
     result = asyncio.run(
-        extractor.extract(text="input", llm=llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=llm,
+            system_prompt="system",
+        )
     )
 
     assert result == [{"id": "from-text"}]
@@ -173,7 +223,12 @@ def test_extract_uses_content_when_valid_even_if_text_exists() -> None:
     )
 
     result = asyncio.run(
-        extractor.extract(text="input", llm=llm, system_prompt="system")
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=llm,
+            system_prompt="system",
+        )
     )
 
     assert result == [{"id": "from-content"}]
@@ -221,7 +276,13 @@ def test_chunk_entity_extraction_filters_pending_and_updates_status() -> None:
         retry_attempts=1,
     )
 
-    entities = asyncio.run(extractor.extract_entities_for_chunks(["c1", "c2"]))
+    entities = asyncio.run(
+        extractor.extract(
+            mode="chunk_entities",
+            chunk_ids=["c1", "c2"],
+            llm=llm,
+        )
+    )
 
     assert len(entities) == 1
     assert entities[0].id == "entity-1"
@@ -269,7 +330,14 @@ def test_chunk_entity_extraction_force_ignores_status_filter() -> None:
         retry_attempts=1,
     )
 
-    entities = asyncio.run(extractor.extract_entities_for_chunks(["c2"], force=True))
+    entities = asyncio.run(
+        extractor.extract(
+            mode="chunk_entities",
+            chunk_ids=["c2"],
+            llm=llm,
+            force=True,
+        )
+    )
 
     assert len(entities) == 1
     neo4j.get_chunk_extraction_status.assert_not_called()
@@ -292,3 +360,55 @@ def test_upsert_with_retry_marks_chunk_pending_on_failure() -> None:
 
     assert ok is False
     extractor._mark_chunk_pending.assert_awaited_once_with("c-fail")
+
+
+def test_chunk_entity_extraction_uses_runtime_system_prompt_override() -> None:
+    neo4j = AsyncMock()
+    neo4j.get_chunk_extraction_status.return_value = {"c3": "PENDING"}
+    chroma = AsyncMock()
+    chroma.get_documents_by_ids.side_effect = [
+        [Document(id="c3", page_content="chunk text", metadata={"chunk_id": "c3"})],
+        [Document(id="c3", page_content="chunk text", metadata={"chunk_id": "c3"})],
+    ]
+    nodeset_manager = AsyncMock()
+    nodeset_manager.get_global_financial_events_id.return_value = "nodeset-1"
+    entity_resolver = AsyncMock()
+    entity_resolver.resolve_entity.return_value = SimpleNamespace(entity_id="entity-3")
+    llm = _PromptAwareChunkLLM(
+        BatchEntityExtractionResult(
+            results=[
+                ChunkEntityExtractionResult(
+                    chunk_id="c3",
+                    entities=[
+                        EntityNode(
+                            id="",
+                            name="Intel",
+                            entity_type="Company",
+                            description="Intel description",
+                        )
+                    ],
+                )
+            ]
+        )
+    )
+    extractor = RelationshipExtractor(
+        neo4j_adapter=neo4j,
+        chroma_adapter=chroma,
+        nodeset_manager=nodeset_manager,
+        entity_resolver=entity_resolver,
+        retry_attempts=1,
+    )
+
+    custom_prompt = "CUSTOM CHUNK PROMPT"
+    entities = asyncio.run(
+        extractor.extract(
+            mode="chunk_entities",
+            chunk_ids=["c3"],
+            llm=llm,
+            system_prompt=custom_prompt,
+        )
+    )
+
+    assert len(entities) == 1
+    assert llm.system_prompts
+    assert llm.system_prompts[0] == custom_prompt

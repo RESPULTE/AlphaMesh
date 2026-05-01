@@ -54,10 +54,10 @@ _EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT = f"""\
 """.strip()
 
 
-def _build_chunk_extraction_prompt() -> ChatPromptTemplate:
+def _build_chunk_extraction_prompt(system_prompt: str) -> ChatPromptTemplate:
     return ChatPromptTemplate.from_messages(
         [
-            ("system", _EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT),
+            ("system", system_prompt),
             ("user", _CHUNK_EXTRACTION_USER_TEMPLATE),
         ]
     )
@@ -90,17 +90,53 @@ class RelationshipExtractor:
     async def extract(
         self,
         *,
+        mode: str = "relationships",
+        text: Optional[str] = None,
+        chunk_ids: Optional[List[str]] = None,
+        llm: Optional[object] = None,
+        system_prompt: Optional[str] = None,
+        force: bool = False,
+    ) -> List[dict] | List[EntityNode]:
+        if mode == "relationships":
+            return await self._extract_relationships(
+                text=text or "",
+                llm=llm,
+                system_prompt=system_prompt or "",
+            )
+
+        if mode == "chunk_entities":
+            return await self._extract_chunk_entities(
+                chunk_ids=list(chunk_ids or []),
+                llm=llm,
+                system_prompt=system_prompt,
+                force=force,
+            )
+
+        logger.warning("RelationshipExtractor.extract: unknown mode '%s'", mode)
+        return []
+
+    async def _extract_relationships(
+        self,
+        *,
         text: str,
-        llm: object,
+        llm: Optional[object],
         system_prompt: str,
     ) -> List[dict]:
         """Extract relationships from text; returns [] on any failure."""
         if not text or not text.strip():
             return []
+        if llm is None:
+            logger.warning("RelationshipExtractor.extract: missing llm for relationships")
+            return []
+        if not system_prompt.strip():
+            logger.warning(
+                "RelationshipExtractor.extract: missing system_prompt for relationships"
+            )
+            return []
 
         try:
             if self._retry_attempts <= 1:
-                return await self._extract_once(
+                return await self._extract_relationships_once(
                     text=text,
                     llm=llm,
                     system_prompt=system_prompt,
@@ -112,7 +148,7 @@ class RelationshipExtractor:
                 reraise=False,
             ):
                 with attempt:
-                    return await self._extract_once(
+                    return await self._extract_relationships_once(
                         text=text,
                         llm=llm,
                         system_prompt=system_prompt,
@@ -122,16 +158,20 @@ class RelationshipExtractor:
 
         return []
 
-    async def extract_entities_for_chunks(
+    async def _extract_chunk_entities(
         self,
+        *,
         chunk_ids: List[str],
+        llm: Optional[object],
+        system_prompt: Optional[str],
         force: bool = False,
     ) -> List[EntityNode]:
         """Extract entities for chunk IDs and upsert mentions/status metadata."""
         if not chunk_ids:
             return []
 
-        llm = self._resolve_chunk_extraction_llm()
+        if llm is None:
+            llm = self._resolve_chunk_extraction_llm()
         if llm is None:
             logger.warning("Entity extraction requested but no LLM configured.")
             return []
@@ -147,16 +187,17 @@ class RelationshipExtractor:
             return []
 
         try:
-            return await self._extract_entities_for_chunks(
+            return await self._run_chunk_entity_extraction(
                 chunk_ids=chunk_ids,
                 llm=llm,
+                system_prompt=system_prompt or self.default_chunk_system_prompt(),
                 force=force,
             )
         except Exception:
             logger.exception("Entity extraction failed for chunks.")
             return []
 
-    async def _extract_once(
+    async def _extract_relationships_once(
         self,
         *,
         text: str,
@@ -185,11 +226,12 @@ class RelationshipExtractor:
 
         return []
 
-    async def _extract_entities_for_chunks(
+    async def _run_chunk_entity_extraction(
         self,
         *,
         chunk_ids: List[str],
         llm: object,
+        system_prompt: str,
         force: bool = False,
     ) -> List[EntityNode]:
         if not chunk_ids:
@@ -225,7 +267,7 @@ class RelationshipExtractor:
         if not chunks_to_process:
             return []
 
-        prompt = _build_chunk_extraction_prompt()
+        prompt = _build_chunk_extraction_prompt(system_prompt)
         extraction_chain = prompt | llm.with_structured_output(BatchEntityExtractionResult)
 
         async def _extract_batch(chunks: List[dict]) -> BatchEntityExtractionResult:
@@ -432,6 +474,10 @@ class RelationshipExtractor:
                 logger.exception("Failed to resolve LLM via llm_provider.")
                 return None
         return self._llm
+
+    @staticmethod
+    def default_chunk_system_prompt() -> str:
+        return _EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT
 
     @staticmethod
     def _parse_relationships(raw: str, *, source: str) -> Optional[List[dict]]:

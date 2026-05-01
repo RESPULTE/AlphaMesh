@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from core.logger import get_logger
@@ -61,6 +62,7 @@ class GraphWritePipeline:
         try:
             llm = self._llm_provider(task.llm_config)
             relationships = await self._extractor.extract(
+                mode="relationships",
                 text=task.extraction_text,
                 llm=llm,
                 system_prompt=prompt,
@@ -188,20 +190,57 @@ class GraphWritePipeline:
         return domain_written, user_written
 
     async def _process_chunk_entity_tasks(self, tasks: List[GraphTask]) -> None:
-        chunk_ids: List[str] = []
+        chunk_groups: Dict[Tuple[str, str], Dict[str, object]] = {}
         for task in tasks:
-            if task.task_kind == TASK_KIND_CHUNK_ENTITIES and task.chunk_ids:
-                chunk_ids.extend(task.chunk_ids)
-        chunk_ids = list(dict.fromkeys(chunk_ids))
-        if not chunk_ids:
-            return
-        try:
-            await self._extractor.extract_entities_for_chunks(chunk_ids)
-        except Exception:
-            logger.exception(
-                "GraphWritePipeline: chunk entity extraction failed for %d chunk(s)",
-                len(chunk_ids),
+            if task.task_kind != TASK_KIND_CHUNK_ENTITIES or not task.chunk_ids:
+                continue
+            prompt_text = self._resolve_chunk_system_prompt(task)
+            prompt_key = (
+                task.system_prompt_id
+                or (prompt_text.strip() if prompt_text and prompt_text.strip() else "")
+                or "__default__"
             )
+            llm_config_key = json.dumps(task.llm_config or {}, sort_keys=True, default=str)
+            group_key = (prompt_key, llm_config_key)
+            group_entry = chunk_groups.setdefault(
+                group_key,
+                {
+                    "chunk_ids": [],
+                    "prompt_text": prompt_text,
+                    "llm_config": task.llm_config,
+                },
+            )
+            group_entry["chunk_ids"].extend(task.chunk_ids)
+
+        if not chunk_groups:
+            return
+
+        for (_prompt_key, _llm_config_key), group in chunk_groups.items():
+            chunk_ids = list(dict.fromkeys(group["chunk_ids"]))
+            if not chunk_ids:
+                continue
+            try:
+                llm = self._llm_provider(group["llm_config"])
+                await self._extractor.extract(
+                    mode="chunk_entities",
+                    chunk_ids=chunk_ids,
+                    llm=llm,
+                    system_prompt=group["prompt_text"],
+                )
+            except Exception:
+                logger.exception(
+                    "GraphWritePipeline: chunk entity extraction failed for %d chunk(s)",
+                    len(chunk_ids),
+                )
+
+    def _resolve_chunk_system_prompt(self, task: GraphTask) -> Optional[str]:
+        if task.system_prompt and task.system_prompt.strip():
+            return task.system_prompt
+        if task.system_prompt_id:
+            prompt = self._prompt_registry.get(task.system_prompt_id)
+            if prompt:
+                return prompt
+        return None
 
     async def _resolve_domain_entity_cache(
         self,
