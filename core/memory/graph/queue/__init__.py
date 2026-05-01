@@ -57,6 +57,10 @@ def make_extraction_task(
     chunk_ids: Optional[List[str]] = None,
     allowed_entity_types: Optional[List[str]] = None,
     allowed_relationship_types: Optional[List[str]] = None,
+    retry_count: int = 0,
+    max_retries: int = 3,
+    retry_delay_seconds: int = 300,
+    not_before: Optional[float] = None,
 ) -> GraphTask:
     normalized_entity_types = normalize_allowed_entity_types(allowed_entity_types)
     normalized_relationship_types = normalize_allowed_relationship_types(
@@ -96,4 +100,8 @@ def make_extraction_task(
         allowed_entity_types=normalized_entity_types or None,
         allowed_relationship_types=normalized_relationship_types or None,
         llm_config=llm_config,
+        retry_count=max(0, int(retry_count)),
+        max_retries=max(0, int(max_retries)),
+        retry_delay_seconds=max(1, int(retry_delay_seconds)),
+        not_before=not_before,
     )

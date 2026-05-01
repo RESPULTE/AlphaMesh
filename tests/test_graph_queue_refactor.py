@@ -87,6 +87,7 @@ class FakeWriter:
         self.user_edges: List[str] = []
         self.user_events: List[str] = []
         self.session_nodes: List[str] = []
+        self.chunk_entities_rows: List[dict] = []
 
     async def write_relationships(
         self,
@@ -150,6 +151,10 @@ class FakeWriter:
     async def merge_session_node(self, node_id: str, props: dict) -> None:
         _ = props
         self.session_nodes.append(node_id)
+
+    async def get_entities_for_chunks(self, chunk_ids: List[str]) -> List[dict]:
+        _ = chunk_ids
+        return list(self.chunk_entities_rows)
 
 
 class FakeRelationshipExtractor:
@@ -712,6 +717,209 @@ def test_pipeline_groups_chunk_extraction_by_prompt_id(tmp_path: Path) -> None:
         assert prompt_to_chunks[prompt_a] == ["c1", "c2"]
         assert prompt_to_chunks[prompt_b] == ["c3"]
         assert prompt_to_chunks[None] == ["c4"]
+
+    asyncio.run(_run())
+
+
+def test_pipeline_injects_chunk_entity_context_and_filters_relationships(
+    tmp_path: Path,
+) -> None:
+    class RecordingExtractor:
+        def __init__(self) -> None:
+            self.calls: List[dict] = []
+
+        async def extract(
+            self,
+            *,
+            mode: str = "relationships",
+            text: Optional[str] = None,
+            chunk_ids: Optional[List[str]] = None,
+            llm=None,
+            system_prompt: Optional[str] = None,
+            force: bool = False,
+        ) -> List[dict]:
+            self.calls.append(
+                {
+                    "mode": mode,
+                    "text": text,
+                    "chunk_ids": list(chunk_ids or []),
+                    "llm": llm,
+                    "system_prompt": system_prompt,
+                    "force": force,
+                }
+            )
+            return [
+                {
+                    "from_name": "Apple",
+                    "from_type": "Company",
+                    "relation": "RELATED_TO",
+                    "to_name": "Revenue Growth",
+                    "to_type": "FinancialConcept",
+                },
+                {
+                    "from_name": "Apple",
+                    "from_type": "Company",
+                    "relation": "RELATED_TO",
+                    "to_name": "Unknown Entity",
+                    "to_type": "FinancialConcept",
+                },
+            ]
+
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    writer.chunk_entities_rows = [
+        {
+            "entity_name": "Apple",
+            "entity_type": "Company",
+            "source_chunk_id": "chunk-1",
+        },
+        {
+            "entity_name": "Revenue Growth",
+            "entity_type": "FinancialConcept",
+            "source_chunk_id": "chunk-1",
+        },
+    ]
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+    extractor = RecordingExtractor()
+
+    async def _run() -> None:
+        await store.initialize()
+        prompt_registry = PromptRegistry(store)
+        pipeline = GraphWritePipeline(
+            entity_resolver=resolver,
+            graph_writer=writer,
+            relationship_extractor=extractor,
+            llm_provider=fake_llm_provider,
+            prompt_registry=prompt_registry,
+        )
+
+        task = make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            chunk_ids=["chunk-1"],
+            system_prompt="extract relationships",
+            allowed_entity_types=["Company", "FinancialConcept"],
+            allowed_relationship_types=["RELATED_TO"],
+        )
+        assert task.system_prompt is not None
+        await prompt_registry.register(task.system_prompt)
+
+        result = await pipeline.process_tasks([task])
+        assert result["retry_tasks"] == []
+        assert result["processed_task_ids"] == [task.task_id]
+        assert extractor.calls
+        injected_text = str(extractor.calls[0]["text"] or "")
+        assert "Known entities extracted for the referenced chunks" in injected_text
+        assert "Apple (Company)" in injected_text
+        assert "Revenue Growth (FinancialConcept)" in injected_text
+        assert resolver.edge_calls
+        scoped_relationships, _allow_create = resolver.edge_calls[0]
+        assert len(scoped_relationships) == 1
+        assert scoped_relationships[0]["to_name"] == "Revenue Growth"
+
+    asyncio.run(_run())
+
+
+def test_pipeline_no_entities_schedules_retry_then_exhausts(tmp_path: Path) -> None:
+    class EmptyExtractor:
+        async def extract(
+            self,
+            *,
+            mode: str = "relationships",
+            text: Optional[str] = None,
+            chunk_ids: Optional[List[str]] = None,
+            llm=None,
+            system_prompt: Optional[str] = None,
+            force: bool = False,
+        ) -> List[dict]:
+            _ = (mode, text, chunk_ids, llm, system_prompt, force)
+            return []
+
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    writer.chunk_entities_rows = []
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+
+    async def _run() -> None:
+        await store.initialize()
+        prompt_registry = PromptRegistry(store)
+        pipeline = GraphWritePipeline(
+            entity_resolver=resolver,
+            graph_writer=writer,
+            relationship_extractor=EmptyExtractor(),
+            llm_provider=fake_llm_provider,
+            prompt_registry=prompt_registry,
+        )
+
+        task = make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            chunk_ids=["chunk-1"],
+            system_prompt="extract relationships",
+            retry_count=0,
+            max_retries=3,
+            retry_delay_seconds=300,
+        )
+        assert task.system_prompt is not None
+        await prompt_registry.register(task.system_prompt)
+
+        result = await pipeline.process_tasks([task])
+        assert result["processed_task_ids"] == [task.task_id]
+        assert len(result["retry_tasks"]) == 1
+        retry_task = result["retry_tasks"][0]
+        assert retry_task.retry_count == 1
+        assert retry_task.max_retries == 3
+        assert retry_task.not_before is not None
+
+        exhausted_task = make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            chunk_ids=["chunk-1"],
+            system_prompt="extract relationships",
+            retry_count=3,
+            max_retries=3,
+            retry_delay_seconds=300,
+        )
+        assert exhausted_task.system_prompt is not None
+        await prompt_registry.register(exhausted_task.system_prompt)
+        exhausted_result = await pipeline.process_tasks([exhausted_task])
+        assert exhausted_result["processed_task_ids"] == [exhausted_task.task_id]
+        assert exhausted_result["retry_tasks"] == []
+
+    asyncio.run(_run())
+
+
+def test_graph_task_store_roundtrip_persists_retry_metadata(tmp_path: Path) -> None:
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+
+    async def _run() -> None:
+        await store.initialize()
+        task = make_extraction_task(
+            turn_id="turn-1",
+            conversation_id="conv-1",
+            source_agent="agent-a",
+            extraction_text="analysis text",
+            system_prompt="extract relationships",
+            retry_count=2,
+            max_retries=4,
+            retry_delay_seconds=120,
+            not_before=12345.0,
+        )
+        await store.persist_task(task.to_payload())
+
+        rows = await store.load_pending_tasks()
+        assert len(rows) == 1
+        loaded = rows[0]
+        assert loaded["retry_count"] == 2
+        assert loaded["max_retries"] == 4
+        assert loaded["retry_delay_seconds"] == 120
+        assert loaded["not_before"] == 12345.0
 
     asyncio.run(_run())
 

@@ -38,10 +38,7 @@ from core.agents.working_memory.news_working_memory import NewsWorkingMemoryMana
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
-from core.memory.graph.graph_queue import (
-    TASK_KIND_CHUNK_ENTITIES,
-    make_extraction_task,
-)
+from core.memory.graph.graph_queue import make_extraction_task
 from core.memory.retrieval.models import RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
@@ -715,29 +712,6 @@ class NewsAnalysisAgent(AbstractAgent):
             final_chunks=ranked,
         )
 
-        selected_chunk_ids = list(
-            dict.fromkeys(
-                str(chunk.chunk_id or "").strip()
-                for chunk in ranked
-                if str(chunk.chunk_id or "").strip()
-            )
-        )
-        if state.conversation_id and selected_chunk_ids:
-            turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
-            try:
-                chunk_entity_task = make_extraction_task(
-                    turn_id=turn_id,
-                    conversation_id=state.conversation_id,
-                    source_agent=self.name(),
-                    task_kind=TASK_KIND_CHUNK_ENTITIES,
-                    chunk_ids=selected_chunk_ids,
-                )
-                await service_manager.get_graph_queue_manager().enqueue(chunk_entity_task)
-            except Exception:
-                logger.exception(
-                    "_rendezvous_node: failed to enqueue chunk entity extraction task"
-                )
-
         if state.conversation_id:
             self._working_memory.merge_working_chunks(
                 conversation_id=state.conversation_id,
@@ -801,7 +775,6 @@ class NewsAnalysisAgent(AbstractAgent):
         context_prefix = build_analysis_context_prefix(
             company_context=state.company_context,
             agent_memory_context=state.agent_memory_context,
-            cached_entities=[],
         )
 
         messages = [
@@ -848,11 +821,14 @@ class NewsAnalysisAgent(AbstractAgent):
                     sentiment=None,
                 )
 
-        available_chunk_ids = {
-            str(chunk.chunk_id).strip()
-            for chunk in chunks
-            if str(chunk.chunk_id).strip()
-        }
+        final_stage_chunk_ids = list(
+            dict.fromkeys(
+                str(chunk.chunk_id).strip()
+                for chunk in chunks
+                if str(chunk.chunk_id).strip()
+            )
+        )
+        available_chunk_ids = set(final_stage_chunk_ids)
 
         def _normalize_selected_chunk_ids(raw_ids: List[int | str]) -> List[str]:
             mapped_ids = [
@@ -912,6 +888,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     conversation_id=state.conversation_id,
                     source_agent=self.name(),
                     extraction_text=analysis_text,
+                    chunk_ids=final_stage_chunk_ids,
                     system_prompt=relationship_system_prompt,
                     allowed_entity_types=allowed_entity_types,
                     allowed_relationship_types=allowed_relationship_types,

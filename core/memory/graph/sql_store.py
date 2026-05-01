@@ -34,6 +34,10 @@ class GraphTaskSqlStore(SQLiteAdapter):
                 llm_config      TEXT,
                 task_kind       TEXT,
                 chunk_ids       TEXT,
+                retry_count     INTEGER NOT NULL DEFAULT 0,
+                max_retries     INTEGER NOT NULL DEFAULT 3,
+                retry_delay_seconds INTEGER NOT NULL DEFAULT 300,
+                not_before      REAL,
                 status          TEXT NOT NULL DEFAULT 'PENDING',
                 created_at      REAL NOT NULL,
                 processed_at    REAL,
@@ -43,6 +47,9 @@ class GraphTaskSqlStore(SQLiteAdapter):
         )
         await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_gt_status_created ON graph_tasks(status, created_at)"
+        )
+        await self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gt_status_not_before_created ON graph_tasks(status, not_before, created_at)"
         )
         await self.execute(
             "CREATE INDEX IF NOT EXISTS idx_gt_conversation ON graph_tasks(conversation_id, turn_id)"
@@ -56,13 +63,36 @@ class GraphTaskSqlStore(SQLiteAdapter):
             )
             """
         )
+        await self._ensure_graph_task_column(
+            "retry_count",
+            "ALTER TABLE graph_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+        )
+        await self._ensure_graph_task_column(
+            "max_retries",
+            "ALTER TABLE graph_tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 3",
+        )
+        await self._ensure_graph_task_column(
+            "retry_delay_seconds",
+            "ALTER TABLE graph_tasks ADD COLUMN retry_delay_seconds INTEGER NOT NULL DEFAULT 300",
+        )
+        await self._ensure_graph_task_column(
+            "not_before",
+            "ALTER TABLE graph_tasks ADD COLUMN not_before REAL",
+        )
         self._initialized = True
+
+    async def _ensure_graph_task_column(self, column_name: str, ddl: str) -> None:
+        rows = await self.fetchall("PRAGMA table_info(graph_tasks)")
+        existing = {str(row.get("name") or "") for row in rows}
+        if column_name in existing:
+            return
+        await self.execute(ddl)
 
     async def persist_task(self, task_payload: Dict[str, Any]) -> None:
         await self.execute(
             """INSERT OR IGNORE INTO graph_tasks
-               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
+               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
             (
                 task_payload["task_id"],
                 task_payload["turn_id"],
@@ -92,6 +122,14 @@ class GraphTaskSqlStore(SQLiteAdapter):
                     if task_payload.get("chunk_ids")
                     else None
                 ),
+                int(task_payload.get("retry_count") or 0),
+                int(task_payload.get("max_retries") or 3),
+                int(task_payload.get("retry_delay_seconds") or 300),
+                (
+                    float(task_payload["not_before"])
+                    if task_payload.get("not_before") is not None
+                    else None
+                ),
                 float(task_payload.get("created_at", time.time())),
             ),
         )
@@ -107,9 +145,30 @@ class GraphTaskSqlStore(SQLiteAdapter):
 
     async def load_pending_tasks(self) -> List[Dict[str, Any]]:
         rows = await self.fetchall(
-            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, created_at "
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
             "FROM graph_tasks WHERE status='PENDING' ORDER BY created_at ASC"
         )
+        return self._decode_task_rows(rows)
+
+    async def load_pending_tasks_due(self, due_epoch: float) -> List[Dict[str, Any]]:
+        rows = await self.fetchall(
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
+            "FROM graph_tasks WHERE status='PENDING' AND (not_before IS NULL OR not_before <= ?) ORDER BY created_at ASC",
+            (float(due_epoch),),
+        )
+        return self._decode_task_rows(rows)
+
+    async def load_pending_delayed_tasks_due(
+        self, due_epoch: float
+    ) -> List[Dict[str, Any]]:
+        rows = await self.fetchall(
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
+            "FROM graph_tasks WHERE status='PENDING' AND not_before IS NOT NULL AND not_before <= ? ORDER BY created_at ASC",
+            (float(due_epoch),),
+        )
+        return self._decode_task_rows(rows)
+
+    def _decode_task_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         tasks: List[Dict[str, Any]] = []
         for row in rows:
             tasks.append(
@@ -137,6 +196,16 @@ class GraphTaskSqlStore(SQLiteAdapter):
                     "task_kind": row["task_kind"],
                     "chunk_ids": (
                         json.loads(row["chunk_ids"]) if row["chunk_ids"] else None
+                    ),
+                    "retry_count": int(row.get("retry_count") or 0),
+                    "max_retries": int(row.get("max_retries") or 3),
+                    "retry_delay_seconds": int(
+                        row.get("retry_delay_seconds") or 300
+                    ),
+                    "not_before": (
+                        float(row["not_before"])
+                        if row.get("not_before") is not None
+                        else None
                     ),
                     "created_at": row["created_at"],
                 }

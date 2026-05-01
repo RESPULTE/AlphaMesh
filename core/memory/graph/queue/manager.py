@@ -79,6 +79,13 @@ class GraphQueueManager:
             return task.task_id
 
         await self._store.persist_task(task.to_payload())
+        if task.not_before is not None and float(task.not_before) > time.time():
+            logger.info(
+                "GraphQueueManager.enqueue: queued delayed task '%s' for %.0f",
+                task.task_id,
+                float(task.not_before),
+            )
+            return task.task_id
 
         worker, _created = await self._ensure_worker(task.conversation_id, lazy=True)
         await worker.put(task)
@@ -102,7 +109,7 @@ class GraphQueueManager:
 
         await self._store.initialize()
         await self._prompt_registry.load()
-        await self._recover_pending_tasks()
+        await self._recover_pending_tasks(include_unscheduled=True)
 
         self._cleanup_task = asyncio.create_task(
             self._ttl_cleanup_loop(), name="graph_queue_ttl_cleanup"
@@ -155,6 +162,8 @@ class GraphQueueManager:
         task_ids = [task.task_id for task in tasks]
         try:
             results = await self._pipeline.process_tasks(tasks)
+            retry_tasks = list(results.get("retry_tasks") or [])
+            processed_task_ids = list(results.get("processed_task_ids") or task_ids)
             logger.info(
                 "GraphQueueManager: processed turn '%s' tasks=%d domain_edges=%d user_edges=%d",
                 turn_id,
@@ -162,7 +171,9 @@ class GraphQueueManager:
                 results.get("domain_edges", 0),
                 results.get("user_edges", 0),
             )
-            await self._store.mark_processed(task_ids)
+            await self._store.mark_processed(processed_task_ids)
+            for retry_task in retry_tasks:
+                await self.enqueue(retry_task)
         except Exception:
             logger.exception(
                 "GraphQueueManager: failed to process turn '%s' for conversation '%s'",
@@ -170,9 +181,14 @@ class GraphQueueManager:
                 tasks[0].conversation_id if tasks else "",
             )
 
-    async def _recover_pending_tasks(self) -> None:
+    async def _recover_pending_tasks(self, *, include_unscheduled: bool = True) -> None:
+        now = time.time()
         try:
-            rows = await self._store.load_pending_tasks()
+            rows = (
+                await self._store.load_pending_tasks_due(now)
+                if include_unscheduled
+                else await self._store.load_pending_delayed_tasks_due(now)
+            )
         except Exception:
             logger.exception(
                 "GraphQueueManager: failed to query PENDING tasks at startup"
@@ -182,7 +198,11 @@ class GraphQueueManager:
         if not rows:
             return
 
-        logger.info("GraphQueueManager: recovering %d pending task(s)", len(rows))
+        logger.info(
+            "GraphQueueManager: recovering %d pending task(s) include_unscheduled=%s",
+            len(rows),
+            include_unscheduled,
+        )
 
         tasks: List[GraphTask] = [GraphTask.from_payload(row) for row in rows]
 
@@ -198,6 +218,7 @@ class GraphQueueManager:
             try:
                 await asyncio.sleep(_CLEANUP_INTERVAL_SECONDS)
                 await self._evict_idle_queues()
+                await self._recover_pending_tasks(include_unscheduled=False)
                 await self._purge_old_processed_tasks()
             except asyncio.CancelledError:
                 break

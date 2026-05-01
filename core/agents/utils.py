@@ -220,8 +220,9 @@ def build_analysis_context_prefix(
     *,
     company_context: str | None,
     agent_memory_context: str | None,
-    cached_entities: List[tuple[str, str]],
+    cached_entities: Optional[List[tuple[str, str]]] = None,
 ) -> str:
+    cached_entities = list(cached_entities or [])
     sections: List[str] = []
     if company_context:
         sections.append(f"Company Context:\n{company_context}")

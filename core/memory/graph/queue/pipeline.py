@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from uuid import uuid4
 
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
@@ -31,6 +33,9 @@ _NODE_ENDPOINT_FIELDS: Sequence[Tuple[str, str, str]] = (
     ("from_name", "from_type", "from_node_props"),
     ("to_name", "to_type", "to_node_props"),
 )
+_CHUNK_ENTITY_CONTEXT_HEADER = (
+    "Known entities extracted for the referenced chunks (strict grounding scope):"
+)
 
 
 class GraphWritePipeline:
@@ -49,44 +54,92 @@ class GraphWritePipeline:
         self._llm_provider = llm_provider
         self._prompt_registry = prompt_registry
 
-    async def extract_relationships_for_task(self, task: GraphTask) -> List[dict]:
+    async def extract_relationships_for_task(
+        self, task: GraphTask
+    ) -> Tuple[List[dict], Optional[GraphTask]]:
         if is_chunk_entities_task(task) or not has_extractable_payload(task):
-            return []
+            return [], None
         prompt = self._prompt_registry.get(task.system_prompt_id)
         if not prompt:
             logger.warning(
                 "GraphWritePipeline: missing system prompt for id '%s'",
                 task.system_prompt_id,
             )
-            return []
+            return [], None
+
+        extraction_text = task.extraction_text or ""
+        allowed_entity_keys: Optional[set[Tuple[str, str]]] = None
+        if task.chunk_ids:
+            entity_rows = await self._writer.get_entities_for_chunks(task.chunk_ids)
+            entity_context, allowed_entity_keys = self._build_chunk_entity_context(
+                entity_rows
+            )
+            if not allowed_entity_keys:
+                retry_task = self._build_retry_task(task)
+                if retry_task is not None:
+                    logger.info(
+                        "GraphWritePipeline: no chunk entities for task '%s'; scheduling retry %d/%d",
+                        task.task_id,
+                        retry_task.retry_count,
+                        retry_task.max_retries,
+                    )
+                else:
+                    logger.info(
+                        "GraphWritePipeline: no chunk entities for task '%s'; retries exhausted (%d/%d)",
+                        task.task_id,
+                        task.retry_count,
+                        task.max_retries,
+                    )
+                return [], retry_task
+            extraction_text = f"{entity_context}\n\n{extraction_text}"
+
         try:
             llm = self._llm_provider(task.llm_config)
             relationships = await self._extractor.extract(
                 mode="relationships",
-                text=task.extraction_text,
+                text=extraction_text,
                 llm=llm,
                 system_prompt=prompt,
             )
-            return list(relationships or [])
+            normalized_relationships = list(relationships or [])
+            if allowed_entity_keys is not None:
+                normalized_relationships = self._filter_relationships_to_known_entities(
+                    task=task,
+                    relationships=normalized_relationships,
+                    allowed_entity_keys=allowed_entity_keys,
+                )
+            return normalized_relationships, None
         except Exception:
             logger.exception(
                 "GraphWritePipeline: extraction failed for task '%s'", task.task_id
             )
-            return []
+            return [], None
 
-    async def process_tasks(self, tasks: List[GraphTask]) -> Dict[str, int]:
+    async def process_tasks(self, tasks: List[GraphTask]) -> Dict[str, Any]:
         if not tasks:
-            return {"domain_edges": 0, "user_edges": 0}
+            return {
+                "domain_edges": 0,
+                "user_edges": 0,
+                "retry_tasks": [],
+                "processed_task_ids": [],
+            }
 
         await self._process_chunk_entity_tasks(tasks)
 
         prepared_groups: Dict[str, List[Tuple[GraphTask, List[dict]]]] = {}
+        retry_tasks: List[GraphTask] = []
+        processed_task_ids: List[str] = []
         for task in tasks:
+            processed_task_ids.append(task.task_id)
             if task.task_kind == TASK_KIND_CHUNK_ENTITIES:
                 continue
             relationships = list(task.relationships or [])
             if not relationships and task.extraction_text:
-                relationships = await self.extract_relationships_for_task(task)
+                relationships, retry_task = await self.extract_relationships_for_task(
+                    task
+                )
+                if retry_task is not None:
+                    retry_tasks.append(retry_task)
                 if relationships:
                     task.relationships = relationships
             if relationships and task.extraction_text:
@@ -116,7 +169,110 @@ class GraphWritePipeline:
             total_domain += domain_count
             total_user += user_count
 
-        return {"domain_edges": total_domain, "user_edges": total_user}
+        return {
+            "domain_edges": total_domain,
+            "user_edges": total_user,
+            "retry_tasks": retry_tasks,
+            "processed_task_ids": processed_task_ids,
+        }
+
+    @staticmethod
+    def _build_retry_task(task: GraphTask) -> Optional[GraphTask]:
+        max_retries = max(0, int(task.max_retries))
+        current_retry_count = max(0, int(task.retry_count))
+        if current_retry_count >= max_retries:
+            return None
+
+        retry_delay_seconds = max(1, int(task.retry_delay_seconds))
+        return GraphTask(
+            task_id=str(uuid4()),
+            turn_id=task.turn_id,
+            conversation_id=task.conversation_id,
+            source_agent=task.source_agent,
+            immediate=task.immediate,
+            task_kind=task.task_kind,
+            chunk_ids=list(task.chunk_ids or []),
+            relationships=[],
+            extraction_text=task.extraction_text,
+            system_prompt=task.system_prompt,
+            system_prompt_id=task.system_prompt_id,
+            allowed_entity_types=list(task.allowed_entity_types or []),
+            allowed_relationship_types=list(task.allowed_relationship_types or []),
+            llm_config=dict(task.llm_config or {}),
+            retry_count=current_retry_count + 1,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
+            not_before=time.time() + retry_delay_seconds,
+        )
+
+    @staticmethod
+    def _build_chunk_entity_context(
+        entity_rows: List[dict],
+    ) -> Tuple[str, set[Tuple[str, str]]]:
+        normalized_rows: List[Tuple[str, str, str]] = []
+        allowed_entity_keys: set[Tuple[str, str]] = set()
+
+        for row in entity_rows or []:
+            entity_name = normalize_entity_name(
+                str(row.get("entity_name") or row.get("name") or "")
+            )
+            entity_type = normalize_entity_type(
+                str(row.get("entity_type") or row.get("type") or "")
+            )
+            source_chunk_id = str(row.get("source_chunk_id") or "").strip() or "unknown"
+            if not entity_name or not entity_type:
+                continue
+            allowed_entity_keys.add(entity_key(entity_name, entity_type))
+            normalized_rows.append((entity_type, entity_name, source_chunk_id))
+
+        if not normalized_rows:
+            return "", set()
+
+        rendered_rows = sorted(set(normalized_rows))
+        lines = [f"- {name} ({entity_type}) [source_chunk_id={chunk_id}]"
+                 for entity_type, name, chunk_id in rendered_rows]
+        return (
+            f"{_CHUNK_ENTITY_CONTEXT_HEADER}\n"
+            "Only extract relationships between entities in this list.\n"
+            + "\n".join(lines),
+            allowed_entity_keys,
+        )
+
+    def _filter_relationships_to_known_entities(
+        self,
+        *,
+        task: GraphTask,
+        relationships: List[dict],
+        allowed_entity_keys: set[Tuple[str, str]],
+    ) -> List[dict]:
+        if not relationships or not allowed_entity_keys:
+            return []
+
+        filtered: List[dict] = []
+        dropped = 0
+        for rel in relationships:
+            from_name = normalize_entity_name(str(rel.get("from_name") or ""))
+            to_name = normalize_entity_name(str(rel.get("to_name") or ""))
+            from_type = normalize_entity_type(str(rel.get("from_type") or ""))
+            to_type = normalize_entity_type(str(rel.get("to_type") or ""))
+            if not from_name or not to_name or not from_type or not to_type:
+                dropped += 1
+                continue
+            if (
+                entity_key(from_name, from_type) not in allowed_entity_keys
+                or entity_key(to_name, to_type) not in allowed_entity_keys
+            ):
+                dropped += 1
+                continue
+            filtered.append(rel)
+
+        if dropped:
+            logger.info(
+                "GraphWritePipeline: dropped %d relationship(s) outside chunk-entity scope for task '%s'",
+                dropped,
+                task.task_id,
+            )
+        return filtered
 
     async def process_relationships(
         self,

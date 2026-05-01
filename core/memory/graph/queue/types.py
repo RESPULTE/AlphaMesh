@@ -25,6 +25,10 @@ class GraphTask:
     allowed_entity_types: Optional[List[str]] = None
     allowed_relationship_types: Optional[List[str]] = None
     llm_config: Optional[dict] = None
+    retry_count: int = 0
+    max_retries: int = 3
+    retry_delay_seconds: int = 300
+    not_before: Optional[float] = None
     created_at: float = field(default_factory=time.time)
 
     def to_payload(self) -> Dict[str, Any]:
@@ -41,6 +45,10 @@ class GraphTask:
             "allowed_entity_types": self.allowed_entity_types,
             "allowed_relationship_types": self.allowed_relationship_types,
             "llm_config": self.llm_config,
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
+            "retry_delay_seconds": self.retry_delay_seconds,
+            "not_before": self.not_before,
             "created_at": self.created_at,
         }
 
@@ -65,6 +73,14 @@ class GraphTask:
             allowed_entity_types=allowed_entity_types,
             allowed_relationship_types=allowed_relationship_types,
             llm_config=payload.get("llm_config"),
+            retry_count=int(payload.get("retry_count") or 0),
+            max_retries=int(payload.get("max_retries") or 3),
+            retry_delay_seconds=int(payload.get("retry_delay_seconds") or 300),
+            not_before=(
+                float(payload["not_before"])
+                if payload.get("not_before") is not None
+                else None
+            ),
             created_at=float(payload.get("created_at", time.time())),
         )
 
