@@ -46,9 +46,7 @@ from core.logger import get_logger
 from core.memory.graph.graph_queue import make_graph_task
 from core.memory.retrieval.models import CitedSource
 from core.memory.user_signal_writeback import (
-    build_signal_payload,
-    build_user_signal_relationships,
-    update_user_signal_cache,
+    process_user_signal_writeback,
 )
 from core.services import service_manager
 
@@ -749,7 +747,7 @@ class OrchestratorAgent:
         if not investment_signals and not learning_signals:
             return
         user_message = _extract_last_human_message(state.messages)
-        payload = build_signal_payload(
+        writeback_result = await process_user_signal_writeback(
             user_email=state.user_email,
             conversation_id=state.conversation_id,
             turn_id=state.turn_id,
@@ -758,22 +756,19 @@ class OrchestratorAgent:
             detected_investment_signals=investment_signals,
             detected_learning_signals=learning_signals,
         )
-        relationships, cache_entries = await build_user_signal_relationships(payload)
-        if relationships:
+        if writeback_result.relationships:
             try:
                 task = make_graph_task(
                     turn_id=state.turn_id,
                     conversation_id=state.conversation_id,
                     source_agent=self.name(),
-                    relationships=relationships,
+                    relationships=writeback_result.relationships,
                 )
                 await service_manager.get_graph_queue_manager().enqueue(task)
             except Exception:
                 logger.exception(
                     "_synthesize_node: failed to enqueue user signal relationships"
                 )
-        if cache_entries:
-            update_user_signal_cache(cache_entries, state.user_email)
 
     async def _synthesize_node(self, state: OrchestratorState) -> Dict[str, Any]:
         synthesis_inputs = self._collect_synthesis_inputs(state.agent_outputs)

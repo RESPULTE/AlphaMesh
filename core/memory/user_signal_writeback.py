@@ -53,6 +53,12 @@ class UserSignalPayload:
     session_started_at: Optional[str] = None
 
 
+@dataclass
+class UserSignalWritebackResult:
+    relationships: List[dict] = field(default_factory=list)
+    cache_entries: List[InterestCacheEntry] = field(default_factory=list)
+
+
 def _derive_investment_category(
     entity_name: str,
     entity_type: str,
@@ -313,7 +319,7 @@ async def _build_interest_relationships(
     return relationships, cache_entries
 
 
-async def build_user_signal_relationships(
+async def _build_user_signal_relationships(
     payload: UserSignalPayload,
 ) -> Tuple[List[dict], List[InterestCacheEntry]]:
     """
@@ -322,7 +328,7 @@ async def build_user_signal_relationships(
     Returns (relationships, cache_entries). No graph writes here.
     """
     logger.info(
-        "build_user_signal_relationships: user='%s' turn='%s' investment=%d learning=%d",
+        "_build_user_signal_relationships: user='%s' turn='%s' investment=%d learning=%d",
         payload.user_email,
         payload.turn_id,
         len(payload.investment_signals),
@@ -331,7 +337,7 @@ async def build_user_signal_relationships(
 
     if not payload.user_email or not payload.conversation_id:
         logger.warning(
-            "build_user_signal_relationships: missing user_email or conversation_id; skipping"
+            "_build_user_signal_relationships: missing user_email or conversation_id; skipping"
         )
         return [], []
 
@@ -353,13 +359,15 @@ async def build_user_signal_relationships(
         )
     except Exception:
         logger.exception(
-            "build_user_signal_relationships: failed for user '%s'",
+            "_build_user_signal_relationships: failed for user '%s'",
             payload.user_email,
         )
         return [], []
 
 
-def update_user_signal_cache(cache_entries: List[InterestCacheEntry], user_email: str) -> None:
+def _update_user_signal_cache(
+    cache_entries: List[InterestCacheEntry], user_email: str
+) -> None:
     if not cache_entries or not user_email:
         return
     try:
@@ -368,10 +376,10 @@ def update_user_signal_cache(cache_entries: List[InterestCacheEntry], user_email
         user_ctx_svc = service_manager.get_user_context_service()
         user_ctx_svc.update_cache(cache_entries, user_email)
     except Exception:
-        logger.exception("update_user_signal_cache: failed for user '%s'", user_email)
+        logger.exception("_update_user_signal_cache: failed for user '%s'", user_email)
 
 
-def build_signal_payload(
+def _build_signal_payload(
     detected_investment_signals,
     detected_learning_signals,
     user_message: str,
@@ -379,6 +387,7 @@ def build_signal_payload(
     conversation_id: Optional[str],
     turn_id: str,
     ticker_metadata: Dict[str, dict],
+    session_started_at: Optional[str] = None,
 ) -> UserSignalPayload:
     investment_signals = [
         InvestmentSignal(
@@ -410,5 +419,42 @@ def build_signal_payload(
         ticker_metadata=ticker_metadata,
         investment_signals=investment_signals,
         learning_signals=learning_signals,
-        session_started_at=None,
+        session_started_at=session_started_at,
+    )
+
+
+async def process_user_signal_writeback(
+    *,
+    user_email: Optional[str],
+    conversation_id: Optional[str],
+    turn_id: str,
+    user_message: str,
+    ticker_metadata: Optional[Dict[str, dict]] = None,
+    detected_investment_signals: Optional[Sequence[object]] = None,
+    detected_learning_signals: Optional[Sequence[object]] = None,
+    session_started_at: Optional[str] = None,
+) -> UserSignalWritebackResult:
+    """
+    Single entry-point for user-signal writeback.
+
+    Normalizes planner signals, builds graph relationships, and updates the
+    in-memory user-context cache. Graph persistence is intentionally left to
+    the caller via the returned relationships.
+    """
+    payload = _build_signal_payload(
+        detected_investment_signals=detected_investment_signals or [],
+        detected_learning_signals=detected_learning_signals or [],
+        user_message=user_message,
+        user_email=user_email,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        ticker_metadata=ticker_metadata or {},
+        session_started_at=session_started_at,
+    )
+    relationships, cache_entries = await _build_user_signal_relationships(payload)
+    if cache_entries and payload.user_email:
+        _update_user_signal_cache(cache_entries, payload.user_email)
+    return UserSignalWritebackResult(
+        relationships=relationships,
+        cache_entries=cache_entries,
     )
