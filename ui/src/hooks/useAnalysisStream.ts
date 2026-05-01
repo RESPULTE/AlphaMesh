@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { useAuth } from '../auth/AuthContext';
 import type {
   AgentAnalysis,
   AnalysisResponse,
@@ -8,8 +9,6 @@ import type {
   FundamentalsVisualizationPayload,
   StreamEvent
 } from '../types/api';
-
-const DEFAULT_USER_EMAIL = 'demo@alphamesh.local';
 const STORAGE_CONVERSATION_ID = 'alphamesh.active_conversation_id';
 const STORAGE_SESSION_ID = 'alphamesh.active_session_id';
 
@@ -286,6 +285,7 @@ function mergeFinalWithLive(next: AnalysisResponse, prev?: AnalysisResponse | nu
 }
 
 export function useAnalysisStream(query: string | null, requestVersion = 0) {
+  const { authFetch, buildAuthUrl } = useAuth();
   const [data, setData] = useState<PartialAnalysis>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamPhase, setStreamPhase] = useState<StreamPhase>('idle');
@@ -311,8 +311,6 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
   const pendingChartRef = useRef<AnalysisResponse['chartData'] | null>(null);
   const pendingFundamentalsVisualizationRef = useRef<FundamentalsVisualizationPayload | null>(null);
 
-  const stableEmail = useMemo(() => DEFAULT_USER_EMAIL, []);
-
   useEffect(() => {
     if (!query) return;
 
@@ -337,9 +335,7 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
       try {
         if (!conversationIdRef.current) {
           try {
-            const latestRes = await fetch(
-              `/api/v1/conversations?limit=1&user_email=${encodeURIComponent(stableEmail)}`
-            );
+            const latestRes = await authFetch('/api/v1/conversations?limit=1');
             if (latestRes.ok) {
               const rows = (await latestRes.json()) as ConversationSummary[];
               const latestConversationId = rows?.[0]?.conversation_id;
@@ -356,12 +352,11 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
           }
         }
 
-        const res = await fetch('/api/v1/chat', {
+        const res = await authFetch('/api/v1/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             message: query,
-            user_email: stableEmail,
             conversation_id: conversationIdRef.current,
             session_id: sessionIdRef.current
           })
@@ -390,7 +385,7 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
           }
         }
 
-        const es = new EventSource(`/api/v1/stream/${ack.request_id}`);
+        const es = new EventSource(buildAuthUrl(`/api/v1/stream/${ack.request_id}`));
         eventSourceRef.current = es;
 
         es.onmessage = (event) => {
@@ -585,7 +580,7 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
       isMounted = false;
       closeStream();
     };
-  }, [query, requestVersion, stableEmail]);
+  }, [authFetch, buildAuthUrl, query, requestVersion]);
 
   return { data, isStreaming, streamPhase, conversationId, requestId };
 }
