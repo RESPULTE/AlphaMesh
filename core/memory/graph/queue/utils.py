@@ -4,14 +4,11 @@ import hashlib
 from typing import Iterable, List, Optional, Sequence
 
 from core.memory.graph.models import ALLOWED_ENTITY_TYPES, ALLOWED_RELATIONSHIP_TYPES
-
-TASK_KIND_RELATIONSHIPS = "relationships"
-TASK_KIND_CHUNK_ENTITIES = "chunk_entities"
-SHUTDOWN_TURN_ID = "__SHUTDOWN__"
-
-
-from core.memory.graph.models import ALLOWED_RELATIONSHIP_TYPES
-from core.memory.graph.queue.types import TASK_KIND_CHUNK_ENTITIES, GraphTask
+from core.memory.graph.queue.types import (
+    TASK_KIND_EXTRACTION,
+    TASK_KIND_SCOPED_EXTRACTION,
+    GraphTask,
+)
 
 _SCOPE_PROMPT_HEADER = "Task-scoped extraction constraints:"
 _DEFAULT_ALLOWED_ENTITY_TYPES: Sequence[str] = tuple(sorted(ALLOWED_ENTITY_TYPES))
@@ -20,8 +17,16 @@ _DEFAULT_ALLOWED_RELATIONSHIP_TYPES: Sequence[str] = tuple(
 )
 
 
-def is_chunk_entities_task(task: GraphTask) -> bool:
-    return task.task_kind == TASK_KIND_CHUNK_ENTITIES
+def is_extraction_task(task: GraphTask) -> bool:
+    return task.task_kind == TASK_KIND_EXTRACTION
+
+
+def is_scoped_extraction_task(task: GraphTask) -> bool:
+    return task.task_kind == TASK_KIND_SCOPED_EXTRACTION
+
+
+def is_supported_task_kind(task: GraphTask) -> bool:
+    return task.task_kind in {TASK_KIND_EXTRACTION, TASK_KIND_SCOPED_EXTRACTION}
 
 
 def has_chunk_ids(task: GraphTask) -> bool:

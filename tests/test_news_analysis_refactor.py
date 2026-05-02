@@ -167,6 +167,12 @@ def test_analyse_news_node_enqueues_deferred_relationship_extraction_with_final_
     assert queue.enqueued
     assert captured_task_kwargs["extraction_text"] == result["analysis"]
     assert captured_task_kwargs["conversation_id"] == "conv-analysis"
+    assert captured_task_kwargs["task_kind"] == news_module.TASK_KIND_SCOPED_EXTRACTION
     assert captured_task_kwargs["chunk_ids"] == ["chunk-1", "chunk-2"]
+    assert str(captured_task_kwargs["chunk_system_prompt"] or "").strip()
+    assert (
+        captured_task_kwargs["chunk_system_prompt"]
+        != captured_task_kwargs["system_prompt"]
+    )
     assert captured_task_kwargs["allowed_entity_types"]
     assert captured_task_kwargs["allowed_relationship_types"]

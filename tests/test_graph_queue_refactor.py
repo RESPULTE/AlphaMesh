@@ -9,7 +9,8 @@ import pytest
 
 from core.memory.graph.entity_resolver import EntityResolution, ResolvedEdgeBatch
 from core.memory.graph.graph_queue import (
-    TASK_KIND_CHUNK_ENTITIES,
+    TASK_KIND_EXTRACTION,
+    TASK_KIND_SCOPED_EXTRACTION,
     GraphQueueManager,
     make_extraction_task,
     make_graph_task,
@@ -414,8 +415,10 @@ def test_enqueue_skips_invalid_chunk_and_empty_tasks(tmp_path: Path):
                 turn_id="turn-1",
                 conversation_id="conv-1",
                 source_agent="agent-a",
-                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                task_kind=TASK_KIND_SCOPED_EXTRACTION,
                 chunk_ids=[],
+                extraction_text="extract me",
+                system_prompt="extract relationships",
             )
             empty_relationship_task = make_graph_task(
                 turn_id="turn-1",
@@ -531,8 +534,11 @@ def test_graph_task_store_roundtrip_persists_extraction_scope(tmp_path: Path) ->
             turn_id="turn-1",
             conversation_id="conv-1",
             source_agent="agent-a",
+            task_kind=TASK_KIND_SCOPED_EXTRACTION,
             extraction_text="analysis text",
             system_prompt="extract relationships",
+            chunk_system_prompt="extract chunk entities",
+            chunk_ids=["chunk-1"],
             allowed_entity_types=["Company", "Sector"],
             allowed_relationship_types=["BELONGS_TO"],
         )
@@ -543,6 +549,9 @@ def test_graph_task_store_roundtrip_persists_extraction_scope(tmp_path: Path) ->
         loaded = rows[0]
         assert loaded["allowed_entity_types"] == ["Company", "Sector"]
         assert loaded["allowed_relationship_types"] == ["BELONGS_TO"]
+        assert loaded["chunk_system_prompt_id"] == prompt_id_from_text(
+            "extract chunk entities"
+        )
 
     asyncio.run(_run())
 
@@ -683,29 +692,29 @@ def test_pipeline_groups_chunk_extraction_by_prompt_id(tmp_path: Path) -> None:
                 turn_id="turn-1",
                 conversation_id="conv-1",
                 source_agent="agent-a",
-                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                task_kind=TASK_KIND_SCOPED_EXTRACTION,
                 chunk_ids=["c1", "c2", "c1"],
-                system_prompt=prompt_a,
+                chunk_system_prompt=prompt_a,
             ),
             make_extraction_task(
                 turn_id="turn-1",
                 conversation_id="conv-1",
                 source_agent="agent-a",
-                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                task_kind=TASK_KIND_SCOPED_EXTRACTION,
                 chunk_ids=["c3"],
-                system_prompt=prompt_b,
+                chunk_system_prompt=prompt_b,
             ),
             make_extraction_task(
                 turn_id="turn-1",
                 conversation_id="conv-1",
                 source_agent="agent-a",
-                task_kind=TASK_KIND_CHUNK_ENTITIES,
+                task_kind=TASK_KIND_SCOPED_EXTRACTION,
                 chunk_ids=["c4"],
-                system_prompt=None,
+                chunk_system_prompt=None,
             ),
         ]
-        tasks[0].system_prompt_id = prompt_a_id
-        tasks[1].system_prompt_id = prompt_b_id
+        tasks[0].chunk_system_prompt_id = prompt_a_id
+        tasks[1].chunk_system_prompt_id = prompt_b_id
 
         await pipeline.process_tasks(tasks)
 
@@ -797,6 +806,7 @@ def test_pipeline_injects_chunk_entity_context_and_filters_relationships(
             turn_id="turn-1",
             conversation_id="conv-1",
             source_agent="agent-a",
+            task_kind=TASK_KIND_SCOPED_EXTRACTION,
             extraction_text="analysis text",
             chunk_ids=["chunk-1"],
             system_prompt="extract relationships",
@@ -810,7 +820,11 @@ def test_pipeline_injects_chunk_entity_context_and_filters_relationships(
         assert result["retry_tasks"] == []
         assert result["processed_task_ids"] == [task.task_id]
         assert extractor.calls
-        injected_text = str(extractor.calls[0]["text"] or "")
+        relationship_calls = [
+            call for call in extractor.calls if call.get("mode") == "relationships"
+        ]
+        assert relationship_calls
+        injected_text = str(relationship_calls[0]["text"] or "")
         assert "Known entities extracted for the referenced chunks" in injected_text
         assert "Apple (Company)" in injected_text
         assert "Revenue Growth (FinancialConcept)" in injected_text
@@ -857,6 +871,7 @@ def test_pipeline_no_entities_schedules_retry_then_exhausts(tmp_path: Path) -> N
             turn_id="turn-1",
             conversation_id="conv-1",
             source_agent="agent-a",
+            task_kind=TASK_KIND_SCOPED_EXTRACTION,
             extraction_text="analysis text",
             chunk_ids=["chunk-1"],
             system_prompt="extract relationships",
@@ -879,6 +894,7 @@ def test_pipeline_no_entities_schedules_retry_then_exhausts(tmp_path: Path) -> N
             turn_id="turn-1",
             conversation_id="conv-1",
             source_agent="agent-a",
+            task_kind=TASK_KIND_SCOPED_EXTRACTION,
             extraction_text="analysis text",
             chunk_ids=["chunk-1"],
             system_prompt="extract relationships",
@@ -920,6 +936,35 @@ def test_graph_task_store_roundtrip_persists_retry_metadata(tmp_path: Path) -> N
         assert loaded["max_retries"] == 4
         assert loaded["retry_delay_seconds"] == 120
         assert loaded["not_before"] == 12345.0
+
+    asyncio.run(_run())
+
+
+def test_manager_rejects_legacy_task_kinds(tmp_path: Path) -> None:
+    manager = GraphQueueManager(
+        entity_resolver=FakeResolver(),
+        graph_writer=FakeWriter(),
+        relationship_extractor=FakeRelationshipExtractor(),
+        llm_provider=fake_llm_provider,
+        db_path=str(tmp_path / "graph_tasks.db"),
+    )
+
+    async def _run() -> None:
+        await manager.start()
+        try:
+            legacy_task = make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                task_kind=TASK_KIND_EXTRACTION,
+                extraction_text="analysis text",
+                system_prompt="extract relationships",
+            )
+            legacy_task.task_kind = "relationships"
+            with pytest.raises(ValueError, match="unsupported task_kind"):
+                await manager.enqueue(legacy_task)
+        finally:
+            await manager.shutdown()
 
     asyncio.run(_run())
 

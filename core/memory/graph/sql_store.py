@@ -29,6 +29,7 @@ class GraphTaskSqlStore(SQLiteAdapter):
                 relationships   TEXT NOT NULL,
                 extraction_text TEXT,
                 system_prompt_id TEXT,
+                chunk_system_prompt_id TEXT,
                 allowed_entity_types TEXT,
                 allowed_relationship_types TEXT,
                 llm_config      TEXT,
@@ -64,6 +65,10 @@ class GraphTaskSqlStore(SQLiteAdapter):
             """
         )
         await self._ensure_graph_task_column(
+            "chunk_system_prompt_id",
+            "ALTER TABLE graph_tasks ADD COLUMN chunk_system_prompt_id TEXT",
+        )
+        await self._ensure_graph_task_column(
             "retry_count",
             "ALTER TABLE graph_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
         )
@@ -91,8 +96,8 @@ class GraphTaskSqlStore(SQLiteAdapter):
     async def persist_task(self, task_payload: Dict[str, Any]) -> None:
         await self.execute(
             """INSERT OR IGNORE INTO graph_tasks
-               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
+               (task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, chunk_system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
             (
                 task_payload["task_id"],
                 task_payload["turn_id"],
@@ -101,6 +106,7 @@ class GraphTaskSqlStore(SQLiteAdapter):
                 json.dumps(task_payload.get("relationships") or []),
                 task_payload.get("extraction_text"),
                 task_payload.get("system_prompt_id"),
+                task_payload.get("chunk_system_prompt_id"),
                 (
                     json.dumps(task_payload["allowed_entity_types"])
                     if task_payload.get("allowed_entity_types") is not None
@@ -145,14 +151,14 @@ class GraphTaskSqlStore(SQLiteAdapter):
 
     async def load_pending_tasks(self) -> List[Dict[str, Any]]:
         rows = await self.fetchall(
-            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, chunk_system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
             "FROM graph_tasks WHERE status='PENDING' ORDER BY created_at ASC"
         )
         return self._decode_task_rows(rows)
 
     async def load_pending_tasks_due(self, due_epoch: float) -> List[Dict[str, Any]]:
         rows = await self.fetchall(
-            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, chunk_system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
             "FROM graph_tasks WHERE status='PENDING' AND (not_before IS NULL OR not_before <= ?) ORDER BY created_at ASC",
             (float(due_epoch),),
         )
@@ -162,7 +168,7 @@ class GraphTaskSqlStore(SQLiteAdapter):
         self, due_epoch: float
     ) -> List[Dict[str, Any]]:
         rows = await self.fetchall(
-            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
+            "SELECT task_id, turn_id, conversation_id, source_agent, relationships, extraction_text, system_prompt_id, chunk_system_prompt_id, allowed_entity_types, allowed_relationship_types, llm_config, task_kind, chunk_ids, retry_count, max_retries, retry_delay_seconds, not_before, created_at "
             "FROM graph_tasks WHERE status='PENDING' AND not_before IS NOT NULL AND not_before <= ? ORDER BY created_at ASC",
             (float(due_epoch),),
         )
@@ -180,6 +186,7 @@ class GraphTaskSqlStore(SQLiteAdapter):
                     "relationships": json.loads(row["relationships"] or "[]"),
                     "extraction_text": row["extraction_text"],
                     "system_prompt_id": row["system_prompt_id"],
+                    "chunk_system_prompt_id": row.get("chunk_system_prompt_id"),
                     "allowed_entity_types": (
                         json.loads(row["allowed_entity_types"])
                         if row["allowed_entity_types"]

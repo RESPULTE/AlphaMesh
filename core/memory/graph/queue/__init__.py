@@ -3,8 +3,8 @@ from uuid import uuid4
 
 from core.memory.graph.queue.manager import GraphQueueManager
 from core.memory.graph.queue.types import (
-    TASK_KIND_CHUNK_ENTITIES,
-    TASK_KIND_RELATIONSHIPS,
+    TASK_KIND_EXTRACTION,
+    TASK_KIND_SCOPED_EXTRACTION,
     GraphTask,
 )
 
@@ -20,8 +20,8 @@ from .utils import (
 __all__ = [
     "GraphQueueManager",
     "GraphTask",
-    "TASK_KIND_RELATIONSHIPS",
-    "TASK_KIND_CHUNK_ENTITIES",
+    "TASK_KIND_EXTRACTION",
+    "TASK_KIND_SCOPED_EXTRACTION",
     "make_graph_task",
     "make_extraction_task",
     "prompt_id_from_text",
@@ -51,9 +51,10 @@ def make_extraction_task(
     source_agent: str,
     extraction_text: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    chunk_system_prompt: Optional[str] = None,
     llm_config: Optional[dict] = None,
     immediate: bool = False,
-    task_kind: str = TASK_KIND_RELATIONSHIPS,
+    task_kind: str = TASK_KIND_EXTRACTION,
     chunk_ids: Optional[List[str]] = None,
     allowed_entity_types: Optional[List[str]] = None,
     allowed_relationship_types: Optional[List[str]] = None,
@@ -68,7 +69,7 @@ def make_extraction_task(
     )
 
     effective_system_prompt = system_prompt
-    if task_kind == TASK_KIND_RELATIONSHIPS:
+    if task_kind in {TASK_KIND_EXTRACTION, TASK_KIND_SCOPED_EXTRACTION}:
         if not normalized_entity_types:
             normalized_entity_types = default_allowed_entity_types()
         if not normalized_relationship_types:
@@ -85,6 +86,11 @@ def make_extraction_task(
         if effective_system_prompt
         else None
     )
+    chunk_prompt_id = (
+        prompt_id_from_text(chunk_system_prompt)
+        if chunk_system_prompt
+        else None
+    )
     return GraphTask(
         task_id=str(uuid4()),
         turn_id=turn_id,
@@ -97,6 +103,8 @@ def make_extraction_task(
         extraction_text=extraction_text,
         system_prompt=effective_system_prompt,
         system_prompt_id=prompt_id,
+        chunk_system_prompt=chunk_system_prompt,
+        chunk_system_prompt_id=chunk_prompt_id,
         allowed_entity_types=normalized_entity_types or None,
         allowed_relationship_types=normalized_relationship_types or None,
         llm_config=llm_config,

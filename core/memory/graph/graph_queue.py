@@ -9,15 +9,15 @@ once downstream imports migrate to the new package.
 from core.memory.graph.queue import (
     GraphQueueManager,
     GraphTask,
-    TASK_KIND_CHUNK_ENTITIES,
-    TASK_KIND_RELATIONSHIPS,
+    TASK_KIND_EXTRACTION,
+    TASK_KIND_SCOPED_EXTRACTION,
     make_extraction_task,
     make_graph_task,
     prompt_id_from_text,
 )
 
-_TASK_KIND_RELATIONSHIPS = TASK_KIND_RELATIONSHIPS
-_TASK_KIND_CHUNK_ENTITIES = TASK_KIND_CHUNK_ENTITIES
+_TASK_KIND_EXTRACTION = TASK_KIND_EXTRACTION
+_TASK_KIND_SCOPED_EXTRACTION = TASK_KIND_SCOPED_EXTRACTION
 _prompt_id = prompt_id_from_text
 
 __all__ = [
@@ -25,10 +25,10 @@ __all__ = [
     "GraphTask",
     "make_graph_task",
     "make_extraction_task",
-    "TASK_KIND_RELATIONSHIPS",
-    "TASK_KIND_CHUNK_ENTITIES",
-    "_TASK_KIND_RELATIONSHIPS",
-    "_TASK_KIND_CHUNK_ENTITIES",
+    "TASK_KIND_EXTRACTION",
+    "TASK_KIND_SCOPED_EXTRACTION",
+    "_TASK_KIND_EXTRACTION",
+    "_TASK_KIND_SCOPED_EXTRACTION",
     "prompt_id_from_text",
     "_prompt_id",
 ]

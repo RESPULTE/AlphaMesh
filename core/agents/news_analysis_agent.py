@@ -26,6 +26,7 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_ANALYSIS_USER_PROMPT,
     NEWS_DEFERRED_ALLOWED_ENTITY_TYPES,
     NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
+    build_news_deferred_chunk_entity_system_prompt,
     NEWS_PLANNER_SYSTEM_PROMPT,
     build_news_deferred_relationship_system_prompt,
 )
@@ -38,7 +39,10 @@ from core.agents.working_memory.news_working_memory import NewsWorkingMemoryMana
 from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
-from core.memory.graph.graph_queue import make_extraction_task
+from core.memory.graph.graph_queue import (
+    TASK_KIND_SCOPED_EXTRACTION,
+    make_extraction_task,
+)
 from core.memory.retrieval.models import RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
@@ -887,9 +891,11 @@ class NewsAnalysisAgent(AbstractAgent):
                     turn_id=turn_id,
                     conversation_id=state.conversation_id,
                     source_agent=self.name(),
+                    task_kind=TASK_KIND_SCOPED_EXTRACTION,
                     extraction_text=analysis_text,
                     chunk_ids=final_stage_chunk_ids,
                     system_prompt=relationship_system_prompt,
+                    chunk_system_prompt=build_news_deferred_chunk_entity_system_prompt(),
                     allowed_entity_types=allowed_entity_types,
                     allowed_relationship_types=allowed_relationship_types,
                     llm_config={"temperature": getattr(self._llm, "temperature", 0.7)},

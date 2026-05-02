@@ -196,6 +196,22 @@ NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES = (
     "BELONGS_TO",
 )
 
+NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT = """\
+You are an entity extractor for financial news chunks.
+
+Extract only entities that are explicitly supported by each chunk's text.
+Prioritize entities useful for relationship grounding in downstream graph extraction:
+- Company
+- FinancialEvent
+- FinancialConcept
+
+Rules:
+- Keep entity names canonical and concise.
+- Do not infer entities absent from the chunk text.
+- For each entity, provide a short factual description grounded in the chunk.
+- If a chunk has no extractable entities, return an empty entity list for that chunk.
+""".strip()
+
 
 def _build_relationship_schema_for_news_prompt(
     *,
@@ -309,6 +325,10 @@ Return ONLY:
     allowed_relationship_types=allowed_relationship_types,
 )}
 """.strip()
+
+
+def build_news_deferred_chunk_entity_system_prompt() -> str:
+    return NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT
 
 
 NEWS_ANALYSIS_USER_PROMPT = """\

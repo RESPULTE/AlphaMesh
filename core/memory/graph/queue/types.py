@@ -4,8 +4,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-TASK_KIND_RELATIONSHIPS = "relationships"
-TASK_KIND_CHUNK_ENTITIES = "chunk_entities"
+TASK_KIND_EXTRACTION = "extraction"
+TASK_KIND_SCOPED_EXTRACTION = "scoped_extraction"
 SHUTDOWN_TURN_ID = "__SHUTDOWN__"
 
 
@@ -16,12 +16,14 @@ class GraphTask:
     conversation_id: str
     source_agent: str
     immediate: bool = False
-    task_kind: str = TASK_KIND_RELATIONSHIPS
+    task_kind: str = TASK_KIND_EXTRACTION
     chunk_ids: Optional[List[str]] = None
     relationships: List[dict] = field(default_factory=list)
     extraction_text: Optional[str] = None
     system_prompt: Optional[str] = None
     system_prompt_id: Optional[str] = None
+    chunk_system_prompt: Optional[str] = None
+    chunk_system_prompt_id: Optional[str] = None
     allowed_entity_types: Optional[List[str]] = None
     allowed_relationship_types: Optional[List[str]] = None
     llm_config: Optional[dict] = None
@@ -42,6 +44,7 @@ class GraphTask:
             "relationships": self.relationships,
             "extraction_text": self.extraction_text,
             "system_prompt_id": self.system_prompt_id,
+            "chunk_system_prompt_id": self.chunk_system_prompt_id,
             "allowed_entity_types": self.allowed_entity_types,
             "allowed_relationship_types": self.allowed_relationship_types,
             "llm_config": self.llm_config,
@@ -65,11 +68,12 @@ class GraphTask:
             turn_id=str(payload["turn_id"]),
             conversation_id=str(payload["conversation_id"]),
             source_agent=str(payload["source_agent"]),
-            task_kind=str(payload.get("task_kind") or TASK_KIND_RELATIONSHIPS),
+            task_kind=str(payload.get("task_kind") or TASK_KIND_EXTRACTION),
             chunk_ids=payload.get("chunk_ids"),
             relationships=list(payload.get("relationships") or []),
             extraction_text=payload.get("extraction_text"),
             system_prompt_id=payload.get("system_prompt_id"),
+            chunk_system_prompt_id=payload.get("chunk_system_prompt_id"),
             allowed_entity_types=allowed_entity_types,
             allowed_relationship_types=allowed_relationship_types,
             llm_config=payload.get("llm_config"),

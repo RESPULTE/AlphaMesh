@@ -11,7 +11,11 @@ from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.queue.pipeline import GraphWritePipeline
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
-from core.memory.graph.queue.types import TASK_KIND_RELATIONSHIPS, GraphTask
+from core.memory.graph.queue.types import (
+    TASK_KIND_EXTRACTION,
+    TASK_KIND_SCOPED_EXTRACTION,
+    GraphTask,
+)
 from core.memory.graph.queue.utils import (
     default_allowed_entity_types,
     default_allowed_relationship_types,
@@ -19,7 +23,8 @@ from core.memory.graph.queue.utils import (
     has_extractable_payload,
     has_extraction_text,
     has_inline_relationships,
-    is_chunk_entities_task,
+    is_scoped_extraction_task,
+    is_supported_task_kind,
     normalize_allowed_entity_types,
     normalize_allowed_relationship_types,
 )
@@ -242,9 +247,14 @@ class GraphQueueManager:
             logger.exception("GraphQueueManager: failed to purge old processed tasks")
 
     async def _prepare_task(self, task: GraphTask) -> bool:
-        is_chunk_entities = is_chunk_entities_task(task)
+        if not is_supported_task_kind(task):
+            raise ValueError(
+                f"GraphQueueManager.enqueue: unsupported task_kind '{task.task_kind}' for task '{task.task_id}'"
+            )
 
-        if task.task_kind == TASK_KIND_RELATIONSHIPS:
+        is_scoped_extraction = is_scoped_extraction_task(task)
+
+        if task.task_kind in {TASK_KIND_EXTRACTION, TASK_KIND_SCOPED_EXTRACTION}:
             task.allowed_entity_types = self._resolve_task_entity_scope(task)
             task.allowed_relationship_types = self._resolve_task_relationship_scope(
                 task
@@ -254,8 +264,12 @@ class GraphQueueManager:
             task.system_prompt_id = await self._prompt_registry.register(
                 task.system_prompt
             )
+        if task.chunk_system_prompt is not None:
+            task.chunk_system_prompt_id = await self._prompt_registry.register(
+                task.chunk_system_prompt
+            )
 
-        if is_chunk_entities and not has_chunk_ids(task):
+        if is_scoped_extraction and not has_chunk_ids(task):
             logger.warning(
                 "GraphQueueManager.enqueue: missing chunk_ids for '%s'",
                 task.task_id,
@@ -263,8 +277,7 @@ class GraphQueueManager:
             return False
 
         if (
-            (not is_chunk_entities)
-            and has_extraction_text(task)
+            has_extraction_text(task)
             and not task.system_prompt_id
         ):
             logger.warning(
@@ -273,11 +286,9 @@ class GraphQueueManager:
             )
             return False
 
-        has_work = (
-            has_chunk_ids(task)
-            if is_chunk_entities
-            else has_inline_relationships(task) or has_extractable_payload(task)
-        )
+        has_work = has_inline_relationships(task) or has_extractable_payload(task)
+        if is_scoped_extraction:
+            has_work = has_work and has_chunk_ids(task)
         if not has_work:
             logger.debug(
                 "GraphQueueManager.enqueue: skipping empty task from '%s'",
@@ -286,13 +297,21 @@ class GraphQueueManager:
             return False
 
         if (
-            (not is_chunk_entities)
-            and task.system_prompt_id
+            task.system_prompt_id
             and not self._prompt_registry.get(task.system_prompt_id)
         ):
             logger.warning(
                 "GraphQueueManager.enqueue: prompt_id '%s' not registered; extraction may fail",
                 task.system_prompt_id,
+            )
+        if (
+            is_scoped_extraction
+            and task.chunk_system_prompt_id
+            and not self._prompt_registry.get(task.chunk_system_prompt_id)
+        ):
+            logger.warning(
+                "GraphQueueManager.enqueue: chunk_prompt_id '%s' not registered; scoped extraction prepass may fail",
+                task.chunk_system_prompt_id,
             )
         return True
 

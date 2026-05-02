@@ -14,10 +14,10 @@ from core.memory.graph.models import (
 )
 from core.memory.graph.queue.prompt_registry import PromptRegistry
 from core.memory.graph.queue.relationship_extractor import RelationshipExtractor
-from core.memory.graph.queue.types import TASK_KIND_CHUNK_ENTITIES, GraphTask
+from core.memory.graph.queue.types import GraphTask
 from core.memory.graph.queue.utils import (
     has_extractable_payload,
-    is_chunk_entities_task,
+    is_scoped_extraction_task,
 )
 from core.memory.graph.utils import (
     entity_key,
@@ -57,7 +57,7 @@ class GraphWritePipeline:
     async def extract_relationships_for_task(
         self, task: GraphTask
     ) -> Tuple[List[dict], Optional[GraphTask]]:
-        if is_chunk_entities_task(task) or not has_extractable_payload(task):
+        if not has_extractable_payload(task):
             return [], None
         prompt = self._prompt_registry.get(task.system_prompt_id)
         if not prompt:
@@ -69,7 +69,7 @@ class GraphWritePipeline:
 
         extraction_text = task.extraction_text or ""
         allowed_entity_keys: Optional[set[Tuple[str, str]]] = None
-        if task.chunk_ids:
+        if is_scoped_extraction_task(task) and task.chunk_ids:
             entity_rows = await self._writer.get_entities_for_chunks(task.chunk_ids)
             entity_context, allowed_entity_keys = self._build_chunk_entity_context(
                 entity_rows
@@ -131,8 +131,6 @@ class GraphWritePipeline:
         processed_task_ids: List[str] = []
         for task in tasks:
             processed_task_ids.append(task.task_id)
-            if task.task_kind == TASK_KIND_CHUNK_ENTITIES:
-                continue
             relationships = list(task.relationships or [])
             if not relationships and task.extraction_text:
                 relationships, retry_task = await self.extract_relationships_for_task(
@@ -196,6 +194,8 @@ class GraphWritePipeline:
             extraction_text=task.extraction_text,
             system_prompt=task.system_prompt,
             system_prompt_id=task.system_prompt_id,
+            chunk_system_prompt=task.chunk_system_prompt,
+            chunk_system_prompt_id=task.chunk_system_prompt_id,
             allowed_entity_types=list(task.allowed_entity_types or []),
             allowed_relationship_types=list(task.allowed_relationship_types or []),
             llm_config=dict(task.llm_config or {}),
@@ -344,11 +344,11 @@ class GraphWritePipeline:
     async def _process_chunk_entity_tasks(self, tasks: List[GraphTask]) -> None:
         chunk_groups: Dict[Tuple[str, str], Dict[str, object]] = {}
         for task in tasks:
-            if task.task_kind != TASK_KIND_CHUNK_ENTITIES or not task.chunk_ids:
+            if not is_scoped_extraction_task(task) or not task.chunk_ids:
                 continue
             prompt_text = self._resolve_chunk_system_prompt(task)
             prompt_key = (
-                task.system_prompt_id
+                task.chunk_system_prompt_id
                 or (prompt_text.strip() if prompt_text and prompt_text.strip() else "")
                 or "__default__"
             )
@@ -386,10 +386,10 @@ class GraphWritePipeline:
                 )
 
     def _resolve_chunk_system_prompt(self, task: GraphTask) -> Optional[str]:
-        if task.system_prompt and task.system_prompt.strip():
-            return task.system_prompt
-        if task.system_prompt_id:
-            prompt = self._prompt_registry.get(task.system_prompt_id)
+        if task.chunk_system_prompt and task.chunk_system_prompt.strip():
+            return task.chunk_system_prompt
+        if task.chunk_system_prompt_id:
+            prompt = self._prompt_registry.get(task.chunk_system_prompt_id)
             if prompt:
                 return prompt
         return None
