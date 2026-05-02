@@ -49,12 +49,40 @@ _SUPPORTED_CHART_TYPES = {
 _SNAPSHOT_UNSUPPORTED_TYPES = {"line", "area", "scatter", "stacked_area"}
 
 
+def _extract_row_semantics(final_response) -> dict[str, dict[str, Any]]:
+    raw = getattr(final_response, "fundamentals_row_semantics", {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for row_label, meta in raw.items():
+        meta_dict: dict[str, Any] | None = None
+        if isinstance(meta, dict):
+            meta_dict = dict(meta)
+        elif hasattr(meta, "model_dump"):
+            try:
+                dumped = meta.model_dump()
+                if isinstance(dumped, dict):
+                    meta_dict = dumped
+            except Exception:
+                meta_dict = None
+        if not meta_dict:
+            continue
+        key = str(row_label or "").strip()
+        if not key:
+            continue
+        normalized[key] = meta_dict
+    return normalized
+
+
 def _build_metrics_payload(final_response) -> Optional[DataFramePayload]:
     fundamental_df = getattr(final_response, "fundamental_data", None)
     if fundamental_df is None or getattr(fundamental_df, "empty", True):
         return None
     try:
-        return DataFramePayload.from_dataframe(fundamental_df)
+        return DataFramePayload.from_dataframe(
+            fundamental_df,
+            row_semantics=_extract_row_semantics(final_response),
+        )
     except Exception:
         logger.warning(
             "_build_metrics_payload: DataFrame serialisation failed; skipping."
@@ -117,7 +145,10 @@ def _build_fundamentals_visualization_payload(
     raw_df = getattr(final_response, "fundamentals_raw_display_data", None)
     if raw_df is not None and not getattr(raw_df, "empty", True):
         try:
-            raw_data_payload = DataFramePayload.from_dataframe(raw_df)
+            raw_data_payload = DataFramePayload.from_dataframe(
+                raw_df,
+                row_semantics=_extract_row_semantics(final_response),
+            )
         except Exception:
             logger.warning(
                 "_build_fundamentals_visualization_payload: raw_data serialisation failed."
@@ -529,7 +560,10 @@ def _build_final_result(
     financial_payload: Optional[DataFramePayload] = None
     if fundamental_df is not None and not fundamental_df.empty:
         try:
-            financial_payload = DataFramePayload.from_dataframe(fundamental_df)
+            financial_payload = DataFramePayload.from_dataframe(
+                fundamental_df,
+                row_semantics=_extract_row_semantics(final_response),
+            )
         except Exception:
             logger.warning(
                 "_build_final_result: DataFrame serialisation failed; skipping."

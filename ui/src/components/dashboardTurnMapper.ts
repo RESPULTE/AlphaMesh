@@ -2,8 +2,11 @@ import type {
   AgentAnalysis,
   AnalysisResponse,
   ConversationTurn,
-  DataFramePayload,
 } from '../types/api';
+import {
+  buildFundamentalsMetrics,
+  buildFundamentalsTable,
+} from '../lib/fundamentalsDisplay';
 
 function firstSentence(text: string): string {
   const match = text.match(/^(.*?[.!?])\s/);
@@ -17,44 +20,6 @@ function extractDomain(url: string): string {
   } catch {
     return 'Source';
   }
-}
-
-function formatValue(value: number): string {
-  const abs = Math.abs(value);
-  if (abs >= 1e12) return `${(value / 1e12).toFixed(2)}T`;
-  if (abs >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
-  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
-  return value.toFixed(2);
-}
-
-function buildTable(payload?: DataFramePayload | null): AgentAnalysis['tableData'] | undefined {
-  if (!payload || payload.data.length === 0) return undefined;
-  const maxRows = Math.min(8, payload.index.length);
-  const maxCols = Math.min(5, payload.columns.length);
-  const columnStart = payload.columns.length - maxCols;
-  const headers = ['Metric', ...payload.columns.slice(columnStart)];
-  const rows: string[][] = [];
-  for (let r = 0; r < maxRows; r++) {
-    const rowLabel = payload.index[r];
-    const rowValues = payload.data[r]
-      .slice(columnStart)
-      .map((val) => (val == null ? '-' : formatValue(val)));
-    rows.push([rowLabel, ...rowValues]);
-  }
-  return { title: 'Financial Data', headers, rows };
-}
-
-function buildMetrics(payload?: DataFramePayload | null): AgentAnalysis['metrics'] | undefined {
-  if (!payload || payload.data.length === 0) return undefined;
-  const lastColIndex = payload.columns.length - 1;
-  const metrics: AgentAnalysis['metrics'] = [];
-  for (let i = 0; i < payload.index.length && metrics.length < 4; i++) {
-    const val = payload.data[i]?.[lastColIndex];
-    if (val == null) continue;
-    metrics.push({ label: payload.index[i].toUpperCase().slice(0, 12), value: formatValue(val) });
-  }
-  return metrics.length ? metrics : undefined;
 }
 
 export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisResponse {
@@ -100,10 +65,10 @@ export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisRespo
       category: 'Financial Lab',
       recentCatalyst: { title: '', description: '', timeAgo: '' },
       sentiment: { score: 50, label: 'NEUTRAL (50%)' },
-      metrics: buildMetrics(financialData),
+      metrics: buildFundamentalsMetrics(financialData),
       quote: firstSentence(fundamentalsText || synthesis),
       fullReport: fundamentalsText || synthesis,
-      tableData: buildTable(financialData),
+      tableData: buildFundamentalsTable(financialData),
     });
   }
 

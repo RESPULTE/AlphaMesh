@@ -529,6 +529,9 @@ class OrchestratorAgent:
             "fundamentals_raw_display_data": synthesis_inputs[
                 "fundamentals_raw_display_data"
             ],
+            "fundamentals_row_semantics": synthesis_inputs[
+                "fundamentals_row_semantics"
+            ],
             "fundamentals_task_completed": synthesis_inputs[
                 "fundamentals_task_completed"
             ],

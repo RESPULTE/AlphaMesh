@@ -135,6 +135,15 @@ export interface DataFramePayload {
   index: string[];
   columns: string[];
   data: Array<Array<number | null>>;
+  row_semantics?: Record<
+    string,
+    {
+      value_kind?: string;
+      display_unit?: string;
+      invalid?: boolean;
+      invalid_reason?: string;
+    }
+  >;
 }
 
 export type FundamentalsChartType =

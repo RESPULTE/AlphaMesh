@@ -140,6 +140,9 @@ def _coerce_final_response(raw: Any) -> FinalResponse:
             fundamental_data=raw.get("fundamental_data"),
             fundamentals_visualization=raw.get("fundamentals_visualization"),
             fundamentals_raw_display_data=raw.get("fundamentals_raw_display_data"),
+            fundamentals_row_semantics=_normalize_row_semantics(
+                raw.get("fundamentals_row_semantics") or {}
+            ),
             fundamentals_task_completed=raw.get("fundamentals_task_completed", True),
             fundamentals_task_completion_reason=raw.get(
                 "fundamentals_task_completion_reason", ""
@@ -154,7 +157,12 @@ def _coerce_final_response(raw: Any) -> FinalResponse:
         summary=getattr(raw, "summary", "") or "",
         fundamental_data=getattr(raw, "fundamental_data", None),
         fundamentals_visualization=getattr(raw, "fundamentals_visualization", None),
-        fundamentals_raw_display_data=getattr(raw, "fundamentals_raw_display_data", None),
+        fundamentals_raw_display_data=getattr(
+            raw, "fundamentals_raw_display_data", None
+        ),
+        fundamentals_row_semantics=_normalize_row_semantics(
+            getattr(raw, "fundamentals_row_semantics", {}) or {}
+        ),
         fundamentals_task_completed=getattr(raw, "fundamentals_task_completed", True),
         fundamentals_task_completion_reason=getattr(
             raw, "fundamentals_task_completion_reason", ""
@@ -171,11 +179,35 @@ def _extract_response_text(raw: str) -> str:
     return raw.strip()
 
 
+def _normalize_row_semantics(raw: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for row_label, meta in raw.items():
+        key = str(row_label or "").strip()
+        if not key:
+            continue
+        meta_dict: Optional[Dict[str, Any]] = None
+        if isinstance(meta, dict):
+            meta_dict = dict(meta)
+        elif hasattr(meta, "model_dump"):
+            try:
+                dumped = meta.model_dump()
+                if isinstance(dumped, dict):
+                    meta_dict = dumped
+            except Exception:
+                meta_dict = None
+        if meta_dict:
+            normalized[key] = meta_dict
+    return normalized
+
+
 def _collect_synthesis_inputs(agent_outputs: Dict[str, BaseAgentOutput]) -> Dict[str, Any]:
     context_parts: List[str] = []
     fundamental_df = None
     fundamentals_visualization = None
     fundamentals_raw_display_data = None
+    fundamentals_row_semantics = {}
     fundamentals_task_completed = True
     fundamentals_task_completion_reason = ""
     news_sources: List[CitedSource] = []
@@ -191,6 +223,9 @@ def _collect_synthesis_inputs(agent_outputs: Dict[str, BaseAgentOutput]) -> Dict
             fundamental_df = getattr(output, "financial_data", None)
             fundamentals_visualization = getattr(output, "visualization_plan", None)
             fundamentals_raw_display_data = getattr(output, "raw_display_data", None)
+            fundamentals_row_semantics = _normalize_row_semantics(
+                getattr(output, "row_semantics", {}) or {}
+            )
             fundamentals_task_completed = bool(getattr(output, "task_completed", True))
             fundamentals_task_completion_reason = (
                 getattr(output, "task_completion_reason", "") or ""
@@ -207,6 +242,7 @@ def _collect_synthesis_inputs(agent_outputs: Dict[str, BaseAgentOutput]) -> Dict
         "fundamental_df": fundamental_df,
         "fundamentals_visualization": fundamentals_visualization,
         "fundamentals_raw_display_data": fundamentals_raw_display_data,
+        "fundamentals_row_semantics": fundamentals_row_semantics,
         "fundamentals_task_completed": fundamentals_task_completed,
         "fundamentals_task_completion_reason": fundamentals_task_completion_reason,
         "news_sources": news_sources,
@@ -273,4 +309,3 @@ async def validate_and_enrich_plan_tickers(
         "company_context_blocks": company_context_blocks,
         "ticker_metadata": ticker_metadata,
     }
-

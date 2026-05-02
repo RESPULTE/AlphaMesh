@@ -176,6 +176,7 @@ class OrchestratorState(BaseModel):
     fundamentals_raw_display_data: Optional[pd.DataFrame] = Field(
         default=None, exclude=True
     )
+    fundamentals_row_semantics: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     fundamentals_task_completed: bool = Field(default=True)
     fundamentals_task_completion_reason: str = Field(default="")
     sources: List[CitedSource] = Field(default_factory=list)
@@ -203,6 +204,7 @@ class FinalResponse(BaseModel):
     fundamentals_raw_display_data: Optional[pd.DataFrame] = Field(
         default=None, exclude=True
     )
+    fundamentals_row_semantics: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     fundamentals_task_completed: bool = Field(default=True)
     fundamentals_task_completion_reason: str = Field(default="")
     sources: List[CitedSource] = Field(default_factory=list)

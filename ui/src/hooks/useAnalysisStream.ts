@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../auth/AuthContext';
+import {
+  buildFundamentalsMetrics,
+  buildFundamentalsTable,
+} from '../lib/fundamentalsDisplay';
 import type {
   AgentAnalysis,
   AnalysisResponse,
@@ -78,47 +82,9 @@ function deriveConsensus(agentAnalyses: Record<string, string>): AnalysisRespons
   return consensus;
 }
 
-function formatValue(value: number): string {
-  const abs = Math.abs(value);
-  if (abs >= 1e12) return `${(value / 1e12).toFixed(2)}T`;
-  if (abs >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
-  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
-  return value.toFixed(2);
-}
-
-function buildTable(payload?: DataFramePayload | null): AgentAnalysis['tableData'] | undefined {
-  if (!payload || payload.data.length === 0) return undefined;
-  const maxRows = Math.min(8, payload.index.length);
-  const maxCols = Math.min(5, payload.columns.length);
-  const columnStart = payload.columns.length - maxCols;
-  const headers = ['Metric', ...payload.columns.slice(columnStart)];
-  const rows: string[][] = [];
-  for (let r = 0; r < maxRows; r++) {
-    const rowLabel = payload.index[r];
-    const rowValues = payload.data[r]
-      .slice(columnStart)
-      .map((val) => (val == null ? '-' : formatValue(val)));
-    rows.push([rowLabel, ...rowValues]);
-  }
-  return { title: 'Financial Data', headers, rows };
-}
-
-function buildMetrics(payload?: DataFramePayload | null): AgentAnalysis['metrics'] | undefined {
-  if (!payload || payload.data.length === 0) return undefined;
-  const lastColIndex = payload.columns.length - 1;
-  const metrics: AgentAnalysis['metrics'] = [];
-  for (let i = 0; i < payload.index.length && metrics.length < 4; i++) {
-    const val = payload.data[i]?.[lastColIndex];
-    if (val == null) continue;
-    metrics.push({ label: payload.index[i].toUpperCase().slice(0, 12), value: formatValue(val) });
-  }
-  return metrics.length ? metrics : undefined;
-}
-
 function updateFundamentalAgent(prev: AnalysisResponse, payload: DataFramePayload): AnalysisResponse {
-  const metrics = buildMetrics(payload);
-  const tableData = buildTable(payload);
+  const metrics = buildFundamentalsMetrics(payload);
+  const tableData = buildFundamentalsTable(payload);
   if (!metrics && !tableData) return prev;
 
   const agents = [...prev.agents];
@@ -169,8 +135,8 @@ function updateFundamentalVisualization(
 ): AnalysisResponse {
   const mergedVisualization = mergeVisualizationPayload(prev.fundamentalsVisualization, payload);
   const tablePayload = payload.raw_data ?? prev.fundamentalData;
-  const metrics = buildMetrics(tablePayload);
-  const tableData = buildTable(tablePayload);
+  const metrics = buildFundamentalsMetrics(tablePayload);
+  const tableData = buildFundamentalsTable(tablePayload);
   const agents = [...prev.agents];
   const idx = agents.findIndex((agent) => agent.id === 'fundamental');
 
@@ -236,7 +202,7 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
 
   if (agentAnalyses.fundamentals_agent || tickerResult?.financial_data) {
     const text = agentAnalyses.fundamentals_agent || tickerResult?.analysis_text || '';
-    const tableData = buildTable(tickerResult?.financial_data);
+    const tableData = buildFundamentalsTable(tickerResult?.financial_data);
     agents.push({
       id: 'fundamental',
       name: 'Fundamental Agent',
@@ -244,7 +210,7 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
       category: 'Financial Lab',
       recentCatalyst: { title: '', description: '', timeAgo: '' },
       sentiment: { score: 50, label: 'NEUTRAL (50%)' },
-      metrics: buildMetrics(tickerResult?.financial_data),
+      metrics: buildFundamentalsMetrics(tickerResult?.financial_data),
       quote: firstSentence(text),
       fullReport: text,
       tableData

@@ -14,7 +14,11 @@ from api.services.analysis_runner import (
     _build_fundamentals_visualization_payload,
     _build_turn_payload,
 )
-from core.agents.models.fundamental_agent_models import ChartSpec, VisualizationPlan
+from core.agents.models.fundamental_agent_models import (
+    ChartSpec,
+    FundamentalRowSemantic,
+    VisualizationPlan,
+)
 
 
 def _sample_df() -> pd.DataFrame:
@@ -164,3 +168,33 @@ def test_turn_payload_includes_agent_memory_summaries_and_turn_id() -> None:
     assert payload["agent_memory_summaries"]["news_agent"]["source_count"] == 3
     assert payload["ticker_results"][0]["market_quote"] is None
     assert payload["ticker_results"][0]["market_chart"] == []
+
+
+def test_final_result_serializes_pydantic_row_semantics() -> None:
+    df = _sample_df()
+    response = SimpleNamespace(
+        tickers=["AAPL"],
+        agent_analyses={"fundamentals_agent": "Fundamental analysis"},
+        sources=[],
+        fundamental_data=df,
+        summary="Synthesis",
+        fundamentals_visualization=None,
+        fundamentals_raw_display_data=None,
+        fundamentals_task_completed=True,
+        fundamentals_task_completion_reason="",
+        fundamentals_row_semantics={
+            "Revenues": FundamentalRowSemantic(value_kind="currency"),
+            "NetIncomeLoss": FundamentalRowSemantic(value_kind="currency"),
+        },
+    )
+
+    result = _build_final_result(
+        request_id="req-row-semantics",
+        conversation_id="conv-row-semantics",
+        final_response=response,
+        duration_ms=12.3,
+    )
+
+    payload = result.ticker_results[0].financial_data
+    assert payload is not None
+    assert payload.row_semantics["Revenues"]["value_kind"] == "currency"

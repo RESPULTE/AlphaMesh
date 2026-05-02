@@ -13,6 +13,7 @@ from core.agents.models.fundamental_agent_models import (
     ChartSpec,
     CompletionReviewDecision,
     ExecutorBatchLog,
+    FundamentalRowSemantic,
     VisualizationPlan,
 )
 
@@ -401,6 +402,178 @@ def normalise_chart_spec(
 
     snapshot_period = normalise_snapshot_period(chart.snapshot_period)
     return chart_type, data_mode, snapshot_period
+
+
+def _infer_semantic_from_label(row_label: str) -> FundamentalRowSemantic:
+    label = str(row_label or "").strip().lower()
+    if not label:
+        return FundamentalRowSemantic()
+
+    if (
+        label.endswith("_pct_change")
+        or "margin" in label
+        or "yield" in label
+        or "percent" in label
+        or "percentage" in label
+        or label.endswith("_cagr")
+    ):
+        return FundamentalRowSemantic(value_kind="percent", display_unit="%")
+
+    if (
+        "price_to_earnings" in label
+        or label in {"pe", "p_e", "p/e", "pe_ratio"}
+        or "p|e" in label
+        or "price_to_" in label
+        or "ratio" in label
+        or "coverage" in label
+        or label in {"debt_to_equity", "current_ratio", "quick_ratio"}
+    ):
+        return FundamentalRowSemantic(value_kind="ratio", display_unit="x")
+
+    if "stock_price" in label or label in {"close", "open", "high", "low"}:
+        return FundamentalRowSemantic(value_kind="price", display_unit="auto")
+
+    if (
+        "revenue" in label
+        or "income" in label
+        or "profit" in label
+        or "cash" in label
+        or "debt" in label
+        or "asset" in label
+        or "liabilit" in label
+        or "equity" in label
+        or "enterprise_value" in label
+        or "terminal_value" in label
+        or "pv_" in label
+        or "market_cap" in label
+    ):
+        return FundamentalRowSemantic(value_kind="currency", display_unit="auto")
+
+    if "shares" in label or "count" in label:
+        return FundamentalRowSemantic(value_kind="count", display_unit="auto")
+
+    return FundamentalRowSemantic()
+
+
+def _infer_semantic_from_tool(
+    *,
+    tool_name: str,
+    row_label: str,
+    current_semantic: FundamentalRowSemantic,
+    resolved_semantics: Dict[str, FundamentalRowSemantic],
+) -> FundamentalRowSemantic:
+    label = str(row_label or "").strip()
+    lower_label = label.lower()
+    normalized_tool = str(tool_name or "").strip().lower()
+
+    if normalized_tool in {"profitability_ratios", "cagr"}:
+        return FundamentalRowSemantic(value_kind="percent", display_unit="%")
+    if normalized_tool in {"debt_solvency", "liquidity"}:
+        return FundamentalRowSemantic(value_kind="ratio", display_unit="x")
+    if normalized_tool == "period_over_period":
+        if lower_label.endswith("_pct_change"):
+            return FundamentalRowSemantic(value_kind="percent", display_unit="%")
+        if lower_label.endswith("_change"):
+            base_label = label[: -len("_change")]
+            base_semantic = resolved_semantics.get(base_label)
+            if base_semantic is not None:
+                if base_semantic.value_kind == "percent":
+                    return FundamentalRowSemantic(value_kind="percent", display_unit="%")
+                if base_semantic.value_kind in {"currency", "price", "count"}:
+                    return FundamentalRowSemantic(
+                        value_kind=base_semantic.value_kind,
+                        display_unit="auto",
+                    )
+        return current_semantic
+    if normalized_tool == "custom_formula":
+        return _infer_semantic_from_label(label)
+    return current_semantic
+
+
+def _looks_like_pe_ratio_label(row_label: str) -> bool:
+    label = str(row_label or "").strip().lower()
+    if not label:
+        return False
+    if label in {"pe", "p_e", "p/e", "pe_ratio"}:
+        return True
+    return "price_to_earnings" in label or "p|e" in label
+
+
+def _latest_non_null(series: pd.Series) -> float | None:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return None
+    try:
+        return float(clean.iloc[-1])
+    except Exception:
+        return None
+
+
+def _resolve_latest_eps(financial_data: pd.DataFrame) -> float | None:
+    eps_candidates = [
+        "EarningsPerShareBasic",
+        "EarningsPerShareDiluted",
+        "DilutedEarningsPerShare",
+        "BasicEarningsPerShare",
+        "eps",
+    ]
+    for label in financial_data.index:
+        lowered = str(label).strip().lower()
+        if lowered in {c.lower() for c in eps_candidates} or "earningspershare" in lowered:
+            value = _latest_non_null(financial_data.loc[label])
+            if value is not None:
+                return value
+    return None
+
+
+def build_fundamental_row_semantics(
+    *,
+    financial_data: pd.DataFrame,
+    tool_results: Optional[List[ToolResult]] = None,
+) -> Dict[str, FundamentalRowSemantic]:
+    """
+    Build per-row semantic metadata used for display formatting in the UI.
+
+    Priority:
+    1) Label-based baseline inference for all rows.
+    2) Tool-specific overrides for computed rows.
+    3) Invalid ratio marking (e.g., P/E when EPS <= 0).
+    """
+    if financial_data is None or financial_data.empty:
+        return {}
+
+    semantics: Dict[str, FundamentalRowSemantic] = {}
+    for row_label in financial_data.index:
+        label = str(row_label)
+        semantics[label] = _infer_semantic_from_label(label)
+
+    for result in tool_results or []:
+        if not getattr(result, "success", False):
+            continue
+        for row_label in (getattr(result, "added_rows", {}) or {}).keys():
+            label = str(row_label)
+            current = semantics.get(label, FundamentalRowSemantic())
+            semantics[label] = _infer_semantic_from_tool(
+                tool_name=str(getattr(result, "tool_name", "") or ""),
+                row_label=label,
+                current_semantic=current,
+                resolved_semantics=semantics,
+            )
+
+    latest_eps = _resolve_latest_eps(financial_data)
+    for row_label, semantic in semantics.items():
+        if semantic.value_kind != "ratio" or not _looks_like_pe_ratio_label(row_label):
+            continue
+        if latest_eps is not None and latest_eps <= 0:
+            semantic.invalid = True
+            semantic.invalid_reason = "negative earnings (EPS <= 0)"
+            continue
+        ratio_value = _latest_non_null(financial_data.loc[row_label])
+        if ratio_value is not None and ratio_value <= 0:
+            semantic.invalid = True
+            semantic.invalid_reason = "non-positive P/E ratio"
+
+    return semantics
 
 
 def extract_relevant_rows(

@@ -75,6 +75,7 @@ from core.agents.prompts.fundamental_agent_prompts import (
 )
 from core.agents.sentiment_parser import parse_sentiment_block, strip_sentiment_block
 from core.agents.utils import (
+    build_fundamental_row_semantics,
     effective_goal,
     executor_logs_to_text,
     extract_first_sentence,
@@ -104,25 +105,6 @@ _SUPPORTED_CHART_TYPES: Set[str] = {
     "pie",
 }
 _SNAPSHOT_UNSUPPORTED_TYPES: Set[str] = {"line", "area", "scatter", "stacked_area"}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _format_value(x: float) -> str:
-    """Converts a raw float to a human-readable denomination string."""
-    abs_x = abs(x)
-    if abs_x >= 1_000_000_000_000:
-        return f"{x / 1_000_000_000_000:.2f} Trillion"
-    if abs_x >= 1_000_000_000:
-        return f"{x / 1_000_000_000:.2f} Billion"
-    if abs_x >= 1_000_000:
-        return f"{x / 1_000_000:.2f} Million"
-    if abs_x >= 1_000:
-        return f"{x / 1_000:.2f} Thousand"
-    return f"{x:.4g}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,6 +197,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             task_completion_reason=final_state.get("task_completion_reason", ""),
             visualization_plan=final_state.get("visualization_plan"),
             raw_display_data=final_state.get("raw_display_data"),
+            row_semantics=final_state.get("row_semantics") or {},
         )
 
         self._working_memory.persist_agent_memory_summary(
@@ -935,6 +918,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 "task_completion_reason": state.task_completion_reason,
                 "visualization_plan": state.visualization_plan,
                 "raw_display_data": state.raw_display_data,
+                "row_semantics": {},
             }
 
         tool_summary = ""
@@ -1035,6 +1019,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "task_completion_reason": state.task_completion_reason or "",
             "main_conclusion": extract_first_sentence(analysis_text),
         }
+        row_semantics = build_fundamental_row_semantics(
+            financial_data=state.financial_data,
+            tool_results=list(state.tool_results or []),
+        )
 
         return {
             "financial_data": filtered_df,
@@ -1048,4 +1036,5 @@ class FundamentalAnalysisAgent(AbstractAgent):
             "task_completion_reason": state.task_completion_reason,
             "visualization_plan": state.visualization_plan,
             "raw_display_data": state.raw_display_data,
+            "row_semantics": row_semantics,
         }

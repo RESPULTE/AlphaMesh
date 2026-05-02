@@ -206,6 +206,15 @@ class VisualizationPlan(BaseModel):
     reviewer_notes: str = Field(default="")
 
 
+class FundamentalRowSemantic(BaseModel):
+    """Display metadata describing how one fundamentals row should be rendered."""
+
+    value_kind: str = Field(default="generic")
+    display_unit: str = Field(default="auto")
+    invalid: bool = Field(default=False)
+    invalid_reason: str = Field(default="")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Agent Output
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +236,7 @@ class FundamentalAnalysisOutput(BaseAgentOutput):
     task_completion_reason: str = Field(default="")
     visualization_plan: Optional[VisualizationPlan] = Field(default=None)
     raw_display_data: Optional[pd.DataFrame] = Field(default=None)
+    row_semantics: Dict[str, FundamentalRowSemantic] = Field(default_factory=dict)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -312,5 +322,6 @@ class _AgentState(BaseAgentInput):
     task_completion_reason: str = Field(default="")
     visualization_plan: Optional[VisualizationPlan] = Field(default=None)
     raw_display_data: Optional[pd.DataFrame] = Field(default=None)
+    row_semantics: Dict[str, FundamentalRowSemantic] = Field(default_factory=dict)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

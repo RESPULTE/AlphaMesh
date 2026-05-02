@@ -55,9 +55,21 @@ class DataFramePayload(BaseModel):
     data: List[List[Optional[float]]] = Field(
         description="Row-major numeric values; NaN represented as null."
     )
+    row_semantics: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Optional per-row display metadata keyed by row label "
+            "(value kind, display unit, invalid markers)."
+        ),
+    )
 
     @classmethod
-    def from_dataframe(cls, df: pd.DataFrame) -> "DataFramePayload":
+    def from_dataframe(
+        cls,
+        df: pd.DataFrame,
+        *,
+        row_semantics: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> "DataFramePayload":
         """Construct a DataFramePayload from a pandas DataFrame."""
 
         def _safe(v: Any) -> Optional[float]:
@@ -69,13 +81,22 @@ class DataFramePayload(BaseModel):
             except (TypeError, ValueError):
                 return None
 
+        index = [str(idx) for idx in df.index]
+        semantics = row_semantics or {}
+        filtered_semantics: Dict[str, Dict[str, Any]] = {}
+        for row_label in index:
+            meta = semantics.get(row_label)
+            if isinstance(meta, dict) and meta:
+                filtered_semantics[row_label] = dict(meta)
+
         return cls(
-            index=[str(idx) for idx in df.index],
+            index=index,
             columns=[str(col) for col in df.columns],
             data=[
                 [_safe(df.iat[r, c]) for c in range(len(df.columns))]
                 for r in range(len(df.index))
             ],
+            row_semantics=filtered_semantics,
         )
 
 
