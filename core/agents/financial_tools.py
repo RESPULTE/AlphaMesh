@@ -23,7 +23,7 @@ Architecture
 Tools
 -----
   cagr                 — Compound Annual Growth Rate for any metric
-  dcf_intrinsic_value  — DCF enterprise value + optional per-share value
+  valuation_multiples_snapshot - P/S, P/E, EV/EBITDA, P/FCF + trend rows
   profitability_ratios — Gross / operating / net margin
   debt_solvency        — Debt-to-equity, interest coverage
   liquidity            — Current ratio, quick ratio
@@ -65,7 +65,7 @@ class ToolResult(BaseModel):
     # Shape: { row_label -> { date_col -> value } }
     added_rows: Optional[Dict[str, Dict[str, float]]] = None
 
-    # Human-readable justification (used by DCF for assumption traceability)
+    # Human-readable justification for tool-specific assumption traceability
     reasoning: Optional[str] = None
 
     # One-line plain-English summary of results
@@ -82,21 +82,6 @@ class FinancialAnalyticsAdapter(ABC):
 
     @abstractmethod
     def cagr(self, start_value: float, end_value: float, n_periods: float) -> float: ...
-
-    @abstractmethod
-    def npv(self, rate: float, cash_flows: List[float]) -> float: ...
-
-    @abstractmethod
-    def irr(self, cash_flows: List[float]) -> float: ...
-
-    @abstractmethod
-    def dcf_intrinsic_value(
-        self,
-        free_cash_flows: List[float],
-        wacc: float,
-        terminal_growth_rate: float,
-        shares_outstanding: Optional[float] = None,
-    ) -> Dict[str, float]: ...
 
     @abstractmethod
     def gross_margin(self, revenue: float, cogs: float) -> float: ...
@@ -126,8 +111,8 @@ class FinancialAnalyticsAdapter(ABC):
 
 class NumpyFinancialAdapter(FinancialAnalyticsAdapter):
     """
-    Default adapter using numpy-financial for TVM primitives.
-    Pure-Python formulas for all ratios — no external API key required.
+    Default adapter with pure-Python formulas for core metrics.
+    No external API key required.
     """
 
     def _safe_div(self, numerator: float, denominator: float) -> float:
@@ -137,63 +122,6 @@ class NumpyFinancialAdapter(FinancialAnalyticsAdapter):
         if start_value <= 0 or n_periods <= 0:
             raise ValueError("start_value and n_periods must be positive for CAGR")
         return (end_value / start_value) ** (1.0 / n_periods) - 1.0
-
-    def npv(self, rate: float, cash_flows: List[float]) -> float:
-        try:
-            import numpy_financial as npf  # type: ignore
-
-            return float(npf.npv(rate, cash_flows))
-        except ImportError:
-            # Pure-python fallback
-            return sum(cf / (1 + rate) ** i for i, cf in enumerate(cash_flows))
-
-    def irr(self, cash_flows: List[float]) -> float:
-        try:
-            import numpy_financial as npf  # type: ignore
-
-            result = npf.irr(cash_flows)
-            return (
-                float(result)
-                if result is not None and not np.isnan(result)
-                else float("nan")
-            )
-        except ImportError:
-            return float("nan")
-
-    def dcf_intrinsic_value(
-        self,
-        free_cash_flows: List[float],
-        wacc: float,
-        terminal_growth_rate: float,
-        shares_outstanding: Optional[float] = None,
-    ) -> Dict[str, float]:
-        if wacc <= terminal_growth_rate:
-            raise ValueError(
-                f"WACC ({wacc:.1%}) must exceed terminal growth rate ({terminal_growth_rate:.1%})"
-            )
-        # PV of explicit forecast period
-        pv_fcfs = [
-            fcf / (1 + wacc) ** i for i, fcf in enumerate(free_cash_flows, start=1)
-        ]
-        pv_fcf_total = sum(pv_fcfs)
-
-        # Terminal value via Gordon Growth Model applied to last FCF
-        last_fcf = free_cash_flows[-1] if free_cash_flows else 0.0
-        terminal_value = (
-            last_fcf * (1 + terminal_growth_rate) / (wacc - terminal_growth_rate)
-        )
-        pv_terminal = terminal_value / (1 + wacc) ** len(free_cash_flows)
-
-        enterprise_value = pv_fcf_total + pv_terminal
-        result: Dict[str, float] = {
-            "pv_fcf": pv_fcf_total,
-            "terminal_value": terminal_value,
-            "pv_terminal_value": pv_terminal,
-            "enterprise_value": enterprise_value,
-        }
-        if shares_outstanding and shares_outstanding > 0:
-            result["intrinsic_value_per_share"] = enterprise_value / shares_outstanding
-        return result
 
     def gross_margin(self, revenue: float, cogs: float) -> float:
         return self._safe_div(revenue - cogs, revenue)
@@ -243,15 +171,6 @@ class FinanceToolkitAdapter(FinancialAnalyticsAdapter):
 
     def cagr(self, *a, **kw) -> float:
         self._not_implemented()  # type: ignore
-
-    def npv(self, *a, **kw) -> float:
-        self._not_implemented()  # type: ignore
-
-    def irr(self, *a, **kw) -> float:
-        self._not_implemented()  # type: ignore
-
-    def dcf_intrinsic_value(self, *a, **kw):
-        self._not_implemented()
 
     def gross_margin(self, *a, **kw) -> float:
         self._not_implemented()  # type: ignore
@@ -385,134 +304,141 @@ class CAGRTool(FinancialTool):
             return ToolResult(tool_name=self.name, success=False, error=str(exc))
 
 
-# ── DCF ──────────────────────────────────────────────────────────────────────
+# -- Valuation Multiples Snapshot -------------------------------------------------
 
 
-class DCFParams(BaseModel):
+class ValuationMultiplesSnapshotParams(BaseModel):
+    market_cap_metric: str = Field(
+        description="Exact row label for market capitalization (e.g. 'market_cap')."
+    )
+    enterprise_value_metric: str = Field(
+        description="Exact row label for enterprise value (e.g. 'enterprise_value')."
+    )
+    revenue_metric: str = Field(
+        description="Exact row label for revenue (e.g. 'Revenues')."
+    )
+    ebitda_metric: str = Field(
+        description="Exact row label for EBITDA (e.g. 'EBITDA')."
+    )
+    net_income_metric: str = Field(
+        description="Exact row label for net income (e.g. 'NetIncomeLoss')."
+    )
     fcf_metric: str = Field(
-        description="Exact row label in the DataFrame for Free Cash Flow (e.g. 'FreeCashFlow' or 'NetCashProvidedByUsedInOperatingActivities')."
-    )
-    wacc: float = Field(
-        description="Weighted Average Cost of Capital as a decimal (e.g. 0.10 for 10%). Must be LLM-estimated from available data."
-    )
-    terminal_growth_rate: float = Field(
-        description="Perpetual terminal growth rate as a decimal (e.g. 0.025 for 2.5%)."
-    )
-    projection_years: int = Field(
-        default=5,
-        description="Number of years to project Free Cash Flow forward (typically 5 for mature companies, up to 10 for high-growth).",
-    )
-    shares_outstanding_metric: Optional[str] = Field(
-        default=None,
-        description="Exact row label for shares outstanding. If provided, intrinsic value per share is computed.",
-    )
-    wacc_reasoning: str = Field(
-        default="",
-        description="Detailed justification for the chosen WACC (risk-free rate + beta premium + debt mix).",
-    )
-    terminal_growth_reasoning: str = Field(
-        default="",
-        description="Detailed justification for the terminal growth rate (GDP growth, sector maturity, etc.).",
+        description="Exact row label for free cash flow (e.g. 'FreeCashFlow')."
     )
 
 
-class DCFTool(FinancialTool):
-    name = "dcf_intrinsic_value"
+class ValuationMultiplesSnapshotTool(FinancialTool):
+    name = "valuation_multiples_snapshot"
     description = (
-        "Discounted Cash Flow valuation using historical Free Cash Flow data. "
-        "Projects FCF forward using implied historical CAGR, then discounts back at a "
-        "LLM-estimated WACC to produce enterprise value and optionally intrinsic value per share. "
-        "Always provide detailed wacc_reasoning and terminal_growth_reasoning for traceability."
+        "Computes beginner-friendly valuation multiples across available periods: "
+        "P/S, P/E, EV/EBITDA, and P/FCF. "
+        "Also adds '<multiple>_pct_change' trend rows to show direction and momentum."
     )
-    parameters_schema = DCFParams
+    parameters_schema = ValuationMultiplesSnapshotParams
 
-    def execute(self, df: pd.DataFrame, params: DCFParams) -> ToolResult:  # type: ignore[override]
-        try:
-            if params.fcf_metric not in df.index:
-                return ToolResult(
-                    tool_name=self.name,
-                    success=False,
-                    error=f"FCF metric '{params.fcf_metric}' not found. Available: {list(df.index[:10])}…",
-                )
-
-            fcf_row = df.loc[params.fcf_metric].dropna().sort_index()
-            historical_fcfs = [float(v) for v in fcf_row.values]
-
-            if len(historical_fcfs) < 1:
-                return ToolResult(
-                    tool_name=self.name, success=False, error="No FCF data available."
-                )
-
-            # Project forward using historical implied CAGR (or terminal growth as floor)
-            if len(historical_fcfs) >= 2:
-                try:
-                    implied_cagr = _ADAPTER.cagr(
-                        abs(historical_fcfs[0]),
-                        abs(historical_fcfs[-1]),
-                        float(len(historical_fcfs) - 1),
-                    )
-                    # Cap unreasonably high CAGRs at 30% for projection stability
-                    growth_for_projection = min(implied_cagr, 0.30)
-                except ValueError:
-                    growth_for_projection = params.terminal_growth_rate
-            else:
-                growth_for_projection = params.terminal_growth_rate
-
-            last_fcf = historical_fcfs[-1]
-            projected_fcfs = [
-                last_fcf * (1 + growth_for_projection) ** i
-                for i in range(1, params.projection_years + 1)
-            ]
-
-            # Shares outstanding (last available)
-            shares: Optional[float] = None
-            if (
-                params.shares_outstanding_metric
-                and params.shares_outstanding_metric in df.index
-            ):
-                s_row = df.loc[params.shares_outstanding_metric].dropna()
-                if not s_row.empty:
-                    shares = float(s_row.iloc[-1])
-
-            dcf_result = _ADAPTER.dcf_intrinsic_value(
-                projected_fcfs, params.wacc, params.terminal_growth_rate, shares
-            )
-
-            reasoning = (
-                f"WACC = {params.wacc:.1%}: {params.wacc_reasoning}\n"
-                f"Terminal growth = {params.terminal_growth_rate:.1%}: {params.terminal_growth_reasoning}\n"
-                f"Projected {params.projection_years}-yr FCFs from last historical FCF of "
-                f"{last_fcf:,.0f} using {growth_for_projection:.1%} growth rate."
-            )
-
-            summary_lines = [
-                f"DCF Enterprise Value: {dcf_result['enterprise_value']:,.0f}",
-                f"  PV of projected FCFs: {dcf_result['pv_fcf']:,.0f}",
-                f"  PV of Terminal Value: {dcf_result['pv_terminal_value']:,.0f}",
-            ]
-            if "intrinsic_value_per_share" in dcf_result:
-                summary_lines.append(
-                    f"  Intrinsic Value/Share: {dcf_result['intrinsic_value_per_share']:.2f}"
-                )
-
-            scalar = (
-                dcf_result.get("intrinsic_value_per_share")
-                or dcf_result["enterprise_value"]
-            )
-            logger.info("[DCFTool] %s", summary_lines[0])
+    def execute(  # type: ignore[override]
+        self, df: pd.DataFrame, params: ValuationMultiplesSnapshotParams
+    ) -> ToolResult:
+        required_metrics = [
+            params.market_cap_metric,
+            params.enterprise_value_metric,
+            params.revenue_metric,
+            params.ebitda_metric,
+            params.net_income_metric,
+            params.fcf_metric,
+        ]
+        missing = [label for label in required_metrics if label not in df.index]
+        if missing:
             return ToolResult(
                 tool_name=self.name,
-                success=True,
-                scalar_value=scalar,
-                series_values={k: float(v) for k, v in dcf_result.items()},
-                reasoning=reasoning,
-                summary="\n".join(summary_lines),
+                success=False,
+                error=f"Required metrics not found: {missing}",
             )
-        except Exception as exc:
-            return ToolResult(tool_name=self.name, success=False, error=str(exc))
 
+        try:
+            sorted_cols = sorted(df.columns, key=lambda c: pd.Timestamp(c))
+        except Exception:
+            sorted_cols = list(df.columns)
 
-# ── Profitability Ratios ──────────────────────────────────────────────────────
+        def _ratio_row(numerator_metric: str, denominator_metric: str) -> Dict[str, float]:
+            numerator = pd.to_numeric(df.loc[numerator_metric, sorted_cols], errors="coerce")
+            denominator = pd.to_numeric(df.loc[denominator_metric, sorted_cols], errors="coerce")
+            output: Dict[str, float] = {}
+            for col in sorted_cols:
+                n_val = numerator.get(col)
+                d_val = denominator.get(col)
+                if pd.isna(n_val) or pd.isna(d_val) or float(d_val) <= 0:
+                    continue
+                output[col] = float(n_val) / float(d_val)
+            return output
+
+        base_rows: Dict[str, Dict[str, float]] = {
+            "price_to_sales": _ratio_row(params.market_cap_metric, params.revenue_metric),
+            "price_to_earnings": _ratio_row(params.market_cap_metric, params.net_income_metric),
+            "ev_to_ebitda": _ratio_row(
+                params.enterprise_value_metric, params.ebitda_metric
+            ),
+            "price_to_fcf": _ratio_row(params.market_cap_metric, params.fcf_metric),
+        }
+        base_rows = {k: v for k, v in base_rows.items() if v}
+
+        if not base_rows:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error=(
+                    "No valuation multiples could be computed. Ensure numerator values are "
+                    "numeric and denominator metrics are positive."
+                ),
+            )
+
+        added_rows: Dict[str, Dict[str, float]] = dict(base_rows)
+        summary_lines: List[str] = []
+
+        for row_label, row_values in base_rows.items():
+            aligned = pd.Series(
+                {col: row_values.get(col, np.nan) for col in sorted_cols}, dtype=float
+            )
+            trend_series = aligned.pct_change(fill_method=None)
+            trend_row = {
+                col: float(val)
+                for col, val in trend_series.items()
+                if pd.notna(val) and not np.isinf(val)
+            }
+            if trend_row:
+                added_rows[f"{row_label}_pct_change"] = trend_row
+
+            latest_col = None
+            latest_val = None
+            for col in reversed(sorted_cols):
+                value = row_values.get(col)
+                if value is not None and pd.notna(value):
+                    latest_col = col
+                    latest_val = float(value)
+                    break
+
+            latest_trend = trend_row.get(latest_col) if latest_col is not None else None
+            trend_text = (
+                f"{latest_trend:+.1%}"
+                if latest_trend is not None and pd.notna(latest_trend)
+                else "n/a"
+            )
+            if latest_col is not None and latest_val is not None:
+                summary_lines.append(
+                    f"{row_label} (latest {str(latest_col)[:7]}): {latest_val:.2f}x | trend {trend_text}"
+                )
+
+        logger.info(
+            "[ValuationMultiplesSnapshotTool] Computed rows: %s",
+            list(added_rows.keys()),
+        )
+        return ToolResult(
+            tool_name=self.name,
+            success=True,
+            added_rows=added_rows,
+            summary="\n".join(summary_lines),
+        )
 
 
 class ProfitabilityParams(BaseModel):
@@ -1005,7 +931,7 @@ class PeriodOverPeriodTool(FinancialTool):
 
 TOOL_REGISTRY: Dict[str, FinancialTool] = {
     CAGRTool.name: CAGRTool(),
-    DCFTool.name: DCFTool(),
+    ValuationMultiplesSnapshotTool.name: ValuationMultiplesSnapshotTool(),
     ProfitabilityTool.name: ProfitabilityTool(),
     DebtSolvencyTool.name: DebtSolvencyTool(),
     LiquidityTool.name: LiquidityTool(),

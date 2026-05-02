@@ -265,10 +265,10 @@ def test_fundamental_manager_persists_counts_and_batch_records() -> None:
                         added_row_count=1,
                     ),
                     ExecutorToolLog(
-                        tool_name="dcf_intrinsic_value",
-                        parameters={"fcf_metric": "FreeCashFlow"},
+                        tool_name="valuation_multiples_snapshot",
+                        parameters={"market_cap_metric": "market_cap"},
                         success=False,
-                        error="Missing FreeCashFlow",
+                        error="Missing market_cap",
                         summary="Failed",
                         added_row_count=0,
                     ),

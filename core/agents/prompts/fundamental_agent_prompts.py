@@ -81,8 +81,8 @@ relevant to the goal), tool execution results, and the agent goal.
 
 Write a comprehensive evidence-based analysis:
 - Highlight key trends, risks, and positives.
-- Reference and interpret every tool result (CAGR, ratios, DCF, etc.).
-- For DCF, state WACC and terminal growth assumptions and valuation implication.
+- Reference and interpret every tool result (CAGR, ratios, valuation multiples, etc.).
+- For valuation multiples, interpret level and direction for P/S, P/E, EV/EBITDA, and P/FCF.
 - If a derived metric was computed, explain how it was derived.
 - Convert large numbers to human-readable form.
 - Be concise but comprehensive.

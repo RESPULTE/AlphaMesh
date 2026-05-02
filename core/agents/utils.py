@@ -468,7 +468,11 @@ def _infer_semantic_from_tool(
 
     if normalized_tool in {"profitability_ratios", "cagr"}:
         return FundamentalRowSemantic(value_kind="percent", display_unit="%")
-    if normalized_tool in {"debt_solvency", "liquidity"}:
+    if normalized_tool in {
+        "debt_solvency",
+        "liquidity",
+        "valuation_multiples_snapshot",
+    }:
         return FundamentalRowSemantic(value_kind="ratio", display_unit="x")
     if normalized_tool == "period_over_period":
         if lower_label.endswith("_pct_change"):

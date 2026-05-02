@@ -17,7 +17,7 @@ class ToolCallSpec(BaseModel):
     tool_name: str = Field(
         description=(
             "Exact name of the tool to call from the registry "
-            "(e.g. 'cagr', 'dcf_intrinsic_value', 'profitability_ratios', "
+            "(e.g. 'cagr', 'valuation_multiples_snapshot', 'profitability_ratios', "
             "'custom_formula')."
         )
     )
@@ -68,9 +68,9 @@ class IterativeToolPlan(BaseModel):
     Design principles
     -----------------
     • All dependency chains must be expressed upfront as ordered batches.
-      Example (FCF → DCF):
-        batch[0]: custom_formula to derive FreeCashFlow
-        batch[1]: dcf_intrinsic_value using FreeCashFlow from batch[0]
+      Example (EBITDA derivation → multiples):
+        batch[0]: custom_formula to derive EBITDA
+        batch[1]: valuation_multiples_snapshot using EBITDA from batch[0]
 
     • Calls within a batch run in parallel (asyncio.gather).
     • Calls across batches run sequentially (batch N+1 sees batch N's results).

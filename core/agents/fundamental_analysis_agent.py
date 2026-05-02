@@ -140,7 +140,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
     def description() -> str:
         return (
             "Fetches standardised EDGAR financial statements and computes "
-            "quantitative metrics (CAGR, DCF, ratios) via a pre-planned, "
+            "quantitative metrics (CAGR, valuation multiples, ratios) via a pre-planned, "
             "parallel tool execution pipeline. Returns enriched financial data "
             "and a written analysis."
         )
