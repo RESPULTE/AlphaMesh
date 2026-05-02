@@ -229,8 +229,7 @@ class GraphWritePipeline:
             return "", set()
 
         rendered_rows = sorted(set(normalized_rows))
-        lines = [f"- {name} ({entity_type}) [source_chunk_id={chunk_id}]"
-                 for entity_type, name, chunk_id in rendered_rows]
+        lines = [f"- {name} ({entity_type})" for entity_type, name, _ in rendered_rows]
         return (
             f"{_CHUNK_ENTITY_CONTEXT_HEADER}\n"
             "Only extract relationships between entities in this list.\n"
@@ -352,7 +351,9 @@ class GraphWritePipeline:
                 or (prompt_text.strip() if prompt_text and prompt_text.strip() else "")
                 or "__default__"
             )
-            llm_config_key = json.dumps(task.llm_config or {}, sort_keys=True, default=str)
+            llm_config_key = json.dumps(
+                task.llm_config or {}, sort_keys=True, default=str
+            )
             group_key = (prompt_key, llm_config_key)
             group_entry = chunk_groups.setdefault(
                 group_key,
@@ -509,7 +510,9 @@ class GraphWritePipeline:
             )
             return
         if node_type == "UserInterestEvent":
-            await self._writer.merge_user_interest_event(node_id=node_id, props=merged_props)
+            await self._writer.merge_user_interest_event(
+                node_id=node_id, props=merged_props
+            )
             return
         if node_type == "SessionNode":
             await self._writer.merge_session_node(node_id=node_id, props=merged_props)

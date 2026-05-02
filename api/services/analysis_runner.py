@@ -492,6 +492,7 @@ class AnalysisRunner:
             )
 
             # -- 8. Deliver completion event -----------------------------------
+            await sink.drain()
             await event_queue.put(
                 {
                     "event_type": "complete",
@@ -505,6 +506,7 @@ class AnalysisRunner:
                 "AnalysisRunner: unhandled exception for request %s", request_id
             )
             try:
+                await sink.drain()
                 await event_queue.put(
                     {
                         "event_type": "error",

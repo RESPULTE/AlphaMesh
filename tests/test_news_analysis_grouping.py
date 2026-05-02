@@ -166,6 +166,10 @@ def test_rendezvous_context_dedupes_repeated_text_within_same_article() -> None:
     state = NewsAgentState(
         goal="Assess Berkshire meeting prep",
         conversation_id="conv-2",
+        planner_decision=PlannerDecision(
+            action="web_search",
+            queries=[DomainQuery(domain="company", query="Berkshire meeting prep")],
+        ),
         retrieved_chunks=[
             _chunk(
                 "dup-1",
@@ -193,20 +197,24 @@ def test_rendezvous_context_dedupes_repeated_text_within_same_article() -> None:
     assert final_chunks[0].chunk_id == "dup-2"
 
 
-def test_analyse_news_prompt_contains_article_grouped_section() -> None:
+def test_analyse_news_prompt_contains_article_grouped_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import news_analysis_agent as news_module
+
     llm = _FakeLLM(
         {
             "is_context_sufficient": False,
-            "analysis": "",
             "missing_information_goal": "Need recent guidance revision details",
             "persist_chunk_ids": ["1"],
             "source_chunk_ids": [],
-            "sentiment": None,
         }
+    )
+    monkeypatch.setattr(
+        news_module.service_manager, "get_agent", lambda temperature=0.0: llm
     )
 
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
-    agent._llm = llm
 
     state = NewsAgentState(
         goal="Evaluate AAPL qualitative outlook",

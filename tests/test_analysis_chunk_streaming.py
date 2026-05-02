@@ -76,6 +76,41 @@ def test_sse_sink_blocks_for_analysis_chunk_when_queue_is_full() -> None:
     asyncio.run(_run())
 
 
+def test_sse_sink_drain_preserves_chunk_order_before_terminal_event() -> None:
+    async def _run() -> None:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        await queue.put({"event_type": "existing"})
+        sink = SSESink(
+            request_id="req-1",
+            response_id="resp-1",
+            event_queue=queue,
+            loop=loop,
+        )
+
+        sink.on_event(_analysis_chunk_event(seq=2))
+        await asyncio.sleep(0)
+
+        first = await queue.get()
+        queue.task_done()
+        assert first["event_type"] == "existing"
+
+        await sink.drain()
+        complete_put = asyncio.create_task(queue.put({"event_type": "complete"}))
+
+        second = await queue.get()
+        queue.task_done()
+        await complete_put
+        third = await queue.get()
+        queue.task_done()
+
+        assert second["event_type"] == "analysis_chunk"
+        assert second["seq"] == 2
+        assert third["event_type"] == "complete"
+
+    asyncio.run(_run())
+
+
 def test_analysis_chunk_streamer_emits_start_delta_end(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[tuple[str, str, dict]] = []
 

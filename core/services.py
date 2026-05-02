@@ -1,5 +1,8 @@
 # core/services.py
 from core.config import settings
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class ServiceManager:
@@ -16,7 +19,7 @@ class ServiceManager:
     """
 
     def __init__(self):
-        self._llm = None
+        self._llm_backend_logged = False
         self._embedding_func = None
         self._financial_db = None
         self._neo4j_adapter = None
@@ -44,13 +47,28 @@ class ServiceManager:
         try:
             # Return a dedicated model instance per call so concurrent agent runs
             # never race on mutable temperature state.
-            return ChatGoogleGenerativeAI(
+            llm = ChatGoogleGenerativeAI(
                 model=settings.LLM_MODEL,
                 temperature=temperature,
-                google_api_key=settings.GOOGLE_API_KEY,
+                api_key=settings.GOOGLE_API_KEY,
+                disable_streaming=False,
                 thinking_budget=0,  # disable thinking for Gemini 2.5 Flash family
                 include_thoughts=False,
             )
+            if not self._llm_backend_logged:
+                self._llm_backend_logged = True
+                backend = (
+                    "vertexai"
+                    if bool(settings.GOOGLE_CLOUD_PROJECT)
+                    or bool(settings.GOOGLE_CLOUD_LOCATION)
+                    else "gemini_developer_api"
+                )
+                logger.info(
+                    "LLM configured: model=%s backend=%s",
+                    settings.LLM_MODEL,
+                    backend,
+                )
+            return llm
         except Exception as e:
             print(f"Error initializing LLM: {e}")
             raise

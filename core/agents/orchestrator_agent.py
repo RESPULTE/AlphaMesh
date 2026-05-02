@@ -68,7 +68,6 @@ _AGENT_MEMORY_WINDOW: int = 8
 
 class OrchestratorAgent:
     def __init__(self):
-        self._llm = service_manager.get_agent(temperature=0)
         self._agents: Dict[str, AbstractAgent] = {
             agent.name(): agent() for agent in AVAILABLE_AGENTS
         }
@@ -265,7 +264,7 @@ class OrchestratorAgent:
                 latest_user_message=latest_human,
                 baseline_user_context_block=state.user_context_block,
                 portfolio_block=state.portfolio_block,
-                llm=self._llm,
+                llm=service_manager.get_agent(temperature=0.0),
             )
             return {
                 "user_interest_query_spec": result.query_spec,
@@ -306,7 +305,9 @@ class OrchestratorAgent:
         canonical_sector_names_block = ", ".join(sorted(ALL_MAIN_SECTORS.keys()))
 
         try:
-            structured_llm = self._llm.with_structured_output(OrchestratorPlan)
+            structured_llm = service_manager.get_agent(
+                temperature=0.0
+            ).with_structured_output(OrchestratorPlan)
             planner_messages: List[BaseMessage] = [
                 SystemMessage(content=system_content),
                 SystemMessage(content=context_content),
@@ -454,6 +455,7 @@ class OrchestratorAgent:
             )
         streamer: AnalysisChunkStreamer | None = None
         try:
+            synthesis_llm = service_manager.get_agent(temperature=0.0)
             system_prompt = self._build_synthesis_system_prompt(
                 user_context=state.user_context_block,
                 portfolio=portfolio_block,
@@ -490,7 +492,7 @@ class OrchestratorAgent:
             if streamer.enabled:
                 streamer.start()
                 raw_text = await stream_model_text(
-                    llm=self._llm,
+                    llm=synthesis_llm,
                     messages=messages,
                     streamer=streamer,
                 )
@@ -499,7 +501,7 @@ class OrchestratorAgent:
                 publish_success("orchestrator", "Synthesis complete.")
                 return final_text
 
-            response = await self._llm.ainvoke(messages)
+            response = await synthesis_llm.ainvoke(messages)
             publish_success("orchestrator", "Synthesis complete.")
             return _extract_response_text(response.text if response else "")
         except Exception:

@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.base_agent import AbstractAgent
 from core.agents.analysis_token_stream import AnalysisChunkStreamer, stream_model_text
-from core.agents.models.base_agent_models import AgentSentiment, BaseAgentInput
+from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.news_agent_models import (
     DomainQuery,
     NewsAgentOutput,
@@ -80,20 +80,16 @@ class NewsAnalysisStructuredOutput(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     is_context_sufficient: bool = False
-    analysis: str = ""
     missing_information_goal: str = ""
     persist_chunk_ids: List[int | str] = Field(default_factory=list)
     source_chunk_ids: List[int | str] = Field(default_factory=list)
-    sentiment: Optional[AgentSentiment] = None
 
 
 class NewsAnalysisStructuredOutputForced(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     is_context_sufficient: bool = True
-    analysis: str = ""
     source_chunk_ids: List[int | str] = Field(default_factory=list)
-    sentiment: Optional[AgentSentiment] = None
 
 
 class NewsAnalysisAgent(AbstractAgent):
@@ -101,7 +97,6 @@ class NewsAnalysisAgent(AbstractAgent):
 
     def __init__(self) -> None:
         super().__init__()
-        self._llm = service_manager.get_agent()
         self._graph = self._build_graph()
         self._working_memory = NewsWorkingMemoryManager()
 
@@ -421,7 +416,9 @@ class NewsAnalysisAgent(AbstractAgent):
         )
 
         try:
-            structured_llm = self._llm.with_structured_output(PlannerDecision)
+            structured_llm = service_manager.get_agent(
+                temperature=0.0
+            ).with_structured_output(PlannerDecision)
             decision: PlannerDecision = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=NEWS_PLANNER_SYSTEM_PROMPT),
@@ -803,27 +800,23 @@ class NewsAnalysisAgent(AbstractAgent):
             else NewsAnalysisStructuredOutput
         )
         try:
-            structured_llm = self._llm.with_structured_output(response_model)
+            structured_llm = service_manager.get_agent(
+                temperature=0.0
+            ).with_structured_output(response_model)
             response = await structured_llm.ainvoke(messages)
         except Exception as exc:
             logger.error("_analyse_news_node: analysis LLM call failed: %s", exc)
             if forced_final_pass:
                 response = NewsAnalysisStructuredOutputForced(
                     is_context_sufficient=True,
-                    analysis=(
-                        "Best-effort analysis could not be generated due to an internal error."
-                    ),
                     source_chunk_ids=[],
-                    sentiment=None,
                 )
             else:
                 response = NewsAnalysisStructuredOutput(
                     is_context_sufficient=False,
-                    analysis="Insufficient context to answer comprehensively.",
                     missing_information_goal=state.missing_information_goal
                     or state.goal,
                     persist_chunk_ids=[],
-                    sentiment=None,
                 )
 
         final_stage_chunk_ids = list(
@@ -876,49 +869,64 @@ class NewsAnalysisAgent(AbstractAgent):
             selected_source_chunk_ids,
         )
         sources, _ = RetrievedChunk._build_deduplicated_sources(selected_source_chunks)
-        analysis_text = response.analysis
-        if settings.ENABLE_ANALYSIS_TOKEN_STREAMING and analysis_text.strip():
-            streamer = AnalysisChunkStreamer(
-                source=self.name(),
-                agent=self.name(),
-                node="_analyse_news_node",
-                enabled=True,
-            )
-            streamer.start()
-            try:
-                rewrite_messages = [
-                    SystemMessage(
-                        content=(
-                            "You are a financial news analysis assistant. "
-                            "Return plain text only. Do not return JSON."
-                        )
-                    ),
-                    HumanMessage(
-                        content=(
-                            f"Goal: {state.goal}\n\n"
-                            "Rewrite the following draft analysis into a clear, "
-                            "investor-useful narrative while preserving its facts.\n\n"
-                            f"Draft analysis:\n{analysis_text}"
-                        )
-                    ),
-                ]
-                streamed_text = await stream_model_text(
-                    llm=service_manager.get_agent(
-                        temperature=float(getattr(self._llm, "temperature", 0.7))
-                    ),
-                    messages=rewrite_messages,
+        selected_article_context, _ = self._build_article_context_block(
+            final_chunks=selected_source_chunks
+        )
+        analysis_messages = [
+            SystemMessage(
+                content=(
+                    "You are a financial news analysis assistant. Return plain text only. "
+                    "Do not return JSON."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"Goal: {state.goal}\n\n"
+                    f"{context_prefix}\n\n"
+                    "Article-grouped evidence (selected sources):\n"
+                    f"{selected_article_context}\n\n"
+                    "Write a concise investor-oriented analysis grounded only in this evidence. "
+                    "Cover key catalysts, risks, and near-term watchpoints."
+                )
+            ),
+        ]
+        analysis_text = ""
+        streamer = AnalysisChunkStreamer(
+            source=self.name(),
+            agent=self.name(),
+            node="_analyse_news_node",
+            enabled=settings.ENABLE_ANALYSIS_TOKEN_STREAMING,
+        )
+        try:
+            analysis_llm = service_manager.get_agent(temperature=0.7)
+            if streamer.enabled:
+                streamer.start()
+                analysis_text = await stream_model_text(
+                    llm=analysis_llm,
+                    messages=analysis_messages,
                     streamer=streamer,
                 )
-                streamed_text = streamed_text.strip()
-                if streamed_text:
-                    analysis_text = streamed_text
-                streamer.end(final_text=analysis_text)
-            except Exception as exc:
-                streamer.error(str(exc))
-                logger.warning(
-                    "_analyse_news_node: token streaming rewrite failed, using structured analysis: %s",
-                    exc,
+                analysis_text = (analysis_text or "").strip()
+                if analysis_text:
+                    streamer.end(final_text=analysis_text)
+                else:
+                    analysis_text = (
+                        "Best-effort analysis could not be generated from available evidence."
+                    )
+                    streamer.end(final_text=analysis_text)
+            else:
+                response_text = await analysis_llm.ainvoke(analysis_messages)
+                analysis_text = (
+                    str(getattr(response_text, "text", "") or "").strip()
+                    or "Best-effort analysis could not be generated from available evidence."
                 )
+        except Exception as exc:
+            if streamer.enabled:
+                streamer.error(str(exc))
+            logger.exception("_analyse_news_node: narrative generation failed")
+            analysis_text = (
+                "Best-effort analysis could not be generated due to an internal error."
+            )
 
         task_id = None
         if state.conversation_id and analysis_text:
@@ -941,7 +949,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     chunk_system_prompt=build_news_deferred_chunk_entity_system_prompt(),
                     allowed_entity_types=allowed_entity_types,
                     allowed_relationship_types=allowed_relationship_types,
-                    llm_config={"temperature": getattr(self._llm, "temperature", 0.7)},
+                    llm_config={"temperature": 0.7},
                 )
                 task_id = await service_manager.get_graph_queue_manager().enqueue(task)
             except Exception:
@@ -957,7 +965,7 @@ class NewsAnalysisAgent(AbstractAgent):
             "tools_used": tools_used,
             "source_count": len(sources),
             "top_references": top_references,
-            "sentiment": response.sentiment.model_dump() if response.sentiment else {},
+            "sentiment": {},
             "missing_information_goal": response_missing_goal.strip(),
             "persist_chunk_ids": selected_chunk_ids,
         }
@@ -967,14 +975,12 @@ class NewsAnalysisAgent(AbstractAgent):
             "sources": sources,
             "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
-            "sentiment": response.sentiment,
+            "sentiment": None,
             "memory_summary": memory_summary,
             "is_context_sufficient": True,
             "persist_chunk_ids": selected_chunk_ids,
             "final_chunks": chunks,
         }
-        if response.sentiment is not None:
-            result["sentiment"] = response.sentiment
 
         publish_success("news_agent", "News analysis complete.")
         return result

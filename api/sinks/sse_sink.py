@@ -57,6 +57,15 @@ class SSESink:
                 "timestamp": event.timestamp.isoformat(),
             }
         try:
+            # Fast path: if already on the owning loop, enqueue immediately to
+            # preserve strict ordering.
+            if asyncio.get_running_loop() is self._loop:
+                self._safe_put(payload)
+                return
+        except RuntimeError:
+            # No running loop in this thread: fall back to thread-safe callback.
+            pass
+        try:
             self._loop.call_soon_threadsafe(self._safe_put, payload)
         except RuntimeError:
             # Loop is closed (e.g. shutdown during a request). Discard silently.
@@ -69,7 +78,7 @@ class SSESink:
         pass
 
     def _safe_put(self, payload: dict) -> None:
-        """Called from the event loop via call_soon_threadsafe."""
+        """Called from the event loop to enqueue one SSE payload."""
         try:
             self._event_queue.put_nowait(payload)
         except asyncio.QueueFull:
@@ -83,3 +92,14 @@ class SSESink:
                 "SSESink: event queue full for request %s - dropping event",
                 self._request_id,
             )
+
+    async def drain(self) -> None:
+        """
+        Wait for all pending token enqueue tasks to complete.
+
+        This is used by AnalysisRunner before sending terminal events so queued
+        token chunks are not silently reordered behind `complete`.
+        """
+        if not self._pending_puts:
+            return
+        await asyncio.gather(*list(self._pending_puts), return_exceptions=True)

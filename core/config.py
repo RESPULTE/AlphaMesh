@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import ConfigDict, Field
+from pydantic import AliasChoices, ConfigDict, Field
 from pydantic_settings import BaseSettings
 
 # Determine the path to .env file relative to this config.py file
@@ -17,7 +17,10 @@ class Settings(BaseSettings):
     )
 
     # ── LLM and Embedding ─────────────────────────────────────────────────────
-    GOOGLE_API_KEY: Optional[str] = Field(default=None, validation_alias="LLM_API_KEY")
+    GOOGLE_API_KEY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("LLM_API_KEY", "GOOGLE_API_KEY"),
+    )
     EMBEDDING_API_KEY: Optional[str] = Field(
         default=None, validation_alias="EMBEDDING_API_KEY"
     )
@@ -147,7 +150,7 @@ class Settings(BaseSettings):
     FUNDAMENTAL_AGENT_TASKLIST_MAX_ITEMS: int = 6
     FUNDAMENTAL_VIZ_MAX_ROWS_PER_CHART: int = 6
     FUNDAMENTAL_RAW_DISPLAY_MAX_ROWS: int = 12
-    ENABLE_ANALYSIS_TOKEN_STREAMING: bool = True
+    ENABLE_ANALYSIS_TOKEN_STREAMING: bool = False
 
     # =========================================================================
     # API Layer settings  (consumed by api/ only; still one .env file)

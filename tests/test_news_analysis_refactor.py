@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,13 +58,24 @@ class _FakeStructuredLLM:
 
 
 class _FakeLLM:
-    def __init__(self, payload: dict, temperature: float = 0.23) -> None:
+    def __init__(
+        self,
+        payload: dict | None = None,
+        *,
+        narrative_text: str = "",
+        temperature: float = 0.23,
+    ) -> None:
         self._payload = payload
+        self._narrative_text = narrative_text
         self.temperature = temperature
         self.last_messages = None
 
     def with_structured_output(self, schema):
         return _FakeStructuredLLM(schema.model_validate(self._payload), owner=self)
+
+    async def ainvoke(self, messages):
+        self.last_messages = messages
+        return SimpleNamespace(text=self._narrative_text)
 
 
 def test_rendezvous_node_does_not_enqueue_chunk_entity_tasks(
@@ -128,15 +140,24 @@ def test_analyse_news_node_enqueues_deferred_relationship_extraction_with_final_
 
     monkeypatch.setattr(news_module, "make_extraction_task", _fake_make_extraction_task)
 
-    llm = _FakeLLM(
+    structured_llm = _FakeLLM(
         payload={
             "is_context_sufficient": True,
-            "analysis": "Primary takeaway from second source.",
             "source_chunk_ids": [2],
         }
     )
+    narrative_llm = _FakeLLM(
+        narrative_text="Primary takeaway from second source."
+    )
+    monkeypatch.setattr(
+        news_module.service_manager,
+        "get_agent",
+        lambda temperature=0.0: (
+            structured_llm if float(temperature) == 0.0 else narrative_llm
+        ),
+    )
+
     agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
-    agent._llm = llm
     agent._working_memory = news_module.NewsWorkingMemoryManager()
 
     state = NewsAgentState(
@@ -164,6 +185,8 @@ def test_analyse_news_node_enqueues_deferred_relationship_extraction_with_final_
     result = asyncio.run(agent._analyse_news_node(state))
 
     assert result["analysis"] == "Primary takeaway from second source."
+    assert structured_llm.last_messages is not None
+    assert narrative_llm.last_messages is not None
     assert queue.enqueued
     assert captured_task_kwargs["extraction_text"] == result["analysis"]
     assert captured_task_kwargs["conversation_id"] == "conv-analysis"

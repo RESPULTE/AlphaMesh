@@ -1,22 +1,20 @@
-"""
+﻿"""
 api/services/event_broadcaster.py
 
-Registry of per-request asyncio.Queues that feed the SSE endpoints.
+Registry of per-request asyncio.Queues that feed SSE endpoints.
 
 Lifecycle
-─────────
-1. AnalysisRunner calls `broadcaster.create(request_id)` → gets a Queue.
-2. SSE endpoint calls `broadcaster.get(request_id)` → reads from the same Queue.
-3. AnalysisRunner puts the final `complete` or `error` dict into the queue
-   and schedules a delayed `broadcaster.remove(request_id)` call.
-4. After `_CLEANUP_DELAY_S` seconds the entry is evicted even if the SSE
-   connection was never opened (prevents memory leaks on abandoned requests).
+---------
+1. AnalysisRunner calls `broadcaster.create(request_id)` and gets a queue.
+2. SSE endpoint calls `broadcaster.get(request_id)` and reads that queue.
+3. AnalysisRunner enqueues the terminal `complete` or `error` event and schedules delayed cleanup.
+4. After `_CLEANUP_DELAY_S`, the queue is evicted even if no client attached.
 
 Queue capacity
-──────────────
-maxsize=512 is generous — at ~1 event per agent step there are rarely more
-than 20 events per request.  The SSE sink silently drops events when the queue
-is full rather than blocking the agent pipeline.
+--------------
+`maxsize=512` is intentionally generous. Queue overflow handling is owned by
+the sink: `analysis_chunk` events use backpressure and are not dropped for
+connected clients, while non-token events may be dropped under pressure.
 """
 
 from __future__ import annotations
@@ -78,3 +76,4 @@ class EventBroadcaster:
             self.remove(request_id)
 
         asyncio.create_task(_cleanup(), name=f"broadcaster_cleanup_{request_id[:8]}")
+

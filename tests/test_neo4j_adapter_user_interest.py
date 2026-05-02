@@ -105,6 +105,8 @@ def test_query_user_interest_context_applies_filters_and_hop_clamp() -> None:
 
     assert "size($target_filters) = 0" in captured["cypher"]
     assert "edge_limit" in captured["cypher"]
+    assert "WITH collect(DISTINCT {id: neighbor.id, name: neighbor.name, entity_type: neighbor.entity_type}) AS all_expanded_neighbors" in captured["cypher"]
+    assert "RETURN all_expanded_neighbors[..expanded_entity_limit] AS expanded_neighbors" in captured["cypher"]
     assert captured["params"]["hops"] == 2
     assert captured["params"]["include_negative"] is False
     assert captured["params"]["domain_type"] == "investment"

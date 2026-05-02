@@ -115,7 +115,9 @@ def test_run_populates_portfolio_block_from_per_user_file(monkeypatch, tmp_path)
     assert captured["state"].portfolio_block != "[]"
 
 
-def test_plan_node_receives_portfolio_context_message() -> None:
+def test_plan_node_receives_portfolio_context_message(
+    monkeypatch,
+) -> None:
     captured: dict = {}
 
     class FakeStructuredLLM:
@@ -127,8 +129,10 @@ def test_plan_node_receives_portfolio_context_message() -> None:
         def with_structured_output(self, _schema):
             return FakeStructuredLLM()
 
+    fake_llm = FakeLLM()
+    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0.0: fake_llm)
+
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = FakeLLM()
     agent._agents = {
         "news_agent": SimpleNamespace(
             build_memory_context_from_history=lambda turns, window=8: (
@@ -192,8 +196,13 @@ def test_synthesize_node_uses_state_portfolio_block(monkeypatch) -> None:
             captured["messages"] = messages
             return SimpleNamespace(text="synthesised output")
 
+    monkeypatch.setattr(
+        service_manager,
+        "get_agent",
+        lambda temperature=0.0: FakeLLM(),
+    )
+
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = FakeLLM()
 
     state = OrchestratorState(
         messages=[HumanMessage(content="Summarise this for me.")],
@@ -247,8 +256,13 @@ def test_plan_node_sets_clarification_on_invalid_ticker(monkeypatch) -> None:
         service_manager, "get_ticker_validator", lambda: FakeTickerValidator()
     )
 
+    monkeypatch.setattr(
+        service_manager,
+        "get_agent",
+        lambda temperature=0.0: FakeLLM(),
+    )
+
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = FakeLLM()
     agent._agents = {}
 
     state = OrchestratorState(
@@ -305,8 +319,13 @@ def test_plan_node_populates_enrichment_for_valid_equity(monkeypatch) -> None:
         lambda source, event_type, payload: events.append((source, event_type, payload)),
     )
 
+    monkeypatch.setattr(
+        service_manager,
+        "get_agent",
+        lambda temperature=0.0: FakeLLM(),
+    )
+
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = FakeLLM()
     agent._agents = {}
 
     state = OrchestratorState(
@@ -363,6 +382,8 @@ def test_prepare_user_interest_context_delegates_to_user_context_service(
 ) -> None:
     captured: dict = {}
 
+    sentinel_llm = object()
+
     class FakeUserContextService:
         async def build_targeted_orchestrator_context(self, **kwargs):
             captured.update(kwargs)
@@ -375,9 +396,11 @@ def test_prepare_user_interest_context_delegates_to_user_context_service(
     monkeypatch.setattr(
         service_manager, "get_user_context_service", lambda: FakeUserContextService()
     )
+    monkeypatch.setattr(
+        service_manager, "get_agent", lambda temperature=0.0: sentinel_llm
+    )
 
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = object()
     agent._agents = {}
 
     state = OrchestratorState(
@@ -393,7 +416,7 @@ def test_prepare_user_interest_context_delegates_to_user_context_service(
     assert captured["latest_user_message"] == "what are my interests these days?"
     assert captured["baseline_user_context_block"] == "USER CONTEXT: baseline"
     assert captured["portfolio_block"] == '[{"ticker":"AAPL"}]'
-    assert captured["llm"] is agent._llm
+    assert captured["llm"] is sentinel_llm
     assert payload["user_interest_graph_context_block"].startswith("Domain Summary")
     assert payload["user_interest_query_debug"]["mode"] == "fallback_domains_only"
 
@@ -408,9 +431,9 @@ def test_prepare_user_interest_context_service_error_returns_none_block(
     monkeypatch.setattr(
         service_manager, "get_user_context_service", lambda: FakeUserContextService()
     )
+    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0.0: object())
 
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = object()
     agent._agents = {}
 
     state = OrchestratorState(
@@ -424,7 +447,9 @@ def test_prepare_user_interest_context_service_error_returns_none_block(
     assert payload["user_interest_query_debug"]["mode"] == "error"
 
 
-def test_plan_node_receives_targeted_user_interest_context_message() -> None:
+def test_plan_node_receives_targeted_user_interest_context_message(
+    monkeypatch,
+) -> None:
     captured: dict = {}
 
     class FakeStructuredLLM:
@@ -436,8 +461,10 @@ def test_plan_node_receives_targeted_user_interest_context_message() -> None:
         def with_structured_output(self, _schema):
             return FakeStructuredLLM()
 
+    fake_llm = FakeLLM()
+    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0.0: fake_llm)
+
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = FakeLLM()
     agent._agents = {}
 
     state = OrchestratorState(
@@ -457,7 +484,9 @@ def test_plan_node_receives_targeted_user_interest_context_message() -> None:
     )
 
 
-def test_plan_node_receives_canonical_sector_names_context_message() -> None:
+def test_plan_node_receives_canonical_sector_names_context_message(
+    monkeypatch,
+) -> None:
     captured: dict = {}
 
     class FakeStructuredLLM:
@@ -469,8 +498,10 @@ def test_plan_node_receives_canonical_sector_names_context_message() -> None:
         def with_structured_output(self, _schema):
             return FakeStructuredLLM()
 
+    fake_llm = FakeLLM()
+    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0.0: fake_llm)
+
     agent = OrchestratorAgent.__new__(OrchestratorAgent)
-    agent._llm = FakeLLM()
     agent._agents = {}
 
     state = OrchestratorState(
