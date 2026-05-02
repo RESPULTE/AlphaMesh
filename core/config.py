@@ -150,7 +150,7 @@ class Settings(BaseSettings):
     FUNDAMENTAL_AGENT_TASKLIST_MAX_ITEMS: int = 6
     FUNDAMENTAL_VIZ_MAX_ROWS_PER_CHART: int = 6
     FUNDAMENTAL_RAW_DISPLAY_MAX_ROWS: int = 12
-    ENABLE_ANALYSIS_TOKEN_STREAMING: bool = False
+    ENABLE_ANALYSIS_TOKEN_STREAMING: bool = True
 
     # =========================================================================
     # API Layer settings  (consumed by api/ only; still one .env file)

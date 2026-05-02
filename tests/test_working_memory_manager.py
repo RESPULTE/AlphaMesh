@@ -10,6 +10,7 @@ from core.agents.working_memory.base import (
 )
 from core.agents.working_memory.news_working_memory import NewsWorkingMemoryManager
 from core.agents.working_memory.fundamental_working_memory import (
+    FundamentalTickerDataFrameCacheEntry,
     FundamentalWorkingMemoryManager,
 )
 from core.agents.models.fundamental_agent_models import (
@@ -410,3 +411,48 @@ def test_fundamental_manager_financial_cache_returns_copy() -> None:
     )
     assert second is not None
     assert second.loc["Revenues", "2023-12-31"] == 100.0
+
+
+def test_fundamental_manager_financial_cache_skips_price_only_rows() -> None:
+    manager = FundamentalWorkingMemoryManager(max_turns=10)
+    price_only_df = pd.DataFrame(
+        [[150.0, 180.0]],
+        index=["stock_price"],
+        columns=["2023-12-31", "2024-12-31"],
+    )
+    manager.upsert_cached_financial_data(
+        conversation_id="conv-price-only",
+        ticker="AAPL",
+        granularity="yearly",
+        financial_data=price_only_df,
+    )
+
+    cached = manager.resolve_cached_financial_data(
+        conversation_id="conv-price-only",
+        ticker="AAPL",
+        granularity="yearly",
+    )
+    assert cached is None
+
+
+def test_fundamental_manager_resolve_evicts_legacy_price_only_cache_entry() -> None:
+    manager = FundamentalWorkingMemoryManager(max_turns=10)
+    memory = manager.get_conversation_memory("conv-legacy-price-only")
+    price_only_df = pd.DataFrame(
+        [[120.0, 140.0]],
+        index=["stock_price"],
+        columns=["2023-12-31", "2024-12-31"],
+    )
+    memory.financial_df_cache_by_ticker["AAPL"] = FundamentalTickerDataFrameCacheEntry(
+        ticker_key="AAPL",
+        granularity="yearly",
+        financial_data=price_only_df,
+    )
+
+    cached = manager.resolve_cached_financial_data(
+        conversation_id="conv-legacy-price-only",
+        ticker="AAPL",
+        granularity="yearly",
+    )
+    assert cached is None
+    assert "AAPL" not in memory.financial_df_cache_by_ticker

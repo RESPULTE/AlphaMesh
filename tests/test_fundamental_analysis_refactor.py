@@ -415,6 +415,60 @@ def test_data_prep_cache_miss_when_requested_range_exceeds_cached_coverage(
     assert result["financial_data"].equals(fetched_df)
 
 
+def test_data_prep_cache_miss_when_cached_data_is_price_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+    from core.agents.working_memory.fundamental_working_memory import (
+        FundamentalTickerDataFrameCacheEntry,
+    )
+
+    cfg = SimpleNamespace(
+        start_dt=datetime(2022, 1, 1),
+        end_dt=datetime(2024, 12, 31),
+        periods=[2022, 2023, 2024],
+    )
+    monkeypatch.setattr(module, "_resolve_date_range", lambda _state: cfg)
+
+    fetch_calls = {"count": 0}
+    fetched_df = pd.DataFrame(
+        [[80.0, 90.0, 100.0]],
+        index=["Revenues"],
+        columns=["2022-12-31", "2023-12-31", "2024-12-31"],
+    )
+
+    async def _fake_fetch(*_args, **_kwargs):
+        fetch_calls["count"] += 1
+        return fetched_df.copy(deep=True), pd.DataFrame()
+
+    monkeypatch.setattr(module, "_fetch_raw_data", _fake_fetch)
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
+    agent.db = object()
+
+    memory = agent._working_memory.get_conversation_memory("conv-price-only-cache")
+    memory.financial_df_cache_by_ticker["AAPL"] = FundamentalTickerDataFrameCacheEntry(
+        ticker_key="AAPL",
+        granularity="yearly",
+        financial_data=pd.DataFrame(
+            [[150.0, 180.0, 210.0]],
+            index=["stock_price"],
+            columns=["2022-12-31", "2023-12-31", "2024-12-31"],
+        ),
+    )
+
+    state = _AgentState(
+        ticker="AAPL",
+        granularity="yearly",
+        conversation_id="conv-price-only-cache",
+    )
+    result = asyncio.run(agent._data_prep_node(state))
+
+    assert fetch_calls["count"] == 1
+    assert result["financial_data"].equals(fetched_df)
+
+
 def test_tool_executor_populates_structured_result_detail_fields() -> None:
     state = _AgentState(
         query="Compute margin trend",
@@ -775,3 +829,47 @@ def test_render_memory_summary_delegates_to_manager() -> None:
     rendered = FundamentalAnalysisAgent.render_memory_summary(summary)
     assert rendered.startswith("tools=cagr")
     assert "rows=Revenues" in rendered
+
+
+def test_analyst_node_handles_list_content_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    class _FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+    class _FakeAnalystLLM:
+        async def ainvoke(self, _messages):
+            return _FakeResponse(
+                [
+                    {"text": "Revenue trend remains positive.\n"},
+                    {
+                        "text": (
+                            "<sentiment>{\"score\":72,\"label\":\"BUY\","
+                            "\"rationale\":\"Growth and margins are stable.\"}"
+                            "</sentiment>"
+                        )
+                    },
+                ]
+            )
+
+    monkeypatch.setattr(module.settings, "ENABLE_ANALYSIS_TOKEN_STREAMING", False)
+    monkeypatch.setattr(
+        module.service_manager, "get_agent", lambda temperature=0.7: _FakeAnalystLLM()
+    )
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    state = _AgentState(
+        query="Assess financial health",
+        ticker="AAPL",
+        financial_data=_sample_df(),
+        task_completed=True,
+        task_completion_reason="",
+    )
+
+    result = asyncio.run(agent._analyst_node(state))
+
+    assert "Revenue trend remains positive." in result["analysis"]
+    assert "<sentiment>" not in result["analysis"]
+    assert result["sentiment"] is not None
+    assert result["sentiment"].label == "BUY"

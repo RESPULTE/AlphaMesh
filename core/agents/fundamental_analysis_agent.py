@@ -42,7 +42,11 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from core.agents.base_agent import AbstractAgent
-from core.agents.analysis_token_stream import AnalysisChunkStreamer, stream_model_text
+from core.agents.analysis_token_stream import (
+    AnalysisChunkStreamer,
+    chunk_text,
+    stream_model_text,
+)
 from core.agents.data_prep import (
     _fetch_raw_data,
     _merge_price_rows,
@@ -985,7 +989,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 streamer.end(final_text=raw)
             else:
                 response = await llm.ainvoke(messages)
-                raw = response.content if response else ""
+                raw = chunk_text(response.content if response else "")
             sentiment = parse_sentiment_block(raw)
             analysis_text = strip_sentiment_block(raw)
             success = True

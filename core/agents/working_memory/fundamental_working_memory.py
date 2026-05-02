@@ -112,6 +112,16 @@ class FundamentalWorkingMemoryManager(
             ts = ts.tz_localize(None)
         return ts
 
+    @staticmethod
+    def _has_non_price_fundamental_rows(financial_data: pd.DataFrame | None) -> bool:
+        if financial_data is None or financial_data.empty:
+            return False
+        for label in financial_data.index:
+            normalized = str(label or "").strip().lower()
+            if normalized and not normalized.startswith("stock_price"):
+                return True
+        return False
+
     def upsert_cached_financial_data(
         self,
         *,
@@ -121,6 +131,8 @@ class FundamentalWorkingMemoryManager(
         financial_data: pd.DataFrame | None,
     ) -> None:
         if not conversation_id or financial_data is None or financial_data.empty:
+            return
+        if not self._has_non_price_fundamental_rows(financial_data):
             return
         ticker_key = self.normalize_ticker_key(ticker)
         if not ticker_key:
@@ -164,6 +176,9 @@ class FundamentalWorkingMemoryManager(
 
         cached_df = entry.financial_data
         if cached_df is None or cached_df.empty:
+            return None
+        if not self._has_non_price_fundamental_rows(cached_df):
+            memory.financial_df_cache_by_ticker.pop(ticker_key, None)
             return None
 
         requested_start = self._to_timestamp(start_dt)
