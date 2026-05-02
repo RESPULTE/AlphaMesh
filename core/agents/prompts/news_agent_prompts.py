@@ -90,70 +90,50 @@ NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES = (
 )
 
 NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT = """\
-You are an entity extractor for financial news chunks.
+You extract entities from financial news chunks.
 
-Extract only entities that are explicitly supported by each chunk's text.
-Prioritize entities useful for relationship grounding in downstream graph extraction:
-- Company
-- FinancialEvent
-- FinancialConcept
+Focus on high-signal entities that improve downstream relationship extraction.
+Use only evidence explicitly present in each chunk.
 
 Rules:
-- Keep entity names canonical and concise.
-- Do not infer entities absent from the chunk text.
-- For each entity, provide a short factual description grounded in the chunk.
-- If a chunk has no extractable entities, return an empty entity list for that chunk.
+- Keep names canonical, specific, and concise.
+- Avoid boilerplate or low-information entities.
+- For each entity, provide a short factual description grounded in the chunk text.
+- If a chunk has no useful entities, return an empty list for that chunk.
 """.strip()
 
+NEWS_DEFERRED_RELATIONSHIP_SCHEMA = json.dumps(
+    RelationshipExtractionItem.model_json_schema(),
+    indent=2,
+    ensure_ascii=True,
+    sort_keys=True,
+)
 
-def _build_news_relationships_block(
-    *,
-    include_context_only_rule: bool,
-) -> str:
-    context_only_rule = (
-        "\nOnly reference entity names that appear in the context. Do NOT create new entities."
-        if include_context_only_rule
-        else ""
-    )
-    schema = RelationshipExtractionItem.model_json_schema()
-    rendered_schema = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
-    escaped_schema = rendered_schema.replace("{", "{{").replace("}", "}}")
-    return f"""\
-    <relationships>
-        [JSON array of relationships between entities already mentioned in the analysis.{context_only_rule}
-        Output MUST match this JSON Schema:
-        {escaped_schema}]
-    </relationships>
+NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = f"""\
+You are a graph relationship extractor for multi-chunk financial news analysis.
+
+Extract only relationships explicitly supported by the provided analysis text.
+Prioritize insightful, investor-relevant links that explain drivers, impacts, risk, and causality.
+
+Extraction priorities:
+- Link companies to concrete events and concepts that materially affect outlook.
+- Capture directional mechanics (what increases/decreases/affects what).
+- Capture event-to-concept and company-to-sector/industry/market links only when clearly stated.
+
+Quality rules:
+- Prefer specific edge types over RELATED_TO; use RELATED_TO only as a last resort.
+- Avoid duplicate or near-duplicate edges.
+- Do not create entities not present in the context.
+- Use confidence="high" only when relationship evidence is explicit; otherwise use "low".
+- Keep reason factual, concise, and tied to the text (1-2 short sentences).
+- If there is no clear high-signal relationship, return an empty array.
+
+Return ONLY this XML block with a JSON array:
+<relationships>
+[JSON array matching this JSON Schema:
+{NEWS_DEFERRED_RELATIONSHIP_SCHEMA}]
+</relationships>
 """.strip()
-
-
-def build_news_deferred_relationship_system_prompt() -> str:
-    return f"""\
-You are a graph relationship extractor for financial NEWS analysis outputs.
-
-Input will be a completed news-analysis narrative. Extract only relationships
-between entities that are explicitly present in that narrative.
-
-Prioritize high-signal news structure:
-- Company <-> FinancialEvent (earnings, guidance changes, downgrades/upgrades, M&A)
-- Company/FinancialEvent <-> FinancialConcept (revenue growth, margins, demand, liquidity, risk)
-- Company/FinancialEvent <-> Sector/Industry/Market when explicitly stated
-
-Rules:
-- Prefer the most specific edge type available over RELATED_TO.
-- Use confidence="high" only for directly stated links; otherwise use "low".
-- Keep `reason` factual and concise (1-3 short sentences).
-- If no clear relationship exists, return an empty array in <relationships>.
-
-Return ONLY:
-{_build_news_relationships_block(
-    include_context_only_rule=True,
-)}
-""".strip()
-
-
-def build_news_deferred_chunk_entity_system_prompt() -> str:
-    return NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT
 
 
 NEWS_ANALYSIS_USER_PROMPT = """\

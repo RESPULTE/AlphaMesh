@@ -28,8 +28,8 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_DEFERRED_ALLOWED_ENTITY_TYPES,
     NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
     NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT,
+    NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
     NEWS_PLANNER_SYSTEM_PROMPT,
-    build_news_deferred_relationship_system_prompt,
 )
 from core.agents.utils import (
     build_analysis_context_prefix,
@@ -931,9 +931,6 @@ class NewsAnalysisAgent(AbstractAgent):
             turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
             allowed_entity_types = list(NEWS_DEFERRED_ALLOWED_ENTITY_TYPES)
             allowed_relationship_types = list(NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES)
-            relationship_system_prompt = (
-                build_news_deferred_relationship_system_prompt()
-            )
             try:
                 task = make_extraction_task(
                     turn_id=turn_id,
@@ -942,7 +939,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     task_kind=TASK_KIND_SCOPED_EXTRACTION,
                     extraction_text=analysis_text,
                     chunk_ids=final_stage_chunk_ids,
-                    system_prompt=relationship_system_prompt,
+                    system_prompt=NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
                     chunk_system_prompt=NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT,
                     allowed_entity_types=allowed_entity_types,
                     allowed_relationship_types=allowed_relationship_types,

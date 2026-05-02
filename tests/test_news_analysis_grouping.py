@@ -11,7 +11,7 @@ from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.news_agent_models import DomainQuery, NewsAgentState, PlannerDecision
 from core.agents.news_analysis_agent import NewsAnalysisAgent
 from core.agents.prompts.news_agent_prompts import (
-    build_news_deferred_relationship_system_prompt,
+    NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
 )
 from core.agents.working_memory.news_working_memory import NewsWorkingMemoryManager
 from core.memory.retrieval.models import RetrievedChunk
@@ -468,8 +468,8 @@ def test_fetch_and_ingest_dedupes_query_variant_urls_and_seen_chunk_ids(
     assert result["seen_chunk_ids"] == []
 
 
-def test_news_relationship_prompt_factory_scopes_schema_enums() -> None:
-    prompt = build_news_deferred_relationship_system_prompt()
+def test_news_relationship_prompt_scopes_schema_enums() -> None:
+    prompt = NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT
 
     assert '"relationship_type"' in prompt
     assert '"from_type"' in prompt
