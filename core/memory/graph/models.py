@@ -225,6 +225,17 @@ _USER_SCOPED_TYPES = frozenset(
     }
 )
 
+# User-scoped relationship types that must not be used for domain traversal.
+_USER_SCOPED_RELATIONSHIP_TYPES = frozenset(
+    {
+        "HAS_INTEREST_IN",
+        "TARGETS",
+        "HAS_EVENT",
+        "OBSERVED_IN",
+        "BELONGS_TO_NODESET",
+    }
+)
+
 # ── New models ─────────────────────────────────────────────────────────────────
 
 

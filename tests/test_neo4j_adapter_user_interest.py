@@ -141,10 +141,26 @@ def test_query_user_interest_context_applies_filters_and_hop_clamp() -> None:
     assert "edge_limit" in captured["cypher"]
     assert "WITH collect(DISTINCT {id: neighbor.id, name: neighbor.name, entity_type: neighbor.entity_type}) AS all_expanded_neighbors" in captured["cypher"]
     assert "RETURN all_expanded_neighbors[..expanded_entity_limit] AS expanded_neighbors" in captured["cypher"]
+    assert "all(rel IN relationships(path) WHERE NOT type(rel) IN blocked_relationship_types)" in captured["cypher"]
+    assert "none(label IN labels(path_node) WHERE label IN blocked_node_labels)" in captured["cypher"]
+    assert "coalesce(trim(path_node.user_email), '') IN ['', user_email]" in captured["cypher"]
     assert captured["params"]["hops"] == 2
     assert captured["params"]["include_negative"] is False
     assert captured["params"]["domain_type"] == "investment"
     assert captured["params"]["category"] == "Technology"
+    assert captured["params"]["blocked_relationship_types"] == [
+        "BELONGS_TO_NODESET",
+        "HAS_EVENT",
+        "HAS_INTEREST_IN",
+        "OBSERVED_IN",
+        "TARGETS",
+    ]
+    assert captured["params"]["blocked_node_labels"] == [
+        "SessionNode",
+        "UserInterestDomain",
+        "UserInterestEdge",
+        "UserInterestEvent",
+    ]
     assert captured["params"]["target_filters"] == [
         {"name_lower": "apple inc.", "entity_type": "Company"}
     ]
@@ -173,3 +189,58 @@ def test_query_user_interest_context_enables_negative_stance_for_risk_intent() -
 
     asyncio.run(_run())
     assert captured["params"]["include_negative"] is True
+
+
+def test_get_entity_neighbors_excludes_user_scoped_edges_and_nodes() -> None:
+    adapter = Neo4jAdapter(
+        uri="bolt://unused",
+        username="unused",
+        password="unused",
+    )
+    captured: dict = {}
+
+    async def _fake_execute_read(cypher: str, params: dict):
+        captured["cypher"] = cypher
+        captured["params"] = params
+        return []
+
+    adapter._execute_read = _fake_execute_read  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        await adapter.get_entity_neighbors(["entity-1"], ["entity-2"])
+
+    asyncio.run(_run())
+
+    assert "NOT type(r) IN $blocked_relationship_types" in captured["cypher"]
+    assert "coalesce(trim(e.user_email), '') = ''" in captured["cypher"]
+    assert "coalesce(trim(neighbor.user_email), '') = ''" in captured["cypher"]
+    assert captured["params"]["blocked_relationship_types"] == [
+        "BELONGS_TO_NODESET",
+        "HAS_EVENT",
+        "HAS_INTEREST_IN",
+        "OBSERVED_IN",
+        "TARGETS",
+    ]
+
+
+def test_get_chunks_for_entities_excludes_user_owned_entities() -> None:
+    adapter = Neo4jAdapter(
+        uri="bolt://unused",
+        username="unused",
+        password="unused",
+    )
+    captured: dict = {}
+
+    async def _fake_execute_read(cypher: str, params: dict):
+        captured["cypher"] = cypher
+        captured["params"] = params
+        return []
+
+    adapter._execute_read = _fake_execute_read  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        await adapter.get_chunks_for_entities(["entity-1"], ["chunk-1"])
+
+    asyncio.run(_run())
+
+    assert "coalesce(trim(e.user_email), '') = ''" in captured["cypher"]

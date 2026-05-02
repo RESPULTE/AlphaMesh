@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from neo4j import AsyncDriver, AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
@@ -12,6 +12,7 @@ from neo4j.exceptions import Neo4jError, ServiceUnavailable
 from core.logger import get_logger
 from core.memory.graph.models import (
     _USER_SCOPED_TYPES,
+    _USER_SCOPED_RELATIONSHIP_TYPES,
     ALLOWED_ENTITY_TYPES,
     DocumentNode,
     EntityNode,
@@ -428,9 +429,13 @@ class Neo4jAdapter:
         """Return neighboring entities connected by edges."""
         if not entity_ids:
             return []
+        blocked_relationship_types = sorted(_USER_SCOPED_RELATIONSHIP_TYPES)
         cypher = (
             "MATCH (e:Entity)-[r]-(neighbor:Entity) "
             "WHERE e.id IN $entity_ids "
+            "AND NOT type(r) IN $blocked_relationship_types "
+            "AND coalesce(trim(e.user_email), '') = '' "
+            "AND coalesce(trim(neighbor.user_email), '') = '' "
             "AND ($exclude_ids IS NULL OR NOT neighbor.id IN $exclude_ids) "
             "RETURN e.id AS source_entity_id, "
             "e.name AS source_entity_name, "
@@ -441,7 +446,12 @@ class Neo4jAdapter:
             "r.reason AS reason"
         )
         records = await self._execute_read(
-            cypher, {"entity_ids": entity_ids, "exclude_ids": exclude_ids}
+            cypher,
+            {
+                "entity_ids": entity_ids,
+                "exclude_ids": exclude_ids,
+                "blocked_relationship_types": blocked_relationship_types,
+            },
         )
         self._logger.info(
             "Fetched %d neighbors for %d entities.",
@@ -466,6 +476,7 @@ class Neo4jAdapter:
         cypher = (
             "MATCH (c:Chunk)-[:MENTIONS_ENTITY]->(e:Entity) "
             "WHERE e.id IN $entity_ids "
+            "AND coalesce(trim(e.user_email), '') = '' "
             "AND ($exclude_chunk_ids IS NULL OR NOT c.id IN $exclude_chunk_ids) "
             "RETURN c.id AS chunk_id, "
             "c.text AS chunk_text, "
@@ -705,6 +716,8 @@ class Neo4jAdapter:
                 }
             )
 
+        blocked_relationship_types = sorted(_USER_SCOPED_RELATIONSHIP_TYPES)
+        blocked_node_labels = sorted(_USER_SCOPED_TYPES)
         cypher = (
             "MATCH (ns:NodeSet {id: $nodeset_id})"
             "<-[:BELONGS_TO_NODESET]-(d:UserInterestDomain {user_email: $user_email}) "
@@ -736,10 +749,14 @@ class Neo4jAdapter:
             "WITH row.d AS d, row.e AS e, row.entity AS entity, row.stance AS stance, row.edge_last_changed AS edge_last_changed, "
             "     hops, expanded_entity_limit "
             "CALL { "
-            "  WITH entity, hops, expanded_entity_limit "
-            "  WITH entity, hops, expanded_entity_limit WHERE hops > 0 "
+            "  WITH entity, hops, expanded_entity_limit, $blocked_relationship_types AS blocked_relationship_types, "
+            "       $blocked_node_labels AS blocked_node_labels, $user_email AS user_email "
+            "  WITH entity, hops, expanded_entity_limit, blocked_relationship_types, blocked_node_labels, user_email WHERE hops > 0 "
             "  MATCH path=(entity)-[*1..2]-(neighbor:Entity) "
             "  WHERE length(path) <= hops "
+            "    AND all(rel IN relationships(path) WHERE NOT type(rel) IN blocked_relationship_types) "
+            "    AND all(path_node IN tail(nodes(path)) WHERE none(label IN labels(path_node) WHERE label IN blocked_node_labels)) "
+            "    AND all(path_node IN tail(nodes(path)) WHERE coalesce(trim(path_node.user_email), '') IN ['', user_email]) "
             "  WITH collect(DISTINCT {id: neighbor.id, name: neighbor.name, entity_type: neighbor.entity_type}) AS all_expanded_neighbors, "
             "       expanded_entity_limit "
             "  RETURN all_expanded_neighbors[..expanded_entity_limit] AS expanded_neighbors "
@@ -762,6 +779,8 @@ class Neo4jAdapter:
                 "edge_limit": safe_edge_limit,
                 "hops": safe_hops,
                 "expanded_entity_limit": safe_expanded_limit,
+                "blocked_relationship_types": blocked_relationship_types,
+                "blocked_node_labels": blocked_node_labels,
             },
         )
 
