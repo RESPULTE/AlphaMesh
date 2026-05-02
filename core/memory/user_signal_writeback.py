@@ -11,15 +11,21 @@ UserInterestEvent -[:OBSERVED_IN]-> SessionNode
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 from core.logger import get_logger
+from core.memory.graph.models import ALL_MAIN_SECTORS
 from core.memory.user_interest_models import UserInterestEntityRef
 from core.memory.user_context_service import InterestCacheEntry
 
 logger = get_logger(__name__)
+
+_CANONICAL_SECTOR_BY_LOWER = {
+    str(name).strip().lower(): str(name).strip() for name in ALL_MAIN_SECTORS
+}
 
 
 @dataclass
@@ -72,6 +78,22 @@ def _derive_investment_category(
                 if sector:
                     return sector
     return "general"
+
+
+def _canonicalize_sector_name(entity_name: str) -> str:
+    value = str(entity_name or "").strip()
+    if not value:
+        return ""
+
+    direct = _CANONICAL_SECTOR_BY_LOWER.get(value.lower())
+    if direct:
+        return direct
+
+    trimmed = re.sub(r"\s+sector$", "", value, flags=re.IGNORECASE).strip()
+    if not trimmed:
+        return value
+
+    return _CANONICAL_SECTOR_BY_LOWER.get(trimmed.lower(), value)
 
 
 async def _derive_learning_category(entity_type: str, entity_id: str, neo4j) -> str:
@@ -216,12 +238,17 @@ async def _build_interest_relationships(
         operation = "invalidate" if stance == "negative" else "reinforce"
 
         for entity in signal.target_entities:
-            key = (entity.entity_name, entity.entity_type)
+            target_name = str(entity.entity_name or "").strip()
+            target_type = str(entity.entity_type or "").strip()
+            if target_type == "Sector":
+                target_name = _canonicalize_sector_name(target_name)
+
+            key = (target_name, target_type)
             resolved_id = entity_cache.get(key)
             if resolved_id is None:
                 resolution = await entity_resolver.resolve_entity(
-                    name=entity.entity_name,
-                    entity_type=entity.entity_type,
+                    name=target_name,
+                    entity_type=target_type,
                 )
                 if resolution.entity_id:
                     resolved_id = resolution.entity_id
@@ -231,13 +258,13 @@ async def _build_interest_relationships(
 
             if signal.kind == "investment":
                 category = _derive_investment_category(
-                    entity.entity_name,
-                    entity.entity_type,
+                    target_name,
+                    target_type,
                     payload.ticker_metadata,
                 )
             else:
                 category = await _derive_learning_category(
-                    entity.entity_type,
+                    target_type,
                     resolved_id,
                     neo4j,
                 )
@@ -288,8 +315,8 @@ async def _build_interest_relationships(
                 domain_props=domain_props,
                 edge_id=edge_id,
                 edge_props=edge_props,
-                entity_name=entity.entity_name,
-                entity_type=entity.entity_type,
+                entity_name=target_name,
+                entity_type=target_type,
                 event_id=event_id,
                 event_props=event_props,
             )
@@ -298,8 +325,8 @@ async def _build_interest_relationships(
                     kind=signal.kind,
                     category=category,
                     entity_id=resolved_id,
-                    entity_name=entity.entity_name,
-                    entity_type=entity.entity_type,
+                    entity_name=target_name,
+                    entity_type=target_type,
                     cumulative_weight=max(0.0, signal.confidence),
                     reinforcement_count=1 if stance == "positive" else 0,
                     invalidation_count=1 if stance == "negative" else 0,

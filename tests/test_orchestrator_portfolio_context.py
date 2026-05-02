@@ -179,8 +179,13 @@ def test_plan_node_receives_portfolio_context_message() -> None:
     )
 
 
-def test_synthesize_node_uses_state_portfolio_block() -> None:
+def test_synthesize_node_uses_state_portfolio_block(monkeypatch) -> None:
     captured: dict = {}
+    monkeypatch.setattr(
+        "core.config.settings.ENABLE_ANALYSIS_TOKEN_STREAMING",
+        False,
+        raising=False,
+    )
 
     class FakeLLM:
         async def ainvoke(self, messages):
@@ -448,5 +453,38 @@ def test_plan_node_receives_targeted_user_interest_context_message() -> None:
         isinstance(message, SystemMessage)
         and "TARGETED USER-INTEREST GRAPH CONTEXT" in str(message.content)
         and "investment:Technology" in str(message.content)
+        for message in captured["messages"]
+    )
+
+
+def test_plan_node_receives_canonical_sector_names_context_message() -> None:
+    captured: dict = {}
+
+    class FakeStructuredLLM:
+        async def ainvoke(self, messages):
+            captured["messages"] = messages
+            return OrchestratorPlan(query="route this")
+
+    class FakeLLM:
+        def with_structured_output(self, _schema):
+            return FakeStructuredLLM()
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._llm = FakeLLM()
+    agent._agents = {}
+
+    state = OrchestratorState(
+        messages=[HumanMessage(content="What sector should this be?")],
+        user_context_block="USER CONTEXT: baseline",
+        portfolio_block="[]",
+    )
+
+    _ = asyncio.run(agent._plan_node(state))
+
+    assert any(
+        isinstance(message, SystemMessage)
+        and "CANONICAL SECTOR NAMES" in str(message.content)
+        and "Technology" in str(message.content)
+        and "Healthcare" in str(message.content)
         for message in captured["messages"]
     )

@@ -18,6 +18,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from core.agents.base_agent import AbstractAgent
+from core.agents.analysis_token_stream import AnalysisChunkStreamer, stream_model_text
 from core.agents.fundamental_analysis_agent import FundamentalAnalysisAgent
 from core.agents.models.base_agent_models import BaseAgentInput, BaseAgentOutput
 from core.agents.models.orchestrator_models import (
@@ -51,6 +52,7 @@ from core.config import settings
 from core.event_queue import publish_progress, publish_success
 from core.logger import get_logger
 from core.memory.graph.graph_queue import make_graph_task
+from core.memory.graph.models import ALL_MAIN_SECTORS
 from core.memory.user_signal_writeback import (
     process_user_signal_writeback,
 )
@@ -301,6 +303,7 @@ class OrchestratorAgent:
         )
         planner_conversation_memory_block = state.conversation_memory_block or "(none)"
         user_interest_context_block = state.user_interest_graph_context_block or "(none)"
+        canonical_sector_names_block = ", ".join(sorted(ALL_MAIN_SECTORS.keys()))
 
         try:
             structured_llm = self._llm.with_structured_output(OrchestratorPlan)
@@ -331,6 +334,12 @@ class OrchestratorAgent:
                     content=(
                         "TARGETED USER-INTEREST GRAPH CONTEXT:\n"
                         f"{user_interest_context_block}"
+                    )
+                ),
+                SystemMessage(
+                    content=(
+                        "CANONICAL SECTOR NAMES (use exact labels for Sector entities):\n"
+                        f"{canonical_sector_names_block}"
                     )
                 ),
                 HumanMessage(content=latest_human),
@@ -443,6 +452,7 @@ class OrchestratorAgent:
                 "I wasn't able to retrieve data for your query at this time. "
                 "Please try again or rephrase your question."
             )
+        streamer: AnalysisChunkStreamer | None = None
         try:
             system_prompt = self._build_synthesis_system_prompt(
                 user_context=state.user_context_block,
@@ -471,10 +481,30 @@ class OrchestratorAgent:
                     )
                 ),
             ]
+            streamer = AnalysisChunkStreamer(
+                source="orchestrator",
+                agent="orchestrator",
+                node="_build_synthesis_text",
+                enabled=settings.ENABLE_ANALYSIS_TOKEN_STREAMING,
+            )
+            if streamer.enabled:
+                streamer.start()
+                raw_text = await stream_model_text(
+                    llm=self._llm,
+                    messages=messages,
+                    streamer=streamer,
+                )
+                final_text = _extract_response_text(raw_text)
+                streamer.end(final_text=final_text)
+                publish_success("orchestrator", "Synthesis complete.")
+                return final_text
+
             response = await self._llm.ainvoke(messages)
             publish_success("orchestrator", "Synthesis complete.")
             return _extract_response_text(response.text if response else "")
         except Exception:
+            if streamer is not None and streamer.enabled:
+                streamer.error("Synthesis failed.")
             logger.exception("_synthesize_node: LLM synthesis failed")
             return (
                 "I encountered an error while synthesising the analysis. "

@@ -41,21 +41,19 @@ class ServiceManager:
     def get_agent(self, temperature=0.0):
         from langchain_google_genai.chat_models import ChatGoogleGenerativeAI
 
-        if self._llm is None:
-            try:
-                self._llm = ChatGoogleGenerativeAI(
-                    model=settings.LLM_MODEL,
-                    temperature=temperature,
-                    google_api_key=settings.GOOGLE_API_KEY,
-                    thinking_budget=0,  # disable thinking for Gemini 2.5 Flash family
-                    include_thoughts=False,
-                )
-            except Exception as e:
-                print(f"Error initializing LLM: {e}")
-                raise
-        if temperature != self._llm.temperature:
-            self._llm.temperature = temperature
-        return self._llm
+        try:
+            # Return a dedicated model instance per call so concurrent agent runs
+            # never race on mutable temperature state.
+            return ChatGoogleGenerativeAI(
+                model=settings.LLM_MODEL,
+                temperature=temperature,
+                google_api_key=settings.GOOGLE_API_KEY,
+                thinking_budget=0,  # disable thinking for Gemini 2.5 Flash family
+                include_thoughts=False,
+            )
+        except Exception as e:
+            print(f"Error initializing LLM: {e}")
+            raise
 
     def get_embedding_func(self):
         from langchain_google_genai.embeddings import GoogleGenerativeAIEmbeddings

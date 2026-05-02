@@ -82,6 +82,102 @@ function deriveConsensus(agentAnalyses: Record<string, string>): AnalysisRespons
   return consensus;
 }
 
+type StreamedAgentKey = 'news_agent' | 'fundamentals_agent';
+
+const STREAM_AGENT_META: Record<
+  StreamedAgentKey,
+  Pick<AgentAnalysis, 'id' | 'name' | 'icon' | 'category'>
+> = {
+  news_agent: {
+    id: 'news',
+    name: 'News Analysis Agent',
+    icon: 'news',
+    category: 'Intelligence Unit'
+  },
+  fundamentals_agent: {
+    id: 'fundamental',
+    name: 'Fundamental Agent',
+    icon: 'analytics',
+    category: 'Financial Lab'
+  }
+};
+
+function upsertLiveAgentText(
+  prev: AnalysisResponse,
+  agentKey: StreamedAgentKey,
+  text: string
+): AnalysisResponse {
+  const meta = STREAM_AGENT_META[agentKey];
+  const agents = [...prev.agents];
+  const idx = agents.findIndex((agent) => agent.id === meta.id);
+  if (idx === -1) {
+    const catalyst = firstSentence(text);
+    agents.push({
+      id: meta.id,
+      name: meta.name,
+      icon: meta.icon,
+      category: meta.category,
+      recentCatalyst: {
+        title: agentKey === 'news_agent' ? catalyst : '',
+        description: agentKey === 'news_agent' ? text.slice(0, 140) : '',
+        timeAgo: 'LIVE'
+      },
+      sentiment: { score: 50, label: 'NEUTRAL (50%)' },
+      quote: agentKey === 'fundamentals_agent' ? firstSentence(text) : '',
+      fullReport: text
+    });
+  } else {
+    const current = agents[idx];
+    agents[idx] = {
+      ...current,
+      fullReport: text,
+      quote:
+        agentKey === 'fundamentals_agent'
+          ? firstSentence(text)
+          : current.quote,
+      recentCatalyst:
+        agentKey === 'news_agent'
+          ? {
+              title: firstSentence(text),
+              description: text.slice(0, 140),
+              timeAgo: 'LIVE'
+            }
+          : current.recentCatalyst
+    };
+  }
+  return { ...prev, agents };
+}
+
+function mergeAgentsPreservingLive(
+  finalAgents: AgentAnalysis[],
+  liveAgents: AgentAnalysis[]
+): AgentAnalysis[] {
+  if (!liveAgents.length) return finalAgents;
+  if (!finalAgents.length) return liveAgents;
+
+  const liveById = new Map(liveAgents.map((agent) => [agent.id, agent]));
+  const merged = finalAgents.map((agent) => {
+    const live = liveById.get(agent.id);
+    if (!live) return agent;
+    return {
+      ...live,
+      ...agent,
+      fullReport: agent.fullReport || live.fullReport,
+      quote: agent.quote || live.quote,
+      references: agent.references?.length ? agent.references : live.references,
+      metrics: agent.metrics?.length ? agent.metrics : live.metrics,
+      tableData: agent.tableData ?? live.tableData
+    };
+  });
+
+  for (const live of liveAgents) {
+    if (!merged.some((agent) => agent.id === live.id)) {
+      merged.push(live);
+    }
+  }
+  return merged;
+}
+
 function updateFundamentalAgent(prev: AnalysisResponse, payload: DataFramePayload): AnalysisResponse {
   const metrics = buildFundamentalsMetrics(payload);
   const tableData = buildFundamentalsTable(payload);
@@ -246,7 +342,16 @@ function mergeFinalWithLive(next: AnalysisResponse, prev?: AnalysisResponse | nu
       prev.fundamentalsVisualization,
       next.fundamentalsVisualization
     ),
-    agents: next.agents.length ? next.agents : prev.agents
+    agents: mergeAgentsPreservingLive(next.agents, prev.agents),
+    summary: {
+      ...prev.summary,
+      ...next.summary,
+      coreNarrative: next.summary?.coreNarrative || prev.summary?.coreNarrative || '',
+      verdict: {
+        ...prev.summary?.verdict,
+        ...next.summary?.verdict
+      }
+    }
   };
 }
 
@@ -276,6 +381,12 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
   const pendingQuoteRef = useRef<AnalysisResponse | null>(null);
   const pendingChartRef = useRef<AnalysisResponse['chartData'] | null>(null);
   const pendingFundamentalsVisualizationRef = useRef<FundamentalsVisualizationPayload | null>(null);
+  const liveAgentTextRef = useRef<Record<StreamedAgentKey, string>>({
+    news_agent: '',
+    fundamentals_agent: ''
+  });
+  const liveSynthesisRef = useRef<string>('');
+  const seenChunkSeqRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     if (!query) return;
@@ -289,6 +400,9 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
     pendingQuoteRef.current = null;
     pendingChartRef.current = null;
     pendingFundamentalsVisualizationRef.current = null;
+    liveAgentTextRef.current = { news_agent: '', fundamentals_agent: '' };
+    liveSynthesisRef.current = '';
+    seenChunkSeqRef.current = {};
 
     const closeStream = () => {
       if (eventSourceRef.current) {
@@ -463,6 +577,61 @@ export function useAnalysisStream(query: string | null, requestVersion = 0) {
                 payload.fundamentals_visualization
               );
             });
+            return;
+          }
+
+          if (payload.event_type === 'analysis_chunk') {
+            const streamKey = payload.stream_id;
+            const lastSeq = seenChunkSeqRef.current[streamKey];
+            if (typeof lastSeq === 'number' && payload.seq <= lastSeq) {
+              return;
+            }
+            seenChunkSeqRef.current[streamKey] = payload.seq;
+            setIsStreaming(true);
+            setStreamPhase((prev) => (prev === 'awaiting_ticker' ? prev : 'streaming'));
+
+            if (payload.agent === 'orchestrator') {
+              if (payload.phase === 'delta' && payload.delta) {
+                liveSynthesisRef.current += payload.delta;
+              }
+              if (payload.phase === 'end' && payload.text) {
+                liveSynthesisRef.current = payload.text;
+              }
+              const synthesisText = liveSynthesisRef.current.trim();
+              if (synthesisText) {
+                setData((prev) => {
+                  if (!prev) return prev;
+                  const current = prev as AnalysisResponse;
+                  return {
+                    ...current,
+                    summary: {
+                      ...current.summary,
+                      coreNarrative: synthesisText
+                    }
+                  };
+                });
+              }
+              return;
+            }
+
+            if (
+              payload.agent === 'news_agent' ||
+              payload.agent === 'fundamentals_agent'
+            ) {
+              const key = payload.agent;
+              if (payload.phase === 'delta' && payload.delta) {
+                liveAgentTextRef.current[key] += payload.delta;
+              }
+              if (payload.phase === 'end' && payload.text) {
+                liveAgentTextRef.current[key] = payload.text;
+              }
+              const liveText = liveAgentTextRef.current[key].trim();
+              if (!liveText) return;
+              setData((prev) => {
+                if (!prev) return prev;
+                return upsertLiveAgentText(prev as AnalysisResponse, key, liveText);
+              });
+            }
             return;
           }
 

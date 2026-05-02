@@ -263,6 +263,7 @@ class StreamEvent(BaseModel):
         "metrics",
         "ticker_resolved",
         "fundamentals_visualization",
+        "analysis_chunk",
     ]
     request_id: str
 
@@ -293,6 +294,16 @@ class StreamEvent(BaseModel):
     # -- present when event_type == "ticker_resolved" --------------------------
     ticker: Optional[str] = None
     tickers: Optional[List[str]] = None
+
+    # -- present when event_type == "analysis_chunk" ---------------------------
+    agent: Optional[str] = None
+    node: Optional[str] = None
+    stream_id: Optional[str] = None
+    phase: Optional[Literal["start", "delta", "end", "error"]] = None
+    seq: Optional[int] = None
+    delta: Optional[str] = None
+    text: Optional[str] = None
+    is_final: Optional[bool] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
 from core.memory.user_signal_writeback import (
-    DetectedEntity,
     InvestmentSignal,
     LearningSignal,
     UserSignalPayload,
@@ -24,6 +24,12 @@ class FakeResolver:
 class FakeNeo4j:
     async def get_entity_category(self, _entity_id: str):
         return "Valuation"
+
+
+@dataclass
+class DetectedEntity:
+    entity_name: str
+    entity_type: str
 
 
 def test_build_interest_relationships_emits_session_and_event_edges() -> None:
@@ -71,3 +77,41 @@ def test_build_interest_relationships_emits_session_and_event_edges() -> None:
     assert any(rel.get("to_type") == "SessionNode" for rel in relationships)
     assert any(rel.get("to_type") == "UserInterestEvent" for rel in relationships)
     assert {entry.kind for entry in cache_entries} == {"investment", "learning"}
+
+
+def test_build_interest_relationships_canonicalizes_sector_suffix_name() -> None:
+    payload = UserSignalPayload(
+        user_email="user@example.com",
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        user_message="I like technology sector.",
+        ticker_metadata={},
+        investment_signals=[
+            InvestmentSignal(
+                status="Interested",
+                confidence=1.0,
+                target_entities=[
+                    DetectedEntity(entity_name="Technology Sector", entity_type="Sector")
+                ],
+            )
+        ],
+        learning_signals=[],
+    )
+
+    relationships, cache_entries = asyncio.run(
+        _build_interest_relationships(
+            payload=payload,
+            entity_resolver=FakeResolver(),
+            neo4j=FakeNeo4j(),
+            nodeset_id="nodeset-1",
+        )
+    )
+
+    target_rels = [rel for rel in relationships if rel.get("relation") == "TARGETS"]
+    assert target_rels
+    assert target_rels[0]["to_type"] == "Sector"
+    assert target_rels[0]["to_name"] == "Technology"
+
+    assert cache_entries
+    assert cache_entries[0].category == "Technology"
+    assert cache_entries[0].entity_name == "Technology"

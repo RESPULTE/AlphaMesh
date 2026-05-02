@@ -3,23 +3,6 @@ api/sinks/sse_sink.py
 
 EventQueue sink that bridges the synchronous EventQueue fire path to the
 asyncio.Queue consumed by each request's SSE stream.
-
-Thread-safety
-─────────────
-`on_event()` is called synchronously from EventQueue._fire(), which itself is
-called from within a coroutine running in the asyncio event loop.  However,
-to be safe against any future path where publish() might be called from a
-thread pool (e.g. inside asyncio.to_thread), we always use
-`loop.call_soon_threadsafe` which is safe from both in-loop and out-of-loop
-callers.
-
-Filtering
-─────────
-Each SSESink is bound to a specific `response_id`.  Because EventQueue is a
-global singleton shared across all concurrent requests, a sink must ignore
-events from other concurrent runs.  The `response_id` is obtained from the
-ResponseGroup created by `EventQueue.start_response()` and is a stable UUID
-that never collides across runs.
 """
 
 from __future__ import annotations
@@ -50,8 +33,7 @@ class SSESink:
         self._response_id = response_id
         self._event_queue = event_queue
         self._loop = loop
-
-    # ── EventQueue sink protocol ──────────────────────────────────────────────
+        self._pending_puts: set[asyncio.Task] = set()
 
     def on_event(self, event: Any) -> None:  # event: core.event_queue.Event
         """Filter to this request's response group, then enqueue for SSE."""
@@ -74,27 +56,30 @@ class SSESink:
                 "message": event.message,
                 "timestamp": event.timestamp.isoformat(),
             }
-        # call_soon_threadsafe is safe from both in-loop and thread contexts
         try:
             self._loop.call_soon_threadsafe(self._safe_put, payload)
         except RuntimeError:
-            # Loop is closed (e.g. shutdown during a request) — silently discard
+            # Loop is closed (e.g. shutdown during a request). Discard silently.
             pass
 
     def on_group_opened(self, group: Any) -> None:
-        pass  # No-op; we don't expose group lifecycle to the frontend
+        pass
 
     def on_group_closed(self, group: Any) -> None:
-        pass  # No-op
-
-    # ── Internal ─────────────────────────────────────────────────────────────
+        pass
 
     def _safe_put(self, payload: dict) -> None:
         """Called from the event loop via call_soon_threadsafe."""
         try:
             self._event_queue.put_nowait(payload)
         except asyncio.QueueFull:
+            # For token chunks, preserve delivery by waiting for queue space.
+            if payload.get("event_type") == "analysis_chunk":
+                task = self._loop.create_task(self._event_queue.put(payload))
+                self._pending_puts.add(task)
+                task.add_done_callback(self._pending_puts.discard)
+                return
             logger.debug(
-                "SSESink: event queue full for request %s — dropping event",
+                "SSESink: event queue full for request %s - dropping event",
                 self._request_id,
             )

@@ -42,6 +42,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from core.agents.base_agent import AbstractAgent
+from core.agents.analysis_token_stream import AnalysisChunkStreamer, stream_model_text
 from core.agents.data_prep import (
     _fetch_raw_data,
     _merge_price_rows,
@@ -962,20 +963,38 @@ class FundamentalAnalysisAgent(AbstractAgent):
         )
         success = False
         sentiment = None
+        streamer = AnalysisChunkStreamer(
+            source=self.name(),
+            agent=self.name(),
+            node="_analyst_node",
+            enabled=settings.ENABLE_ANALYSIS_TOKEN_STREAMING,
+        )
         try:
-            response = await service_manager.get_agent(temperature=0.7).ainvoke(
-                [
-                    SystemMessage(content=_ANALYST_SYSTEM),
-                    HumanMessage(content=analysis_prompt),
-                ]
-            )
-            raw = response.content if response else ""
-            sentiment = parse_sentiment_block(raw)  # ← parse before stripping
+            messages = [
+                SystemMessage(content=_ANALYST_SYSTEM),
+                HumanMessage(content=analysis_prompt),
+            ]
+            llm = service_manager.get_agent(temperature=0.7)
+            if streamer.enabled:
+                streamer.start()
+                raw = await stream_model_text(
+                    llm=llm,
+                    messages=messages,
+                    streamer=streamer,
+                )
+                streamer.end(final_text=raw)
+            else:
+                response = await llm.ainvoke(messages)
+                raw = response.content if response else ""
+            sentiment = parse_sentiment_block(raw)
             analysis_text = strip_sentiment_block(raw)
             success = True
         except Exception as exc:
+            if streamer.enabled:
+                streamer.error(str(exc))
             logger.error("[analyst] Analysis LLM call failed: %s", exc)
             analysis_text = "Analysis could not be generated due to an internal error."
+
 
         task_id = None
         if state.conversation_id and analysis_text and success:

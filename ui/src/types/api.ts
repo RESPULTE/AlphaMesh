@@ -127,7 +127,8 @@ export interface AnalysisResponse {
  * 1) POST /api/v1/chat  � start analysis, returns request_id
  * 2) GET  /api/v1/stream/{request_id}  � SSE stream
  *
- * The stream emits `progress`, `init`, `chart`, `metrics`, `complete`, or `error`.
+ * The stream emits `progress`, `init`, `chart`, `metrics`, `analysis_chunk`,
+ * `complete`, or `error`.
  * We map incremental payloads into the AnalysisResponse shape used by the UI.
  */
 
@@ -293,4 +294,17 @@ export type StreamEvent =
       request_id: string;
       ticker?: string;
       tickers?: string[];
+    }
+  | {
+      event_type: 'analysis_chunk';
+      request_id: string;
+      agent: 'news_agent' | 'fundamentals_agent' | 'orchestrator';
+      node: string;
+      stream_id: string;
+      phase: 'start' | 'delta' | 'end' | 'error';
+      seq: number;
+      delta?: string;
+      text?: string;
+      is_final?: boolean;
+      error?: string;
     };

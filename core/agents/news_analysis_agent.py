@@ -12,6 +12,7 @@ from langgraph.types import Overwrite
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.agents.base_agent import AbstractAgent
+from core.agents.analysis_token_stream import AnalysisChunkStreamer, stream_model_text
 from core.agents.models.base_agent_models import AgentSentiment, BaseAgentInput
 from core.agents.models.news_agent_models import (
     DomainQuery,
@@ -876,6 +877,48 @@ class NewsAnalysisAgent(AbstractAgent):
         )
         sources, _ = RetrievedChunk._build_deduplicated_sources(selected_source_chunks)
         analysis_text = response.analysis
+        if settings.ENABLE_ANALYSIS_TOKEN_STREAMING and analysis_text.strip():
+            streamer = AnalysisChunkStreamer(
+                source=self.name(),
+                agent=self.name(),
+                node="_analyse_news_node",
+                enabled=True,
+            )
+            streamer.start()
+            try:
+                rewrite_messages = [
+                    SystemMessage(
+                        content=(
+                            "You are a financial news analysis assistant. "
+                            "Return plain text only. Do not return JSON."
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"Goal: {state.goal}\n\n"
+                            "Rewrite the following draft analysis into a clear, "
+                            "investor-useful narrative while preserving its facts.\n\n"
+                            f"Draft analysis:\n{analysis_text}"
+                        )
+                    ),
+                ]
+                streamed_text = await stream_model_text(
+                    llm=service_manager.get_agent(
+                        temperature=float(getattr(self._llm, "temperature", 0.7))
+                    ),
+                    messages=rewrite_messages,
+                    streamer=streamer,
+                )
+                streamed_text = streamed_text.strip()
+                if streamed_text:
+                    analysis_text = streamed_text
+                streamer.end(final_text=analysis_text)
+            except Exception as exc:
+                streamer.error(str(exc))
+                logger.warning(
+                    "_analyse_news_node: token streaming rewrite failed, using structured analysis: %s",
+                    exc,
+                )
 
         task_id = None
         if state.conversation_id and analysis_text:
