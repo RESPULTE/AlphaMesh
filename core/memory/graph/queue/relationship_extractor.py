@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Callable, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -13,8 +12,9 @@ from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential
 from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.models import (
-    _EXTRACTABLE_ENTITY_TYPES,
+    ENTITY_TYPE_EXTRACTION_GUIDANCE,
     FINANCIAL_CONCEPT_CATEGORIES,
+    RELATIONSHIP_TYPE_METADATA,
     BatchEntityExtractionResult,
     ChunkEntityExtractionResult,
     EntityNode,
@@ -29,29 +29,6 @@ _CHUNK_EXTRACTION_USER_TEMPLATE = (
     "Each chunk is labeled with [CHUNK_ID: ...].\n\n"
     "{chunk_blocks}\n\n"
 )
-
-
-def _build_batch_extraction_schema_for_prompt() -> str:
-    schema = BatchEntityExtractionResult.model_json_schema()
-    rendered_schema = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
-    return rendered_schema.replace("{", "{{").replace("}", "}}")
-
-
-_EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT = f"""\
-        You are an information extraction system. Extract entities from each
-        news chunk provided. Only use information explicitly stated in each chunk.
-        Allowed entity types: {", ".join(_EXTRACTABLE_ENTITY_TYPES)}.
-        Sector, Industry, Market and FinancialConceptCategory entities are managed by the taxonomy pipeline and must NOT
-        be extracted from text. Each entity must include a short, single-sentence description
-        drawn only from the chunk text.
-        FinancialConcept entities must be insightful and provide useful learning experience for the user or context for future analysis.
-        They should NOT be generic definitions easily found in a textbook.
-        Each FinancialConcept must include 1 to 3 (at max) concept_categories chosen from: {", ".join(FINANCIAL_CONCEPT_CATEGORIES.keys())}.
-        Return a JSON object matching the BatchEntityExtractionResult schema.
-        Each result must echo the chunk_id exactly as provided.
-        JSON Schema:\n
-        {_build_batch_extraction_schema_for_prompt()}
-""".strip()
 
 
 def _build_chunk_extraction_prompt(system_prompt: str) -> ChatPromptTemplate:
@@ -93,6 +70,8 @@ class RelationshipExtractor:
         mode: str = "relationships",
         text: Optional[str] = None,
         chunk_ids: Optional[List[str]] = None,
+        allowed_entity_types: Optional[List[str]] = None,
+        allowed_relationship_types: Optional[List[str]] = None,
         llm: Optional[object] = None,
         system_prompt: Optional[str] = None,
         force: bool = False,
@@ -102,6 +81,8 @@ class RelationshipExtractor:
                 text=text or "",
                 llm=llm,
                 system_prompt=system_prompt or "",
+                allowed_entity_types=allowed_entity_types,
+                allowed_relationship_types=allowed_relationship_types,
             )
 
         if mode == "chunk_entities":
@@ -109,6 +90,7 @@ class RelationshipExtractor:
                 chunk_ids=list(chunk_ids or []),
                 llm=llm,
                 system_prompt=system_prompt,
+                allowed_entity_types=allowed_entity_types,
                 force=force,
             )
 
@@ -121,6 +103,8 @@ class RelationshipExtractor:
         text: str,
         llm: Optional[object],
         system_prompt: str,
+        allowed_entity_types: Optional[List[str]],
+        allowed_relationship_types: Optional[List[str]],
     ) -> List[dict]:
         """Extract relationships from text; returns [] on any failure."""
         if not text or not text.strip():
@@ -133,13 +117,18 @@ class RelationshipExtractor:
                 "RelationshipExtractor.extract: missing system_prompt for relationships"
             )
             return []
+        effective_prompt = self._compose_relationship_system_prompt(
+            base_prompt=system_prompt,
+            allowed_entity_types=allowed_entity_types,
+            allowed_relationship_types=allowed_relationship_types,
+        )
 
         try:
             if self._retry_attempts <= 1:
                 return await self._extract_relationships_once(
                     text=text,
                     llm=llm,
-                    system_prompt=system_prompt,
+                    system_prompt=effective_prompt,
                 )
 
             async for attempt in AsyncRetrying(
@@ -151,7 +140,7 @@ class RelationshipExtractor:
                     return await self._extract_relationships_once(
                         text=text,
                         llm=llm,
-                        system_prompt=system_prompt,
+                        system_prompt=effective_prompt,
                     )
         except Exception:
             logger.exception("RelationshipExtractor.extract: all attempts failed")
@@ -164,6 +153,7 @@ class RelationshipExtractor:
         chunk_ids: List[str],
         llm: Optional[object],
         system_prompt: Optional[str],
+        allowed_entity_types: Optional[List[str]],
         force: bool = False,
     ) -> List[EntityNode]:
         """Extract entities for chunk IDs and upsert mentions/status metadata."""
@@ -174,6 +164,11 @@ class RelationshipExtractor:
             llm = self._resolve_chunk_extraction_llm()
         if llm is None:
             logger.warning("Entity extraction requested but no LLM configured.")
+            return []
+        if not str(system_prompt or "").strip():
+            logger.warning(
+                "Entity extraction requested but no chunk entity system_prompt was provided."
+            )
             return []
         if (
             self._neo4j_adapter is None
@@ -187,10 +182,14 @@ class RelationshipExtractor:
             return []
 
         try:
+            effective_prompt = self._compose_chunk_entity_system_prompt(
+                base_prompt=system_prompt or "",
+                allowed_entity_types=allowed_entity_types,
+            )
             return await self._run_chunk_entity_extraction(
                 chunk_ids=chunk_ids,
                 llm=llm,
-                system_prompt=system_prompt or self.default_chunk_system_prompt(),
+                system_prompt=effective_prompt,
                 force=force,
             )
         except Exception:
@@ -508,8 +507,93 @@ class RelationshipExtractor:
         return self._llm
 
     @staticmethod
-    def default_chunk_system_prompt() -> str:
-        return _EXTERNAL_SOURCE_CHUNK_EXTRACTION_PROMPT
+    def _normalize_allowed_types(
+        values: Optional[List[str]],
+        allowed_values: set[str],
+    ) -> List[str]:
+        if not values:
+            return []
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            item = str(value or "").strip()
+            if not item or item not in allowed_values or item in seen:
+                continue
+            seen.add(item)
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _build_entity_type_guidance_block(
+        allowed_entity_types: Optional[List[str]],
+    ) -> str:
+        allowed = set(ENTITY_TYPE_EXTRACTION_GUIDANCE.keys())
+        resolved_types = RelationshipExtractor._normalize_allowed_types(
+            values=allowed_entity_types,
+            allowed_values=allowed,
+        ) or list(ENTITY_TYPE_EXTRACTION_GUIDANCE.keys())
+        lines = [
+            "Entity Type Guidance (strictly use these definitions):",
+        ]
+        for entity_type in resolved_types:
+            lines.append(
+                f"- {entity_type}: {ENTITY_TYPE_EXTRACTION_GUIDANCE[entity_type]}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_relationship_type_guidance_block(
+        allowed_relationship_types: Optional[List[str]],
+    ) -> str:
+        allowed = set(RELATIONSHIP_TYPE_METADATA.keys())
+        resolved_types = RelationshipExtractor._normalize_allowed_types(
+            values=allowed_relationship_types,
+            allowed_values=allowed,
+        ) or list(RELATIONSHIP_TYPE_METADATA.keys())
+        lines = [
+            "Relationship Type Guidance (strictly use these definitions and weights):",
+        ]
+        for relationship_type in resolved_types:
+            metadata = RELATIONSHIP_TYPE_METADATA[relationship_type]
+            lines.append(
+                f"- {relationship_type} (weight={float(metadata['weight']):.2f}): {metadata['description']}"
+            )
+        return "\n".join(lines)
+
+    def _compose_relationship_system_prompt(
+        self,
+        *,
+        base_prompt: str,
+        allowed_entity_types: Optional[List[str]],
+        allowed_relationship_types: Optional[List[str]],
+    ) -> str:
+        entity_block = self._build_entity_type_guidance_block(allowed_entity_types)
+        relationship_block = self._build_relationship_type_guidance_block(
+            allowed_relationship_types
+        )
+        return (
+            f"{base_prompt.rstrip()}\n\n"
+            f"{entity_block}\n\n"
+            f"{relationship_block}\n"
+        ).strip()
+
+    def _compose_chunk_entity_system_prompt(
+        self,
+        *,
+        base_prompt: str,
+        allowed_entity_types: Optional[List[str]],
+    ) -> str:
+        entity_block = self._build_entity_type_guidance_block(allowed_entity_types)
+        concept_categories = ", ".join(FINANCIAL_CONCEPT_CATEGORIES.keys())
+        concept_rule = (
+            "If extracting FinancialConcept, include `concept_categories` with 1 to 3 values "
+            f"selected from: {concept_categories}."
+        )
+        return (
+            f"{base_prompt.rstrip()}\n\n"
+            f"{entity_block}\n\n"
+            f"{concept_rule}\n"
+        ).strip()
 
     @staticmethod
     def _parse_relationships(raw: str, *, source: str) -> Optional[List[dict]]:

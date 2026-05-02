@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Type
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,8 +11,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Overwrite
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.agents.base_agent import AbstractAgent
 from core.agents.analysis_token_stream import AnalysisChunkStreamer, stream_model_text
+from core.agents.base_agent import AbstractAgent
 from core.agents.models.base_agent_models import BaseAgentInput
 from core.agents.models.news_agent_models import (
     DomainQuery,
@@ -27,7 +27,7 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_ANALYSIS_USER_PROMPT,
     NEWS_DEFERRED_ALLOWED_ENTITY_TYPES,
     NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
-    build_news_deferred_chunk_entity_system_prompt,
+    NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT,
     NEWS_PLANNER_SYSTEM_PROMPT,
     build_news_deferred_relationship_system_prompt,
 )
@@ -910,9 +910,7 @@ class NewsAnalysisAgent(AbstractAgent):
                 if analysis_text:
                     streamer.end(final_text=analysis_text)
                 else:
-                    analysis_text = (
-                        "Best-effort analysis could not be generated from available evidence."
-                    )
+                    analysis_text = "Best-effort analysis could not be generated from available evidence."
                     streamer.end(final_text=analysis_text)
             else:
                 response_text = await analysis_llm.ainvoke(analysis_messages)
@@ -933,9 +931,8 @@ class NewsAnalysisAgent(AbstractAgent):
             turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
             allowed_entity_types = list(NEWS_DEFERRED_ALLOWED_ENTITY_TYPES)
             allowed_relationship_types = list(NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES)
-            relationship_system_prompt = build_news_deferred_relationship_system_prompt(
-                allowed_entity_types=allowed_entity_types,
-                allowed_relationship_types=allowed_relationship_types,
+            relationship_system_prompt = (
+                build_news_deferred_relationship_system_prompt()
             )
             try:
                 task = make_extraction_task(
@@ -946,7 +943,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     extraction_text=analysis_text,
                     chunk_ids=final_stage_chunk_ids,
                     system_prompt=relationship_system_prompt,
-                    chunk_system_prompt=build_news_deferred_chunk_entity_system_prompt(),
+                    chunk_system_prompt=NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT,
                     allowed_entity_types=allowed_entity_types,
                     allowed_relationship_types=allowed_relationship_types,
                     llm_config={"temperature": 0.7},

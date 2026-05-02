@@ -59,6 +59,44 @@ ALLOWED_ENTITY_TYPES = {
 
 _EXTRACTABLE_ENTITY_TYPES = {"Company", "FinancialEvent", "FinancialConcept"}
 
+ENTITY_TYPE_EXTRACTION_GUIDANCE: dict[str, str] = {
+    "Company": (
+        "Use a legally or commercially recognized organization name explicitly stated in the text. "
+        "Prefer canonical company names over abbreviations when both are present. "
+        "Do not infer companies that are not directly mentioned."
+    ),
+    "FinancialEvent": (
+        "Capture concrete finance-relevant events explicitly described in the text, such as earnings releases, guidance revisions, "
+        "M&A announcements, rating actions, funding activity, or regulatory developments. "
+        "Keep names concise and specific enough to anchor downstream relationships."
+    ),
+    "FinancialConcept": (
+        "Extract substantive finance concepts that explain mechanism, risk, valuation, liquidity, profitability, or market behavior in context. "
+        "Descriptions should be insight-oriented and tied to source context rather than generic textbook definitions. "
+        "Avoid trivial or overly broad concepts with low analytical value."
+    ),
+    "FinancialConceptCategory": (
+        "Use this type only for canonical taxonomy categories that already exist in the system. "
+        "Do not derive this type from free text extraction unless explicitly required by task constraints. "
+        "Prefer linking FinancialConcept nodes to known categories instead of creating new category entities."
+    ),
+    "Sector": (
+        "Represent broad economic sectors using canonical market taxonomy labels. "
+        "Only extract sectors explicitly stated in the source text. "
+        "Do not substitute implied sectors from outside knowledge."
+    ),
+    "Industry": (
+        "Represent industry-level groupings narrower than sectors when explicitly mentioned in the text. "
+        "Use canonical industry phrasing when multiple variants appear. "
+        "Do not infer industry labels solely from a company's known business profile."
+    ),
+    "Market": (
+        "Represent explicit market-level entities such as regions, exchanges, or broad market aggregates stated in context. "
+        "Use concise canonical labels and avoid synthetic market terms. "
+        "Only extract market entities directly supported by source text."
+    ),
+}
+
 # ── ALLOWED_RELATIONSHIP_TYPES: add BELONGS_TO ───────────────────────────────
 ALLOWED_RELATIONSHIP_TYPES = [
     "AFFECTS",
@@ -98,18 +136,72 @@ GlobalRelationshipType = Literal[
     "BELONGS_TO",
 ]
 
+RELATIONSHIP_TYPE_METADATA: dict[str, dict[str, str | float]] = {
+    "AFFECTS": {
+        "description": "A directional influence where one entity impacts the state, outcomes, or behavior of another.",
+        "weight": 1.0,
+    },
+    "CAUSED_BY": {
+        "description": "A causal link where an effect entity is explicitly caused by the source entity or event.",
+        "weight": 0.95,
+    },
+    "INCREASES": {
+        "description": "A directional relationship where the source contributes to or is associated with an increase in the target.",
+        "weight": 0.85,
+    },
+    "DECREASES": {
+        "description": "A directional relationship where the source contributes to or is associated with a decrease in the target.",
+        "weight": 0.85,
+    },
+    "CORRELATED_WITH": {
+        "description": "A non-causal association where two entities are described as moving or occurring together.",
+        "weight": 0.70,
+    },
+    "EXPOSES_TO": {
+        "description": "A relationship where one entity increases another entity's exposure to a risk, factor, or condition.",
+        "weight": 0.65,
+    },
+    "MITIGATES": {
+        "description": "A relationship where one entity reduces risk, severity, or impact associated with the target.",
+        "weight": 0.55,
+    },
+    "COMPETES_WITH": {
+        "description": "A competitive relationship between peer entities operating in overlapping markets or products.",
+        "weight": 0.45,
+    },
+    "ACQUIRED_BY": {
+        "description": "A corporate action relationship where the source entity is acquired by the target entity.",
+        "weight": 0.40,
+    },
+    "RELATED_TO": {
+        "description": "A generic fallback relationship for relevance when no more specific edge type is justified.",
+        "weight": 0.10,
+    },
+    "BELONGS_TO": {
+        "description": "A membership or classification relationship where the source is categorized under the target.",
+        "weight": 0.20,
+    },
+    "HAS_INTEREST_IN": {
+        "description": "A user-interest relationship indicating an interest domain or edge targets a specific entity.",
+        "weight": 0.35,
+    },
+    "TARGETS": {
+        "description": "A directional user-interest relationship linking an interest edge to its underlying target entity.",
+        "weight": 0.30,
+    },
+    "HAS_EVENT": {
+        "description": "A provenance relationship linking an interest edge to a concrete interest observation event.",
+        "weight": 0.25,
+    },
+    "OBSERVED_IN": {
+        "description": "A provenance relationship linking an observed event to the session context in which it occurred.",
+        "weight": 0.20,
+    },
+}
+
 _RELATIONSHIP_WEIGHTS: dict[str, float] = {
-    "AFFECTS": 1.0,
-    "CAUSED_BY": 0.95,
-    "BOOSTS": 0.85,
-    "DRAGS": 0.85,
-    "CORRELATED_WITH": 0.70,
-    "EXPOSES_TO": 0.65,
-    "MITIGATES": 0.55,
-    "COMPETES_WITH": 0.45,
-    "ACQUIRED_BY": 0.40,
-    "RELATED_TO": 0.10,  # generic fallback — lowest priority
-    "BELONGS_TO": 0.20,  # intermediate priority between RELATED_TO and specific causal/affective relationships
+    relationship_type: float(metadata["weight"])
+    for relationship_type, metadata in RELATIONSHIP_TYPE_METADATA.items()
 }
 
 # ── _ENTITY_TYPE_WEIGHTS: add Industry and Market ────────────────────────────
@@ -243,6 +335,20 @@ class EntityNode(BaseModel):
     nodeset_ids: List[str] = Field(default_factory=list)
 
 
+class RelationshipExtractionItem(BaseModel):
+    """Schema for one relationship item expected inside <relationships> prompts."""
+
+    from_name: str
+    from_type: str
+    relationship_type: str
+    to_name: str
+    to_type: str
+    confidence: str = Field(
+        description='"high" for explicit evidence, "low" for inferred.'
+    )
+    reason: str = Field(description="1-2 short sentences explaining the relationship.")
+
+
 class ChunkEntityExtractionResult(BaseModel):
     """Structured entity extraction output for a single chunk."""
 
@@ -260,3 +366,4 @@ class BatchEntityExtractionResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     results: List[ChunkEntityExtractionResult] = Field(default_factory=list)
+

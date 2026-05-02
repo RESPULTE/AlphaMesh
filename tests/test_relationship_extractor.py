@@ -26,9 +26,11 @@ class _FakeLLM:
     def __init__(self, responses: list[object]) -> None:
         self._responses = list(responses)
         self.calls = 0
+        self.last_messages = None
 
     async def ainvoke(self, _messages: object) -> _FakeResponse:
         self.calls += 1
+        self.last_messages = _messages
         if not self._responses:
             raise RuntimeError("No responses configured")
         next_response = self._responses.pop(0)
@@ -289,6 +291,7 @@ def test_chunk_entity_extraction_filters_pending_and_updates_status() -> None:
             mode="chunk_entities",
             chunk_ids=["c1", "c2"],
             llm=llm,
+            system_prompt="chunk prompt",
         )
     )
 
@@ -353,6 +356,7 @@ def test_chunk_entity_extraction_treats_missing_status_rows_as_pending() -> None
             mode="chunk_entities",
             chunk_ids=["c1"],
             llm=llm,
+            system_prompt="chunk prompt",
         )
     )
 
@@ -407,6 +411,7 @@ def test_chunk_entity_extraction_verification_failure_marks_chunk_pending() -> N
             mode="chunk_entities",
             chunk_ids=["c1"],
             llm=llm,
+            system_prompt="chunk prompt",
         )
     )
 
@@ -474,6 +479,7 @@ def test_chunk_entity_extraction_force_ignores_status_filter() -> None:
             mode="chunk_entities",
             chunk_ids=["c2"],
             llm=llm,
+            system_prompt="chunk prompt",
             force=True,
         )
     )
@@ -559,5 +565,63 @@ def test_chunk_entity_extraction_uses_runtime_system_prompt_override() -> None:
 
     assert len(entities) == 1
     assert llm.system_prompts
-    assert llm.system_prompts[0] == custom_prompt
+    assert llm.system_prompts[0].startswith(custom_prompt)
+    assert "Entity Type Guidance (strictly use these definitions):" in llm.system_prompts[0]
     neo4j.get_entities_for_chunks.assert_awaited_once_with(["c3"])
+
+
+def test_chunk_entity_extraction_requires_runtime_prompt() -> None:
+    neo4j = AsyncMock()
+    chroma = AsyncMock()
+    nodeset_manager = AsyncMock()
+    entity_resolver = AsyncMock()
+    llm = _FakeChunkLLM(BatchEntityExtractionResult(results=[]))
+    extractor = RelationshipExtractor(
+        neo4j_adapter=neo4j,
+        chroma_adapter=chroma,
+        nodeset_manager=nodeset_manager,
+        entity_resolver=entity_resolver,
+        retry_attempts=1,
+    )
+
+    entities = asyncio.run(
+        extractor.extract(
+            mode="chunk_entities",
+            chunk_ids=["c3"],
+            llm=llm,
+            system_prompt=None,
+        )
+    )
+
+    assert entities == []
+    neo4j.get_chunk_extraction_status.assert_not_called()
+
+
+def test_relationship_extraction_injects_scoped_type_guidance() -> None:
+    extractor = RelationshipExtractor(retry_attempts=1)
+    llm = _FakeLLM(
+        [
+            '<relationships>[{"from_name":"A","from_type":"Company","relationship_type":"AFFECTS","to_name":"B","to_type":"Market"}]</relationships>'
+        ]
+    )
+
+    result = asyncio.run(
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=llm,
+            system_prompt="base prompt",
+            allowed_entity_types=["Company", "Market"],
+            allowed_relationship_types=["AFFECTS"],
+        )
+    )
+
+    assert result
+    assert llm.last_messages is not None
+    system_prompt = str(llm.last_messages[0].content)
+    assert system_prompt.startswith("base prompt")
+    assert "- Company:" in system_prompt
+    assert "- Market:" in system_prompt
+    assert "- FinancialConcept:" not in system_prompt
+    assert "- AFFECTS (weight=1.00):" in system_prompt
+    assert "- RELATED_TO (weight=0.10):" not in system_prompt

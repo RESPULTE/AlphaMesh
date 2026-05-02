@@ -469,15 +469,11 @@ def test_fetch_and_ingest_dedupes_query_variant_urls_and_seen_chunk_ids(
 
 
 def test_news_relationship_prompt_factory_scopes_schema_enums() -> None:
-    prompt = build_news_deferred_relationship_system_prompt(
-        allowed_entity_types=["Company", "Market"],
-        allowed_relationship_types=["AFFECTS", "RELATED_TO"],
-    )
+    prompt = build_news_deferred_relationship_system_prompt()
 
-    assert '"Company"' in prompt
-    assert '"Market"' in prompt
-    assert '"AFFECTS"' in prompt
-    assert '"RELATED_TO"' in prompt
+    assert '"relationship_type"' in prompt
+    assert '"from_type"' in prompt
+    assert '"to_type"' in prompt
     assert "<relationships>" in prompt
 
 

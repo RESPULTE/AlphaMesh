@@ -100,6 +100,8 @@ class GraphWritePipeline:
                 text=extraction_text,
                 llm=llm,
                 system_prompt=prompt,
+                allowed_entity_types=list(task.allowed_entity_types or []),
+                allowed_relationship_types=list(task.allowed_relationship_types or []),
             )
             normalized_relationships = list(relationships or [])
             if allowed_entity_keys is not None:
@@ -341,7 +343,7 @@ class GraphWritePipeline:
         return domain_written, user_written
 
     async def _process_chunk_entity_tasks(self, tasks: List[GraphTask]) -> None:
-        chunk_groups: Dict[Tuple[str, str], Dict[str, object]] = {}
+        chunk_groups: Dict[Tuple[str, str, str], Dict[str, object]] = {}
         for task in tasks:
             if not is_scoped_extraction_task(task) or not task.chunk_ids:
                 continue
@@ -354,13 +356,24 @@ class GraphWritePipeline:
             llm_config_key = json.dumps(
                 task.llm_config or {}, sort_keys=True, default=str
             )
-            group_key = (prompt_key, llm_config_key)
+            allowed_entity_types = list(task.allowed_entity_types or [])
+            allowed_relationship_types = list(task.allowed_relationship_types or [])
+            scope_key = json.dumps(
+                {
+                    "allowed_entity_types": allowed_entity_types,
+                    "allowed_relationship_types": allowed_relationship_types,
+                },
+                sort_keys=True,
+            )
+            group_key = (prompt_key, llm_config_key, scope_key)
             group_entry = chunk_groups.setdefault(
                 group_key,
                 {
                     "chunk_ids": [],
                     "prompt_text": prompt_text,
                     "llm_config": task.llm_config,
+                    "allowed_entity_types": allowed_entity_types,
+                    "allowed_relationship_types": allowed_relationship_types,
                 },
             )
             group_entry["chunk_ids"].extend(task.chunk_ids)
@@ -368,7 +381,7 @@ class GraphWritePipeline:
         if not chunk_groups:
             return
 
-        for (_prompt_key, _llm_config_key), group in chunk_groups.items():
+        for (_prompt_key, _llm_config_key, _scope_key), group in chunk_groups.items():
             chunk_ids = list(dict.fromkeys(group["chunk_ids"]))
             if not chunk_ids:
                 continue
@@ -379,6 +392,10 @@ class GraphWritePipeline:
                     chunk_ids=chunk_ids,
                     llm=llm,
                     system_prompt=group["prompt_text"],
+                    allowed_entity_types=list(group["allowed_entity_types"] or []),
+                    allowed_relationship_types=list(
+                        group["allowed_relationship_types"] or []
+                    ),
                 )
             except Exception:
                 logger.exception(

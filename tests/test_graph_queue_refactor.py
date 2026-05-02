@@ -168,10 +168,13 @@ class FakeRelationshipExtractor:
         mode: str = "relationships",
         text: Optional[str] = None,
         chunk_ids: Optional[List[str]] = None,
+        allowed_entity_types: Optional[List[str]] = None,
+        allowed_relationship_types: Optional[List[str]] = None,
         llm=None,
         system_prompt: Optional[str] = None,
         force: bool = False,
     ) -> List[dict]:
+        _ = (allowed_entity_types, allowed_relationship_types)
         self.calls.append(
             {
                 "mode": mode,
@@ -564,11 +567,22 @@ def test_pipeline_drops_out_of_scope_extracted_relationships(tmp_path: Path) -> 
             mode: str = "relationships",
             text: Optional[str] = None,
             chunk_ids: Optional[List[str]] = None,
+            allowed_entity_types: Optional[List[str]] = None,
+            allowed_relationship_types: Optional[List[str]] = None,
             llm=None,
             system_prompt: Optional[str] = None,
             force: bool = False,
         ) -> List[dict]:
-            _ = (mode, text, chunk_ids, llm, system_prompt, force)
+            _ = (
+                mode,
+                text,
+                chunk_ids,
+                allowed_entity_types,
+                allowed_relationship_types,
+                llm,
+                system_prompt,
+                force,
+            )
             if mode != "relationships":
                 return []
             return [
@@ -651,16 +665,27 @@ def test_pipeline_groups_chunk_extraction_by_prompt_id(tmp_path: Path) -> None:
             mode: str = "relationships",
             text: Optional[str] = None,
             chunk_ids: Optional[List[str]] = None,
+            allowed_entity_types: Optional[List[str]] = None,
+            allowed_relationship_types: Optional[List[str]] = None,
             llm=None,
             system_prompt: Optional[str] = None,
             force: bool = False,
         ) -> List[dict]:
-            _ = (text, force)
+            _ = (
+                text,
+                allowed_entity_types,
+                allowed_relationship_types,
+                force,
+            )
             if mode == "chunk_entities":
                 self.chunk_calls.append(
                     {
                         "chunk_ids": list(chunk_ids or []),
                         "system_prompt": system_prompt,
+                        "allowed_entity_types": list(allowed_entity_types or []),
+                        "allowed_relationship_types": list(
+                            allowed_relationship_types or []
+                        ),
                         "llm": llm,
                     }
                 )
@@ -730,6 +755,90 @@ def test_pipeline_groups_chunk_extraction_by_prompt_id(tmp_path: Path) -> None:
     asyncio.run(_run())
 
 
+def test_pipeline_groups_chunk_extraction_by_scope(tmp_path: Path) -> None:
+    class RecordingExtractor:
+        def __init__(self) -> None:
+            self.chunk_calls: List[dict] = []
+
+        async def extract(
+            self,
+            *,
+            mode: str = "relationships",
+            text: Optional[str] = None,
+            chunk_ids: Optional[List[str]] = None,
+            allowed_entity_types: Optional[List[str]] = None,
+            allowed_relationship_types: Optional[List[str]] = None,
+            llm=None,
+            system_prompt: Optional[str] = None,
+            force: bool = False,
+        ) -> List[dict]:
+            _ = (text, llm, force)
+            if mode == "chunk_entities":
+                self.chunk_calls.append(
+                    {
+                        "chunk_ids": list(chunk_ids or []),
+                        "system_prompt": system_prompt,
+                        "allowed_entity_types": list(allowed_entity_types or []),
+                        "allowed_relationship_types": list(
+                            allowed_relationship_types or []
+                        ),
+                    }
+                )
+            return []
+
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+    extractor = RecordingExtractor()
+
+    async def _run() -> None:
+        await store.initialize()
+        prompt_registry = PromptRegistry(store)
+        pipeline = GraphWritePipeline(
+            entity_resolver=resolver,
+            graph_writer=writer,
+            relationship_extractor=extractor,
+            llm_provider=fake_llm_provider,
+            prompt_registry=prompt_registry,
+        )
+
+        prompt = "shared chunk prompt"
+        tasks = [
+            make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                task_kind=TASK_KIND_SCOPED_EXTRACTION,
+                chunk_ids=["c1"],
+                chunk_system_prompt=prompt,
+                allowed_entity_types=["Company"],
+                allowed_relationship_types=["RELATED_TO"],
+            ),
+            make_extraction_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                task_kind=TASK_KIND_SCOPED_EXTRACTION,
+                chunk_ids=["c2"],
+                chunk_system_prompt=prompt,
+                allowed_entity_types=["Company", "Market"],
+                allowed_relationship_types=["RELATED_TO"],
+            ),
+        ]
+
+        await pipeline.process_tasks(tasks)
+
+        assert len(extractor.chunk_calls) == 2
+        scope_to_chunks = {
+            tuple(call["allowed_entity_types"]): sorted(call["chunk_ids"])
+            for call in extractor.chunk_calls
+        }
+        assert scope_to_chunks[("Company",)] == ["c1"]
+        assert scope_to_chunks[("Company", "Market")] == ["c2"]
+
+    asyncio.run(_run())
+
+
 def test_pipeline_injects_chunk_entity_context_and_filters_relationships(
     tmp_path: Path,
 ) -> None:
@@ -743,15 +852,22 @@ def test_pipeline_injects_chunk_entity_context_and_filters_relationships(
             mode: str = "relationships",
             text: Optional[str] = None,
             chunk_ids: Optional[List[str]] = None,
+            allowed_entity_types: Optional[List[str]] = None,
+            allowed_relationship_types: Optional[List[str]] = None,
             llm=None,
             system_prompt: Optional[str] = None,
             force: bool = False,
         ) -> List[dict]:
+            _ = (allowed_entity_types, allowed_relationship_types)
             self.calls.append(
                 {
                     "mode": mode,
                     "text": text,
                     "chunk_ids": list(chunk_ids or []),
+                    "allowed_entity_types": list(allowed_entity_types or []),
+                    "allowed_relationship_types": list(
+                        allowed_relationship_types or []
+                    ),
                     "llm": llm,
                     "system_prompt": system_prompt,
                     "force": force,
@@ -824,6 +940,11 @@ def test_pipeline_injects_chunk_entity_context_and_filters_relationships(
             call for call in extractor.calls if call.get("mode") == "relationships"
         ]
         assert relationship_calls
+        assert relationship_calls[0]["allowed_entity_types"] == [
+            "Company",
+            "FinancialConcept",
+        ]
+        assert relationship_calls[0]["allowed_relationship_types"] == ["RELATED_TO"]
         injected_text = str(relationship_calls[0]["text"] or "")
         assert "Known entities extracted for the referenced chunks" in injected_text
         assert "Apple (Company)" in injected_text
@@ -844,11 +965,22 @@ def test_pipeline_no_entities_schedules_retry_then_exhausts(tmp_path: Path) -> N
             mode: str = "relationships",
             text: Optional[str] = None,
             chunk_ids: Optional[List[str]] = None,
+            allowed_entity_types: Optional[List[str]] = None,
+            allowed_relationship_types: Optional[List[str]] = None,
             llm=None,
             system_prompt: Optional[str] = None,
             force: bool = False,
         ) -> List[dict]:
-            _ = (mode, text, chunk_ids, llm, system_prompt, force)
+            _ = (
+                mode,
+                text,
+                chunk_ids,
+                allowed_entity_types,
+                allowed_relationship_types,
+                llm,
+                system_prompt,
+                force,
+            )
             return []
 
     resolver = FakeResolver()

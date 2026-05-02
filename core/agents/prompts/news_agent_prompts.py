@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Sequence
+
+from core.memory.graph.models import RelationshipExtractionItem
 
 NEWS_PLANNER_SYSTEM_PROMPT = """\
 You are a retrieval planner for a financial news analysis agent.
@@ -105,94 +106,28 @@ Rules:
 """.strip()
 
 
-def _build_relationship_schema_for_news_prompt(
-    *,
-    allowed_entity_types: Sequence[str],
-    allowed_relationship_types: Sequence[str],
-) -> str:
-    entity_types = [
-        str(item).strip() for item in allowed_entity_types if str(item).strip()
-    ]
-    relationship_types = [
-        str(item).strip() for item in allowed_relationship_types if str(item).strip()
-    ]
-    schema: dict = {
-        "type": "object",
-        "title": "Relationship",
-        "description": "Schema for one relationship item expected inside <relationships>.",
-        "properties": {
-            "from_name": {"title": "From Name", "type": "string"},
-            "from_type": {
-                "title": "From Type",
-                "type": "string",
-                "enum": entity_types,
-            },
-            "relationship_type": {
-                "title": "Relationship Type",
-                "type": "string",
-                "enum": relationship_types,
-            },
-            "to_name": {"title": "To Name", "type": "string"},
-            "to_type": {
-                "title": "To Type",
-                "type": "string",
-                "enum": entity_types,
-            },
-            "confidence": {
-                "title": "Confidence",
-                "type": "string",
-                "enum": ["high", "low"],
-                "description": '"high" for explicit evidence, "low" for inferred.',
-            },
-            "reason": {
-                "title": "Reason",
-                "type": "string",
-                "description": "1-2 short sentences explaining the relationship.",
-            },
-        },
-        "required": [
-            "from_name",
-            "from_type",
-            "relationship_type",
-            "to_name",
-            "to_type",
-            "confidence",
-            "reason",
-        ],
-        "additionalProperties": False,
-    }
-    rendered = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
-    return rendered.replace("{", "{{").replace("}", "}}")
-
-
 def _build_news_relationships_block(
     *,
     include_context_only_rule: bool,
-    allowed_entity_types: Sequence[str],
-    allowed_relationship_types: Sequence[str],
 ) -> str:
     context_only_rule = (
         "\nOnly reference entity names that appear in the context. Do NOT create new entities."
         if include_context_only_rule
         else ""
     )
+    schema = RelationshipExtractionItem.model_json_schema()
+    rendered_schema = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
+    escaped_schema = rendered_schema.replace("{", "{{").replace("}", "}}")
     return f"""\
     <relationships>
         [JSON array of relationships between entities already mentioned in the analysis.{context_only_rule}
         Output MUST match this JSON Schema:
-        {_build_relationship_schema_for_news_prompt(
-            allowed_entity_types=allowed_entity_types,
-            allowed_relationship_types=allowed_relationship_types,
-        )}]
+        {escaped_schema}]
     </relationships>
 """.strip()
 
 
-def build_news_deferred_relationship_system_prompt(
-    *,
-    allowed_entity_types: Sequence[str],
-    allowed_relationship_types: Sequence[str],
-) -> str:
+def build_news_deferred_relationship_system_prompt() -> str:
     return f"""\
 You are a graph relationship extractor for financial NEWS analysis outputs.
 
@@ -213,8 +148,6 @@ Rules:
 Return ONLY:
 {_build_news_relationships_block(
     include_context_only_rule=True,
-    allowed_entity_types=allowed_entity_types,
-    allowed_relationship_types=allowed_relationship_types,
 )}
 """.strip()
 

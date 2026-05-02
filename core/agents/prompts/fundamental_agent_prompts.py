@@ -1,6 +1,6 @@
-from core.agents.prompts.relationship_extraction_prompts import (
-    build_relationships_block,
-)
+import json
+
+from core.memory.graph.models import RelationshipExtractionItem
 
 _TOOL_PLANNER_SYSTEM = """\
 You are a quantitative financial analysis planner. Produce an IterativeToolPlan
@@ -186,6 +186,24 @@ FUNDAMENTAL_DEFERRED_ALLOWED_RELATIONSHIP_TYPES = (
 )
 
 
+def _build_fundamental_relationships_block(*, include_context_only_rule: bool) -> str:
+    context_only_rule = (
+        "\nOnly reference entity names that appear in the context. Do NOT create new entities."
+        if include_context_only_rule
+        else ""
+    )
+    schema = RelationshipExtractionItem.model_json_schema()
+    rendered_schema = json.dumps(schema, indent=2, ensure_ascii=True, sort_keys=True)
+    escaped_schema = rendered_schema.replace("{", "{{").replace("}", "}}")
+    return f"""\
+    <relationships>
+        [JSON array of relationships between entities already mentioned in the analysis.{context_only_rule}
+        Output MUST match this JSON Schema:
+        {escaped_schema}]
+    </relationships>
+""".strip()
+
+
 FUNDAMENTAL_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = f"""\
 You are a graph relationship extractor for fundamental equity analysis outputs.
 
@@ -203,5 +221,5 @@ Rules:
 - If no clear relationship exists, return an empty array in <relationships>.
 
 Return ONLY:
-{build_relationships_block(include_context_only_rule=True)}
+{_build_fundamental_relationships_block(include_context_only_rule=True)}
 """.strip()
