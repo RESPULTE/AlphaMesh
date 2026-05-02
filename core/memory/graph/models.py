@@ -336,7 +336,7 @@ class EntityNode(BaseModel):
 
 
 class RelationshipExtractionItem(BaseModel):
-    """Schema for one relationship item expected inside <relationships> prompts."""
+    """Schema for one extracted relationship item."""
 
     from_name: str
     from_type: str
@@ -366,4 +366,12 @@ class BatchEntityExtractionResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     results: List[ChunkEntityExtractionResult] = Field(default_factory=list)
+
+
+class RelationshipExtractionBatchResult(BaseModel):
+    """Structured relationship extraction output for one extraction pass."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    relationships: List[RelationshipExtractionItem] = Field(default_factory=list)
 

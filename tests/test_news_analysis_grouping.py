@@ -474,7 +474,8 @@ def test_news_relationship_prompt_scopes_schema_enums() -> None:
     assert '"relationship_type"' in prompt
     assert '"from_type"' in prompt
     assert '"to_type"' in prompt
-    assert "<relationships>" in prompt
+    assert "<relationships>" not in prompt
+    assert "Return structured output only" in prompt
 
 
 def test_run_seeds_and_persists_seen_history_across_turns() -> None:

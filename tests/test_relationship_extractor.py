@@ -12,33 +12,37 @@ from core.memory.graph.models import (
     BatchEntityExtractionResult,
     ChunkEntityExtractionResult,
     EntityNode,
+    RelationshipExtractionBatchResult,
 )
 from tenacity.wait import wait_none
 
 
-class _FakeResponse:
-    def __init__(self, content: object, text: object = "") -> None:
-        self.content = content
-        self.text = text
+class _FakeStructuredRelationshipLLM:
+    def __init__(self, owner: "_FakeLLM", schema: object) -> None:
+        self._owner = owner
+        self._schema = schema
+
+    async def ainvoke(self, messages: object) -> RelationshipExtractionBatchResult:
+        self._owner.calls += 1
+        self._owner.last_messages = messages
+        if not self._owner.responses:
+            raise RuntimeError("No responses configured")
+        next_response = self._owner.responses.pop(0)
+        if isinstance(next_response, Exception):
+            raise next_response
+        if isinstance(next_response, RelationshipExtractionBatchResult):
+            return next_response
+        return self._schema.model_validate(next_response)
 
 
 class _FakeLLM:
     def __init__(self, responses: list[object]) -> None:
-        self._responses = list(responses)
+        self.responses = list(responses)
         self.calls = 0
         self.last_messages = None
 
-    async def ainvoke(self, _messages: object) -> _FakeResponse:
-        self.calls += 1
-        self.last_messages = _messages
-        if not self._responses:
-            raise RuntimeError("No responses configured")
-        next_response = self._responses.pop(0)
-        if isinstance(next_response, Exception):
-            raise next_response
-        if isinstance(next_response, _FakeResponse):
-            return next_response
-        return _FakeResponse(str(next_response))
+    def with_structured_output(self, schema: object) -> _FakeStructuredRelationshipLLM:
+        return _FakeStructuredRelationshipLLM(self, schema)
 
 
 class _FakeChunkLLM:
@@ -66,9 +70,7 @@ class _PromptAwareChunkLLM:
 
 def test_extract_skips_blank_text_without_llm_call() -> None:
     extractor = RelationshipExtractor(retry_attempts=3)
-    llm = _FakeLLM(
-        ['<relationships>[{"from_name":"A"}]</relationships>']
-    )
+    llm = _FakeLLM([{"relationships": [{"from_name": "A"}]}])
 
     result = asyncio.run(
         extractor.extract(
@@ -87,7 +89,19 @@ def test_extract_parses_relationship_array() -> None:
     extractor = RelationshipExtractor(retry_attempts=1)
     llm = _FakeLLM(
         [
-            '<relationships>[{"from_name":"A","from_type":"Company","to_name":"B","to_type":"Sector"}]</relationships>'
+            {
+                "relationships": [
+                    {
+                        "from_name": "A",
+                        "from_type": "Company",
+                        "relationship_type": "AFFECTS",
+                        "to_name": "B",
+                        "to_type": "Sector",
+                        "confidence": "high",
+                        "reason": "A directly affects B.",
+                    }
+                ]
+            }
         ]
     )
 
@@ -104,39 +118,30 @@ def test_extract_parses_relationship_array() -> None:
         {
             "from_name": "A",
             "from_type": "Company",
+            "relationship_type": "AFFECTS",
             "to_name": "B",
             "to_type": "Sector",
+            "confidence": "high",
+            "reason": "A directly affects B.",
         }
     ]
     assert llm.calls == 1
 
 
-def test_extract_returns_empty_for_missing_or_invalid_blocks() -> None:
+def test_extract_returns_empty_for_invalid_structured_payload() -> None:
     extractor = RelationshipExtractor(retry_attempts=1)
-    missing_block_llm = _FakeLLM(["no xml block"])
-    invalid_json_llm = _FakeLLM(["<relationships>{not-json}</relationships>"])
-
-    missing = asyncio.run(
-        extractor.extract(
-            mode="relationships",
-            text="input",
-            llm=missing_block_llm,
-            system_prompt="system",
-        )
-    )
+    invalid_payload_llm = _FakeLLM([{"relationships": [{"from_name": "A"}]}])
     invalid = asyncio.run(
         extractor.extract(
             mode="relationships",
             text="input",
-            llm=invalid_json_llm,
+            llm=invalid_payload_llm,
             system_prompt="system",
         )
     )
 
-    assert missing == []
     assert invalid == []
-    assert missing_block_llm.calls == 1
-    assert invalid_json_llm.calls == 1
+    assert invalid_payload_llm.calls == 1
 
 
 def test_extract_retries_until_success(monkeypatch) -> None:
@@ -150,7 +155,19 @@ def test_extract_retries_until_success(monkeypatch) -> None:
         [
             RuntimeError("transient-1"),
             RuntimeError("transient-2"),
-            '<relationships>[{"id":"ok"}]</relationships>',
+            {
+                "relationships": [
+                    {
+                        "from_name": "A",
+                        "from_type": "Company",
+                        "relationship_type": "AFFECTS",
+                        "to_name": "B",
+                        "to_type": "Market",
+                        "confidence": "high",
+                        "reason": "A affects B.",
+                    }
+                ]
+            },
         ]
     )
 
@@ -163,7 +180,17 @@ def test_extract_retries_until_success(monkeypatch) -> None:
         )
     )
 
-    assert result == [{"id": "ok"}]
+    assert result == [
+        {
+            "from_name": "A",
+            "from_type": "Company",
+            "relationship_type": "AFFECTS",
+            "to_name": "B",
+            "to_type": "Market",
+            "confidence": "high",
+            "reason": "A affects B.",
+        }
+    ]
     assert llm.calls == 3
 
 
@@ -172,7 +199,19 @@ def test_extract_with_retry_budget_one_does_not_retry() -> None:
     llm = _FakeLLM(
         [
             RuntimeError("first failure"),
-            '<relationships>[{"id":"would-have-succeeded"}]</relationships>',
+            {
+                "relationships": [
+                    {
+                        "from_name": "A",
+                        "from_type": "Company",
+                        "relationship_type": "AFFECTS",
+                        "to_name": "B",
+                        "to_type": "Market",
+                        "confidence": "high",
+                        "reason": "A affects B.",
+                    }
+                ]
+            },
         ]
     )
 
@@ -189,52 +228,36 @@ def test_extract_with_retry_budget_one_does_not_retry() -> None:
     assert llm.calls == 1
 
 
-def test_extract_parses_from_response_text_when_content_unusable() -> None:
+def test_extract_relationships_requires_llm() -> None:
     extractor = RelationshipExtractor(retry_attempts=1)
-    llm = _FakeLLM(
-        [
-            _FakeResponse(
-                content="[{'type': 'text', 'text': 'not-parseable-json-like-content'}]",
-                text='<relationships>[{"id":"from-text"}]</relationships>',
-            )
-        ]
+
+    result = asyncio.run(
+        extractor.extract(
+            mode="relationships",
+            text="input",
+            llm=None,
+            system_prompt="system",
+        )
     )
+
+    assert result == []
+
+
+def test_extract_relationships_requires_system_prompt() -> None:
+    extractor = RelationshipExtractor(retry_attempts=1)
+    llm = _FakeLLM([{"relationships": []}])
 
     result = asyncio.run(
         extractor.extract(
             mode="relationships",
             text="input",
             llm=llm,
-            system_prompt="system",
+            system_prompt="   ",
         )
     )
 
-    assert result == [{"id": "from-text"}]
-    assert llm.calls == 1
-
-
-def test_extract_uses_content_when_valid_even_if_text_exists() -> None:
-    extractor = RelationshipExtractor(retry_attempts=1)
-    llm = _FakeLLM(
-        [
-            _FakeResponse(
-                content='<relationships>[{"id":"from-content"}]</relationships>',
-                text='<relationships>[{"id":"from-text"}]</relationships>',
-            )
-        ]
-    )
-
-    result = asyncio.run(
-        extractor.extract(
-            mode="relationships",
-            text="input",
-            llm=llm,
-            system_prompt="system",
-        )
-    )
-
-    assert result == [{"id": "from-content"}]
-    assert llm.calls == 1
+    assert result == []
+    assert llm.calls == 0
 
 
 def test_chunk_entity_extraction_filters_pending_and_updates_status() -> None:
@@ -601,7 +624,19 @@ def test_relationship_extraction_injects_scoped_type_guidance() -> None:
     extractor = RelationshipExtractor(retry_attempts=1)
     llm = _FakeLLM(
         [
-            '<relationships>[{"from_name":"A","from_type":"Company","relationship_type":"AFFECTS","to_name":"B","to_type":"Market"}]</relationships>'
+            {
+                "relationships": [
+                    {
+                        "from_name": "A",
+                        "from_type": "Company",
+                        "relationship_type": "AFFECTS",
+                        "to_name": "B",
+                        "to_type": "Market",
+                        "confidence": "high",
+                        "reason": "A affects B.",
+                    }
+                ]
+            }
         ]
     )
 

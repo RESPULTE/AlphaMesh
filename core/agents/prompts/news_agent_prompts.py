@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import json
-
-from core.memory.graph.models import RelationshipExtractionItem
-
 NEWS_PLANNER_SYSTEM_PROMPT = """\
 You are a retrieval planner for a financial news analysis agent.
 
@@ -102,12 +98,6 @@ Rules:
 - If a chunk has no useful entities, return an empty list for that chunk.
 """.strip()
 
-NEWS_DEFERRED_RELATIONSHIP_SCHEMA = json.dumps(
-    RelationshipExtractionItem.model_json_schema(),
-    indent=2,
-    ensure_ascii=True,
-    sort_keys=True,
-)
 
 NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT = f"""\
 You are a graph relationship extractor for multi-chunk financial news analysis.
@@ -126,13 +116,7 @@ Quality rules:
 - Do not create entities not present in the context.
 - Use confidence="high" only when relationship evidence is explicit; otherwise use "low".
 - Keep reason factual, concise, and tied to the text (1-2 short sentences).
-- If there is no clear high-signal relationship, return an empty array.
-
-Return ONLY this XML block with a JSON array:
-<relationships>
-[JSON array matching this JSON Schema:
-{NEWS_DEFERRED_RELATIONSHIP_SCHEMA}]
-</relationships>
+- If there is no clear high-signal relationship, return `relationships: []`.
 """.strip()
 
 

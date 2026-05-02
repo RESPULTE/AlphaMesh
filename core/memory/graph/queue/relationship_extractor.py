@@ -18,9 +18,9 @@ from core.memory.graph.models import (
     BatchEntityExtractionResult,
     ChunkEntityExtractionResult,
     EntityNode,
+    RelationshipExtractionBatchResult,
 )
 from core.memory.graph.utils import canonical_entity_id
-from core.memory.graph.utils import parse_relationships_block
 
 logger = get_logger(__name__)
 
@@ -203,27 +203,14 @@ class RelationshipExtractor:
         llm: object,
         system_prompt: str,
     ) -> List[dict]:
-        response = await llm.ainvoke(
+        structured_llm = llm.with_structured_output(RelationshipExtractionBatchResult)
+        response: RelationshipExtractionBatchResult = await structured_llm.ainvoke(
             [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=text),
             ]
         )
-
-        content_value = getattr(response, "content", "")
-        content_raw = "" if content_value is None else str(content_value)
-        parsed = self._parse_relationships(content_raw, source="content")
-        if parsed is not None:
-            return parsed
-
-        text_value = getattr(response, "text", "")
-        text_raw = "" if text_value is None else str(text_value)
-        if text_raw and text_raw != content_raw:
-            parsed = self._parse_relationships(text_raw, source="text")
-            if parsed is not None:
-                return parsed
-
-        return []
+        return [item.model_dump() for item in list(response.relationships or [])]
 
     async def _run_chunk_entity_extraction(
         self,
@@ -595,19 +582,3 @@ class RelationshipExtractor:
             f"{concept_rule}\n"
         ).strip()
 
-    @staticmethod
-    def _parse_relationships(raw: str, *, source: str) -> Optional[List[dict]]:
-        parsed = parse_relationships_block(raw)
-        if parsed is None:
-            if "<relationships" not in raw.lower():
-                logger.debug(
-                    "RelationshipExtractor: no <relationships> block found in %s",
-                    source,
-                )
-            else:
-                logger.warning(
-                    "RelationshipExtractor: failed to parse relationships block as JSON array from %s",
-                    source,
-                )
-            return None
-        return parsed

@@ -92,7 +92,7 @@ def build_scoped_system_prompt(
         f"- Allowed entity types (strict): {entities_block}\n"
         f"- Allowed relationship types (strict): {relationships_block}\n"
         "- Reject any relationship where either endpoint type or relationship type is outside these allowed lists.\n"
-        "- If no valid relationships remain, return an empty array in <relationships>."
+        "- If no valid relationships remain, return an empty relationships list."
     )
     return f"{base_prompt.rstrip()}\n\n{constraints}"
 
