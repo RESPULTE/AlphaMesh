@@ -402,6 +402,77 @@ def test_pipeline_upserts_session_and_event_nodes_before_edge_write(
     asyncio.run(_run())
 
 
+def test_pipeline_user_scoped_dedup_is_partitioned_by_user_email(
+    tmp_path: Path,
+):
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    store = GraphTaskSqlStore(str(tmp_path / "graph_tasks.db"))
+
+    async def _run() -> None:
+        await store.initialize()
+        prompt_registry = PromptRegistry(store)
+        pipeline = GraphWritePipeline(
+            entity_resolver=resolver,
+            graph_writer=writer,
+            relationship_extractor=FakeRelationshipExtractor(),
+            llm_provider=fake_llm_provider,
+            prompt_registry=prompt_registry,
+        )
+
+        relationships = [
+            {
+                "from_name": "domain-shared",
+                "from_type": "UserInterestDomain",
+                "relation": "HAS_INTEREST_IN",
+                "to_name": "edge-shared",
+                "to_type": "UserInterestEdge",
+                "from_node_props": {
+                    "id": "domain-user-1",
+                    "user_email": "one@example.com",
+                    "nodeset_id": "nodeset-1",
+                },
+                "to_node_props": {
+                    "id": "edge-user-1",
+                    "user_email": "one@example.com",
+                    "operation": "reinforce",
+                },
+            },
+            {
+                "from_name": "domain-shared",
+                "from_type": "UserInterestDomain",
+                "relation": "HAS_INTEREST_IN",
+                "to_name": "edge-shared",
+                "to_type": "UserInterestEdge",
+                "from_node_props": {
+                    "id": "domain-user-2",
+                    "user_email": "two@example.com",
+                    "nodeset_id": "nodeset-2",
+                },
+                "to_node_props": {
+                    "id": "edge-user-2",
+                    "user_email": "two@example.com",
+                    "operation": "reinforce",
+                },
+            },
+        ]
+
+        _domain_written, user_written = await pipeline.process_relationships(
+            relationships=relationships,
+            conversation_id="conversation-1",
+            source_agent="orchestrator",
+            allow_create=False,
+        )
+        assert user_written == 2
+        assert writer.user_domains == ["domain-user-1", "domain-user-2"]
+        assert [p.get("user_email") for p in writer.user_domain_props] == [
+            "one@example.com",
+            "two@example.com",
+        ]
+
+    asyncio.run(_run())
+
+
 def test_enqueue_skips_invalid_chunk_and_empty_tasks(tmp_path: Path):
     manager = GraphQueueManager(
         entity_resolver=FakeResolver(),

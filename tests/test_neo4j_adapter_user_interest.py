@@ -39,6 +39,40 @@ def test_merge_user_interest_domain_persists_nodeset_link() -> None:
     assert "nodeset_id" not in captured["params"]["props"]
 
 
+def test_merge_session_node_persists_nodeset_link() -> None:
+    adapter = Neo4jAdapter(
+        uri="bolt://unused",
+        username="unused",
+        password="unused",
+    )
+
+    captured: dict = {}
+
+    async def _fake_execute_write(cypher: str, params: dict) -> None:
+        captured["cypher"] = cypher
+        captured["params"] = params
+
+    adapter._execute_write = _fake_execute_write  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        await adapter.merge_session_node(
+            "session-1",
+            {
+                "id": "session-1",
+                "user_email": "demo@alphamesh.local",
+                "conversation_id": "conv-1",
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "nodeset_id": "nodeset-1",
+            },
+        )
+
+    asyncio.run(_run())
+
+    assert "BELONGS_TO_NODESET" in captured["cypher"]
+    assert captured["params"]["nodeset_id"] == "nodeset-1"
+    assert "nodeset_id" not in captured["params"]["props"]
+
+
 def test_get_user_interest_domain_summary_clamps_limit_and_uses_ranked_query() -> None:
     adapter = Neo4jAdapter(
         uri="bolt://unused",

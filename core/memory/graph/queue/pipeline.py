@@ -462,7 +462,7 @@ class GraphWritePipeline:
         self, relationships: List[dict]
     ) -> Dict[Tuple[str, str], str]:
         cache: Dict[Tuple[str, str], str] = {}
-        seen: set[Tuple[str, str]] = set()
+        seen: set[Tuple[str, str, str]] = set()
 
         for rel in relationships:
             for (
@@ -476,12 +476,16 @@ class GraphWritePipeline:
                 if not node_name:
                     continue
 
-                cache_key = entity_key(node_name, node_type)
-                if cache_key in seen:
-                    continue
-                seen.add(cache_key)
-
                 node_props = dict(raw_props) if isinstance(raw_props, dict) else {}
+                dedup_key = self._user_scoped_dedup_key(
+                    node_name=node_name,
+                    node_type=node_type,
+                    node_props=node_props,
+                )
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+
                 node_id = str(node_props.get("id") or node_name).strip()
                 if not node_id:
                     continue
@@ -492,9 +496,16 @@ class GraphWritePipeline:
                     node_props=node_props,
                 )
 
-                cache[cache_key] = node_id
+                cache[entity_key(node_name, node_type)] = node_id
 
         return cache
+
+    @staticmethod
+    def _user_scoped_dedup_key(
+        *, node_name: str, node_type: str, node_props: dict
+    ) -> Tuple[str, str, str]:
+        user_email = str(node_props.get("user_email") or "").strip().lower()
+        return node_name.lower(), node_type, user_email
 
     def _iter_relationship_endpoints(
         self, relationship: dict

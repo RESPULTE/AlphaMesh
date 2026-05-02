@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from core.memory.graph.utils import generate_uuid5
 from core.memory.user_signal_writeback import (
     InvestmentSignal,
     LearningSignal,
@@ -74,7 +75,18 @@ def test_build_interest_relationships_emits_session_and_event_edges() -> None:
     assert "TARGETS" in rel_types
     assert "HAS_EVENT" in rel_types
     assert "OBSERVED_IN" in rel_types
-    assert any(rel.get("to_type") == "SessionNode" for rel in relationships)
+    session_rels = [rel for rel in relationships if rel.get("to_type") == "SessionNode"]
+    assert session_rels
+    expected_session_id = generate_uuid5("user@example.com::session::conv-1")
+    assert all(rel.get("to_name") == expected_session_id for rel in session_rels)
+    assert all(
+        rel.get("to_node_props", {}).get("conversation_id") == "conv-1"
+        for rel in session_rels
+    )
+    assert all(
+        rel.get("to_node_props", {}).get("nodeset_id") == "nodeset-1"
+        for rel in session_rels
+    )
     assert any(rel.get("to_type") == "UserInterestEvent" for rel in relationships)
     assert {entry.kind for entry in cache_entries} == {"investment", "learning"}
 

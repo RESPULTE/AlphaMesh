@@ -590,8 +590,28 @@ class Neo4jAdapter:
 
     async def merge_session_node(self, node_id: str, props: dict) -> None:
         """Merge one lightweight session node per conversation."""
-        cypher = "MERGE (s:SessionNode {id: $id}) ON CREATE SET s += $props"
-        await self._execute_write(cypher, {"id": node_id, "props": props})
+        belongs_to = RelationshipType.BELONGS_TO_NODESET.value
+        cypher = (
+            "MERGE (s:SessionNode {id: $id}) "
+            "ON CREATE SET s += $props "
+            "ON MATCH SET s.last_seen_at = $now "
+            "WITH s "
+            "FOREACH (_ IN CASE WHEN $nodeset_id IS NULL THEN [] ELSE [1] END | "
+            "  MERGE (ns:NodeSet {id: $nodeset_id}) "
+            f"  MERGE (s)-[:{belongs_to}]->(ns)"
+            ")"
+        )
+        nodeset_id = str(props.get("nodeset_id") or "").strip() or None
+        clean = {k: v for k, v in props.items() if k != "nodeset_id"}
+        await self._execute_write(
+            cypher,
+            {
+                "id": node_id,
+                "props": clean,
+                "nodeset_id": nodeset_id,
+                "now": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     async def get_entity_category(self, entity_id: str) -> Optional[str]:
         """Return the category field of an entity (used for FinancialConcept category)."""

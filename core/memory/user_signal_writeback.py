@@ -7,6 +7,7 @@ NodeSet <-[:BELONGS_TO_NODESET]- UserInterestDomain
        -[:TARGETS]-> Entity
        -[:HAS_EVENT]-> UserInterestEvent
 UserInterestEvent -[:OBSERVED_IN]-> SessionNode
+SessionNode -[:BELONGS_TO_NODESET]-> NodeSet
 """
 
 from __future__ import annotations
@@ -156,7 +157,9 @@ async def _build_interest_relationships(
 
     now = datetime.now(timezone.utc)
     now_str = now.isoformat()
-    session_id = payload.conversation_id
+    session_id = generate_uuid5(
+        f"{payload.user_email}::session::{payload.conversation_id}"
+    )
     session_started_at = payload.session_started_at or now_str
     relationships: List[dict] = []
     cache_entries: List[InterestCacheEntry] = []
@@ -165,7 +168,9 @@ async def _build_interest_relationships(
     session_node_props = {
         "id": session_id,
         "user_email": payload.user_email,
+        "conversation_id": payload.conversation_id,
         "started_at": session_started_at,
+        "nodeset_id": nodeset_id,
     }
 
     def _append_rels(
