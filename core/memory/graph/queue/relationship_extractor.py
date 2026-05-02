@@ -13,12 +13,13 @@ from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.models import (
     ENTITY_TYPE_EXTRACTION_GUIDANCE,
-    FINANCIAL_CONCEPT_CATEGORIES,
     RELATIONSHIP_TYPE_METADATA,
     BatchEntityExtractionResult,
     ChunkEntityExtractionResult,
     EntityNode,
     RelationshipExtractionBatchResult,
+    financial_concept_category_names,
+    render_financial_concept_category_prompt_context,
 )
 from core.memory.graph.utils import canonical_entity_id
 
@@ -434,7 +435,7 @@ class RelationshipExtractor:
             )
             return
 
-        allowed = set(FINANCIAL_CONCEPT_CATEGORIES)
+        allowed = financial_concept_category_names()
         categories = [category for category in raw_categories if category in allowed]
         if not categories:
             logger.warning(
@@ -571,11 +572,7 @@ class RelationshipExtractor:
         allowed_entity_types: Optional[List[str]],
     ) -> str:
         entity_block = self._build_entity_type_guidance_block(allowed_entity_types)
-        concept_categories = ", ".join(FINANCIAL_CONCEPT_CATEGORIES.keys())
-        concept_rule = (
-            "If extracting FinancialConcept, include `concept_categories` with 1 to 3 values "
-            f"selected from: {concept_categories}."
-        )
+        concept_rule = render_financial_concept_category_prompt_context()
         return (
             f"{base_prompt.rstrip()}\n\n"
             f"{entity_block}\n\n"

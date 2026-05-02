@@ -31,6 +31,27 @@ FINANCIAL_CONCEPT_CATEGORIES = {
     "Regulation & Governance": "Regulation, compliance, governance, and market oversight.",
 }
 
+
+def financial_concept_category_names() -> set[str]:
+    """Return canonical FinancialConcept category labels."""
+    return set(FINANCIAL_CONCEPT_CATEGORIES.keys())
+
+
+def render_financial_concept_category_prompt_context() -> str:
+    """Render strict taxonomy guidance for FinancialConcept category extraction."""
+    lines = [
+        "FinancialConcept category taxonomy (use exact labels only):",
+    ]
+    for name, description in FINANCIAL_CONCEPT_CATEGORIES.items():
+        lines.append(f"- {name}: {description}")
+    lines.append(
+        "If extracting FinancialConcept, `concept_categories` must contain 1 to 3 values selected exactly from the labels above."
+    )
+    lines.append(
+        "Do not paraphrase, merge, invent, or slightly rename category labels."
+    )
+    return "\n".join(lines)
+
 # ── ALL_MAIN_SECTORS: update to yfinance canonical names ─────────────────────
 ALL_MAIN_SECTORS = {
     "Technology": "Companies involved in research, development, and manufacturing of technologically based goods and services.",

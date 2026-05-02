@@ -14,6 +14,7 @@ from core.memory.graph.models import (
     EntityNode,
     RelationshipExtractionBatchResult,
 )
+from core.memory.graph.utils import canonical_entity_id
 from tenacity.wait import wait_none
 
 
@@ -590,6 +591,11 @@ def test_chunk_entity_extraction_uses_runtime_system_prompt_override() -> None:
     assert llm.system_prompts
     assert llm.system_prompts[0].startswith(custom_prompt)
     assert "Entity Type Guidance (strictly use these definitions):" in llm.system_prompts[0]
+    assert "FinancialConcept category taxonomy (use exact labels only):" in llm.system_prompts[0]
+    assert (
+        "- Monetary Policy & Rates: Central bank policy, interest rates, yield curves, and rate expectations."
+        in llm.system_prompts[0]
+    )
     neo4j.get_entities_for_chunks.assert_awaited_once_with(["c3"])
 
 
@@ -660,3 +666,30 @@ def test_relationship_extraction_injects_scoped_type_guidance() -> None:
     assert "- FinancialConcept:" not in system_prompt
     assert "- AFFECTS (weight=1.00):" in system_prompt
     assert "- RELATED_TO (weight=0.10):" not in system_prompt
+
+
+def test_link_financial_concept_categories_keeps_only_canonical_values() -> None:
+    neo4j = AsyncMock()
+    extractor = RelationshipExtractor(neo4j_adapter=neo4j, retry_attempts=1)
+    entity = EntityNode(
+        id="concept-1",
+        name="Margin Compression",
+        entity_type="FinancialConcept",
+        description="Operating margins narrowed due to input-cost inflation.",
+        concept_categories=[
+            "Inflation & Prices",
+            "Not A Real Category",
+            "Risk & Volatility",
+            "Credit & Fixed Income",
+        ],
+    )
+
+    asyncio.run(extractor._link_financial_concept_categories(entity))
+
+    assert neo4j.merge_relationship.await_count == 3
+    target_ids = [call.args[1] for call in neo4j.merge_relationship.await_args_list]
+    assert target_ids == [
+        canonical_entity_id("Inflation & Prices", "FinancialConceptCategory"),
+        canonical_entity_id("Risk & Volatility", "FinancialConceptCategory"),
+        canonical_entity_id("Credit & Fixed Income", "FinancialConceptCategory"),
+    ]
