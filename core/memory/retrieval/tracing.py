@@ -78,22 +78,22 @@ class NetworkXRetrievalTraceSink:
         return graph
 
     def export_node_link_json(self, run_id: str, output_path: str) -> str:
-        graph = self._require_graph(run_id)
+        graph = self._export_graph(self._require_graph(run_id))
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        payload = json_graph.node_link_data(graph)
+        payload = json_graph.node_link_data(graph, edges="links")
         output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return str(output)
 
     def export_graphml(self, run_id: str, output_path: str) -> str:
-        graph = self._to_graphml_safe_graph(self._require_graph(run_id))
+        graph = self._to_graphml_safe_graph(self._export_graph(self._require_graph(run_id)))
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
         nx.write_graphml(graph, output)
         return str(output)
 
     def export_html(self, run_id: str, output_path: str) -> str:
-        graph = self._require_graph(run_id)
+        graph = self._export_graph(self._require_graph(run_id))
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -232,6 +232,67 @@ class NetworkXRetrievalTraceSink:
         if graph is None:
             raise ValueError(f"No retrieval trace run found: {run_id}")
         return graph
+
+    @staticmethod
+    def _is_chunk_hit_edge(attrs: Dict[str, Any]) -> bool:
+        stage = str(attrs.get("stage") or "").strip()
+        edge_type = str(attrs.get("edge_type") or "").strip()
+        return (
+            stage == "vector_seed"
+            or edge_type == "vector_seed"
+            or stage == "frontier_chunks"
+            or edge_type == "graph_chunk_hit"
+        )
+
+    def _export_graph(self, graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
+        """
+        Derive an export-only subgraph containing only paths that lead to chunk hits.
+
+        In-memory run graphs remain unfiltered for diagnostics.
+        """
+        kept_edges: set[tuple[str, str, Any]] = set()
+        kept_nodes: set[str] = set()
+        to_visit: list[str] = []
+
+        for source, target, key, attrs in graph.edges(keys=True, data=True):
+            if not self._is_chunk_hit_edge(attrs):
+                continue
+            target_type = str(graph.nodes.get(target, {}).get("node_type") or "")
+            if target_type != "chunk":
+                continue
+            kept_edges.add((source, target, key))
+            kept_nodes.add(source)
+            kept_nodes.add(target)
+            to_visit.append(source)
+            to_visit.append(target)
+
+        if not kept_edges:
+            empty = nx.MultiDiGraph()
+            empty.graph.update(graph.graph)
+            return empty
+
+        while to_visit:
+            node_id = to_visit.pop()
+            for source, _target, key, _attrs in graph.in_edges(
+                node_id, keys=True, data=True
+            ):
+                edge_key = (source, node_id, key)
+                if edge_key in kept_edges:
+                    continue
+                kept_edges.add(edge_key)
+                if source not in kept_nodes:
+                    kept_nodes.add(source)
+                    to_visit.append(source)
+                if node_id not in kept_nodes:
+                    kept_nodes.add(node_id)
+
+        pruned = nx.MultiDiGraph()
+        pruned.graph.update(graph.graph)
+        for node_id in kept_nodes:
+            pruned.add_node(node_id, **dict(graph.nodes[node_id]))
+        for source, target, key in kept_edges:
+            pruned.add_edge(source, target, key=key, **dict(graph.edges[source, target, key]))
+        return pruned
 
     @staticmethod
     def _sanitize_attr(value: Any) -> Any:
@@ -442,6 +503,7 @@ class NetworkXRetrievalTraceSink:
 
             source_node_id = f"entity:{source_entity_id}"
             neighbor_node_id = f"entity:{neighbor_entity_id}"
+            source_name = str(item.get("source_entity_name") or source_entity_id)
             neighbor_name = str(item.get("neighbor_name") or neighbor_entity_id)
 
             self._ensure_node(
@@ -451,8 +513,8 @@ class NetworkXRetrievalTraceSink:
                 domain=event.domain,
                 layer=event.layer,
                 iteration=event.hop,
-                label=source_entity_id,
-                display_label=source_entity_id,
+                label=source_name,
+                display_label=source_name,
             )
             self._ensure_node(
                 graph,
@@ -483,6 +545,9 @@ class NetworkXRetrievalTraceSink:
         }
         for item in event.payload.get("links", []):
             supporting_entity_id = str(item.get("supporting_entity_id") or "").strip()
+            supporting_entity_name = str(
+                item.get("supporting_entity_name") or supporting_entity_id
+            )
             raw_chunk_id = str(item.get("chunk_id") or "").strip()
             if not supporting_entity_id or not raw_chunk_id:
                 continue
@@ -495,8 +560,8 @@ class NetworkXRetrievalTraceSink:
                 domain=event.domain,
                 layer=event.layer,
                 iteration=event.hop,
-                label=supporting_entity_id,
-                display_label=supporting_entity_id,
+                label=supporting_entity_name,
+                display_label=supporting_entity_name,
             )
 
             meta = chunk_meta.get(raw_chunk_id, {})
@@ -547,7 +612,12 @@ class NetworkXRetrievalTraceSink:
         domain = str(attrs.get("domain") or "unknown")
         layer = int(attrs.get("layer") or 0)
         iteration = int(attrs.get("iteration") or 0)
-        display_label = str(attrs.get("display_id") or attrs.get("display_label") or attrs.get("label") or node_id)
+        display_label = str(
+            attrs.get("display_id")
+            or attrs.get("display_label")
+            or attrs.get("label")
+            or node_id
+        )
         if len(display_label) > 18:
             display_label = display_label[:16] + ".."
 
@@ -568,11 +638,16 @@ class NetworkXRetrievalTraceSink:
                 ]
             )
 
+        node_label = display_label
+        if node_type != "entity":
+            node_label = f"{display_label}\nI{iteration}"
+
         return {
             "id": str(node_id),
-            "label": f"{display_label}\nI{iteration}",
+            "label": node_label,
             "title": "<br>".join(title),
             "group": f"{domain}:L{layer}:{node_type}",
+            "size": 23,
         }
 
     def _html_edge(self, source: str, target: str, attrs: Dict[str, Any]) -> Dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -101,6 +102,17 @@ class FakeNeo4jAdapter:
                         "neighbor_type": "FinancialConcept",
                         "relationship_type": "RELATED_TO",
                         "reason": "Apple depends on supply chain continuity.",
+                    }
+                )
+                rows.append(
+                    {
+                        "source_entity_id": "e-comp-1",
+                        "source_entity_name": "Apple",
+                        "neighbor_entity_id": "e-unused-1",
+                        "neighbor_name": "Unused Entity",
+                        "neighbor_type": "FinancialConcept",
+                        "relationship_type": "RELATED_TO",
+                        "reason": "Synthetic non-contributing neighbor for trace pruning.",
                     }
                 )
             elif entity_id == "e-comp-2":
@@ -295,30 +307,35 @@ async def test_trace_graph_contains_layered_vector_and_graph_edges() -> None:
 
     edge_tuples = [(u, v, d) for u, v, d in graph.edges(data=True)]
     assert any(
-        u == "query:run-company"
-        and v == "chunk:c-seed-1"
+        graph.nodes[u].get("node_type") == "query"
+        and graph.nodes[v].get("node_type") == "chunk"
         and d.get("stage") == "vector_seed"
         and d.get("layer") == 0
         for u, v, d in edge_tuples
     )
     assert any(
-        u == "chunk:c-seed-1"
-        and v == "entity:e-comp-1"
+        graph.nodes[u].get("node_type") == "chunk"
+        and graph.nodes[v].get("node_type") == "entity"
         and d.get("stage") == "seed_entities"
         and d.get("layer") == 0
         for u, v, d in edge_tuples
     )
     assert any(
-        u == "entity:e-common-1"
-        and v == "chunk:graph-shared"
+        graph.nodes[u].get("node_type") == "entity"
+        and graph.nodes[v].get("node_type") == "chunk"
         and d.get("stage") == "frontier_chunks"
         and d.get("layer") == 1
         for u, v, d in edge_tuples
     )
 
-    node_attrs = graph.nodes["chunk:graph-shared"]
-    assert node_attrs.get("domain") == "company"
-    assert node_attrs.get("layer") == 1
+    graph_chunk_nodes = [
+        attrs
+        for _node_id, attrs in graph.nodes(data=True)
+        if attrs.get("node_type") == "chunk" and attrs.get("source") == "graph"
+    ]
+    assert graph_chunk_nodes
+    assert all(attrs.get("domain") == "company" for attrs in graph_chunk_nodes)
+    assert all(int(attrs.get("layer") or 0) >= 1 for attrs in graph_chunk_nodes)
 
 
 @pytest.mark.asyncio
@@ -447,6 +464,82 @@ async def test_trace_visualization_artifacts_are_exported() -> None:
     assert graphml_path.exists()
     assert html_path.stat().st_size > 0
     assert graphml_path.stat().st_size > 0
+
+
+@pytest.mark.asyncio
+async def test_export_prunes_to_paths_that_lead_to_chunk_hits(tmp_path: Path) -> None:
+    sink = NetworkXRetrievalTraceSink(max_runs=20)
+    retriever = _build_retriever(trace_sink=sink)
+
+    run_id = "prune-run"
+    await retriever.retrieve("company query", run_id=run_id, domain="company")
+
+    raw_graph = sink.get_run_graph(run_id)
+    assert raw_graph is not None
+    assert raw_graph.has_node("entity:e-unused-1")
+
+    node_link_path = tmp_path / "pruned.json"
+    sink.export_node_link_json(run_id, str(node_link_path))
+    payload = json.loads(node_link_path.read_text(encoding="utf-8"))
+
+    exported_nodes = {str(node["id"]) for node in payload.get("nodes", [])}
+    assert "entity:e-unused-1" not in exported_nodes
+
+    exported_links = payload.get("links", [])
+    assert any(str(link.get("stage") or "") == "vector_seed" for link in exported_links)
+    assert any(
+        str(link.get("stage") or "") == "frontier_chunks" for link in exported_links
+    )
+
+
+@pytest.mark.asyncio
+async def test_export_html_uses_entity_names_and_uniform_node_size(tmp_path: Path) -> None:
+    sink = NetworkXRetrievalTraceSink(max_runs=20)
+    retriever = _build_retriever(trace_sink=sink)
+
+    run_id = "viz-label-run"
+    await retriever.retrieve("company query", run_id=run_id, domain="company")
+
+    html_path = tmp_path / "trace.html"
+    sink.export_html(run_id, str(html_path))
+    html = html_path.read_text(encoding="utf-8")
+
+    assert '"label": "Apple"' in html
+    assert "Apple\\nI0" not in html
+    assert "id=entity:e-comp-1" in html
+    assert '"size": 23' in html
+
+
+def test_export_is_empty_when_no_chunk_hit_paths_exist(tmp_path: Path) -> None:
+    sink = NetworkXRetrievalTraceSink(max_runs=20)
+    run_id = "no-hit-run"
+    sink.record(
+        RetrievalTraceEvent(
+            run_id=run_id,
+            parent_run_id=None,
+            domain="comprehensive",
+            stage="prefilter_output",
+            hop=0,
+            layer=0,
+            payload={
+                "ranked_chunks": [
+                    {
+                        "chunk_id": "chunk-only",
+                        "domain": "comprehensive",
+                        "chunk_text": "prefilter only",
+                        "rank": 1,
+                        "selected": True,
+                    }
+                ]
+            },
+        )
+    )
+
+    node_link_path = tmp_path / "no_hit.json"
+    sink.export_node_link_json(run_id, str(node_link_path))
+    payload = json.loads(node_link_path.read_text(encoding="utf-8"))
+    assert payload.get("nodes", []) == []
+    assert payload.get("links", []) == []
 
 
 @pytest.mark.asyncio

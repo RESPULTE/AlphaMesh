@@ -578,7 +578,7 @@ class DualStoreRetriever:
         new_chunks_by_id: Dict[str, RetrievedChunk] = {}
         new_chunk_ids: List[str] = []
         previously_visited_chunk_ids = set(state["visited_chunk_ids"])
-        trace_links: Set[tuple[str, str]] = set()
+        trace_links: Set[tuple[str, str, str]] = set()
 
         for row in rows:
             parsed = _parse_chunk_row(row)
@@ -622,6 +622,15 @@ class DualStoreRetriever:
                     support_ids.append(support_id)
 
                 support_relationships = selected_relationships_map.get(support_id) or []
+                supporting_entity_name = support_id
+                for relationship in support_relationships:
+                    candidate_name = str(
+                        relationship.get("selected_neighbor_name") or ""
+                    ).strip()
+                    if candidate_name:
+                        supporting_entity_name = candidate_name
+                        break
+
                 existing_relationships = chunk.metadata.setdefault(
                     SELECTED_NEIGHBOR_RELATIONSHIPS_KEY, []
                 )
@@ -630,7 +639,9 @@ class DualStoreRetriever:
                         [*existing_relationships, *support_relationships]
                     )
                 )
-                trace_links.add((support_id, parsed.chunk_id))
+                trace_links.add(
+                    (support_id, supporting_entity_name, parsed.chunk_id)
+                )
 
         new_chunks = list(new_chunks_by_id.values())
         accumulated = state["accumulated_chunks"] + new_chunks
@@ -646,9 +657,12 @@ class DualStoreRetriever:
                 "links": [
                     {
                         "supporting_entity_id": supporting_entity_id,
+                        "supporting_entity_name": supporting_entity_name,
                         "chunk_id": chunk_id,
                     }
-                    for supporting_entity_id, chunk_id in sorted(trace_links)
+                    for supporting_entity_id, supporting_entity_name, chunk_id in sorted(
+                        trace_links
+                    )
                 ],
                 "chunks": [
                     {
