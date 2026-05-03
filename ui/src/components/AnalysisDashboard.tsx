@@ -18,6 +18,7 @@ interface AnalysisDashboardProps {
 const HISTORY_PAGE_SIZE = 8;
 const LIVE_PANEL_OFFSET_TOP = 96;
 const FAR_SCROLL_DISTANCE = 900;
+const STORAGE_CONVERSATION_ID = 'alphamesh.active_conversation_id';
 
 const EMPTY_LIVE_RESPONSE: AnalysisResponse = {
   ticker: '',
@@ -104,6 +105,26 @@ export default function AnalysisDashboard({
   const autoScrolledConversationRef = useRef<string | null>(null);
   const scrollAnimationRef = useRef<number | null>(null);
   const lastAutoScrollQueryVersionRef = useRef<number | null>(null);
+  const staleRecoveryRunForConversationRef = useRef<string | null>(null);
+
+  const recoverFromStaleConversation = useCallback(async () => {
+    if (!conversationId) return;
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(STORAGE_CONVERSATION_ID);
+    }
+    setHistoricalTurns([]);
+    setHasMoreHistory(false);
+    setNextBeforeTurnId(null);
+    setHistoryLoadedForConversation(conversationId);
+
+    if (staleRecoveryRunForConversationRef.current === conversationId) return;
+    staleRecoveryRunForConversationRef.current = conversationId;
+    try {
+      await authFetch('/api/v1/conversations?limit=1');
+    } catch {
+      // best-effort only
+    }
+  }, [authFetch, conversationId]);
 
   const loadHistoryPage = useCallback(
     async (opts?: { reset?: boolean; beforeTurnId?: string | null }) => {
@@ -122,7 +143,16 @@ export default function AnalysisDashboard({
         const res = await authFetch(
           `/api/v1/conversations/${encodeURIComponent(conversationId)}/turns?${params.toString()}`
         );
-        if (!res.ok) return;
+        if (res.status === 404) {
+          await recoverFromStaleConversation();
+          return;
+        }
+        if (!res.ok) {
+          if (reset) {
+            setHistoryLoadedForConversation(conversationId);
+          }
+          return;
+        }
 
         const payload = (await res.json()) as ConversationTurnsResponse;
         const incoming = payload.turns || [];
@@ -140,7 +170,7 @@ export default function AnalysisDashboard({
         setIsLoadingHistory(false);
       }
     },
-    [authFetch, conversationId, isLoadingHistory]
+    [authFetch, conversationId, isLoadingHistory, recoverFromStaleConversation]
   );
 
   useEffect(() => {

@@ -63,6 +63,12 @@ class ConversationStore:
         """Delegate schema creation to the persistence adapter."""
         await self._db.initialize()
 
+    async def ensure_user_workspace(self, user_email: str) -> int:
+        """
+        Ensure per-user chatlog workspace exists and return conversation count.
+        """
+        return await self._db.ensure_user_workspace(user_email)
+
     def _get_lock(self, conversation_id: str) -> asyncio.Lock:
         if conversation_id not in self._locks:
             self._locks[conversation_id] = asyncio.Lock()

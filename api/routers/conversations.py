@@ -14,11 +14,13 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.dependencies import (
+    get_current_user,
     get_current_user_optional,
     get_session_service,
     get_store,
 )
 from api.models.responses import (
+    ConversationBootstrapResponse,
     ConversationHistoryResponse,
     ConversationMessage,
     ConversationSummary,
@@ -68,6 +70,19 @@ async def list_conversations(
         )
         for r in rows
     ]
+
+
+@router.post(
+    "/bootstrap",
+    response_model=ConversationBootstrapResponse,
+    summary="Ensure per-user chatlog workspace exists",
+)
+async def bootstrap_conversations(
+    user_id: str = Depends(get_current_user),
+    store: ConversationStore = Depends(get_store),
+) -> ConversationBootstrapResponse:
+    count = await store.ensure_user_workspace(user_id)
+    return ConversationBootstrapResponse(status="ok", conversation_count=count)
 
 
 @router.get(

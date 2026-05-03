@@ -194,7 +194,7 @@ class AnalysisRunner:
         self._session_service = session_service
         self._orchestrator = orchestrator
 
-    def launch(
+    async def launch(
         self,
         request_id: str,
         chat_request: ChatRequest,
@@ -203,10 +203,16 @@ class AnalysisRunner:
         session_id: str,
     ) -> str:
         """
-        Create the asyncio.Queue, then fire-and-forget the analysis task.
+        Prepare conversation ownership state, then fire-and-forget the analysis task.
         Returns the conversation_id immediately so POST /chat can ACK the client.
         """
         conversation_id = chat_request.conversation_id or str(uuid4())
+        await self._store.ensure_conversation(conversation_id, user_id)
+        await self._session_service.link_conversation(
+            user_id=user_id,
+            session_id=session_id,
+            conversation_id=conversation_id,
+        )
         self._broadcaster.create(request_id)
         asyncio.create_task(
             self._run(
@@ -375,13 +381,7 @@ class AnalysisRunner:
         queue.add_sink(market_sink)
 
         try:
-            # -- 3. Prepare conversation ---------------------------------------
-            await self._store.ensure_conversation(conversation_id, user_id)
-            await self._session_service.link_conversation(
-                user_id=user_id,
-                session_id=session_id,
-                conversation_id=conversation_id,
-            )
+            # -- 3. Load conversation state ------------------------------------
             history = await self._store.get_langchain_messages(
                 conversation_id,
                 user_email=user_id,

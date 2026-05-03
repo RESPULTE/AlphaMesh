@@ -55,6 +55,7 @@ export default function History({
   const [fullViewNextBefore, setFullViewNextBefore] = useState<string | null>(null);
 
   const initialOpenDone = useRef(false);
+  const staleRecoveryRunForConversationRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (query || dashboardConversationId) return;
@@ -111,6 +112,30 @@ export default function History({
       const res = await authFetch(
         `/api/v1/conversations/${encodeURIComponent(conversationId)}/turns?${params.toString()}`
       );
+      if (res.status === 404) {
+        if (typeof window !== 'undefined') {
+          window.localStorage.removeItem(STORAGE_CONVERSATION_ID);
+        }
+        setActiveConversationId(null);
+        setFullViewId(null);
+        setFullViewTurns([]);
+        setFullViewHasMore(false);
+        setFullViewNextBefore(null);
+
+        if (staleRecoveryRunForConversationRef.current !== conversationId) {
+          staleRecoveryRunForConversationRef.current = conversationId;
+          try {
+            const listRes = await authFetch('/api/v1/conversations?limit=50');
+            if (listRes.ok) {
+              const rows = (await listRes.json()) as ConversationSummary[];
+              setConversations(Array.isArray(rows) ? rows : []);
+            }
+          } catch {
+            // best-effort only
+          }
+        }
+        return;
+      }
       if (!res.ok) return;
       const payload = (await res.json()) as ConversationTurnsResponse;
       const incoming = payload.turns || [];

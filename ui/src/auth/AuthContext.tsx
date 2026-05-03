@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import type { AuthRequest, AuthResponse } from '../types/api';
+import type { AuthRequest, AuthResponse, ConversationBootstrapResponse } from '../types/api';
 
 const STORAGE_ACCESS_TOKEN = 'alphamesh.auth.access_token';
 const STORAGE_REFRESH_TOKEN = 'alphamesh.auth.refresh_token';
@@ -45,11 +45,17 @@ function readInitialState(): AuthState {
       sessionId: null,
     };
   }
+  // Force fresh login on every app load.
+  window.localStorage.removeItem(STORAGE_ACCESS_TOKEN);
+  window.localStorage.removeItem(STORAGE_REFRESH_TOKEN);
+  window.localStorage.removeItem(STORAGE_USER_EMAIL);
+  window.localStorage.removeItem(STORAGE_SESSION_ID);
+  window.localStorage.removeItem(STORAGE_CONVERSATION_ID);
   return {
-    accessToken: window.localStorage.getItem(STORAGE_ACCESS_TOKEN),
-    refreshToken: window.localStorage.getItem(STORAGE_REFRESH_TOKEN),
-    userEmail: window.localStorage.getItem(STORAGE_USER_EMAIL),
-    sessionId: window.localStorage.getItem(STORAGE_SESSION_ID),
+    accessToken: null,
+    refreshToken: null,
+    userEmail: null,
+    sessionId: null,
   };
 }
 
@@ -130,6 +136,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new Error(detail);
       }
       const payload = (await response.json()) as AuthResponse;
+      try {
+        const bootstrap = await fetch('/api/v1/conversations/bootstrap', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${payload.access_token}`,
+          },
+        });
+        // Backward compatibility: older backend builds may not expose this route yet.
+        // Do not block login if bootstrap endpoint is unavailable.
+        if (bootstrap.status === 404) {
+          applyAuthPayload(payload);
+          return;
+        }
+        if (!bootstrap.ok) {
+          const bootstrapPayload = await bootstrap.json().catch(() => null);
+          const detail =
+            bootstrapPayload && typeof bootstrapPayload.detail === 'string'
+              ? bootstrapPayload.detail
+              : 'Unable to initialize conversation workspace.';
+          throw new Error(`${detail} (HTTP ${bootstrap.status})`);
+        }
+        const bootstrapPayload = (await bootstrap.json()) as ConversationBootstrapResponse;
+        if (bootstrapPayload.status !== 'ok') {
+          throw new Error('Unable to initialize conversation workspace.');
+        }
+      } catch (err) {
+        // Bootstrap failures should not block auth; first /chat call will still create chatlog.
+        // Keep this warning so operational issues are visible during debugging.
+        // eslint-disable-next-line no-console
+        console.warn('Conversation workspace bootstrap failed; continuing login.', err);
+      }
       applyAuthPayload(payload);
     },
     [applyAuthPayload]

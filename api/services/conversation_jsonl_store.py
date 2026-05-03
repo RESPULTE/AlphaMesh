@@ -79,11 +79,30 @@ class JsonlConversationStore:
         temp_path.replace(path)
 
     @staticmethod
+    def _ensure_index_file_sync(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            return
+        path.write_text("[]", encoding="utf-8")
+
+    @staticmethod
     def _ensure_conversation_file_sync(path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             return
         path.write_text("", encoding="utf-8")
+
+    async def ensure_user_workspace(self, user_email: str) -> int:
+        """
+        Ensure the user chatlog directory + index file exist.
+
+        Returns the current conversation count from index.json.
+        """
+        index_path = self._get_index_path(user_email)
+        async with self._lock:
+            await asyncio.to_thread(self._ensure_index_file_sync, index_path)
+            rows = await asyncio.to_thread(self._read_index_sync, index_path)
+        return len(rows)
 
     async def ensure_conversation(
         self,
@@ -176,7 +195,9 @@ class JsonlConversationStore:
                         turns.append(payload)
             return turns
 
-        return await asyncio.to_thread(_load_sync, chatlog_path)
+        async with self._lock:
+            await asyncio.to_thread(self._ensure_conversation_file_sync, chatlog_path)
+            return await asyncio.to_thread(_load_sync, chatlog_path)
 
     async def list_conversations(
         self,

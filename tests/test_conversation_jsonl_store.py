@@ -87,3 +87,46 @@ def test_conversation_service_projects_turns_to_message_history(tmp_path) -> Non
     )
     assert isinstance(langchain_messages[0], HumanMessage)
     assert isinstance(langchain_messages[1], AIMessage)
+
+
+def test_jsonl_store_load_turns_self_heals_missing_chatlog_file(tmp_path) -> None:
+    store = JsonlConversationStore(str(tmp_path / "chatlogs"))
+    asyncio.run(store.initialize())
+
+    turns = asyncio.run(store.load_turns("conv-missing", "alpha@example.com"))
+    assert turns == []
+
+    chatlog_path = tmp_path / "chatlogs" / "alpha_example.com" / "conv-missing.jsonl"
+    assert chatlog_path.exists()
+
+
+def test_jsonl_store_ensure_user_workspace_creates_index_only(tmp_path) -> None:
+    store = JsonlConversationStore(str(tmp_path / "chatlogs"))
+    asyncio.run(store.initialize())
+
+    count = asyncio.run(store.ensure_user_workspace("alpha@example.com"))
+    user_dir = tmp_path / "chatlogs" / "alpha_example.com"
+
+    assert count == 0
+    assert (user_dir / "index.json").exists()
+    assert list(user_dir.glob("*.jsonl")) == []
+
+
+def test_jsonl_store_ensure_user_workspace_is_idempotent(tmp_path) -> None:
+    store = JsonlConversationStore(str(tmp_path / "chatlogs"))
+    asyncio.run(store.initialize())
+    asyncio.run(store.ensure_conversation("conv-1", "alpha@example.com"))
+
+    first = asyncio.run(store.ensure_user_workspace("alpha@example.com"))
+    second = asyncio.run(store.ensure_user_workspace("alpha@example.com"))
+
+    assert first == 1
+    assert second == 1
+
+    index_payload = json.loads(
+        (tmp_path / "chatlogs" / "alpha_example.com" / "index.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(index_payload) == 1
+    assert index_payload[0]["conversation_id"] == "conv-1"

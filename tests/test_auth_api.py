@@ -20,7 +20,9 @@ class _FakeRunner:
     def __init__(self) -> None:
         self.calls: list[dict[str, str]] = []
 
-    def launch(self, request_id: str, _body, *, user_id: str, session_id: str) -> str:
+    async def launch(
+        self, request_id: str, _body, *, user_id: str, session_id: str
+    ) -> str:
         self.calls.append(
             {
                 "request_id": request_id,

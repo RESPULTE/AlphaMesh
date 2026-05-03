@@ -86,6 +86,11 @@ export interface AuthResponse {
   session_id: string;
 }
 
+export interface ConversationBootstrapResponse {
+  status: 'ok';
+  conversation_count: number;
+}
+
 export interface TickerSearchResult {
   ticker: string;
   company_name: string;

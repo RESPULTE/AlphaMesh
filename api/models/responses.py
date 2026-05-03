@@ -352,4 +352,9 @@ class ConversationTurnsResponse(BaseModel):
     next_before_turn_id: Optional[str] = None
 
 
+class ConversationBootstrapResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    conversation_count: int = 0
+
+
 

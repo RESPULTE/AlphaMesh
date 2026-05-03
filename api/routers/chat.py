@@ -56,7 +56,7 @@ async def post_chat(
         session_id=body.session_id,
     )
     request_id = str(uuid4())
-    conversation_id = runner.launch(
+    conversation_id = await runner.launch(
         request_id,
         body,
         user_id=user_id,
