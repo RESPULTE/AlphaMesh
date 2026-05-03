@@ -53,6 +53,7 @@ export function mapTurnToAnalysisResponse(turn: ConversationTurn): AnalysisRespo
         title: s.title,
         url: s.url,
         source: extractDomain(s.url),
+        page_content: s.page_content,
       })),
     });
   }

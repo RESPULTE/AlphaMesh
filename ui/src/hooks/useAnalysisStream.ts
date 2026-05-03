@@ -291,7 +291,8 @@ function mapFinalResult(result: FinalResult): AnalysisResponse {
         id: s.source_id,
         title: s.title,
         url: s.url,
-        source: extractDomain(s.url)
+        source: extractDomain(s.url),
+        page_content: s.page_content
       }))
     });
   }

@@ -8,12 +8,10 @@ import {
   TrendingUp,
   ChevronDown,
   ChevronUp,
-  ExternalLink,
   FileText,
   BarChart2,
   ArrowUp,
 } from 'lucide-react';
-import Markdown from 'react-markdown';
 import {
   Area,
   AreaChart as RechartsAreaChart,
@@ -32,7 +30,6 @@ import type {
   ConversationTurn,
   DataFramePayload,
   FundamentalsVisualizationPayload,
-  SourceItem,
 } from '../types/api';
 import {
   getNormalisedFundamentalsCharts,
@@ -40,7 +37,10 @@ import {
   toSnapshotDataset,
   toTimeseriesDataset,
 } from './charting/fundamentalsChartUtils';
-import { groupSourcesByArticle } from '../utils/sourceGrouping';
+import CitationMarkdown from './CitationMarkdown';
+import CitationReferenceList, {
+  type CitationReferenceListHandle,
+} from './CitationReferenceList';
 
 interface FullConversationViewProps {
   turns: ConversationTurn[];
@@ -200,59 +200,6 @@ function FundamentalsChart({
 
 // ─── Sources list ─────────────────────────────────────────────────────────────
 
-function SourcesList({ sources }: { sources: SourceItem[] }) {
-  if (!sources.length) return null;
-  const groupedSources = groupSourcesByArticle(sources);
-  const itemClassName =
-    'flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container-lowest border border-outline-variant/10 hover:border-primary/30 hover:bg-surface-container-low/50 transition-all group';
-  return (
-    <div className="mt-3 space-y-1.5">
-      {groupedSources.map((src) =>
-        src.url ? (
-          <a
-            key={src.key}
-            href={src.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={itemClassName}
-          >
-            <div className="shrink-0 min-w-5 h-5 rounded-full bg-surface-container-high flex items-center justify-center text-[9px] font-bold text-on-surface-variant group-hover:text-primary transition-colors mt-0.5 px-1">
-              {src.citationIds[0] ?? '?'}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-on-surface group-hover:text-primary transition-colors line-clamp-2 leading-snug">
-                {src.title}
-              </p>
-              {src.citationIds.length > 0 && (
-                <p className="text-[10px] text-on-surface-variant/70 mt-1 font-mono">
-                  {src.citationIds.map((id) => `[${id}]`).join(' ')}
-                </p>
-              )}
-            </div>
-            <ExternalLink className="w-3 h-3 text-on-surface-variant/30 group-hover:text-primary transition-colors shrink-0 mt-0.5" />
-          </a>
-        ) : (
-          <div key={src.key} className={itemClassName}>
-            <div className="shrink-0 min-w-5 h-5 rounded-full bg-surface-container-high flex items-center justify-center text-[9px] font-bold text-on-surface-variant mt-0.5 px-1">
-              {src.citationIds[0] ?? '?'}
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-on-surface line-clamp-2 leading-snug">
-                {src.title}
-              </p>
-              {src.citationIds.length > 0 && (
-                <p className="text-[10px] text-on-surface-variant/70 mt-1 font-mono">
-                  {src.citationIds.map((id) => `[${id}]`).join(' ')}
-                </p>
-              )}
-            </div>
-          </div>
-        )
-      )}
-    </div>
-  );
-}
-
 // ─── Agent detail panel (collapsible) ────────────────────────────────────────
 
 function AgentDetailPanel({ agentKey, analysisText }: { agentKey: string; analysisText: string }) {
@@ -285,9 +232,10 @@ function AgentDetailPanel({ agentKey, analysisText }: { agentKey: string; analys
             className="overflow-hidden"
           >
             <div className="px-4 py-3 bg-surface-container-lowest border-t border-outline-variant/10">
-              <div className="prose prose-sm max-w-none prose-p:text-on-surface-variant prose-p:text-xs prose-p:leading-relaxed prose-li:text-on-surface-variant prose-li:text-xs prose-headings:text-on-surface prose-headings:font-bold prose-strong:text-on-surface prose-a:text-primary">
-                <Markdown>{analysisText}</Markdown>
-              </div>
+              <CitationMarkdown
+                text={analysisText}
+                className="prose prose-sm max-w-none prose-p:text-on-surface-variant prose-p:text-xs prose-p:leading-relaxed prose-li:text-on-surface-variant prose-li:text-xs prose-headings:text-on-surface prose-headings:font-bold prose-strong:text-on-surface prose-a:text-primary"
+              />
             </div>
           </motion.div>
         )}
@@ -300,6 +248,7 @@ function AgentDetailPanel({ agentKey, analysisText }: { agentKey: string; analys
 
 function RichTurn({ turn, index }: { turn: ConversationTurn; index: number }) {
   const [showAgents, setShowAgents] = useState(false);
+  const referenceListRef = useRef<CitationReferenceListHandle | null>(null);
   const agentKeys = Object.keys(turn.agent_analyses || {});
   const hasAgents = agentKeys.length > 0;
 
@@ -308,6 +257,9 @@ function RichTurn({ turn, index }: { turn: ConversationTurn; index: number }) {
     (tr) => tr.financial_data && tr.fundamentals_visualization
   );
   const allSources = (turn.ticker_results || []).flatMap((tr) => tr.sources || []);
+  const handleCitationClick = (citationId: number) => {
+    referenceListRef.current?.focusCitation(citationId);
+  };
 
   return (
     <motion.div
@@ -359,9 +311,11 @@ function RichTurn({ turn, index }: { turn: ConversationTurn; index: number }) {
 
             {/* Main synthesis */}
             <div className="bg-surface-container border border-outline-variant/15 rounded-2xl rounded-bl-md px-4 py-4 shadow-sm">
-              <div className="prose prose-sm max-w-none prose-headings:font-headline prose-headings:font-bold prose-headings:text-on-surface prose-p:text-on-surface-variant prose-p:leading-relaxed prose-li:text-on-surface-variant prose-a:text-primary hover:prose-a:text-primary/80 prose-strong:text-on-surface prose-code:text-primary prose-code:bg-surface-container-highest prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs">
-                <Markdown>{turn.assistant_synthesis}</Markdown>
-              </div>
+              <CitationMarkdown
+                text={turn.assistant_synthesis}
+                onCitationClick={handleCitationClick}
+                className="prose prose-sm max-w-none prose-headings:font-headline prose-headings:font-bold prose-headings:text-on-surface prose-p:text-on-surface-variant prose-p:leading-relaxed prose-li:text-on-surface-variant prose-a:text-primary hover:prose-a:text-primary/80 prose-strong:text-on-surface prose-code:text-primary prose-code:bg-surface-container-highest prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs"
+              />
             </div>
 
             {/* Charts from ticker results */}
@@ -377,7 +331,7 @@ function RichTurn({ turn, index }: { turn: ConversationTurn; index: number }) {
             {allSources.length > 0 && (
               <div className="px-1">
                 <div className="text-[9px] font-black font-label tracking-widest text-on-surface-variant/50 uppercase mb-1.5">Sources</div>
-                <SourcesList sources={allSources} />
+                <CitationReferenceList ref={referenceListRef} sources={allSources} />
               </div>
             )}
 

@@ -28,6 +28,7 @@ export interface AgentAnalysis {
     title: string;
     url: string;
     source: string;
+    page_content?: string;
   }[];
 }
 

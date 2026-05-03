@@ -68,3 +68,36 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-outline);
 }
+
+.citation-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 35%, transparent);
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  color: var(--color-primary);
+  font-family: var(--font-label);
+  font-size: 0.72em;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  line-height: 1;
+  padding: 0.15rem 0.42rem;
+  margin: 0 0.1rem;
+  cursor: pointer;
+  transition: box-shadow 180ms ease, transform 180ms ease, background-color 180ms ease,
+    border-color 180ms ease;
+}
+
+.citation-chip:hover {
+  background: color-mix(in srgb, var(--color-primary) 18%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-primary) 45%, transparent),
+    0 0 18px color-mix(in srgb, var(--color-primary) 30%, transparent);
+  transform: translateY(-1px);
+}
+
+.citation-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-primary) 70%, transparent),
+    0 0 22px color-mix(in srgb, var(--color-primary) 40%, transparent);
+}

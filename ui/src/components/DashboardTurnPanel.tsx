@@ -33,11 +33,9 @@ import {
   X,
   ChevronDown,
   ChevronUp,
-  ExternalLink,
 } from 'lucide-react';
 import clsx from 'clsx';
-import Markdown from 'react-markdown';
-import type { AgentAnalysis, AnalysisResponse } from '../types/api';
+import type { AgentAnalysis, AnalysisResponse, SourceItem } from '../types/api';
 import type { StreamPhase } from '../hooks/useAnalysisStream';
 import {
   normaliseChartSpec,
@@ -52,7 +50,10 @@ import {
   getChartAvailability,
   type DashboardLayoutVariant,
 } from './dashboard/analysisViewModel';
-import { groupSourcesByArticle } from '../utils/sourceGrouping';
+import CitationMarkdown from './CitationMarkdown';
+import CitationReferenceList, {
+  type CitationReferenceListHandle,
+} from './CitationReferenceList';
 
 interface DashboardTurnPanelProps {
   query: string;
@@ -65,14 +66,23 @@ const CHART_COLORS = ['#007a01', '#2b9f30', '#6ecf72', '#87d98a', '#b6e8b9', '#d
 
 function AgentModal({ agent, onClose }: { agent: AgentAnalysis; onClose: () => void }) {
   const [isExpanded, setIsExpanded] = useState(false);
-  const groupedReferences = groupSourcesByArticle(
-    (agent.references || []).map((ref) => ({
-      source_id: ref.id,
-      title: ref.title,
-      url: ref.url,
-    }))
+  const referenceListRef = useRef<CitationReferenceListHandle | null>(null);
+  const sourceItems: SourceItem[] = useMemo(
+    () =>
+      (agent.references || []).map((ref) => ({
+        source_id: ref.id,
+        title: ref.title,
+        url: ref.url,
+        page_content: ref.page_content,
+      })),
+    [agent.references]
   );
-  const hasExtraContent = !!agent.tableData || groupedReferences.length > 0;
+  const hasExtraContent = !!agent.tableData || sourceItems.length > 0;
+
+  const handleCitationClick = (citationId: number) => {
+    setIsExpanded(true);
+    referenceListRef.current?.focusCitation(citationId);
+  };
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-8">
@@ -125,9 +135,11 @@ function AgentModal({ agent, onClose }: { agent: AgentAnalysis; onClose: () => v
               hasExtraContent ? 'md:w-1/2 md:border-r border-outline-variant/10' : 'w-full'
             )}
           >
-            <div className="prose prose-sm md:prose-base prose-invert max-w-none prose-headings:font-headline prose-headings:font-bold prose-a:text-primary hover:prose-a:text-primary/80 prose-strong:text-on-surface prose-p:text-on-surface-variant prose-li:text-on-surface-variant">
-              <Markdown>{agent.fullReport || 'No detailed report available.'}</Markdown>
-            </div>
+            <CitationMarkdown
+              text={agent.fullReport || 'No detailed report available.'}
+              onCitationClick={handleCitationClick}
+              className="prose prose-sm md:prose-base prose-invert max-w-none prose-headings:font-headline prose-headings:font-bold prose-a:text-primary hover:prose-a:text-primary/80 prose-strong:text-on-surface prose-p:text-on-surface-variant prose-li:text-on-surface-variant"
+            />
           </div>
 
           {hasExtraContent && (
@@ -196,7 +208,7 @@ function AgentModal({ agent, onClose }: { agent: AgentAnalysis; onClose: () => v
                   </div>
                 )}
 
-                {groupedReferences.length > 0 && (
+                {sourceItems.length > 0 && (
                   <div className="w-full max-w-lg mx-auto">
                     <div className="flex items-center gap-3 mb-6">
                       <div className="p-2 bg-primary/10 rounded-lg">
@@ -204,35 +216,7 @@ function AgentModal({ agent, onClose }: { agent: AgentAnalysis; onClose: () => v
                       </div>
                       <h3 className="font-headline font-bold text-lg text-on-surface">Sources & References</h3>
                     </div>
-                    <div className="space-y-3">
-                      {groupedReferences.map((ref) => (
-                        <a
-                          key={ref.key}
-                          href={ref.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="group flex items-start gap-4 p-4 rounded-2xl bg-surface-container-lowest border border-outline-variant/20 hover:border-primary/40 hover:bg-surface-container-low/50 hover:shadow-md hover:-translate-y-0.5 transition-all duration-300"
-                        >
-                          <div className="flex-shrink-0 min-w-7 h-7 rounded-full bg-surface-container-high group-hover:bg-primary/10 group-hover:text-primary text-on-surface-variant flex items-center justify-center text-xs font-bold font-mono mt-0.5 transition-colors px-1">
-                            {ref.citationIds[0] ?? '?'}
-                          </div>
-                          <div className="flex-grow">
-                            <h4 className="text-sm font-medium text-on-surface group-hover:text-primary transition-colors line-clamp-2 mb-1.5 leading-snug">
-                              {ref.title}
-                            </h4>
-                            <div className="flex items-center gap-2 text-[11px] text-on-surface-variant/60 font-mono uppercase tracking-wider">
-                              <span>{ref.domain}</span>
-                            </div>
-                            {ref.citationIds.length > 0 && (
-                              <p className="text-[11px] text-on-surface-variant/80 font-mono mt-1.5 normal-case tracking-normal">
-                                {ref.citationIds.map((id) => `[${id}]`).join(' ')}
-                              </p>
-                            )}
-                          </div>
-                          <ExternalLink className="w-4 h-4 text-on-surface-variant/30 group-hover:text-primary transition-colors flex-shrink-0 mt-1" />
-                        </a>
-                      ))}
-                    </div>
+                    <CitationReferenceList ref={referenceListRef} sources={sourceItems} />
                   </div>
                 )}
               </div>

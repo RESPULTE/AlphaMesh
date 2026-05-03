@@ -6,6 +6,8 @@ export interface GroupedArticleSource {
   url: string;
   domain: string;
   citationIds: number[];
+  chunkByCitationId: Record<number, string>;
+  primaryChunkText: string;
 }
 
 const _WHITESPACE_RE = /\s+/g;
@@ -50,7 +52,7 @@ function _sourceGroupKey(source: Pick<SourceItem, 'title' | 'url'>): string {
 }
 
 export function groupSourcesByArticle(
-  sources: Array<Pick<SourceItem, 'source_id' | 'title' | 'url'>>
+  sources: Array<Pick<SourceItem, 'source_id' | 'title' | 'url' | 'page_content'>>
 ): GroupedArticleSource[] {
   const grouped = new Map<string, GroupedArticleSource>();
 
@@ -59,6 +61,7 @@ export function groupSourcesByArticle(
     const title = (source.title || '').trim() || 'Unknown Title';
     const url = (source.url || '').trim();
     const citationId = Number(source.source_id);
+    const chunkText = String(source.page_content || '').trim();
 
     const existing = grouped.get(key);
     if (!existing) {
@@ -68,12 +71,20 @@ export function groupSourcesByArticle(
         url,
         domain: extractSourceDomain(url),
         citationIds: Number.isFinite(citationId) ? [citationId] : [],
+        chunkByCitationId:
+          Number.isFinite(citationId) && chunkText
+            ? { [citationId]: chunkText }
+            : {},
+        primaryChunkText: chunkText,
       });
       continue;
     }
 
     if (Number.isFinite(citationId) && !existing.citationIds.includes(citationId)) {
       existing.citationIds.push(citationId);
+    }
+    if (Number.isFinite(citationId) && chunkText) {
+      existing.chunkByCitationId[citationId] = chunkText;
     }
     if (!existing.url && url) {
       existing.url = url;
@@ -82,10 +93,17 @@ export function groupSourcesByArticle(
     if (existing.title === 'Unknown Title' && title !== 'Unknown Title') {
       existing.title = title;
     }
+    if (!existing.primaryChunkText && chunkText) {
+      existing.primaryChunkText = chunkText;
+    }
   }
 
   for (const article of grouped.values()) {
     article.citationIds.sort((a, b) => a - b);
+    if (!article.primaryChunkText && article.citationIds.length > 0) {
+      const firstCitation = article.citationIds[0];
+      article.primaryChunkText = article.chunkByCitationId[firstCitation] || '';
+    }
   }
 
   return Array.from(grouped.values());
