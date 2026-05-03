@@ -5,6 +5,7 @@ import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
+from core.config import settings
 from core.logger import get_logger
 from core.memory.graph.entity_resolver import EntityResolver
 from core.memory.graph.models import (
@@ -53,6 +54,9 @@ class GraphWritePipeline:
         self._extractor = relationship_extractor
         self._llm_provider = llm_provider
         self._prompt_registry = prompt_registry
+        self._allow_create_sources = self._parse_allow_create_sources(
+            settings.GRAPH_ALLOW_CREATE_SOURCES
+        )
 
     async def extract_relationships_for_task(
         self, task: GraphTask
@@ -128,7 +132,7 @@ class GraphWritePipeline:
 
         await self._process_chunk_entity_tasks(tasks)
 
-        prepared_groups: Dict[str, List[Tuple[GraphTask, List[dict]]]] = {}
+        prepared_groups: Dict[Tuple[str, bool], List[Tuple[GraphTask, List[dict]]]] = {}
         retry_tasks: List[GraphTask] = []
         processed_task_ids: List[str] = []
         for task in tasks:
@@ -146,12 +150,15 @@ class GraphWritePipeline:
                 relationships = self._filter_relationships_for_task(task, relationships)
                 task.relationships = relationships
             if relationships:
-                group_key = task.conversation_id
+                group_key = (
+                    task.conversation_id,
+                    self._source_allows_create(task.source_agent),
+                )
                 prepared_groups.setdefault(group_key, []).append((task, relationships))
 
         total_domain = 0
         total_user = 0
-        for conversation_id, group in prepared_groups.items():
+        for (conversation_id, allow_create), group in prepared_groups.items():
             if not group:
                 continue
             merged_relationships: List[dict] = []
@@ -164,7 +171,7 @@ class GraphWritePipeline:
                 relationships=merged_relationships,
                 conversation_id=conversation_id,
                 source_agent=source_agent_label,
-                allow_create=False,
+                allow_create=allow_create,
             )
             total_domain += domain_count
             total_user += user_count
@@ -175,6 +182,17 @@ class GraphWritePipeline:
             "retry_tasks": retry_tasks,
             "processed_task_ids": processed_task_ids,
         }
+
+    @staticmethod
+    def _parse_allow_create_sources(raw: str) -> set[str]:
+        return {
+            token.strip().lower()
+            for token in str(raw or "").split(",")
+            if token.strip()
+        }
+
+    def _source_allows_create(self, source_agent: str) -> bool:
+        return str(source_agent or "").strip().lower() in self._allow_create_sources
 
     @staticmethod
     def _build_retry_task(task: GraphTask) -> Optional[GraphTask]:

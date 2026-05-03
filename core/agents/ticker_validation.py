@@ -1,7 +1,7 @@
 ﻿"""
 core/agents/ticker_validation.py
 
-Validates up to 3 ticker symbols via yfinance and enriches new ones with
+Validates up to 3 ticker symbols via yfinance and enriches equities with
 canonical metadata (long name, sector, industry, business description).
 
 Design notes
@@ -16,8 +16,8 @@ Design notes
   TODO: For lower latency on known companies, replace the yfinance .info call
         with a Neo4j get_company_entity_by_ticker() query that returns the
         cached (name, description, sector, industry) from the graph store.
-- Taxonomy upsert: Industry and Company nodes are written to Neo4j + Chroma
-  as a background asyncio task so the critical path is never blocked.
+- Taxonomy upsert: Market/Sector/Industry/Company taxonomy links are queued
+  for every validated equity ticker.
 """
 
 from __future__ import annotations
@@ -94,7 +94,6 @@ class TickerInfo:
     description: str = ""  # yfinance longBusinessSummary
     sector: str = ""  # yfinance canonical sector name
     industry: str = ""  # yfinance industry string
-    is_new: bool = False  # True when no Company entity exists in Neo4j yet
     needs_confirmation: bool = False  # True when non-equity or lookup suggestions found
     suggestions: List[str] = field(default_factory=list)
 
@@ -122,16 +121,14 @@ class TickerValidator:
     """
     Validates and enriches up to MAX_TICKERS tickers using yfinance.
 
-    For new companies, upserts Company and Industry entity nodes into both
-    Neo4j and ChromaDB, and creates BELONGS_TO taxonomy edges
-    (Company â†’ Industry â†’ Sector) as a non-blocking background task.
+    For validated equities, upserts taxonomy edges
+    (Company â†’ Industry â†’ Sector plus Sector â†’ Market).
     """
 
     def __init__(
         self, neo4j_adapter: Neo4jAdapter, entity_chroma_adapter: ChromaDBAdapter
     ) -> None:
-        self._neo4j = neo4j_adapter
-        self._chroma = entity_chroma_adapter
+        _ = (neo4j_adapter, entity_chroma_adapter)
         self._logger = get_logger(__name__)
 
     async def validate_and_enrich(self, tickers: List[str]) -> Dict[str, TickerInfo]:
@@ -144,20 +141,15 @@ class TickerValidator:
             self._batch_validate_and_enrich_sync, tickers
         )
 
-        # â”€â”€ Check novelty and schedule taxonomy upsert for new companies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Schedule taxonomy upsert for all validated equity tickers.
         for t, info in results.items():
             if not info.is_valid or not info.is_equity or info.needs_confirmation:
                 continue
-            existing_id = await self._neo4j.entity_exists_by_ticker(t)
-            if existing_id:
-                info.is_new = False
-            else:
-                info.is_new = True
-                if info.long_name:
-                    await asyncio.create_task(
-                        self._upsert_company_taxonomy(info),
-                        name=f"taxonomy_upsert_{t}",
-                    )
+            if info.long_name:
+                asyncio.create_task(
+                    self._upsert_company_taxonomy(info),
+                    name=f"taxonomy_upsert_{t}",
+                )
 
         return results
 
@@ -268,7 +260,7 @@ class TickerValidator:
 
     async def _upsert_company_taxonomy(self, info) -> None:
         """
-        For a newly discovered company, write the full taxonomy chain
+        For a validated equity ticker, write the full taxonomy chain
         (Market â†’ Sector â†’ Industry â†’ Company) via GraphQueueManager.enqueue(task).
 
         Replaces the old schedule(bypass_guards=True) call and carries runtime
@@ -369,7 +361,9 @@ class TickerValidator:
                 relationships=relationships,
                 immediate=True,
             )
-            await service_manager.get_graph_queue_manager().enqueue(task)
+            queue_manager = service_manager.get_graph_queue_manager()
+            await queue_manager.enqueue(task)
+            await queue_manager.flush_turn(task.conversation_id, task.turn_id)
 
             logger.info(
                 "_upsert_company_taxonomy: scheduled %d BELONGS_TO edge(s) for '%s'",

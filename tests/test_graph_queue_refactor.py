@@ -193,7 +193,7 @@ def fake_llm_provider(_config: Optional[dict]):
     return object()
 
 
-def test_enqueue_immediate_relationship_task_disables_creation(tmp_path: Path):
+def test_enqueue_taxonomy_source_enables_creation(tmp_path: Path):
     resolver = FakeResolver()
     writer = FakeWriter()
     manager = GraphQueueManager(
@@ -220,6 +220,45 @@ def test_enqueue_immediate_relationship_task_disables_creation(tmp_path: Path):
                     }
                 ],
                 immediate=True,
+            )
+            task_id = await manager.enqueue(task)
+            assert task_id == task.task_id
+            await manager.close_session(task.conversation_id)
+            assert resolver.batch_calls
+            assert resolver.batch_calls[0][1] is True
+        finally:
+            await manager.shutdown()
+
+    asyncio.run(_run())
+
+
+def test_enqueue_non_whitelisted_source_disables_creation(tmp_path: Path):
+    resolver = FakeResolver()
+    writer = FakeWriter()
+    manager = GraphQueueManager(
+        entity_resolver=resolver,
+        graph_writer=writer,
+        relationship_extractor=FakeRelationshipExtractor(),
+        llm_provider=fake_llm_provider,
+        db_path=str(tmp_path / "graph_tasks.db"),
+    )
+
+    async def _run() -> None:
+        await manager.start()
+        try:
+            task = make_graph_task(
+                turn_id="turn-1",
+                conversation_id="conv-1",
+                source_agent="agent-a",
+                relationships=[
+                    {
+                        "from_name": "Apple",
+                        "from_type": "Company",
+                        "relation": "BELONGS_TO",
+                        "to_name": "Technology",
+                        "to_type": "Sector",
+                    }
+                ],
             )
             task_id = await manager.enqueue(task)
             assert task_id == task.task_id
@@ -520,7 +559,7 @@ def test_enqueue_skips_invalid_chunk_and_empty_tasks(tmp_path: Path):
     asyncio.run(_run())
 
 
-def test_recover_pending_tasks_without_allow_create_policy(tmp_path: Path):
+def test_recover_pending_tasks_applies_allow_create_policy(tmp_path: Path):
     resolver = FakeResolver()
     writer = FakeWriter()
     manager = GraphQueueManager(
@@ -534,7 +573,7 @@ def test_recover_pending_tasks_without_allow_create_policy(tmp_path: Path):
     async def _run() -> None:
         await manager._store.initialize()
 
-        task = make_graph_task(
+        taxonomy_task = make_graph_task(
             turn_id="turn-1",
             conversation_id="conv-1",
             source_agent="taxonomy_bootstrap",
@@ -543,20 +582,40 @@ def test_recover_pending_tasks_without_allow_create_policy(tmp_path: Path):
                     "from_name": "Apple",
                     "from_type": "Company",
                     "relation": "BELONGS_TO",
-                "to_name": "Technology",
-                "to_type": "Sector",
+                    "to_name": "Technology",
+                    "to_type": "Sector",
                 }
             ],
         )
-        await manager._store.persist_task(task.to_payload())
+        await manager._store.persist_task(taxonomy_task.to_payload())
 
-        async def _capture_process(tasks: List[object]) -> Dict[str, int]:
-            assert len(tasks) == 1
-            assert not hasattr(tasks[0], "allow_create")
-            return {"domain_edges": 0, "user_edges": 0}
+        strict_task = make_graph_task(
+            turn_id="turn-2",
+            conversation_id="conv-2",
+            source_agent="agent-a",
+            relationships=[
+                {
+                    "from_name": "Microsoft",
+                    "from_type": "Company",
+                    "relation": "BELONGS_TO",
+                    "to_name": "Technology",
+                    "to_type": "Sector",
+                }
+            ],
+        )
+        await manager._store.persist_task(strict_task.to_payload())
 
-        manager._pipeline.process_tasks = _capture_process  # type: ignore[method-assign]
         await manager._recover_pending_tasks()
+        assert len(resolver.batch_calls) == 2
+        policy_by_company: Dict[str, bool] = {}
+        for calls, allow_create in resolver.batch_calls:
+            names = {str(name).strip().lower() for name, _entity_type, _props in calls}
+            if "apple" in names:
+                policy_by_company["apple"] = allow_create
+            if "microsoft" in names:
+                policy_by_company["microsoft"] = allow_create
+        assert policy_by_company["apple"] is True
+        assert policy_by_company["microsoft"] is False
 
     asyncio.run(_run())
 
