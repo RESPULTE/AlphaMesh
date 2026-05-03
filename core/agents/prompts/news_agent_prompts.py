@@ -16,6 +16,12 @@ Rules:
 - Provide 1-4 queries total, at most one per domain.
 - Queries must be specific and self-contained.
 - Never return empty queries.
+- Treat a tool run as not useful when it produced no meaningful retrieval signal
+  (for example, zero newly fetched articles and/or zero merged chunks).
+- If the most recent tool run was not useful, switch to the other tool on the next
+  decision instead of repeating the same tool.
+- If both tools have already failed without useful results, choose the one that is
+  most likely to produce incremental evidence for the missing_information_goal.
 
 Return ONLY a valid PlannerDecision object.
 """
