@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Dict, List, Type
 from uuid import uuid4
 
@@ -29,12 +30,15 @@ from core.agents.prompts.news_agent_prompts import (
     NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES,
     NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT,
     NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
+    NEWS_NARRATIVE_SYSTEM_PROMPT,
+    NEWS_NARRATIVE_USER_PROMPT,
     NEWS_PLANNER_SYSTEM_PROMPT,
 )
 from core.agents.utils import (
     build_analysis_context_prefix,
     constrain_date_range,
     get_default_date_range,
+    remap_numeric_citations,
 )
 from core.agents.working_memory.news_working_memory import NewsWorkingMemoryManager
 from core.config import settings
@@ -44,7 +48,7 @@ from core.memory.graph.graph_queue import (
     TASK_KIND_SCOPED_EXTRACTION,
     make_extraction_task,
 )
-from core.memory.retrieval.models import RetrievedChunk, RewrittenQueries
+from core.memory.retrieval.models import CitedSource, RetrievedChunk, RewrittenQueries
 from core.services import service_manager
 
 logger = get_logger(__name__)
@@ -291,6 +295,51 @@ class NewsAnalysisAgent(AbstractAgent):
                 )
             lines.append("")
         return ("\n".join(lines).strip() or "(none)", chunk_id_to_alias)
+
+    @staticmethod
+    def _build_chunk_level_sources(chunks: List[RetrievedChunk]) -> List[CitedSource]:
+        sources: List[CitedSource] = []
+        for source_id, chunk in enumerate(chunks, start=1):
+            metadata = chunk.metadata or {}
+            title = (
+                str(metadata.get("article_title") or chunk.article_title or "").strip()
+                or "Unknown Title"
+            )
+            url = str(metadata.get("source_url") or chunk.source_url or "").strip()
+            page_content = str(chunk.text or "").strip()
+            sources.append(
+                CitedSource(
+                    source_id=source_id,
+                    title=title,
+                    url=url,
+                    page_content=page_content,
+                )
+            )
+        return sources
+
+    @staticmethod
+    def _build_chunk_citation_context_block(
+        *,
+        chunks: List[RetrievedChunk],
+        sources: List[CitedSource],
+    ) -> str:
+        if not chunks or not sources:
+            return "(none)"
+        lines: List[str] = []
+        for chunk, source in zip(chunks, sources, strict=False):
+            relevance = (
+                "N/A"
+                if chunk.relevance_score is None
+                else f"{float(chunk.relevance_score):.4f}"
+            )
+            chunk_text = str(chunk.text or "").strip() or "(empty)"
+            lines.append(
+                f"[{source.source_id}] title={source.title} | url={source.url or 'N/A'} | "
+                f"date={chunk.date_tag or 'N/A'} | relevance_score={relevance}"
+            )
+            lines.append(f"chunk_text={chunk_text}")
+            lines.append("")
+        return "\n".join(lines).strip() or "(none)"
 
     async def run(self, input_data: BaseAgentInput) -> NewsAgentOutput:
         """Run the agent end-to-end with the provided input."""
@@ -868,25 +917,18 @@ class NewsAnalysisAgent(AbstractAgent):
             chunks,
             selected_source_chunk_ids,
         )
-        sources, _ = RetrievedChunk._build_deduplicated_sources(selected_source_chunks)
-        selected_article_context, _ = self._build_article_context_block(
-            final_chunks=selected_source_chunks
+        chunk_level_sources = self._build_chunk_level_sources(selected_source_chunks)
+        chunk_citation_context = self._build_chunk_citation_context_block(
+            chunks=selected_source_chunks,
+            sources=chunk_level_sources,
         )
         analysis_messages = [
-            SystemMessage(
-                content=(
-                    "You are a financial news analysis assistant. Return plain text only. "
-                    "Do not return JSON."
-                )
-            ),
+            SystemMessage(content=NEWS_NARRATIVE_SYSTEM_PROMPT),
             HumanMessage(
-                content=(
-                    f"Goal: {state.goal}\n\n"
-                    f"{context_prefix}\n\n"
-                    "Article-grouped evidence (selected sources):\n"
-                    f"{selected_article_context}\n\n"
-                    "Write a concise investor-oriented analysis grounded only in this evidence. "
-                    "Cover key catalysts, risks, and near-term watchpoints."
+                content=NEWS_NARRATIVE_USER_PROMPT.format(
+                    goal=state.goal,
+                    entities_section=context_prefix,
+                    citation_evidence=chunk_citation_context,
                 )
             ),
         ]
@@ -897,6 +939,7 @@ class NewsAnalysisAgent(AbstractAgent):
             node="_analyse_news_node",
             enabled=settings.ENABLE_ANALYSIS_TOKEN_STREAMING,
         )
+        generation_failed = False
         try:
             analysis_llm = service_manager.get_agent(temperature=0.7)
             if streamer.enabled:
@@ -907,11 +950,10 @@ class NewsAnalysisAgent(AbstractAgent):
                     streamer=streamer,
                 )
                 analysis_text = (analysis_text or "").strip()
-                if analysis_text:
-                    streamer.end(final_text=analysis_text)
-                else:
-                    analysis_text = "Best-effort analysis could not be generated from available evidence."
-                    streamer.end(final_text=analysis_text)
+                if not analysis_text:
+                    analysis_text = (
+                        "Best-effort analysis could not be generated from available evidence."
+                    )
             else:
                 response_text = await analysis_llm.ainvoke(analysis_messages)
                 analysis_text = (
@@ -919,6 +961,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     or "Best-effort analysis could not be generated from available evidence."
                 )
         except Exception as exc:
+            generation_failed = True
             if streamer.enabled:
                 streamer.error(str(exc))
             logger.exception("_analyse_news_node: narrative generation failed")
@@ -926,8 +969,19 @@ class NewsAnalysisAgent(AbstractAgent):
                 "Best-effort analysis could not be generated due to an internal error."
             )
 
+        has_numeric_citations = bool(re.search(r"\[(\d+)\]", analysis_text))
+        remapped_text, remapped_sources = remap_numeric_citations(
+            analysis_text,
+            chunk_level_sources,
+        )
+        final_analysis_text = remapped_text if has_numeric_citations else analysis_text
+        final_sources = remapped_sources if has_numeric_citations else chunk_level_sources
+
+        if streamer.enabled and not generation_failed:
+            streamer.end(final_text=final_analysis_text)
+
         task_id = None
-        if state.conversation_id and analysis_text:
+        if state.conversation_id and final_analysis_text:
             turn_id = (getattr(state, "turn_id", None) or "").strip() or str(uuid4())
             allowed_entity_types = list(NEWS_DEFERRED_ALLOWED_ENTITY_TYPES)
             allowed_relationship_types = list(NEWS_DEFERRED_ALLOWED_RELATIONSHIP_TYPES)
@@ -937,7 +991,7 @@ class NewsAnalysisAgent(AbstractAgent):
                     conversation_id=state.conversation_id,
                     source_agent=self.name(),
                     task_kind=TASK_KIND_SCOPED_EXTRACTION,
-                    extraction_text=analysis_text,
+                    extraction_text=final_analysis_text,
                     chunk_ids=final_stage_chunk_ids,
                     system_prompt=NEWS_DEFERRED_RELATIONSHIP_SYSTEM_PROMPT,
                     chunk_system_prompt=NEWS_DEFERRED_CHUNK_ENTITY_SYSTEM_PROMPT,
@@ -952,12 +1006,12 @@ class NewsAnalysisAgent(AbstractAgent):
         tools_used = _list_unique_actions(state.research_logs)
         top_references = [
             {"source_id": int(src.source_id), "title": src.title, "url": src.url}
-            for src in sources[:3]
+            for src in final_sources[:3]
         ]
         memory_summary = {
             "research_actions": tools_used,
             "tools_used": tools_used,
-            "source_count": len(sources),
+            "source_count": len(final_sources),
             "top_references": top_references,
             "sentiment": {},
             "missing_information_goal": response_missing_goal.strip(),
@@ -965,8 +1019,8 @@ class NewsAnalysisAgent(AbstractAgent):
         }
 
         result = {
-            "analysis": analysis_text,
-            "sources": sources,
+            "analysis": final_analysis_text,
+            "sources": final_sources,
             "subgraph_id": task_id,
             "relationships_extracted": relationships_extracted,
             "sentiment": None,

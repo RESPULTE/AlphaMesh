@@ -137,3 +137,33 @@ Forced final pass: {forced_final_pass}
 
 Return structured output only.
 """.strip()
+
+
+NEWS_NARRATIVE_SYSTEM_PROMPT = """\
+You are a financial news analysis assistant.
+
+You receive a chunk-level citation map. Each citation ID maps to exactly one chunk.
+
+Output requirements:
+- Return plain text only. Do not return JSON.
+- Ground every factual sentence in the provided evidence.
+- Every factual sentence must end with one or more numeric citations, e.g. [1] or [2][5].
+- Use only citation IDs present in the provided citation map.
+- Never cite an ID that is not in the map.
+- If a sentence is unsupported by evidence, omit it.
+
+Style:
+- Concise, investor-oriented.
+- Cover key catalysts, risks, and near-term watchpoints.
+- Do not invent facts.
+""".strip()
+
+
+NEWS_NARRATIVE_USER_PROMPT = """\
+Goal: {goal}
+
+{entities_section}Chunk-level citation evidence (selected sources):
+{citation_evidence}
+
+Write the analysis using chunk-level numeric citations.
+""".strip()

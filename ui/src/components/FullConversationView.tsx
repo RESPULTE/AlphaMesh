@@ -40,6 +40,7 @@ import {
   toSnapshotDataset,
   toTimeseriesDataset,
 } from './charting/fundamentalsChartUtils';
+import { groupSourcesByArticle } from '../utils/sourceGrouping';
 
 interface FullConversationViewProps {
   turns: ConversationTurn[];
@@ -201,27 +202,53 @@ function FundamentalsChart({
 
 function SourcesList({ sources }: { sources: SourceItem[] }) {
   if (!sources.length) return null;
+  const groupedSources = groupSourcesByArticle(sources);
+  const itemClassName =
+    'flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container-lowest border border-outline-variant/10 hover:border-primary/30 hover:bg-surface-container-low/50 transition-all group';
   return (
     <div className="mt-3 space-y-1.5">
-      {sources.map((src) => (
-        <a
-          key={src.source_id}
-          href={src.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container-lowest border border-outline-variant/10 hover:border-primary/30 hover:bg-surface-container-low/50 transition-all group"
-        >
-          <div className="shrink-0 w-5 h-5 rounded-full bg-surface-container-high flex items-center justify-center text-[9px] font-bold text-on-surface-variant group-hover:text-primary transition-colors mt-0.5">
-            {src.source_id}
+      {groupedSources.map((src) =>
+        src.url ? (
+          <a
+            key={src.key}
+            href={src.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={itemClassName}
+          >
+            <div className="shrink-0 min-w-5 h-5 rounded-full bg-surface-container-high flex items-center justify-center text-[9px] font-bold text-on-surface-variant group-hover:text-primary transition-colors mt-0.5 px-1">
+              {src.citationIds[0] ?? '?'}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-on-surface group-hover:text-primary transition-colors line-clamp-2 leading-snug">
+                {src.title}
+              </p>
+              {src.citationIds.length > 0 && (
+                <p className="text-[10px] text-on-surface-variant/70 mt-1 font-mono">
+                  {src.citationIds.map((id) => `[${id}]`).join(' ')}
+                </p>
+              )}
+            </div>
+            <ExternalLink className="w-3 h-3 text-on-surface-variant/30 group-hover:text-primary transition-colors shrink-0 mt-0.5" />
+          </a>
+        ) : (
+          <div key={src.key} className={itemClassName}>
+            <div className="shrink-0 min-w-5 h-5 rounded-full bg-surface-container-high flex items-center justify-center text-[9px] font-bold text-on-surface-variant mt-0.5 px-1">
+              {src.citationIds[0] ?? '?'}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-on-surface line-clamp-2 leading-snug">
+                {src.title}
+              </p>
+              {src.citationIds.length > 0 && (
+                <p className="text-[10px] text-on-surface-variant/70 mt-1 font-mono">
+                  {src.citationIds.map((id) => `[${id}]`).join(' ')}
+                </p>
+              )}
+            </div>
           </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-xs font-medium text-on-surface group-hover:text-primary transition-colors line-clamp-2 leading-snug">
-              {src.title}
-            </p>
-          </div>
-          <ExternalLink className="w-3 h-3 text-on-surface-variant/30 group-hover:text-primary transition-colors shrink-0 mt-0.5" />
-        </a>
-      ))}
+        )
+      )}
     </div>
   );
 }

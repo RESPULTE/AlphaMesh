@@ -126,6 +126,9 @@ def test_analyse_news_node_enqueues_deferred_relationship_extraction_with_final_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from core.agents import news_analysis_agent as news_module
+    monkeypatch.setattr(
+        news_module.settings, "ENABLE_ANALYSIS_TOKEN_STREAMING", False
+    )
 
     queue = _FakeGraphQueueManager(enqueued=[])
     monkeypatch.setattr(
@@ -199,3 +202,152 @@ def test_analyse_news_node_enqueues_deferred_relationship_extraction_with_final_
     )
     assert captured_task_kwargs["allowed_entity_types"]
     assert captured_task_kwargs["allowed_relationship_types"]
+
+
+def test_analyse_news_node_uses_chunk_level_citation_context_and_remaps_sparse_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import news_analysis_agent as news_module
+    monkeypatch.setattr(
+        news_module.settings, "ENABLE_ANALYSIS_TOKEN_STREAMING", False
+    )
+
+    queue = _FakeGraphQueueManager(enqueued=[])
+    monkeypatch.setattr(
+        news_module.service_manager, "get_graph_queue_manager", lambda: queue
+    )
+
+    structured_llm = _FakeLLM(
+        payload={
+            "is_context_sufficient": True,
+            "source_chunk_ids": [1, 2, 3, 4],
+        }
+    )
+    narrative_llm = _FakeLLM(
+        narrative_text=(
+            "Revenue momentum improved versus prior guidance [2]. "
+            "Execution risk remains due to supply constraints [4]."
+        )
+    )
+    monkeypatch.setattr(
+        news_module.service_manager,
+        "get_agent",
+        lambda temperature=0.0: (
+            structured_llm if float(temperature) == 0.0 else narrative_llm
+        ),
+    )
+
+    agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
+
+    state = NewsAgentState(
+        goal="Assess current setup",
+        conversation_id="conv-analysis-remap",
+        final_chunks=[
+            _make_chunk(
+                "chunk-1",
+                "first chunk text",
+                title="Same Article",
+                url="https://example.com/same",
+                relevance_score=0.9,
+            ),
+            _make_chunk(
+                "chunk-2",
+                "second chunk text",
+                title="Same Article",
+                url="https://example.com/same",
+                relevance_score=0.8,
+            ),
+            _make_chunk(
+                "chunk-3",
+                "third chunk text",
+                title="Same Article",
+                url="https://example.com/same",
+                relevance_score=0.7,
+            ),
+            _make_chunk(
+                "chunk-4",
+                "fourth chunk text",
+                title="Same Article",
+                url="https://example.com/same",
+                relevance_score=0.6,
+            ),
+        ],
+    )
+
+    result = asyncio.run(agent._analyse_news_node(state))
+
+    assert narrative_llm.last_messages is not None
+    narrative_prompt = narrative_llm.last_messages[1].content
+    assert "Chunk-level citation evidence" in narrative_prompt
+    assert "[1] title=Same Article" in narrative_prompt
+    assert "[2] title=Same Article" in narrative_prompt
+    assert "[4] title=Same Article" in narrative_prompt
+
+    assert "[1]" in result["analysis"]
+    assert "[2]" in result["analysis"]
+    assert "[4]" not in result["analysis"]
+    assert [src.source_id for src in result["sources"]] == [1, 2]
+    assert result["sources"][0].title == "Same Article"
+    assert result["sources"][1].title == "Same Article"
+
+
+def test_analyse_news_node_without_citations_keeps_chunk_level_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import news_analysis_agent as news_module
+    monkeypatch.setattr(
+        news_module.settings, "ENABLE_ANALYSIS_TOKEN_STREAMING", False
+    )
+
+    queue = _FakeGraphQueueManager(enqueued=[])
+    monkeypatch.setattr(
+        news_module.service_manager, "get_graph_queue_manager", lambda: queue
+    )
+
+    structured_llm = _FakeLLM(
+        payload={
+            "is_context_sufficient": True,
+            "source_chunk_ids": [1, 2],
+        }
+    )
+    narrative_text = "Catalysts are improving while key execution risks remain."
+    narrative_llm = _FakeLLM(narrative_text=narrative_text)
+    monkeypatch.setattr(
+        news_module.service_manager,
+        "get_agent",
+        lambda temperature=0.0: (
+            structured_llm if float(temperature) == 0.0 else narrative_llm
+        ),
+    )
+
+    agent = NewsAnalysisAgent.__new__(NewsAnalysisAgent)
+    agent._working_memory = news_module.NewsWorkingMemoryManager()
+
+    state = NewsAgentState(
+        goal="Assess current setup",
+        conversation_id="conv-analysis-fallback",
+        final_chunks=[
+            _make_chunk(
+                "chunk-1",
+                "first chunk text",
+                title="Article One",
+                url="https://example.com/one",
+                relevance_score=0.9,
+            ),
+            _make_chunk(
+                "chunk-2",
+                "second chunk text",
+                title="Article Two",
+                url="https://example.com/two",
+                relevance_score=0.8,
+            ),
+        ],
+    )
+
+    result = asyncio.run(agent._analyse_news_node(state))
+
+    assert result["analysis"] == narrative_text
+    assert [src.source_id for src in result["sources"]] == [1, 2]
+    assert result["sources"][0].title == "Article One"
+    assert result["sources"][1].title == "Article Two"
