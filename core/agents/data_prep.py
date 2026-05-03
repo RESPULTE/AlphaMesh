@@ -36,11 +36,15 @@ logger = get_logger(__name__)
 
 @dataclass
 class _DataPrepConfig:
+    # Fetch window used for retrieval and tool computation.
     start_dt: datetime
     end_dt: datetime
+    # Requested display window (trimmed later before analyst/output).
+    requested_start_dt: datetime
+    requested_end_dt: datetime
     form_type: str  # "10-K" | "10-Q"
     price_interval: str  # "daily" | "monthly"
-    periods: List  # List[int] for 10-K, List[Tuple[int,int]] for 10-Q
+    periods: List  # buffered periods used for fetch/computation
 
 
 def _price_interval_from_span(start: datetime, end: datetime) -> str:
@@ -86,37 +90,77 @@ def _resolve_date_range(state: _AgentState) -> _DataPrepConfig:
     Encapsulates every branch of the yearly-vs-quarterly logic so
     _data_prep_node never has to reason about it.
     """
+    def _as_datetime(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            return value
+        if value is None:
+            return datetime.now()
+        return datetime.combine(value, datetime.min.time())
+
     granularity: str = getattr(state, "granularity", "yearly") or "yearly"
-    end_dt = state.end_date or datetime.now()
-    price_interval = _price_interval_from_span(
-        state.start_date or end_dt, end_dt
-    )
+    end_dt = _as_datetime(state.end_date)
 
     if granularity == "yearly":
         default_start = datetime(end_dt.year - 4, 1, 1)
-        start_dt = state.start_date or default_start
-        # Ensure at least a 4-year window
-        if (end_dt.year - start_dt.year) < 4:
-            start_dt = datetime(end_dt.year - 4, 1, 1)
-
+        requested_start_dt = _as_datetime(state.start_date) if state.start_date else default_start
+        requested_end_dt = end_dt
         today = datetime.now()
         last_complete_year = today.year - 1 if today.month < 12 else today.year
-        periods = list(range(start_dt.year, min(end_dt.year, last_complete_year) + 1))
+
+        requested_periods = list(
+            range(
+                requested_start_dt.year,
+                min(requested_end_dt.year, last_complete_year) + 1,
+            )
+        )
+        multi_period = len(requested_periods) > 1
+
+        fetch_start_year = (
+            requested_start_dt.year - 2
+            if multi_period
+            else requested_start_dt.year
+        )
+        start_dt = datetime(fetch_start_year, 1, 1)
+        periods = list(
+            range(fetch_start_year, min(requested_end_dt.year, last_complete_year) + 1)
+        )
+        price_interval = _price_interval_from_span(start_dt, end_dt)
 
         return _DataPrepConfig(
             start_dt=start_dt,
             end_dt=end_dt,
+            requested_start_dt=requested_start_dt,
+            requested_end_dt=requested_end_dt,
             form_type="10-K",
             price_interval=price_interval,
             periods=periods,
         )
     else:
-        start_dt = state.start_date or (end_dt - timedelta(days=2 * 365))
+        requested_start_dt = (
+            _as_datetime(state.start_date)
+            if state.start_date
+            else (end_dt - timedelta(days=2 * 365))
+        )
+        requested_end_dt = end_dt
+        requested_periods = _quarterly_periods(requested_start_dt, requested_end_dt)
+        multi_period = len(requested_periods) > 1
+
+        if multi_period:
+            fetch_start_ts = (
+                pd.Timestamp(requested_start_dt).to_period("Q") - 2
+            ).start_time
+            start_dt = fetch_start_ts.to_pydatetime()
+        else:
+            start_dt = requested_start_dt
+
         periods = _quarterly_periods(start_dt, end_dt)
+        price_interval = _price_interval_from_span(start_dt, end_dt)
 
         return _DataPrepConfig(
             start_dt=start_dt,
             end_dt=end_dt,
+            requested_start_dt=requested_start_dt,
+            requested_end_dt=requested_end_dt,
             form_type="10-Q",
             price_interval=price_interval,
             periods=periods,

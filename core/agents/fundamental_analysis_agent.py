@@ -262,6 +262,74 @@ class FundamentalAnalysisAgent(AbstractAgent):
         workflow.add_edge("analyst", END)
         return workflow.compile()
 
+    @staticmethod
+    def _trim_df_to_requested_window(
+        state: _AgentState,
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Trim computation-range data back to the user-requested display window.
+
+        The data prep stage can fetch extra history for tool robustness; this
+        helper enforces user-facing scope before completion-review/analyst output.
+        """
+        if df.empty:
+            return df
+
+        try:
+            cfg = _resolve_date_range(state)
+            start_ts = pd.Timestamp(cfg.requested_start_dt).tz_localize(None)
+            end_ts = pd.Timestamp(cfg.requested_end_dt).tz_localize(None)
+        except Exception:
+            return df
+
+        try:
+            col_dates = pd.to_datetime(df.columns, errors="coerce")
+            keep_mask = (col_dates >= start_ts) & (col_dates <= end_ts)
+            trimmed = df.loc[:, keep_mask]
+            return trimmed if not trimmed.empty else df
+        except Exception:
+            return df
+
+    @staticmethod
+    def _drop_empty_display_periods(
+        *,
+        financial_df: pd.DataFrame,
+        visualization_plan: VisualizationPlan,
+        raw_display_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Hide periods that are empty across selected chart/raw rows.
+        """
+        if financial_df.empty or not len(financial_df.columns):
+            return financial_df, raw_display_df
+
+        selected_rows: List[str] = []
+        for chart in visualization_plan.charts or []:
+            for row_label in chart.row_labels or []:
+                if row_label in financial_df.index and row_label not in selected_rows:
+                    selected_rows.append(row_label)
+        for row_label in visualization_plan.raw_row_labels or []:
+            if row_label in financial_df.index and row_label not in selected_rows:
+                selected_rows.append(row_label)
+
+        if not selected_rows:
+            return financial_df, raw_display_df
+
+        selected = financial_df.loc[selected_rows].apply(pd.to_numeric, errors="coerce")
+        keep_mask = selected.notna().any(axis=0)
+        keep_cols = [col for col, keep in keep_mask.items() if bool(keep)]
+        if not keep_cols:
+            return financial_df, raw_display_df
+
+        trimmed_financial = financial_df.loc[:, keep_cols]
+        trimmed_raw = (
+            raw_display_df.reindex(columns=keep_cols)
+            if raw_display_df is not None
+            else pd.DataFrame(columns=keep_cols)
+        )
+        return trimmed_financial, trimmed_raw
+
     # ── Routing ───────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -798,6 +866,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
         df = (
             state.financial_data if state.financial_data is not None else pd.DataFrame()
         )
+        df = self._trim_df_to_requested_window(state, df)
         max_rows_per_chart = max(1, int(settings.FUNDAMENTAL_VIZ_MAX_ROWS_PER_CHART))
         max_raw_rows = max(1, int(settings.FUNDAMENTAL_RAW_DISPLAY_MAX_ROWS))
 
@@ -866,6 +935,11 @@ class FundamentalAnalysisAgent(AbstractAgent):
             supported_chart_types=_SUPPORTED_CHART_TYPES,
             snapshot_unsupported_types=_SNAPSHOT_UNSUPPORTED_TYPES,
         )
+        df, raw_display_df = self._drop_empty_display_periods(
+            financial_df=df,
+            visualization_plan=visualization_plan,
+            raw_display_df=raw_display_df,
+        )
 
         should_replan = (
             not decision.task_completed
@@ -878,6 +952,7 @@ class FundamentalAnalysisAgent(AbstractAgent):
             )
 
         return {
+            "financial_data": df,
             "task_completed": decision.task_completed,
             "task_completion_reason": decision.task_completion_reason,
             "visualization_plan": visualization_plan,

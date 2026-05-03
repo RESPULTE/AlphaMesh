@@ -424,9 +424,11 @@ class ValuationMultiplesSnapshotTool(FinancialTool):
                 if latest_trend is not None and pd.notna(latest_trend)
                 else "n/a"
             )
+            coverage_text = f"{len(row_values)}/{len(sorted_cols)} periods"
             if latest_col is not None and latest_val is not None:
                 summary_lines.append(
-                    f"{row_label} (latest {str(latest_col)[:7]}): {latest_val:.2f}x | trend {trend_text}"
+                    f"{row_label} (latest {str(latest_col)[:7]}): {latest_val:.2f}x "
+                    f"| trend {trend_text} | coverage {coverage_text}"
                 )
 
         logger.info(

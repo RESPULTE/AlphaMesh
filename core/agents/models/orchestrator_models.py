@@ -81,8 +81,6 @@ class OrchestratorPlan(BaseAgentInput):
         ),
     )
 
-    # â”€â”€ Orchestrator-only fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
     ticker: Optional[str] = Field(
         default=None,
         description="Derived from tickers[0]; do not populate directly.",

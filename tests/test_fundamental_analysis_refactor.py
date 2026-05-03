@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pandas as pd
@@ -76,6 +76,59 @@ def _valuation_dependency_df() -> pd.DataFrame:
         ],
         columns=["2024-12-31", "2025-12-31"],
     )
+
+
+def test_resolve_date_range_yearly_buffers_two_years_for_multi_period() -> None:
+    from core.agents.data_prep import _resolve_date_range
+
+    state = _AgentState(
+        ticker="AAPL",
+        granularity="yearly",
+        start_date=date(2021, 1, 1),
+        end_date=date(2024, 12, 31),
+    )
+
+    cfg = _resolve_date_range(state)
+
+    assert cfg.requested_start_dt.year == 2021
+    assert cfg.requested_end_dt.year == 2024
+    assert cfg.start_dt.year == 2019
+    assert cfg.periods[0] == 2019
+    assert cfg.periods[-1] == 2024
+
+
+def test_resolve_date_range_quarterly_buffers_two_quarters_for_multi_period() -> None:
+    from core.agents.data_prep import _resolve_date_range
+
+    state = _AgentState(
+        ticker="AAPL",
+        granularity="quarterly",
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 12, 31),
+    )
+
+    cfg = _resolve_date_range(state)
+
+    assert pd.Timestamp(cfg.requested_start_dt).date() == date(2024, 1, 1)
+    assert pd.Timestamp(cfg.start_dt).date() == date(2023, 7, 1)
+    assert cfg.periods[0] == (2023, 3)
+    assert cfg.periods[-1] == (2024, 4)
+
+
+def test_resolve_date_range_yearly_single_period_has_no_buffer() -> None:
+    from core.agents.data_prep import _resolve_date_range
+
+    state = _AgentState(
+        ticker="AAPL",
+        granularity="yearly",
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 12, 31),
+    )
+
+    cfg = _resolve_date_range(state)
+
+    assert cfg.start_dt.year == 2024
+    assert cfg.periods == [2024]
 
 
 def test_completion_review_requests_single_replan_and_dedupes_chart_rows(
@@ -485,6 +538,110 @@ def test_data_prep_cache_miss_when_cached_data_is_price_only(
 
     assert fetch_calls["count"] == 1
     assert result["financial_data"].equals(fetched_df)
+
+
+def test_data_prep_keeps_buffered_periods_for_tool_computation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    cfg = SimpleNamespace(
+        start_dt=datetime(2020, 1, 1),
+        end_dt=datetime(2024, 12, 31),
+        requested_start_dt=datetime(2022, 1, 1),
+        requested_end_dt=datetime(2024, 12, 31),
+        periods=[2020, 2021, 2022, 2023, 2024],
+    )
+    monkeypatch.setattr(module, "_resolve_date_range", lambda _state: cfg)
+
+    fetched_df = pd.DataFrame(
+        [[70.0, 80.0, 90.0, 100.0, 110.0]],
+        index=["Revenues"],
+        columns=[
+            "2020-12-31",
+            "2021-12-31",
+            "2022-12-31",
+            "2023-12-31",
+            "2024-12-31",
+        ],
+    )
+
+    async def _fake_fetch(*_args, **_kwargs):
+        return fetched_df.copy(deep=True), pd.DataFrame()
+
+    monkeypatch.setattr(module, "_fetch_raw_data", _fake_fetch)
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    agent._working_memory = module.FundamentalWorkingMemoryManager()
+    agent.db = object()
+
+    state = _AgentState(
+        ticker="AAPL",
+        granularity="yearly",
+        conversation_id="conv-buffer-kept",
+    )
+    result = asyncio.run(agent._data_prep_node(state))
+
+    assert list(result["financial_data"].columns) == list(fetched_df.columns)
+
+
+def test_completion_review_trims_to_requested_window_and_hides_empty_periods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.agents import fundamental_analysis_agent as module
+
+    llm = _FakeLLM(
+        payload={
+            "task_completed": True,
+            "task_completion_reason": "Enough data for valuation trend.",
+            "replan_guidance": "",
+            "reviewer_notes": "",
+            "charts": [
+                {
+                    "chart_type": "bar",
+                    "data_mode": "timeseries",
+                    "title": "Valuation Trend",
+                    "row_labels": ["price_to_sales"],
+                    "group_rows": True,
+                    "rationale": "Only show valid valuation periods.",
+                }
+            ],
+            "raw_row_labels": ["price_to_sales"],
+        }
+    )
+    monkeypatch.setattr(module.service_manager, "get_agent", lambda temperature=0: llm)
+
+    df = pd.DataFrame(
+        data=[
+            [50.0, 55.0, 60.0, 65.0, 70.0],
+            [1.5, 1.7, float("nan"), 5.4, 6.2],
+        ],
+        index=["Revenues", "price_to_sales"],
+        columns=[
+            "2020-12-31",
+            "2021-12-31",
+            "2022-12-31",
+            "2023-12-31",
+            "2024-12-31",
+        ],
+    )
+
+    state = _AgentState(
+        query="Show valuation trend",
+        ticker="AAPL",
+        granularity="yearly",
+        start_date=date(2022, 1, 1),
+        end_date=date(2024, 12, 31),
+        financial_data=df,
+        tool_plan=IterativeToolPlan(batches=[], data_summary=""),
+    )
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    result = asyncio.run(agent._completion_review_node(state))
+
+    expected_cols = ["2023-12-31", "2024-12-31"]
+    assert list(result["financial_data"].columns) == expected_cols
+    assert list(result["raw_display_data"].columns) == expected_cols
 
 
 def test_tool_executor_populates_structured_result_detail_fields() -> None:

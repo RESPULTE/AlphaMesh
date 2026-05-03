@@ -67,6 +67,7 @@ def test_valuation_multiples_snapshot_computes_rows_and_trends() -> None:
     ps_trend = result.added_rows["price_to_sales_pct_change"]
     assert set(ps_trend.keys()) == {"2023-12-31", "2024-12-31"}
     assert ps_trend["2024-12-31"] > 0
+    assert "coverage 3/3 periods" in result.summary
 
 
 def test_valuation_multiples_snapshot_fails_fast_when_required_metrics_missing() -> None:
@@ -108,6 +109,40 @@ def test_valuation_multiples_snapshot_fails_when_all_denominators_are_non_positi
     assert result.success is False
     assert result.error is not None
     assert "No valuation multiples could be computed" in result.error
+
+
+def test_valuation_multiples_snapshot_summary_reports_partial_coverage() -> None:
+    tool = TOOL_REGISTRY["valuation_multiples_snapshot"]
+    df = pd.DataFrame(
+        data=[
+            [300.0, 320.0, 340.0, 360.0],  # market_cap
+            [360.0, 380.0, 400.0, 420.0],  # enterprise_value
+            [100.0, 0.0, -1.0, 110.0],  # revenues
+            [20.0, 21.0, 22.0, 23.0],  # EBITDA
+            [10.0, 10.5, 11.0, 11.5],  # net income
+            [12.0, 12.5, 13.0, 13.5],  # free cash flow
+        ],
+        index=[
+            "market_cap",
+            "enterprise_value",
+            "Revenues",
+            "EBITDA",
+            "NetIncomeLoss",
+            "FreeCashFlow",
+        ],
+        columns=["2022-12-31", "2023-12-31", "2024-12-31", "2025-12-31"],
+    )
+
+    result = tool.execute(df=df, params=tool.parameters_schema(**_default_params()))
+
+    assert result.success is True
+    assert result.added_rows is not None
+    assert set(result.added_rows["price_to_sales"].keys()) == {
+        "2022-12-31",
+        "2025-12-31",
+    }
+    assert "price_to_sales" in result.summary
+    assert "coverage 2/4 periods" in result.summary
 
 
 def test_custom_formula_normalizes_metric_and_dependencies() -> None:
