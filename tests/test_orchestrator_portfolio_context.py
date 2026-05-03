@@ -4,7 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from core.agents.models.orchestrator_models import (
     OrchestratorPlan,
@@ -164,19 +164,19 @@ def test_plan_node_receives_portfolio_context_message(
 
     assert "plan" in payload
     assert any(
-        isinstance(message, SystemMessage)
+        isinstance(message, HumanMessage)
         and "PORTFOLIO HOLDINGS" in str(message.content)
         and "AAPL" in str(message.content)
         for message in captured["messages"]
     )
     assert any(
-        isinstance(message, SystemMessage)
+        isinstance(message, HumanMessage)
         and "Agent-provided memory contexts from prior turn summaries" in str(message.content)
         and "news_agent" in str(message.content)
         for message in captured["messages"]
     )
     assert any(
-        isinstance(message, SystemMessage)
+        isinstance(message, HumanMessage)
         and "Retrieved private conversation memory chunks" in str(message.content)
         and "AAPL weighting" in str(message.content)
         for message in captured["messages"]
@@ -217,11 +217,12 @@ def test_synthesize_node_uses_state_portfolio_block(monkeypatch) -> None:
     system_messages = [
         m for m in captured["messages"] if isinstance(m, SystemMessage)
     ]
+    human_messages = [m for m in captured["messages"] if isinstance(m, HumanMessage)]
     assert any("TSLA" in str(m.content) for m in system_messages)
     assert any(
         "Retrieved private conversation memory chunks" in str(m.content)
         and "prefers concise summaries" in str(m.content)
-        for m in system_messages
+        for m in human_messages
     )
 
 
@@ -477,7 +478,7 @@ def test_plan_node_receives_targeted_user_interest_context_message(
     _ = asyncio.run(agent._plan_node(state))
 
     assert any(
-        isinstance(message, SystemMessage)
+        isinstance(message, HumanMessage)
         and "TARGETED USER-INTEREST GRAPH CONTEXT" in str(message.content)
         and "investment:Technology" in str(message.content)
         for message in captured["messages"]
@@ -513,9 +514,52 @@ def test_plan_node_receives_canonical_sector_names_context_message(
     _ = asyncio.run(agent._plan_node(state))
 
     assert any(
-        isinstance(message, SystemMessage)
+        isinstance(message, HumanMessage)
         and "CANONICAL SECTOR NAMES" in str(message.content)
         and "Technology" in str(message.content)
         and "Healthcare" in str(message.content)
         for message in captured["messages"]
+    )
+
+
+def test_plan_node_injects_raw_turn_history_messages(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeStructuredLLM:
+        async def ainvoke(self, messages):
+            captured["messages"] = messages
+            return OrchestratorPlan(query="route this")
+
+    class FakeLLM:
+        def with_structured_output(self, _schema):
+            return FakeStructuredLLM()
+
+    monkeypatch.setattr(service_manager, "get_agent", lambda temperature=0.0: FakeLLM())
+
+    agent = OrchestratorAgent.__new__(OrchestratorAgent)
+    agent._agents = {}
+
+    state = OrchestratorState(
+        messages=[HumanMessage(content="What should I do now?")],
+        user_context_block="USER CONTEXT: baseline",
+        portfolio_block="[]",
+        history_turns=[
+            {
+                "user_message": "How is AAPL doing?",
+                "assistant_synthesis": "AAPL is stable with mixed catalysts.",
+            }
+        ],
+    )
+
+    _ = asyncio.run(agent._plan_node(state))
+
+    message_types = [type(m) for m in captured["messages"]]
+    assert message_types.count(SystemMessage) == 1
+    assert any(
+        isinstance(m, HumanMessage) and m.content == "How is AAPL doing?"
+        for m in captured["messages"]
+    )
+    assert any(
+        isinstance(m, AIMessage) and m.content == "AAPL is stable with mixed catalysts."
+        for m in captured["messages"]
     )

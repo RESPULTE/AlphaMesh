@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from core.agents.financial_tools import ToolResult
 from core.agents.models.fundamental_agent_models import (
@@ -72,19 +72,19 @@ def extract_first_sentence(value: str, *, max_chars: int = 220) -> str:
     return text[:max_chars]
 
 
-def build_turn_window_block(turns: List[dict], window: int) -> str:
+def build_turn_window_block(turns: List[dict], window: int) -> List[BaseMessage]:
     if not turns:
-        return "(no prior turns)"
-    lines: List[str] = []
-    for idx, turn in enumerate(turns[-window:], start=1):
-        ts = normalise_turn_timestamp(turn) or "unknown_time"
-        user_message = trim_text(turn.get("user_message") or "")
-        synthesis = trim_text(turn.get("assistant_synthesis") or "")
-        lines.append(
-            f"{idx}. [{ts}] User: {user_message or '(empty)'}\n"
-            f"   Assistant: {synthesis or '(empty)'}"
-        )
-    return "\n".join(lines)
+        return []
+
+    messages: List[BaseMessage] = []
+    for turn in turns[-window:]:
+        user_message = str(turn.get("user_message") or "").strip()
+        synthesis = str(turn.get("assistant_synthesis") or "").strip()
+        if user_message:
+            messages.append(HumanMessage(content=user_message))
+        if synthesis:
+            messages.append(AIMessage(content=synthesis))
+    return messages
 
 
 def render_memory_summary_fallback(summary: dict, *, max_chars: int = 350) -> str:

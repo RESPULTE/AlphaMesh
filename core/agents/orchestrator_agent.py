@@ -14,7 +14,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from core.agents.base_agent import AbstractAgent
@@ -294,7 +294,7 @@ class OrchestratorAgent:
             f"{state.portfolio_block}"
         )
         latest_human = _extract_last_human_message(state.messages)
-        planner_turn_block = build_turn_window_block(
+        planner_turn_messages = build_turn_window_block(
             state.history_turns, _PLANNER_TURN_WINDOW
         )
         planner_memory_block = build_planner_memory_block(
@@ -308,43 +308,50 @@ class OrchestratorAgent:
             structured_llm = service_manager.get_agent(
                 temperature=0.0
             ).with_structured_output(OrchestratorPlan)
-            planner_messages: List[BaseMessage] = [
-                SystemMessage(content=system_content),
-                SystemMessage(content=context_content),
-                SystemMessage(
-                    content=(
-                        "Recent conversation turns (most recent window):\n"
-                        f"{planner_turn_block}"
+            planner_messages: List[BaseMessage] = [SystemMessage(content=system_content)]
+            planner_messages.append(HumanMessage(content=context_content))
+            if planner_turn_messages:
+                planner_messages.append(
+                    HumanMessage(
+                        content=(
+                            "Recent conversation turns are provided below as raw user/assistant "
+                            "messages (oldest to newest). Use them for continuity and reference "
+                            "resolution only."
+                        )
                     )
-                ),
-                SystemMessage(
-                    content=(
-                        "Agent-provided memory contexts from prior turn summaries "
-                        "(use for continuity during routing and per-agent goal generation):\n"
-                        f"{planner_memory_block}"
-                    )
-                ),
-                SystemMessage(
-                    content=(
-                        "Retrieved private conversation memory chunks "
-                        "(use when relevant for continuity; do not treat as external facts):\n"
-                        f"{planner_conversation_memory_block}"
-                    )
-                ),
-                HumanMessage(
-                    content=(
-                        "TARGETED USER-INTEREST GRAPH CONTEXT:\n"
-                        f"{user_interest_context_block}"
-                    )
-                ),
-                SystemMessage(
-                    content=(
-                        "CANONICAL SECTOR NAMES (use exact labels for Sector entities):\n"
-                        f"{canonical_sector_names_block}"
-                    )
-                ),
-                HumanMessage(content=latest_human),
-            ]
+                )
+                planner_messages.extend(planner_turn_messages)
+            planner_messages.extend(
+                [
+                    HumanMessage(
+                        content=(
+                            "Agent-provided memory contexts from prior turn summaries "
+                            "(use for continuity during routing and per-agent goal generation):\n"
+                            f"{planner_memory_block}"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            "Retrieved private conversation memory chunks "
+                            "(use when relevant for continuity; do not treat as external facts):\n"
+                            f"{planner_conversation_memory_block}"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            "TARGETED USER-INTEREST GRAPH CONTEXT:\n"
+                            f"{user_interest_context_block}"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            "CANONICAL SECTOR NAMES (use exact labels for Sector entities):\n"
+                            f"{canonical_sector_names_block}"
+                        )
+                    ),
+                    HumanMessage(content=latest_human),
+                ]
+            )
             plan: OrchestratorPlan = await structured_llm.ainvoke(planner_messages)
             publish_progress(
                 "orchestrator",
@@ -441,7 +448,7 @@ class OrchestratorAgent:
         context_parts: List[str],
     ) -> str:
         portfolio_block = state.portfolio_block or "[]"
-        synthesis_turn_block = build_turn_window_block(
+        synthesis_turn_messages = build_turn_window_block(
             state.history_turns, _SYNTHESIS_TURN_WINDOW
         )
         latest_human = _extract_last_human_message(state.messages)
@@ -461,28 +468,34 @@ class OrchestratorAgent:
                 portfolio=portfolio_block,
                 context_parts=context_parts,
             )
-            messages: List[BaseMessage] = [
-                SystemMessage(content=system_prompt),
-                SystemMessage(
-                    content=(
-                        "Recent conversation turns (most recent window):\n"
-                        f"{synthesis_turn_block}"
+            messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
+            if synthesis_turn_messages:
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            "Recent conversation turns are provided below as raw user/assistant "
+                            "messages (oldest to newest). Use them only when relevant for continuity."
+                        )
                     )
-                ),
-                SystemMessage(
-                    content=(
-                        "Retrieved private conversation memory chunks "
-                        "(use when relevant for continuity; do not treat as external facts):\n"
-                        f"{state.conversation_memory_block or '(none)'}"
-                    )
-                ),
-                HumanMessage(
-                    content=(
-                        f"Latest user question:\n{latest_human}\n\n"
-                        "Produce the final analysis response."
-                    )
-                ),
-            ]
+                )
+                messages.extend(synthesis_turn_messages)
+            messages.extend(
+                [
+                    HumanMessage(
+                        content=(
+                            "Retrieved private conversation memory chunks "
+                            "(use when relevant for continuity; do not treat as external facts):\n"
+                            f"{state.conversation_memory_block or '(none)'}"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"Latest user question:\n{latest_human}\n\n"
+                            "Produce the final analysis response."
+                        )
+                    ),
+                ]
+            )
             streamer = AnalysisChunkStreamer(
                 source="orchestrator",
                 agent="orchestrator",

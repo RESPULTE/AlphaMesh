@@ -2,10 +2,47 @@ from __future__ import annotations
 
 import asyncio
 
+from langchain_core.messages import AIMessage, HumanMessage
+
 from core.agents.models.news_agent_models import NewsAgentOutput
 from core.agents.models.orchestrator_models import OrchestratorPlan, OrchestratorState
 from core.agents.orchestrator_agent import OrchestratorAgent
+from core.agents.utils import build_turn_window_block
 from core.services import service_manager
+
+
+def test_build_turn_window_block_returns_raw_messages_in_order() -> None:
+    turns = [
+        {"user_message": "u1", "assistant_synthesis": "a1"},
+        {"user_message": "u2", "assistant_synthesis": "a2"},
+    ]
+
+    messages = build_turn_window_block(turns, 2)
+
+    assert [type(m) for m in messages] == [
+        HumanMessage,
+        AIMessage,
+        HumanMessage,
+        AIMessage,
+    ]
+    assert [m.content for m in messages] == ["u1", "a1", "u2", "a2"]
+
+
+def test_build_turn_window_block_skips_empty_messages() -> None:
+    turns = [
+        {"user_message": "   ", "assistant_synthesis": ""},
+        {"user_message": "u2", "assistant_synthesis": None},
+    ]
+
+    messages = build_turn_window_block(turns, 4)
+
+    assert len(messages) == 1
+    assert isinstance(messages[0], HumanMessage)
+    assert messages[0].content == "u2"
+
+
+def test_build_turn_window_block_returns_empty_for_no_turns() -> None:
+    assert build_turn_window_block([], 3) == []
 
 
 def test_runtime_agent_memory_context_uses_agent_adapter_window() -> None:
