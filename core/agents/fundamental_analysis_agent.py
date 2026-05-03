@@ -671,7 +671,10 @@ class FundamentalAnalysisAgent(AbstractAgent):
                 all_cols = df.columns.union(new_rows.columns)
                 df = df.reindex(columns=all_cols)
                 new_rows = new_rows.reindex(columns=all_cols)
-                new_rows = new_rows[~new_rows.index.isin(df.index)]
+                # Upsert semantics: recomputed rows overwrite prior values and
+                # missing rows are appended so downstream dependencies always
+                # see the latest derived labels.
+                df = df.drop(index=new_rows.index, errors="ignore")
                 if not new_rows.empty:
                     df = pd.concat([df, new_rows])
                 newly_added_labels.extend(result.added_rows.keys())
@@ -740,7 +743,9 @@ class FundamentalAnalysisAgent(AbstractAgent):
 
         return {
             "financial_data": df,
-            "tool_results": list(state.tool_results) + batch_results,
+            # _AgentState.tool_results uses Annotated[..., operator.add], so this
+            # node must return only the batch delta (not cumulative history).
+            "tool_results": batch_results,
             "iteration_count": state.iteration_count + 1,
             "current_batch_index": batch_index + 1,
             "active_task_id": f"fund-task-{batch_index + 1}",

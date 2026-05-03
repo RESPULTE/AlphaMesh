@@ -756,6 +756,25 @@ class CustomFormulaTool(FinancialTool):
 
     def execute(self, df: pd.DataFrame, params: CustomFormulaParams) -> ToolResult:  # type: ignore[override]
         try:
+            metric_name = str(params.metric_name or "").strip()
+            dependencies = [
+                str(dep).strip()
+                for dep in (params.dependencies or [])
+                if str(dep).strip()
+            ]
+            if not metric_name:
+                return ToolResult(
+                    tool_name=self.name,
+                    success=False,
+                    error="metric_name cannot be empty.",
+                )
+            if not dependencies:
+                return ToolResult(
+                    tool_name=self.name,
+                    success=False,
+                    error="dependencies must include at least one metric label.",
+                )
+
             if not self._SAFE_PATTERN.match(params.expression):
                 return ToolResult(
                     tool_name=self.name,
@@ -766,7 +785,7 @@ class CustomFormulaTool(FinancialTool):
                     ),
                 )
 
-            missing = [d for d in params.dependencies if d not in df.index]
+            missing = [d for d in dependencies if d not in df.index]
             if missing:
                 return ToolResult(
                     tool_name=self.name,
@@ -775,13 +794,23 @@ class CustomFormulaTool(FinancialTool):
                 )
 
             # Transpose so rows become columns for pandas.eval()
-            df_t = df.loc[params.dependencies].T.copy()
-            df_t.eval(f"{params.metric_name} = {params.expression}", inplace=True)
-            result_series = df_t[params.metric_name]
+            df_t = df.loc[dependencies].T.copy()
+            df_t.eval(f"{metric_name} = {params.expression}", inplace=True)
+            result_series = df_t[metric_name]
+            non_null_result = result_series.dropna()
 
-            added_rows = {params.metric_name: result_series.dropna().to_dict()}
+            if non_null_result.empty:
+                logger.warning(
+                    "[CustomFormulaTool] Computed '%s' but produced no non-null values. "
+                    "dependencies=%s expression=%s",
+                    metric_name,
+                    dependencies,
+                    params.expression,
+                )
+
+            added_rows = {metric_name: non_null_result.to_dict()}
             summary = (
-                f"Computed '{params.metric_name}' = {params.expression}. "
+                f"Computed '{metric_name}' = {params.expression}. "
                 f"{params.description}"
             ).strip()
 

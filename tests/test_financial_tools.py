@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from core.agents.financial_tools import TOOL_REGISTRY
 
@@ -107,3 +108,54 @@ def test_valuation_multiples_snapshot_fails_when_all_denominators_are_non_positi
     assert result.success is False
     assert result.error is not None
     assert "No valuation multiples could be computed" in result.error
+
+
+def test_custom_formula_normalizes_metric_and_dependencies() -> None:
+    tool = TOOL_REGISTRY["custom_formula"]
+    df = pd.DataFrame(
+        data=[[10.0, 12.0], [2.0, 3.0]],
+        index=["Revenue", "Cost"],
+        columns=["2024-12-31", "2025-12-31"],
+    )
+
+    result = tool.execute(
+        df=df,
+        params=tool.parameters_schema(
+            metric_name=" GrossProfit ",
+            expression="Revenue - Cost",
+            dependencies=[" Revenue ", "Cost  "],
+            description="Derived gross profit.",
+        ),
+    )
+
+    assert result.success is True
+    assert result.added_rows is not None
+    assert "GrossProfit" in result.added_rows
+    assert result.added_rows["GrossProfit"]["2024-12-31"] == 8.0
+    assert result.added_rows["GrossProfit"]["2025-12-31"] == 9.0
+
+
+def test_custom_formula_logs_warning_when_result_series_is_empty(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tool = TOOL_REGISTRY["custom_formula"]
+    df = pd.DataFrame(
+        data=[[float("nan"), float("nan")]],
+        index=["AllNanInput"],
+        columns=["2024-12-31", "2025-12-31"],
+    )
+
+    with caplog.at_level("WARNING"):
+        result = tool.execute(
+            df=df,
+            params=tool.parameters_schema(
+                metric_name="EmptyDerivedRow",
+                expression="AllNanInput * 2",
+                dependencies=["AllNanInput"],
+                description="Should produce all-NaN output.",
+            ),
+        )
+
+    assert result.success is True
+    assert result.added_rows == {"EmptyDerivedRow": {}}
+    assert "produced no non-null values" in caplog.text

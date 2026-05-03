@@ -60,6 +60,24 @@ def _sample_df() -> pd.DataFrame:
     )
 
 
+def _valuation_dependency_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        data=[
+            [100.0, 110.0],  # stock_price
+            [10.0, 10.0],  # shares
+            [50.0, 60.0],  # LongTermDebt
+            [20.0, 25.0],  # CashAndMarketableSecurities
+        ],
+        index=[
+            "stock_price",
+            "Common_stock_and_capital_stock__shares_authorized_in_shares",
+            "LongTermDebt",
+            "CashAndMarketableSecurities",
+        ],
+        columns=["2024-12-31", "2025-12-31"],
+    )
+
+
 def test_completion_review_requests_single_replan_and_dedupes_chart_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -873,3 +891,223 @@ def test_analyst_node_handles_list_content_response(monkeypatch: pytest.MonkeyPa
     assert "<sentiment>" not in result["analysis"]
     assert result["sentiment"] is not None
     assert result["sentiment"].label == "BUY"
+
+
+def test_tool_executor_preserves_derived_dependency_across_batches() -> None:
+    plan = IterativeToolPlan(
+        batches=[
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="custom_formula",
+                        parameters={
+                            "metric_name": "MarketCap",
+                            "expression": (
+                                "stock_price * "
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares"
+                            ),
+                            "dependencies": [
+                                "stock_price",
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares",
+                            ],
+                            "description": "Market capitalization.",
+                        },
+                        reasoning="Derive MarketCap first.",
+                    )
+                ],
+                batch_reasoning="Batch 0 derives MarketCap.",
+            ),
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="custom_formula",
+                        parameters={
+                            "metric_name": "EnterpriseValue",
+                            "expression": (
+                                "MarketCap + LongTermDebt - CashAndMarketableSecurities"
+                            ),
+                            "dependencies": [
+                                "MarketCap",
+                                "LongTermDebt",
+                                "CashAndMarketableSecurities",
+                            ],
+                            "description": "EV from market cap, debt, and cash.",
+                        },
+                        reasoning="Use derived MarketCap from batch 0.",
+                    )
+                ],
+                batch_reasoning="Batch 1 derives EnterpriseValue from MarketCap.",
+            ),
+        ],
+        data_summary="Derive valuation inputs in sequence.",
+    )
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    base_state = _AgentState(
+        ticker="AAPL",
+        financial_data=_valuation_dependency_df(),
+        tool_plan=plan,
+        current_batch_index=0,
+        tool_results=[],
+    )
+    first = asyncio.run(agent._tool_executor_node(base_state))
+
+    second_state = _AgentState(
+        ticker="AAPL",
+        financial_data=first["financial_data"],
+        tool_plan=plan,
+        current_batch_index=first["current_batch_index"],
+        tool_results=base_state.tool_results + first["tool_results"],
+    )
+    second = asyncio.run(agent._tool_executor_node(second_state))
+
+    assert first["tool_results"][0].success is True
+    assert second["tool_results"][0].success is True
+    assert "MarketCap" in second["financial_data"].index
+    assert "EnterpriseValue" in second["financial_data"].index
+
+
+def test_tool_executor_returns_per_batch_tool_result_delta_only() -> None:
+    plan = IterativeToolPlan(
+        batches=[
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="custom_formula",
+                        parameters={
+                            "metric_name": "MarketCap",
+                            "expression": (
+                                "stock_price * "
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares"
+                            ),
+                            "dependencies": [
+                                "stock_price",
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares",
+                            ],
+                            "description": "Market capitalization.",
+                        },
+                        reasoning="First batch.",
+                    )
+                ],
+            ),
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="custom_formula",
+                        parameters={
+                            "metric_name": "EnterpriseValue",
+                            "expression": (
+                                "MarketCap + LongTermDebt - CashAndMarketableSecurities"
+                            ),
+                            "dependencies": [
+                                "MarketCap",
+                                "LongTermDebt",
+                                "CashAndMarketableSecurities",
+                            ],
+                            "description": "Enterprise value.",
+                        },
+                        reasoning="Second batch.",
+                    )
+                ],
+            ),
+        ],
+        data_summary="Two sequential calls.",
+    )
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    base_state = _AgentState(
+        ticker="AAPL",
+        financial_data=_valuation_dependency_df(),
+        tool_plan=plan,
+        current_batch_index=0,
+        tool_results=[],
+    )
+    first = asyncio.run(agent._tool_executor_node(base_state))
+
+    accumulated_after_first = base_state.tool_results + first["tool_results"]
+    assert len(first["tool_results"]) == 1
+    assert len(accumulated_after_first) == 1
+
+    second_state = _AgentState(
+        ticker="AAPL",
+        financial_data=first["financial_data"],
+        tool_plan=plan,
+        current_batch_index=first["current_batch_index"],
+        tool_results=accumulated_after_first,
+    )
+    second = asyncio.run(agent._tool_executor_node(second_state))
+    accumulated_after_second = second_state.tool_results + second["tool_results"]
+
+    assert len(second["tool_results"]) == 1
+    assert len(accumulated_after_second) == 2
+
+
+def test_tool_executor_recomputed_row_overwrites_previous_values() -> None:
+    plan = IterativeToolPlan(
+        batches=[
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="custom_formula",
+                        parameters={
+                            "metric_name": "MarketCap",
+                            "expression": (
+                                "stock_price * "
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares"
+                            ),
+                            "dependencies": [
+                                "stock_price",
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares",
+                            ],
+                            "description": "Initial market cap.",
+                        },
+                        reasoning="Compute baseline.",
+                    )
+                ],
+            ),
+            ToolCallBatch(
+                calls=[
+                    ToolCallSpec(
+                        tool_name="custom_formula",
+                        parameters={
+                            "metric_name": "MarketCap",
+                            "expression": (
+                                "stock_price * "
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares * 2"
+                            ),
+                            "dependencies": [
+                                "stock_price",
+                                "Common_stock_and_capital_stock__shares_authorized_in_shares",
+                            ],
+                            "description": "Overwrite with updated assumption.",
+                        },
+                        reasoning="Recompute MarketCap with multiplier.",
+                    )
+                ],
+            ),
+        ],
+        data_summary="Recompute same derived row across batches.",
+    )
+
+    agent = FundamentalAnalysisAgent.__new__(FundamentalAnalysisAgent)
+    first_state = _AgentState(
+        ticker="AAPL",
+        financial_data=_valuation_dependency_df(),
+        tool_plan=plan,
+        current_batch_index=0,
+    )
+    first = asyncio.run(agent._tool_executor_node(first_state))
+
+    second_state = _AgentState(
+        ticker="AAPL",
+        financial_data=first["financial_data"],
+        tool_plan=plan,
+        current_batch_index=first["current_batch_index"],
+        tool_results=first["tool_results"],
+    )
+    second = asyncio.run(agent._tool_executor_node(second_state))
+
+    result_df = second["financial_data"]
+    market_cap = result_df.loc["MarketCap"]
+    assert float(market_cap["2024-12-31"]) == 2000.0
+    assert float(market_cap["2025-12-31"]) == 2200.0
