@@ -35,6 +35,7 @@ import type {
   SourceItem,
 } from '../types/api';
 import {
+  getNormalisedFundamentalsCharts,
   normaliseChartSpec,
   toSnapshotDataset,
   toTimeseriesDataset,
@@ -84,8 +85,13 @@ function FundamentalsChart({
   visualization: FundamentalsVisualizationPayload | null | undefined;
 }) {
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const charts = visualization?.charts ?? [];
+  const charts = getNormalisedFundamentalsCharts(visualization);
   if (!charts.length || !financialData) return null;
+
+  useEffect(() => {
+    if (selectedIndex < charts.length) return;
+    setSelectedIndex(0);
+  }, [charts.length, selectedIndex]);
 
   const rawSpec = charts[selectedIndex] ?? charts[0];
   const spec = normaliseChartSpec(rawSpec);

@@ -14,7 +14,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import END, START, StateGraph
 
 from core.agents.base_agent import AbstractAgent
@@ -331,7 +331,7 @@ class OrchestratorAgent:
                         f"{planner_conversation_memory_block}"
                     )
                 ),
-                SystemMessage(
+                HumanMessage(
                     content=(
                         "TARGETED USER-INTEREST GRAPH CONTEXT:\n"
                         f"{user_interest_context_block}"

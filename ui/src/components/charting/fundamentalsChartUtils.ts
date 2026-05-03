@@ -47,6 +47,61 @@ const SNAPSHOT_UNSUPPORTED_TYPES: Set<string> = new Set([
   'stacked_area'
 ]);
 
+function dedupeRowLabels(rowLabels: string[]): string[] {
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  rowLabels.forEach((label) => {
+    if (seen.has(label)) return;
+    seen.add(label);
+    deduped.push(label);
+  });
+  return deduped;
+}
+
+function canCoalesceSplitFragments(
+  previous: FundamentalsChartSpecPayload,
+  current: FundamentalsChartSpecPayload
+): boolean {
+  if (previous.group_rows || current.group_rows) return false;
+  if (previous.row_labels.length !== 1 || current.row_labels.length !== 1) return false;
+  return (
+    previous.title === current.title &&
+    previous.chart_type === current.chart_type &&
+    previous.data_mode === current.data_mode &&
+    previous.snapshot_period === current.snapshot_period &&
+    previous.rationale === current.rationale
+  );
+}
+
+export function getNormalisedFundamentalsCharts(
+  visualization: FundamentalsVisualizationPayload | null | undefined
+): FundamentalsChartSpecPayload[] {
+  const charts = (visualization?.charts ?? []).map((chart) => normaliseChartSpec(chart));
+  if (!charts.length) return [];
+
+  const coalesced: FundamentalsChartSpecPayload[] = [];
+  charts.forEach((chart) => {
+    const normalizedRows = dedupeRowLabels(chart.row_labels);
+    const normalizedChart: FundamentalsChartSpecPayload = {
+      ...chart,
+      row_labels: normalizedRows
+    };
+
+    const previous = coalesced[coalesced.length - 1];
+    if (!previous || !canCoalesceSplitFragments(previous, normalizedChart)) {
+      coalesced.push(normalizedChart);
+      return;
+    }
+
+    coalesced[coalesced.length - 1] = {
+      ...previous,
+      row_labels: dedupeRowLabels([...previous.row_labels, ...normalizedChart.row_labels])
+    };
+  });
+
+  return coalesced;
+}
+
 export function buildChartSelectorOptions(
   marketData: ChartDataPoint[] | undefined,
   visualization: FundamentalsVisualizationPayload | null | undefined
@@ -56,18 +111,17 @@ export function buildChartSelectorOptions(
     options.push({ id: 'market-price', label: 'Market Price', kind: 'market' });
   }
 
-  const charts = visualization?.charts ?? [];
+  const charts = getNormalisedFundamentalsCharts(visualization);
   charts.forEach((chart, index) => {
-    const safeChart = normaliseChartSpec(chart);
     const label =
-      safeChart.title?.trim() ||
-      safeChart.row_labels.join(', ').slice(0, 48) ||
+      chart.title?.trim() ||
+      chart.row_labels.join(', ').slice(0, 48) ||
       `Fundamentals ${index + 1}`;
     options.push({
       id: `fundamentals-${index}`,
       label,
       kind: 'fundamentals',
-      spec: safeChart
+      spec: chart
     });
   });
   return options;
